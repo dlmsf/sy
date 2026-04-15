@@ -48,8 +48,8 @@ const colors = {
 const terminalWidth = process.stdout.columns || 80;
 const terminalHeight = process.stdout.rows || 24;
 
-// Directories to ignore
-const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'coverage', '.cache', 'tmp', 'temp']);
+// Directories to ignore for code analysis (but NOT for total size calculation)
+const IGNORE_DIRS = new Set(['node_modules', 'dist', 'build', 'coverage', '.cache', 'tmp', 'temp']);
 
 // File extensions by language for LOC counting
 const LANGUAGE_EXTENSIONS = {
@@ -232,6 +232,85 @@ async function isBinaryFile(filePath, stats) {
 }
 
 /**
+ * NEW: Calculate real directory size including all files (even ignored ones)
+ * Gets actual file sizes, not disk usage
+ */
+async function getRealDirectorySize(dirPath) {
+  try {
+    // Try using find + du for accurate byte count on Unix
+    if (process.platform !== 'win32') {
+      try {
+        // Method 1: Use find with -type f and stat to sum actual file sizes
+        const { stdout } = await execPromise(`find "${dirPath}" -type f -exec stat -f%z {} \\; 2>/dev/null | awk '{sum+=$1} END {print sum}'`, {
+          encoding: 'utf8',
+          maxBuffer: 10 * 1024 * 1024,
+          shell: true
+        });
+        
+        const size = parseInt(stdout.trim(), 10);
+        if (!isNaN(size) && size > 0) {
+          return size;
+        }
+      } catch (findError) {
+        // Try alternative method for Linux
+        try {
+          const { stdout } = await execPromise(`find "${dirPath}" -type f -exec stat -c%s {} \\; 2>/dev/null | awk '{sum+=$1} END {print sum}'`, {
+            encoding: 'utf8',
+            maxBuffer: 10 * 1024 * 1024,
+            shell: true
+          });
+          
+          const size = parseInt(stdout.trim(), 10);
+          if (!isNaN(size) && size > 0) {
+            return size;
+          }
+        } catch (linuxError) {
+          // Fall back to manual calculation
+        }
+      }
+    }
+    
+    // Manual calculation as fallback (accurate but slower)
+    let totalSize = 0;
+    
+    async function calculateSize(currentPath) {
+      try {
+        const items = await readdir(currentPath);
+        
+        for (const item of items) {
+          const fullPath = path.join(currentPath, item);
+          try {
+            const stats = await stat(fullPath);
+            
+            if (stats.isFile()) {
+              totalSize += stats.size;
+            } else if (stats.isDirectory()) {
+              // Don't add directory size itself, just traverse it
+              await calculateSize(fullPath);
+            } else if (stats.isSymbolicLink()) {
+              // Skip symlinks to avoid double counting
+              continue;
+            }
+          } catch (error) {
+            // Skip files/directories that can't be accessed
+            continue;
+          }
+        }
+      } catch (error) {
+        // Skip directories that can't be read
+        return;
+      }
+    }
+    
+    await calculateSize(dirPath);
+    return totalSize;
+  } catch (error) {
+    // If all else fails, return 0
+    return 0;
+  }
+}
+
+/**
  * Base Analyzer class
  */
 class BaseAnalyzer {
@@ -261,9 +340,12 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
     this.name = 'Total Size Analyzer';
     this.ignoreDirs = ignoreDirs;
     this.totalSize = 0;
+    this.realTotalSize = 0; // NEW: Real total size including .git and ignored dirs
     this.codeSize = 0;
     this.binarySize = 0;
     this.archiveSize = 0;
+    this.gitSize = 0; // NEW: Track .git directory size separately
+    this.ignoredDirsSize = 0; // NEW: Track size of ignored directories
     this.fileCount = 0;
     this.dirCount = 0;
     this.skippedDirs = [];
@@ -274,15 +356,32 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
     const relativePath = path.relative(process.cwd(), filePath);
     const pathParts = relativePath.split(path.sep);
     
+    // Track if this path contains .git
+    const hasGit = pathParts.includes('.git');
+    if (hasGit) {
+      this.gitSize += stats.size;
+      // Skip further processing for .git files - don't categorize them
+      return;
+    }
+    
+    // Check if path should be ignored for code analysis
+    let shouldIgnoreForCode = false;
     for (const part of pathParts) {
       if (this.ignoreDirs.has(part)) {
         this.skippedDirs.push(part);
         this.skippedCount++;
-        return;
+        this.ignoredDirsSize += stats.size;
+        shouldIgnoreForCode = true;
+        break;
       }
     }
-
+  
     this.totalSize += stats.size;
+    
+    // Skip further processing if ignored for code analysis
+    if (shouldIgnoreForCode) {
+      return;
+    }
     
     if (stats.isFile()) {
       const filename = path.basename(filePath);
@@ -295,11 +394,17 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
       }
       else {
         const ext = path.extname(filename).toLowerCase();
+        let isCodeFile = false;
         for (const extensions of Object.values(LANGUAGE_EXTENSIONS)) {
           if (extensions.includes(ext) || extensions.includes(filename)) {
             this.codeSize += stats.size;
+            isCodeFile = true;
             break;
           }
+        }
+        // If not code, binary, or archive, it falls into "other"
+        if (!isCodeFile) {
+          // Already counted in totalSize, will be calculated as "other" in getReport
         }
       }
       
@@ -309,11 +414,21 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
     }
   }
 
+  async calculateRealSize(dirPath) {
+    this.realTotalSize = await getRealDirectorySize(dirPath);
+  }
+
   getReport() {
+    // Other is what's left after subtracting all categorized sizes
+    const otherSize = this.totalSize - this.codeSize - this.binarySize - this.archiveSize;
+    
     return {
       totalSize: this.totalSize,
       totalSizeFormatted: formatSize(this.totalSize),
       totalSizeMB: formatMB(this.totalSize),
+      realTotalSize: this.realTotalSize,
+      realTotalSizeFormatted: formatSize(this.realTotalSize),
+      realTotalSizeMB: formatMB(this.realTotalSize),
       codeSize: this.codeSize,
       codeSizeFormatted: formatSize(this.codeSize),
       codeSizeMB: formatMB(this.codeSize),
@@ -323,6 +438,15 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
       archiveSize: this.archiveSize,
       archiveSizeFormatted: formatSize(this.archiveSize),
       archiveSizeMB: formatMB(this.archiveSize),
+      gitSize: this.gitSize,
+      gitSizeFormatted: formatSize(this.gitSize),
+      gitSizeMB: formatMB(this.gitSize),
+      ignoredDirsSize: this.ignoredDirsSize,
+      ignoredDirsSizeFormatted: formatSize(this.ignoredDirsSize),
+      ignoredDirsSizeMB: formatMB(this.ignoredDirsSize),
+      otherSize: otherSize,
+      otherSizeFormatted: formatSize(otherSize),
+      otherSizeMB: formatMB(otherSize),
       fileCount: this.fileCount,
       dirCount: this.dirCount,
       skippedDirs: [...new Set(this.skippedDirs)],
@@ -332,9 +456,12 @@ class TotalSizeAnalyzer extends BaseAnalyzer {
 
   reset() {
     this.totalSize = 0;
+    this.realTotalSize = 0;
     this.codeSize = 0;
     this.binarySize = 0;
     this.archiveSize = 0;
+    this.gitSize = 0;
+    this.ignoredDirsSize = 0;
     this.fileCount = 0;
     this.dirCount = 0;
     this.skippedDirs = [];
@@ -357,6 +484,16 @@ class PackageJsonAnalyzer extends BaseAnalyzer {
   }
 
   async processFile(filePath, stats) {
+    const relativePath = path.relative(process.cwd(), filePath);
+  const pathParts = relativePath.split(path.sep);
+  
+  // Skip .git and ignored directories completely
+  if (pathParts.includes('.git')) return;
+  for (const part of pathParts) {
+    if (IGNORE_DIRS.has(part)) return;
+  }
+  
+
     if (path.basename(filePath) === 'package.json') {
       this.packageJsonFiles.push(filePath);
       
@@ -433,14 +570,18 @@ class LocAnalyzer extends BaseAnalyzer {
   async processFile(filePath, stats) {
     const filename = path.basename(filePath);
     const ext = path.extname(filename).toLowerCase();
+    const relativePath = path.relative(process.cwd(), filePath);
+    const pathParts = relativePath.split(path.sep);
     
-    if (isArchiveFile(filename)) {
-      return;
+    // Skip .git and ignored directories completely
+    if (pathParts.includes('.git')) return;
+    for (const part of pathParts) {
+      if (IGNORE_DIRS.has(part)) return;
     }
     
-    if (await isBinaryFile(filePath, stats)) {
-      return;
-    }
+    if (isArchiveFile(filename)) return;
+    if (await isBinaryFile(filePath, stats)) return;
+    
     
     if (ASSEMBLY_EXTENSIONS.has(ext)) {
       try {
@@ -529,10 +670,17 @@ class ArchiveAnalyzer extends BaseAnalyzer {
 
   async processFile(filePath, stats) {
     const filename = path.basename(filePath);
+    const relativePath = path.relative(process.cwd(), filePath);
+    const pathParts = relativePath.split(path.sep);
+    
+    // Skip .git and ignored directories completely
+    if (pathParts.includes('.git')) return;
+    for (const part of pathParts) {
+      if (IGNORE_DIRS.has(part)) return;
+    }
     
     if (isArchiveFile(filename)) {
       const ext = path.extname(filename).toLowerCase();
-      
       this.archives.push({
         path: filePath,
         name: filename,
@@ -581,6 +729,20 @@ class BinaryAnalyzer extends BaseAnalyzer {
 
   async processFile(filePath, stats) {
     const filename = path.basename(filePath);
+    const relativePath = path.relative(process.cwd(), filePath);
+    const pathParts = relativePath.split(path.sep);
+    
+    // Skip .git directory completely
+    if (pathParts.includes('.git')) {
+      return;
+    }
+    
+    // Skip ignored directories
+    for (const part of pathParts) {
+      if (IGNORE_DIRS.has(part)) {
+        return;
+      }
+    }
     
     if (isArchiveFile(filename)) {
       return;
@@ -623,15 +785,14 @@ class BinaryAnalyzer extends BaseAnalyzer {
 }
 
 /**
- * NEW: Analyzer for Git repositories to get contributors and commits
- * This is a completely separate analyzer that won't affect existing functionality
+ * Analyzer for Git repositories to get contributors and commits
  */
 class GitAnalyzer extends BaseAnalyzer {
   constructor() {
     super();
     this.name = 'Git Analyzer';
     this.repositories = [];
-    this.gitDirs = new Set(); // Store unique .git directories found
+    this.gitDirs = new Set();
   }
 
   async findGitRepositories(dir) {
@@ -641,19 +802,17 @@ class GitAnalyzer extends BaseAnalyzer {
       try {
         const items = await readdir(currentPath);
         
-        // Check if current directory has a .git folder
         if (items.includes('.git')) {
           const gitPath = path.join(currentPath, '.git');
           const stats = await stat(gitPath);
           if (stats.isDirectory()) {
             gitRepos.push(currentPath);
-            return; // Don't go deeper into git repos
+            return;
           }
         }
         
-        // Continue scanning subdirectories (skip ignored dirs)
         for (const item of items) {
-          if (IGNORE_DIRS.has(item)) {
+          if (IGNORE_DIRS.has(item) && item !== '.git') {
             continue;
           }
           
@@ -675,14 +834,12 @@ class GitAnalyzer extends BaseAnalyzer {
 
   async analyzeRepository(repoPath) {
     try {
-      // Get total commit count
       const { stdout: commitCountOutput } = await execPromise('git rev-list --all --count', {
         cwd: repoPath,
         encoding: 'utf8'
       });
       const totalCommits = parseInt(commitCountOutput.trim(), 10) || 0;
       
-      // Get unique contributors (by email)
       const { stdout: contributorsOutput } = await execPromise('git log --format="%ae" | sort -u | wc -l', {
         cwd: repoPath,
         shell: true,
@@ -690,7 +847,6 @@ class GitAnalyzer extends BaseAnalyzer {
       });
       const uniqueContributors = parseInt(contributorsOutput.trim(), 10) || 0;
       
-      // Get detailed contributor list with names and emails
       const { stdout: contributorDetailsOutput } = await execPromise('git log --format="%an|%ae" | sort -u', {
         cwd: repoPath,
         shell: true,
@@ -714,7 +870,6 @@ class GitAnalyzer extends BaseAnalyzer {
         success: true
       };
     } catch (error) {
-      // Git command failed - might not be a valid git repo or git not installed
       return {
         path: repoPath,
         name: path.basename(repoPath),
@@ -729,7 +884,6 @@ class GitAnalyzer extends BaseAnalyzer {
 
   async processFile(filePath, stats) {
     // This analyzer doesn't process individual files
-    // It will be called separately
   }
 
   async scanDirectory(dir) {
@@ -747,12 +901,10 @@ class GitAnalyzer extends BaseAnalyzer {
     const totalCommitsAcrossRepos = this.repositories.reduce((sum, repo) => sum + repo.totalCommits, 0);
     const totalUniqueContributorsAcrossRepos = this.repositories.reduce((sum, repo) => sum + repo.uniqueContributors, 0);
     
-    // Find repo with most contributors
     const repoWithMostContributors = this.repositories.length > 0
       ? this.repositories.reduce((max, repo) => repo.uniqueContributors > max.uniqueContributors ? repo : max, this.repositories[0])
       : null;
     
-    // Find repo with most commits
     const repoWithMostCommits = this.repositories.length > 0
       ? this.repositories.reduce((max, repo) => repo.totalCommits > max.totalCommits ? repo : max, this.repositories[0])
       : null;
@@ -800,10 +952,6 @@ class DirectoryAnalyzer {
       const items = await readdir(dir);
       
       for (const item of items) {
-        if (IGNORE_DIRS.has(item)) {
-          continue;
-        }
-        
         const fullPath = path.join(dir, item);
         
         try {
@@ -869,7 +1017,7 @@ function printKeyValue(label, value, color = colors.white, width1 = 20, width2 =
 }
 
 /**
- * NEW: Print Git analysis for single directory mode
+ * Print Git analysis for single directory mode
  */
 function printGitAnalysis(gitReport) {
   if (!gitReport || gitReport.totalRepositories === 0) {
@@ -898,7 +1046,6 @@ function printGitAnalysis(gitReport) {
       console.log(`    ${colors.cyan}   👥 ${gitReport.repoWithMostCommits.uniqueContributors} unique contributors${colors.reset}`);
     }
     
-    // List all repositories found
     if (gitReport.repositories.length > 0) {
       console.log(`\n  ${colors.dim}Repositories found:${colors.reset}`);
       gitReport.repositories.slice(0, 5).forEach((repo, idx) => {
@@ -935,7 +1082,7 @@ function printComparisonHeader(directories) {
     const displayDir = truncate(dir, terminalWidth - 10);
     console.log(`  ${colors.bright}${i + 1}.${colors.reset} ${colors.yellow}${displayDir}${colors.reset}`);
   });
-  console.log(`\n${colors.dim}Ignoring: ${Array.from(IGNORE_DIRS).join(', ')}${colors.reset}`);
+  console.log(`\n${colors.dim}Ignoring for code analysis: ${Array.from(IGNORE_DIRS).join(', ')}${colors.reset}`);
   console.log();
 }
 
@@ -944,7 +1091,6 @@ function createTable(directories, metrics, reportsByDir) {
   const maxDirNameLength = Math.min(25, Math.floor(terminalWidth * 0.2));
   const valueWidth = Math.min(15, Math.floor((terminalWidth - maxDirNameLength - 10) / dirCount));
   
-  // Header
   let headerLine = ' '.repeat(maxDirNameLength);
   directories.forEach(dir => {
     const shortName = truncate(path.basename(dir), valueWidth);
@@ -955,7 +1101,6 @@ function createTable(directories, metrics, reportsByDir) {
   console.log(headerLine);
   console.log(colors.dim + '├' + '─'.repeat(maxDirNameLength + 2) + '┼' + '─'.repeat((valueWidth + 4) * dirCount - 1) + '┤' + colors.reset);
   
-  // Rows
   metrics.forEach((metric, idx) => {
     const values = directories.map(dir => {
       const report = reportsByDir[dir];
@@ -965,10 +1110,8 @@ function createTable(directories, metrics, reportsByDir) {
       return report[metric.key];
     });
     
-    // Determine winners
     const numericValues = values.map(v => {
       if (typeof v === 'string' && v.includes(' ')) {
-        // Handle formatted sizes like "1.23 MB"
         const num = parseFloat(v.split(' ')[0]);
         return isNaN(num) ? 0 : num;
       }
@@ -1002,7 +1145,6 @@ function printLanguagesComparison(directories, reportsByDir) {
   const maxDirNameLength = Math.min(20, Math.floor(terminalWidth * 0.15));
   const langWidth = Math.min(15, Math.floor((terminalWidth - maxDirNameLength - 10) / dirCount));
   
-  // Get top languages across all directories
   const allLanguages = new Set();
   directories.forEach(dir => {
     const languages = reportsByDir[dir]['Lines of Code Analyzer'].languages || [];
@@ -1043,7 +1185,7 @@ function printLanguagesComparison(directories, reportsByDir) {
 }
 
 /**
- * NEW: Print Git comparison for multi-directory mode
+ * Print Git comparison for multi-directory mode
  */
 function printGitComparison(directories, reportsByDir) {
   const hasGitRepos = directories.some(dir => {
@@ -1078,7 +1220,6 @@ function printGitComparison(directories, reportsByDir) {
   
   createTable(directories, gitMetrics, reportsByDir);
   
-  // Show detailed repository info for each directory
   console.log(`\n  ${colors.dim}Detailed repository information:${colors.reset}`);
   directories.forEach(dir => {
     const gitReport = reportsByDir[dir]['Git Analyzer'];
@@ -1144,17 +1285,17 @@ async function processSingleDirectory(targetDir) {
   console.log(colors.bgBlue + colors.white + colors.bright + '╚' + '═'.repeat(terminalWidth - 2) + '╝' + colors.reset);
   
   console.log(`\n${colors.cyan}${colors.bright}Scanning:${colors.reset} ${colors.white}${absolutePath}${colors.reset}`);
-  console.log(`${colors.cyan}${colors.bright}Ignoring:${colors.reset} ${colors.dim}${Array.from(IGNORE_DIRS).join(', ')}${colors.reset}`);
+  console.log(`${colors.cyan}${colors.bright}Ignoring for code analysis:${colors.reset} ${colors.dim}${Array.from(IGNORE_DIRS).join(', ')}${colors.reset}`);
   
   const analyzer = new DirectoryAnalyzer();
   
-  analyzer.registerAnalyzer(new TotalSizeAnalyzer(IGNORE_DIRS));
+  const sizeAnalyzer = new TotalSizeAnalyzer(IGNORE_DIRS);
+  analyzer.registerAnalyzer(sizeAnalyzer);
   analyzer.registerAnalyzer(new PackageJsonAnalyzer());
   analyzer.registerAnalyzer(new LocAnalyzer());
   analyzer.registerAnalyzer(new ArchiveAnalyzer());
   analyzer.registerAnalyzer(new BinaryAnalyzer());
   
-  // NEW: Register Git analyzer (optional, won't break anything if git is not available)
   const gitAnalyzer = new GitAnalyzer();
   analyzer.registerAnalyzer(gitAnalyzer);
   
@@ -1162,6 +1303,7 @@ async function processSingleDirectory(targetDir) {
   analyzer.analyzers.forEach(a => console.log(`  ${colors.green}✓${colors.reset} ${a.name}`));
   
   console.log(`\n${colors.yellow}Processing files...${colors.reset}`);
+  console.log(`${colors.dim}Calculating real directory size (including .git and ignored dirs)...${colors.reset}`);
   
   const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let spinnerIndex = 0;
@@ -1173,7 +1315,9 @@ async function processSingleDirectory(targetDir) {
   analyzer.resetAll();
   await analyzer.traverseDirectory(absolutePath);
   
-  // NEW: Run Git analysis separately (since it's not file-based)
+  // Calculate real total size
+  await sizeAnalyzer.calculateRealSize(absolutePath);
+  
   await gitAnalyzer.scanDirectory(absolutePath);
   
   clearInterval(spinnerInterval);
@@ -1186,20 +1330,24 @@ async function processSingleDirectory(targetDir) {
   const sizeReport = reports['Total Size Analyzer'];
   
   const statsData = [
-    { label: 'Total Size', value: sizeReport.totalSizeFormatted, color: colors.green },
+    { label: '📁 REAL Total Size (OS)', value: sizeReport.realTotalSizeFormatted, color: colors.bright + colors.green },
+    { label: '📊 Analyzed Size', value: sizeReport.totalSizeFormatted, color: colors.green },
     { label: '├─ Pure Code', value: sizeReport.codeSizeFormatted, color: colors.green },
     { label: '├─ Binary Files', value: sizeReport.binarySizeFormatted, color: colors.blue },
-    { label: '└─ Archive Files', value: sizeReport.archiveSizeFormatted, color: colors.yellow },
+    { label: '├─ Archive Files', value: sizeReport.archiveSizeFormatted, color: colors.yellow },
+    { label: '├─ .git Directory', value: sizeReport.gitSizeFormatted, color: colors.magenta },
+    { label: '├─ Ignored Dirs', value: sizeReport.ignoredDirsSizeFormatted, color: colors.dim },
+    { label: '└─ Other', value: sizeReport.otherSizeFormatted, color: colors.dim },
     { label: 'Files Scanned', value: sizeReport.fileCount.toLocaleString(), color: colors.cyan },
     { label: 'Directories', value: sizeReport.dirCount.toLocaleString(), color: colors.cyan }
   ];
   
   statsData.forEach(({label, value, color}) => {
-    printKeyValue(label, value, color, 20, 15);
+    printKeyValue(label, value, color, 25, 20);
   });
   
   if (sizeReport.skippedDirs.length > 0) {
-    console.log(`\n  ${colors.dim}Ignored: ${colors.yellow}${Array.from(new Set(sizeReport.skippedDirs)).slice(0, 3).join(', ')}${colors.reset}`);
+    console.log(`\n  ${colors.dim}Ignored for analysis: ${colors.yellow}${Array.from(new Set(sizeReport.skippedDirs)).slice(0, 3).join(', ')}${colors.reset}`);
     if (sizeReport.skippedCount > 3) {
       console.log(`  ${colors.dim}  and ${sizeReport.skippedCount - 3} more items${colors.reset}`);
     }
@@ -1298,7 +1446,7 @@ async function processSingleDirectory(targetDir) {
     console.log(`  ${colors.yellow}No binary files found${colors.reset}`);
   }
   
-  // NEW: Git Analysis Report
+  // Git Analysis Report
   const gitReport = reports['Git Analyzer'];
   if (gitReport && gitReport.totalRepositories > 0) {
     printGitAnalysis(gitReport);
@@ -1308,15 +1456,16 @@ async function processSingleDirectory(targetDir) {
   printHeader('⚡ SUMMARY', colors.white + colors.bgBlue);
   
   const summaryItems = [
-    { icon: '📁', label: 'Total', value: sizeReport.totalSizeFormatted, color: colors.green },
+    { icon: '💾', label: 'REAL Total Size', value: sizeReport.realTotalSizeFormatted, color: colors.bright + colors.green },
+    { icon: '📁', label: 'Analyzed Size', value: sizeReport.totalSizeFormatted, color: colors.green },
     { icon: '📝', label: 'Code', value: sizeReport.codeSizeFormatted, color: colors.green },
     { icon: '💾', label: 'Binary', value: `${binaryReport.totalCount} files (${sizeReport.binarySizeFormatted})`, color: colors.blue },
     { icon: '📦', label: 'Archive', value: `${archiveReport.totalCount} files (${sizeReport.archiveSizeFormatted})`, color: colors.yellow },
+    { icon: '🔧', label: '.git', value: sizeReport.gitSizeFormatted, color: colors.magenta },
     { icon: '📊', label: 'Lines', value: locReport.totalLinesFormatted, color: colors.green },
     { icon: '📋', label: 'Files', value: sizeReport.fileCount.toLocaleString(), color: colors.cyan }
   ];
   
-  // NEW: Add Git summary if available
   if (gitReport && gitReport.totalRepositories > 0) {
     summaryItems.push(
       { icon: '🔀', label: 'Repos', value: gitReport.totalRepositories, color: colors.magenta },
@@ -1342,7 +1491,6 @@ async function processSingleDirectory(targetDir) {
  * Process multiple directories in comparison mode
  */
 async function processMultipleDirectories(directories) {
-  // Validate all directories
   const validDirs = [];
   for (const dir of directories) {
     const absolutePath = path.resolve(dir);
@@ -1372,11 +1520,10 @@ async function processMultipleDirectories(directories) {
   console.clear();
   printComparisonHeader(validDirs);
 
-  // Create analyzer for each directory
   const reports = {};
-  const gitAnalyzers = {}; // Store Git analyzers separately
+  const sizeAnalyzers = {};
+  const gitAnalyzers = {};
 
-  // Progress tracking
   let completedDirs = 0;
   const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   let spinnerIndex = 0;
@@ -1387,25 +1534,26 @@ async function processMultipleDirectories(directories) {
     spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
   }, 100);
 
-  // Process each directory
   for (const dir of validDirs) {
     const analyzer = new DirectoryAnalyzer();
     
-    analyzer.registerAnalyzer(new TotalSizeAnalyzer(IGNORE_DIRS));
+    const sizeAnalyzer = new TotalSizeAnalyzer(IGNORE_DIRS);
+    analyzer.registerAnalyzer(sizeAnalyzer);
     analyzer.registerAnalyzer(new PackageJsonAnalyzer());
     analyzer.registerAnalyzer(new LocAnalyzer());
     analyzer.registerAnalyzer(new ArchiveAnalyzer());
     analyzer.registerAnalyzer(new BinaryAnalyzer());
     
-    // NEW: Register Git analyzer
     const gitAnalyzer = new GitAnalyzer();
     analyzer.registerAnalyzer(gitAnalyzer);
+    
+    sizeAnalyzers[dir] = sizeAnalyzer;
     gitAnalyzers[dir] = gitAnalyzer;
     
     analyzer.resetAll();
     await analyzer.traverseDirectory(dir);
     
-    // NEW: Run Git analysis separately
+    await sizeAnalyzer.calculateRealSize(dir);
     await gitAnalyzer.scanDirectory(dir);
     
     reports[dir] = analyzer.getReport();
@@ -1415,7 +1563,6 @@ async function processMultipleDirectories(directories) {
   clearInterval(spinnerInterval);
   process.stdout.write('\r' + ' '.repeat(60) + '\r');
 
-  // Flatten reports for easier access
   const flattenedReports = {};
   validDirs.forEach(dir => {
     const sizeReport = reports[dir]['Total Size Analyzer'];
@@ -1438,10 +1585,12 @@ async function processMultipleDirectories(directories) {
   // Directory Statistics Table
   console.log('\n' + colors.cyan + colors.bright + '📁 DIRECTORY STATISTICS' + colors.reset);
   const dirMetrics = [
-    { label: 'Total Size', key: 'totalSizeFormatted', winner: 'smallest', getValue: (r) => r.totalSizeFormatted },
+    { label: '💾 REAL Total Size', key: 'realTotalSizeFormatted', winner: 'largest', getValue: (r) => r.realTotalSizeFormatted },
+    { label: 'Total Size (analyzed)', key: 'totalSizeFormatted', winner: 'smallest', getValue: (r) => r.totalSizeFormatted },
     { label: 'Code Size', key: 'codeSizeFormatted', winner: 'largest', getValue: (r) => r.codeSizeFormatted },
     { label: 'Binary Size', key: 'binarySizeFormatted', winner: 'smallest', getValue: (r) => r.binarySizeFormatted },
     { label: 'Archive Size', key: 'archiveSizeFormatted', winner: 'smallest', getValue: (r) => r.archiveSizeFormatted },
+    { label: '.git Size', key: 'gitSizeFormatted', winner: 'smallest', getValue: (r) => r.gitSizeFormatted },
     { label: 'Files', key: 'fileCount', winner: 'largest', getValue: (r) => r.fileCount.toLocaleString() },
     { label: 'Directories', key: 'dirCount', winner: 'largest', getValue: (r) => r.dirCount.toLocaleString() }
   ];
@@ -1492,7 +1641,7 @@ async function processMultipleDirectories(directories) {
     createTable(validDirs, binaryMetrics, flattenedReports);
   }
 
-  // NEW: Git Comparison Table
+  // Git Comparison Table
   printGitComparison(validDirs, flattenedReports);
 
   // Calculate winners
@@ -1509,7 +1658,6 @@ async function processMultipleDirectories(directories) {
   if (hasArchives) allMetrics.push({ label: 'Archive Files', key: 'totalCount', winner: 'smallest' });
   if (hasBinaries) allMetrics.push({ label: 'Binary Files', key: 'totalCount', winner: 'smallest' });
   
-  // NEW: Add Git metrics to winners calculation
   const hasGit = validDirs.some(dir => flattenedReports[dir]['Git Analyzer'].totalRepositories > 0);
   if (hasGit) {
     allMetrics.push(
@@ -1523,10 +1671,12 @@ async function processMultipleDirectories(directories) {
     const values = validDirs.map(dir => {
       if (metric.key.includes('Formatted') || metric.key === 'totalLinesFormatted') {
         const report = flattenedReports[dir];
+        if (metric.key === 'realTotalSizeFormatted') return parseFloat(report.realTotalSizeMB);
         if (metric.key === 'totalSizeFormatted') return parseFloat(report.totalSizeMB);
         if (metric.key === 'codeSizeFormatted') return parseFloat(report.codeSizeMB);
         if (metric.key === 'binarySizeFormatted') return parseFloat(report.binarySizeMB);
         if (metric.key === 'archiveSizeFormatted') return parseFloat(report.archiveSizeMB);
+        if (metric.key === 'gitSizeFormatted') return parseFloat(report.gitSizeMB);
         if (metric.key === 'totalLinesFormatted') return flattenedReports[dir]['Lines of Code Analyzer'].totalLines;
       }
       if (metric.key === 'totalFiles' || metric.key === 'totalDeps' || metric.key === 'purityPercentage') {
@@ -1540,7 +1690,6 @@ async function processMultipleDirectories(directories) {
           return flattenedReports[dir]['Binary Files Analyzer'].totalCount;
         }
       }
-      // NEW: Handle Git metrics
       if (metric.key === 'totalRepositories' || metric.key === 'totalCommits' || metric.key === 'totalUniqueContributors') {
         return flattenedReports[dir]['Git Analyzer'][metric.key] || 0;
       }
