@@ -2891,6 +2891,7 @@ class Session {
     this.ActualProps = undefined
     /** @type {Object|undefined} */
     this.PreviousProps = undefined
+    this.InAction = false
   }
 }
 
@@ -4559,6 +4560,38 @@ class SyAPP {
       includeFuncName: userConfig.includeFuncName !== false
     };
 
+    if(userConfig.RefreshMode){
+      this.Refresher = setInterval(async () => {  
+        
+        
+        //let sessions = [...this.Sessions.keys()]
+        //console.log(this.Sessions.get(sessions[0]))
+        //await this.WaitLog([...this.Sessions.keys()])  
+        
+       
+
+        
+        //this.LoadScreen()
+
+        /*
+        LogMaster.Log('syapp', Object.fromEntries(
+          Array.from(this.Sessions.entries()).map(([key, session]) => {
+            const clean = { ...session };
+            
+            // Clean the nested circular reference
+            if (clean.ActualProps && clean.ActualProps.session) {
+              delete clean.ActualProps.session;
+            }
+            
+            return [key, clean];
+          })
+        ),{statusMode : true});
+        
+*/
+
+      }, 50);
+    }
+
     /**
      * Process and register a function class
      * @param {Function} FuncClass - Function class to process
@@ -4631,7 +4664,7 @@ class SyAPP {
 
     // --------------------------- LoadScreen Method ---------------------------
 
-    /**
+     /**
      * Load a screen/function
      * @param {string} [funcname] - Function name to load
      * @param {Object} [config] - Load configuration
@@ -4640,7 +4673,7 @@ class SyAPP {
      * @param {Object} [config.props={}] - Props to pass
      * @returns {Promise<void>}
      */
-    this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false, resetSelection: false, props: {} }) => {
+     this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false, resetSelection: false, props: {} }) => {
       if (!config.props) { config.props = {}; }
 
       // Handle main function name aliasing
