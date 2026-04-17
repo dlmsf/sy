@@ -4665,129 +4665,161 @@ class SyAPP {
     // --------------------------- LoadScreen Method ---------------------------
 
      /**
-     * Load a screen/function
-     * @param {string} [funcname] - Function name to load
-     * @param {Object} [config] - Load configuration
-     * @param {boolean|number} [config.jumpTo=false] - Jump to index
-     * @param {boolean} [config.resetSelection=false] - Reset selection
-     * @param {Object} [config.props={}] - Props to pass
-     * @returns {Promise<void>}
-     */
-     this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false, resetSelection: false, props: {} }) => {
-      if (!config.props) { config.props = {}; }
+ * Load a screen/function
+ * @param {string} [funcname] - Function name to load
+ * @param {Object} [config] - Load configuration
+ * @param {boolean|number} [config.jumpTo=false] - Jump to index
+ * @param {boolean} [config.resetSelection=false] - Reset selection
+ * @param {Object} [config.props={}] - Props to pass
+ * @returns {Promise<void>}
+ */
+this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false, resetSelection: false, props: {} }) => {
+  const session = this.Sessions.get(this.MainSessionID);
+  
+  // Lock check - if session is already in action, silently return
+  if (session.InAction) {
+    return;
+  }
+  
+  // Acquire lock
+  session.InAction = true;
+  
+  try {
+    if (!config.props) { config.props = {}; }
 
-      // Handle main function name aliasing
-      let targetFuncName = funcname;
-      
-      // If trying to access main function by original name but we have a custom name
-      if (this.serverConfig.mainFuncName && 
-          funcname === this.MainFunc.OriginalName && 
-          this.Funcs.has(this.serverConfig.mainFuncName)) {
-        targetFuncName = this.serverConfig.mainFuncName;
-      }
+    // Handle main function name aliasing
+    let targetFuncName = funcname;
+    
+    // If trying to access main function by original name but we have a custom name
+    if (this.serverConfig.mainFuncName && 
+        funcname === this.MainFunc.OriginalName && 
+        this.Funcs.has(this.serverConfig.mainFuncName)) {
+      targetFuncName = this.serverConfig.mainFuncName;
+    }
 
-      if (!this.Funcs.has(targetFuncName)) {
-        config.props.notfounded_func = funcname;
-        targetFuncName = 'notfounded';
-      }
-      config.props.mainfunc = this.MainFunc.Name;
+    if (!this.Funcs.has(targetFuncName)) {
+      config.props.notfounded_func = funcname;
+      targetFuncName = 'notfounded';
+    }
+    config.props.mainfunc = this.MainFunc.Name;
 
-      // Pass HTTP config to the build function if available
-      if (this.serverConfig.enableHTTP && this.serverConfig.httpConfig) {
-        config.props._httpConfig = this.serverConfig.httpConfig;
-      }
+    // Pass HTTP config to the build function if available
+    if (this.serverConfig.enableHTTP && this.serverConfig.httpConfig) {
+      config.props._httpConfig = this.serverConfig.httpConfig;
+    }
 
-      this.Sessions.get(this.MainSessionID).PreviousPath = this.Sessions.get(this.MainSessionID).ActualPath;
-      this.Sessions.get(this.MainSessionID).ActualPath = targetFuncName;
-      this.Sessions.get(this.MainSessionID).PreviousProps = this.Sessions.get(this.MainSessionID).ActualProps;
-      config.props.session = this.Sessions.get(this.MainSessionID);
-      this.Sessions.get(this.MainSessionID).ActualProps = config.props;
+    session.PreviousPath = session.ActualPath;
+    session.ActualPath = targetFuncName;
+    session.PreviousProps = session.ActualProps;
+    config.props.session = session;
+    session.ActualProps = config.props;
 
-      try {
-        const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
+    try {
+      const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
 
-        if (config.props) {
-          if (config.props.session) {
-            if (config.props.session.ActualPath && config.props.session.PreviousPath) {
-              if (config.props.session.ActualPath != config.props.session.PreviousPath) {
-                config.resetSelection = true;
-              }
+      if (config.props) {
+        if (config.props.session) {
+          if (config.props.session.ActualPath && config.props.session.PreviousPath) {
+            if (config.props.session.ActualPath != config.props.session.PreviousPath) {
+              config.resetSelection = true;
             }
           }
         }
+      }
 
-        if (return_obj && return_obj.goto_now) {
-          this.LoadScreen(return_obj.goto_now.path, {
-            props: return_obj.goto_now.props || {},
-            jumpTo: false,
-            resetSelection: true
-          }).catch(er => {
-            this.LoadScreen('error', {
-              props: {
-                error_message: er,
-                error_func: return_obj.goto_now.path,
-                mainfunc: this.MainFunc.Name
-              }
-            });
-          });
-          return;
-        }
-
-        this.HUD.displayMenu(return_obj.hud_obj, {
-          remember: (!config.resetSelection) ? true : false,
-          jumpToIndex: (!config.jumpTo) ? undefined : config.jumpTo
-        })
-          .catch(e => {
-            this.LoadScreen('error', {
-              props: {
-                error_message: e,
-                error_func: targetFuncName,
-                mainfunc: this.MainFunc.Name
-              }
-            });
-          });
-
-        if (return_obj.wait_input) {
-          let response;
-
-          try {
-            if (return_obj.input_obj.password) {
-              response = await this.HUD.ask(return_obj.input_obj.question || 'Password: ', {
-                password: true,
-                mask: return_obj.input_obj.mask || '*'
-              });
-            } else {
-              response = await this.HUD.ask(return_obj.input_obj.question || 'Type: ');
+      if (return_obj && return_obj.goto_now) {
+        // Release lock before recursive call
+        session.InAction = false;
+        
+        this.LoadScreen(return_obj.goto_now.path, {
+          props: return_obj.goto_now.props || {},
+          jumpTo: false,
+          resetSelection: true
+        }).catch(er => {
+          this.LoadScreen('error', {
+            props: {
+              error_message: er,
+              error_func: return_obj.goto_now.path,
+              mainfunc: this.MainFunc.Name
             }
-
-            this.LoadScreen(return_obj.input_obj.path, {
-              props: {
-                inputValue: response,
-                ...return_obj.input_obj.props
-              }
-            });
-
-          } catch (e) {
-            this.LoadScreen('error', {
-              props: {
-                error_message: e,
-                error_func: targetFuncName,
-                mainfunc: this.MainFunc.Name
-              }
-            });
-          }
-        }
-
-      } catch (buildError) {
-        this.LoadScreen('error', {
-          props: {
-            error_message: buildError,
-            error_func: targetFuncName,
-            mainfunc: this.MainFunc.Name
-          }
+          });
         });
+        return;
       }
-    };
+
+      this.HUD.displayMenu(return_obj.hud_obj, {
+        remember: (!config.resetSelection) ? true : false,
+        jumpToIndex: (!config.jumpTo) ? undefined : config.jumpTo
+      })
+        .catch(e => {
+          this.LoadScreen('error', {
+            props: {
+              error_message: e,
+              error_func: targetFuncName,
+              mainfunc: this.MainFunc.Name
+            }
+          });
+        });
+
+      if (return_obj.wait_input) {
+        let response;
+
+        try {
+          if (return_obj.input_obj.password) {
+            response = await this.HUD.ask(return_obj.input_obj.question || 'Password: ', {
+              password: true,
+              mask: return_obj.input_obj.mask || '*'
+            });
+          } else {
+            response = await this.HUD.ask(return_obj.input_obj.question || 'Type: ');
+          }
+
+          // Release lock before recursive call
+          session.InAction = false;
+          
+          this.LoadScreen(return_obj.input_obj.path, {
+            props: {
+              inputValue: response,
+              ...return_obj.input_obj.props
+            }
+          });
+
+        } catch (e) {
+          // Release lock before recursive error call
+          session.InAction = false;
+          
+          this.LoadScreen('error', {
+            props: {
+              error_message: e,
+              error_func: targetFuncName,
+              mainfunc: this.MainFunc.Name
+            }
+          });
+        }
+        return;
+      }
+
+      // Release lock on successful completion
+      session.InAction = false;
+
+    } catch (buildError) {
+      // Release lock before recursive error call
+      session.InAction = false;
+      
+      this.LoadScreen('error', {
+        props: {
+          error_message: buildError,
+          error_func: targetFuncName,
+          mainfunc: this.MainFunc.Name
+        }
+      });
+    }
+  } catch (error) {
+    // Ensure lock is released even if an unexpected error occurs
+    session.InAction = false;
+    throw error;
+  }
+};
 
     this.HUD.on(this.HUD.eventTypes.MENU_SELECTION, (e) => {
       const currentSession = this.Sessions.get(this.MainSessionID);
