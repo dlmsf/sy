@@ -1231,6 +1231,7 @@ class TerminalHUD extends EventEmitter {
     this.highlightColor = this.getAnsiBackgroundColor(configuration.highlightColor || 'blue');
     this.lastMenuGenerator = null;
     this.lastSelectedIndex = 0;
+    this.lastFocusedIndex = 0; 
     
     // Event emission configuration
     this.enableEvents = configuration.enableEvents !== false; // Default to true
@@ -1658,17 +1659,21 @@ async displayMenu(menuGeneratorOrObject, configuration = {
   const totalOptions = this.countMenuOptions(menu.options);
   
   // Determine base index
-  let baseIndex;
-  
-  if (configuration.remember && this.lastSelectedIndex !== undefined) {
-    // Use remembered index as base if valid
-    baseIndex = (this.lastSelectedIndex >= 0 && this.lastSelectedIndex < totalOptions) 
-      ? this.lastSelectedIndex 
-      : (configuration.initialSelectedIndex || 0);
-  } else {
-    // Use initialSelectedIndex as base
-    baseIndex = configuration.initialSelectedIndex || 0;
-  }
+let baseIndex;
+
+if (configuration.remember) {
+  // Use remembered focus index if valid, otherwise fall back to selected index
+  const rememberedIndex = this.lastFocusedIndex !== undefined 
+    ? this.lastFocusedIndex 
+    : this.lastSelectedIndex;
+    
+  baseIndex = (rememberedIndex >= 0 && rememberedIndex < totalOptions) 
+    ? rememberedIndex 
+    : (configuration.initialSelectedIndex || 0);
+} else {
+  // Use initialSelectedIndex as base
+  baseIndex = configuration.initialSelectedIndex || 0;
+}
   
   // Apply selectedIncrement for backward compatibility
   if (configuration.selectedIncrement) {
@@ -1695,6 +1700,8 @@ async displayMenu(menuGeneratorOrObject, configuration = {
   
   // Ensure finalIndex is within bounds
   finalIndex = Math.max(0, Math.min(finalIndex, totalOptions - 1));
+
+  this.lastFocusedIndex = finalIndex;
   
   // Store reference to menu generator for function case
   if (typeof menuGeneratorOrObject === 'function') {
@@ -1851,11 +1858,14 @@ async displayMenu(menuGeneratorOrObject, configuration = {
         line = newLine;
         column = newColumn;
         
+        // Store the focused index for remember functionality
+        this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, newLine, newColumn);
+        
         // Emit menu navigation event
         this.emitEvent(this.eventTypes.MENU_NAVIGATION, {
           line: newLine,
           column: newColumn,
-          linearIndex: this.getLinearIndexFromCoordinates(normalizedOptions, newLine, newColumn),
+          linearIndex: this.lastFocusedIndex,  // Use the stored value
           question
         });
         
@@ -2084,21 +2094,31 @@ async displayMenu(menuGeneratorOrObject, configuration = {
           case 'up':
             if (line > 0) line--;
             if (column >= normalizedOptions[line].length) column = normalizedOptions[line].length - 1;
+            // Update focused index
+            this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
             break;
           case 'down':
             if (line < normalizedOptions.length - 1) line++;
             if (column >= normalizedOptions[line].length) column = normalizedOptions[line].length - 1;
+            // Update focused index
+            this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
             break;
           case 'left':
             if (column > 0) column--;
+            // Update focused index
+            this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
             break;
           case 'right':
             if (column < normalizedOptions[line].length - 1) column++;
+            // Update focused index
+            this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
             break;
           case 'return':
             stdin.removeListener('keypress', handleKeyPress);
             stdin.setRawMode(false);
             this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
+            // Also update focused index on selection
+            this.lastFocusedIndex = this.lastSelectedIndex;
             const selected = normalizedOptions[line][column];
             
             // Emit menu selection event
@@ -2656,12 +2676,14 @@ getOptionDataForEvent(option) {
         }
       }
       
-      // Update the menu state with new position
       this.currentMenuState.currentLine = newLine;
-      this.currentMenuState.currentColumn = newColumn;
-      
-      // Set focus to new position
-      setFocus(newLine, newColumn);
+this.currentMenuState.currentColumn = newColumn;
+
+// Update the focused index for remember functionality
+this.lastFocusedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, newLine, newColumn);
+
+// Set focus to new position
+setFocus(newLine, newColumn);
       
       // Reset accumulator
       this.wheelAccumulator = 0;
@@ -4563,33 +4585,21 @@ class SyAPP {
     if(userConfig.RefreshMode){
       this.Refresher = setInterval(async () => {  
         
-        
-        //let sessions = [...this.Sessions.keys()]
+        let sessions = [...this.Sessions.keys()]
         //console.log(this.Sessions.get(sessions[0]))
         //await this.WaitLog([...this.Sessions.keys()])  
         
+        sessions.forEach(k => {
+          this.LoadScreen(this.Sessions.get(k).ActualPath)
+        })
        
 
         
-        //this.LoadScreen()
+        this.LoadScreen()
 
-        /*
-        LogMaster.Log('syapp', Object.fromEntries(
-          Array.from(this.Sessions.entries()).map(([key, session]) => {
-            const clean = { ...session };
-            
-            // Clean the nested circular reference
-            if (clean.ActualProps && clean.ActualProps.session) {
-              delete clean.ActualProps.session;
-            }
-            
-            return [key, clean];
-          })
-        ),{statusMode : true});
-        
-*/
 
-      }, 50);
+
+      }, 1000);
     }
 
     /**
@@ -4721,6 +4731,7 @@ this.LoadScreen = async (funcname = this.MainFunc.Name, config = { jumpTo: false
         if (config.props.session) {
           if (config.props.session.ActualPath && config.props.session.PreviousPath) {
             if (config.props.session.ActualPath != config.props.session.PreviousPath) {
+              this.HUD.lastFocusedIndex = 0
               config.resetSelection = true;
             }
           }
