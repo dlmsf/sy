@@ -4592,12 +4592,17 @@ class SyAPP {
         //await this.WaitLog([...this.Sessions.keys()])  
         
         sessions.forEach(k => {
-          this.LoadScreen(this.Sessions.get(k).ActualPath)
+          if(this.Sessions.get(k).ActualProps.page){
+            this.LoadScreen(this.Sessions.get(k).ActualPath,{props : {page : this.Sessions.get(k).ActualProps.page}})
+          } else {
+            this.LoadScreen(this.Sessions.get(k).ActualPath)
+          }
+      
         })
        
 
         
-        this.LoadScreen()
+        //this.LoadScreen()
 
 
 
