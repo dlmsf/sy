@@ -434,7 +434,7 @@ class FastHTTP extends SyAPP.Func() {
                                     }
                                     
                                 } else {
-                                    this.Text(uid,this.TextColor.red(result))
+                                    this.Alert(uid,this.TextColor.red(result))
                                 }
                                  
                                 } else if(route.Method.toLocaleLowerCase() == 'get'){
@@ -451,7 +451,7 @@ class FastHTTP extends SyAPP.Func() {
                                         this.Storages.Set(uid,'request_data',result.data)
                                     }
                                 } else {
-                                    this.Text(uid,this.TextColor.red(result))
+                                    this.Alert(uid,this.TextColor.red(result))
                                 }
                                  
                                 } else {
@@ -598,7 +598,7 @@ class FastHTTP extends SyAPP.Func() {
                                     }
                                     
                                 } else {
-                                    this.Text(uid,this.TextColor.red(result))
+                                    this.Alert(uid,this.TextColor.red(result))
                                 }
                                  
                                 } else if(route.Method.toLocaleLowerCase() == 'get'){
@@ -616,7 +616,7 @@ class FastHTTP extends SyAPP.Func() {
                                         this.Storages.Set(uid,'request_data',result.data)
                                     }
                                 } else {
-                                    this.Text(uid,this.TextColor.red(result))
+                                    this.Alert(uid,this.TextColor.red(result))
                                 }
                                  
                                 } else {

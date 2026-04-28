@@ -3149,6 +3149,17 @@ class SyAPP_Func {
     /** @type {string} */
     this.Group = config.group || ''
 
+/** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
+this.AlertStorage = new Map()
+
+// Alert configuration
+/** @type {Object} */
+this.AlertConfig = {
+  defaultDuration: 5000,
+  maxAlerts: 100,
+  allowDuplicates: false // Default: don't allow duplicate alert names
+}
+
     /** @type {Map<string, userBuild>} */
     this.Builds = new Map()
 
@@ -3556,6 +3567,317 @@ this.Delete = (id, path, handler, config = {
       }
       return false;
     };
+
+
+
+   /**
+ * Set alert configuration
+ * @param {Object} config - Alert configuration
+ * @param {number} [config.defaultDuration=5000] - Default duration in ms
+ * @param {number} [config.maxAlerts=100] - Maximum alerts per user
+ * @param {boolean} [config.allowDuplicates=false] - Allow duplicate alert names
+ */
+this.SetAlertConfig = (config = {}) => {
+  this.AlertConfig = {
+    defaultDuration: config.defaultDuration || 5000,
+    maxAlerts: config.maxAlerts || 100,
+    allowDuplicates: config.allowDuplicates || false
+  }
+}
+
+/**
+ * Add an alert text that persists through refreshes
+ * @param {string} id - User/build ID
+ * @param {string} text - Text to display
+ * @param {Object} [config] - Alert configuration
+ * @param {number} [config.duration] - Duration in ms (default from AlertConfig)
+ * @param {string} [config.name] - Unique name for this alert (auto-generated if not provided)
+ * @param {boolean} [config.allowDuplicate=false] - Allow duplicate alerts with same name
+ * @returns {string} The alert name (for later removal)
+ */
+this.Alert = (id, text, config = {}) => {
+  if (!this.Builds.has(id)) {
+    if (this.Log) {
+      console.log(`this.Alert() Error - userBuild not found | BuildID: ${id}`);
+    }
+    return null;
+  }
+
+  const duration = config.duration || this.AlertConfig.defaultDuration;
+  const allowDuplicate = config.allowDuplicate !== undefined ? config.allowDuplicate : this.AlertConfig.allowDuplicates;
+  
+  // Generate unique name based on text content if not provided
+  const alertName = config.name || `alert_${this._hashString(text)}`;
+
+  // Initialize storage for this user
+  if (!this.AlertStorage.has(id)) {
+    this.AlertStorage.set(id, new Map());
+  }
+
+  const userAlerts = this.AlertStorage.get(id);
+  
+  // Clean expired alerts
+  const now = Date.now();
+  for (const [name, alert] of userAlerts) {
+    if (alert.expiry <= now) {
+      userAlerts.delete(name);
+    }
+  }
+
+  // Check for duplicate if not allowed
+  if (!allowDuplicate && userAlerts.has(alertName)) {
+    // Update existing alert with new duration
+    const existingAlert = userAlerts.get(alertName);
+    existingAlert.expiry = now + duration;
+    existingAlert.data.text = text; // Update text if changed
+    
+    // DON'T call this.Text here - let ProcessAlerts handle it
+    return alertName;
+  }
+
+  // Check max alerts
+  if (userAlerts.size >= this.AlertConfig.maxAlerts) {
+    // Remove oldest alert
+    let oldestName = null;
+    let oldestTime = Infinity;
+    for (const [name, alert] of userAlerts) {
+      if (alert.expiry < oldestTime) {
+        oldestTime = alert.expiry;
+        oldestName = name;
+      }
+    }
+    if (oldestName) {
+      userAlerts.delete(oldestName);
+    }
+  }
+
+  // Get current position in the build output
+  const currentText = this.Builds.get(id).Text || '';
+  const textLines = currentText.split('\n');
+  
+  // Store the alert with its position
+  userAlerts.set(alertName, {
+    type: 'text',
+    data: { text },
+    expiry: now + duration,
+    // Store the line index where this text should appear
+    textLineIndex: textLines.length,
+    // Store surrounding context for position reconstruction
+    position: {
+      lineIndex: textLines.length,
+      // Store the text that was before this point
+      beforeTextLength: currentText.length
+    },
+    alertName
+  });
+
+  this.AlertStorage.set(id, userAlerts);
+
+  // DO NOT call this.Text here - we'll let ProcessAlerts handle positioning
+  // Instead, mark that we need to process alerts
+  this.Builds.get(id)._hasAlerts = true;
+  
+  return alertName;
+}
+
+
+/**
+ * Add an alert button that persists through refreshes
+ * @param {string} id - User/build ID
+ * @param {string|Object} nameOrConfig - Button name or configuration object
+ * @param {Object} [config] - Button configuration
+ * @param {number} [config.duration] - Duration in ms (default from AlertConfig)
+ * @param {string} [config.alertId] - Custom alert ID for management
+ * @param {string} [config.name] - Button name
+ * @param {string} [config.path] - Navigation path
+ * @param {Object} [config.props] - Button props
+ * @param {boolean} [config.resetSelection] - Reset selection
+ * @param {number|boolean} [config.jumpTo] - Jump to index
+ * @param {Function} [config.action] - Button action
+ */
+this.AlertButton = (id, nameOrConfig, config = {}) => {
+  if (!this.Builds.has(id)) {
+    if (this.Log) {
+      console.log(`this.AlertButton() Error - userBuild not found | BuildID: ${id}`);
+    }
+    return;
+  }
+
+  // Extract alert-specific config
+  const duration = config.duration || this.AlertConfig.defaultDuration;
+  const alertId = config.alertId || `alert-btn-${Date.now()}-${Math.random()}`;
+  
+  // Create button config without alert-specific properties
+  const buttonConfig = { ...config };
+  delete buttonConfig.duration;
+  delete buttonConfig.alertId;
+
+  // Store the alert
+  if (!this.AlertStorage.has(id)) {
+    this.AlertStorage.set(id, []);
+  }
+
+  const alerts = this.AlertStorage.get(id);
+  
+  // Clean expired alerts and check max
+  const now = Date.now();
+  const activeAlerts = alerts.filter(alert => alert.expiry > now);
+  
+  if (activeAlerts.length >= this.AlertConfig.maxAlerts) {
+    // Remove oldest alert
+    activeAlerts.shift();
+  }
+
+  // Get current position
+  const currentButtons = this.Builds.get(id).Buttons;
+  
+  // Calculate position for reinsertion
+  const position = {
+    buttonIndex: currentButtons.length,
+    // Store context for proper reinsertion
+    context: {
+      dropdownColor: this.Builds.get(id).dropdown_color,
+      dropdownSpacement: this.Builds.get(id).dropdown_spacement,
+      dropdownHorizontal: this.Builds.get(id).dropdown_horizontal,
+      droplevel: this.Builds.get(id).droplevel,
+      lastDropdownButton: this.Builds.get(id).last_dropdown_button
+    }
+  };
+
+  // Add new alert
+  activeAlerts.push({
+    type: 'button',
+    data: {
+      nameOrConfig,
+      buttonConfig
+    },
+    expiry: now + duration,
+    position,
+    alertId
+  });
+
+  this.AlertStorage.set(id, activeAlerts);
+
+  // Still call the original Button method for immediate display
+  this.Button(id, nameOrConfig, buttonConfig);
+}
+
+/**
+ * Simple string hashing for generating alert names
+ * @private
+ */
+this._hashString = (str) => {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash; // Convert to 32bit integer
+  }
+  return Math.abs(hash).toString(36);
+}
+
+/**
+ * Remove a specific alert by name
+ * @param {string} id - User/build ID
+ * @param {string} alertName - Alert name to remove
+ */
+this.RemoveAlert = (id, alertName) => {
+  if (!this.AlertStorage.has(id)) return;
+  
+  const userAlerts = this.AlertStorage.get(id);
+  userAlerts.delete(alertName);
+  
+  if (userAlerts.size === 0) {
+    this.AlertStorage.delete(id);
+  }
+}
+
+/**
+ * Clear all alerts for a user
+ * @param {string} id - User/build ID
+ */
+this.ClearAlerts = (id) => {
+  this.AlertStorage.delete(id);
+}
+
+/**
+ * Process and insert alerts at their correct positions
+ * This is called after the build function executes
+ * @param {string} id - User/build ID
+ */
+this.ProcessAlerts = (id) => {
+  if (!this.Builds.has(id) || !this.AlertStorage.has(id)) return;
+
+  const now = Date.now();
+  const userAlerts = this.AlertStorage.get(id);
+  
+  // Remove expired alerts
+  for (const [name, alert] of userAlerts) {
+    if (alert.expiry <= now) {
+      userAlerts.delete(name);
+    }
+  }
+
+  if (userAlerts.size === 0) {
+    this.AlertStorage.delete(id);
+    return;
+  }
+
+  // Get current text
+  const currentText = this.Builds.get(id).Text || '';
+  const currentLines = currentText.split('\n');
+  
+  // Get all text alerts sorted by their original line index
+  const textAlerts = Array.from(userAlerts.values())
+    .filter(a => a.type === 'text')
+    .sort((a, b) => a.position.lineIndex - b.position.lineIndex);
+
+  if (textAlerts.length === 0) return;
+
+  // Build the final text by inserting alerts at their correct positions
+  const finalLines = [];
+  let alertIndex = 0;
+  let currentAlert = textAlerts[alertIndex];
+  
+  // If there are no current lines (first build), just add alerts
+  if (currentLines.length === 0 || (currentLines.length === 1 && currentLines[0] === '')) {
+    textAlerts.forEach(alert => {
+      finalLines.push(alert.data.text);
+    });
+  } else {
+    // Reconstruct text with alerts in their original positions
+    for (let i = 0; i < currentLines.length; i++) {
+      // Insert any alerts that should appear before this line
+      while (currentAlert && currentAlert.position.lineIndex <= i) {
+        finalLines.push(currentAlert.data.text);
+        alertIndex++;
+        currentAlert = textAlerts[alertIndex];
+      }
+      
+      // Add the current line (skip if it's an alert text that's already added)
+      const isAlertText = textAlerts.some(alert => alert.data.text === currentLines[i]);
+      if (!isAlertText) {
+        finalLines.push(currentLines[i]);
+      }
+    }
+    
+    // Add any remaining alerts that should appear after all current lines
+    while (currentAlert) {
+      finalLines.push(currentAlert.data.text);
+      alertIndex++;
+      currentAlert = textAlerts[alertIndex];
+    }
+  }
+
+  // Update the build text
+  this.Builds.get(id).Text = finalLines.join('\n');
+  
+  // Update alert positions for next refresh
+  textAlerts.forEach((alert, index) => {
+    alert.position.lineIndex = finalLines.indexOf(alert.data.text);
+  });
+}
+
 
     // --------------------------- GotoNow Method ---------------------------
 
@@ -4117,82 +4439,84 @@ this.Delete = (id, path, handler, config = {
 
     // --------------------------- Build Method ---------------------------
 
-    /**
-     * Build the function output
-     * @param {Object} props - Build properties
-     * @param {Session} props.session - Session object
-     * @returns {Promise<Object>} Build result
-     */
-    this.Build = async (props = { session: new Session }) => {
-      this.Builds.set(props.session.UniqueID, new userBuild({ session: props.session }))
+   // In the Build method, modify it like this:
 
-      try {
-        await build(props)
+this.Build = async (props = { session: new Session }) => {
+  this.Builds.set(props.session.UniqueID, new userBuild({ session: props.session }))
 
-        const userBuild = this.Builds.get(props.session.UniqueID)
+  try {
+    await build(props)
 
-        if (userBuild && userBuild.GotoNow) {
-          const gotoInfo = userBuild.GotoNow
+    const userBuild = this.Builds.get(props.session.UniqueID)
 
-          let obj_return = {
-            hud_obj: {
-              title: '',
-              options: []
-            },
-            wait_input: false,
-            input_obj: {},
-            goto_now: {
-              path: gotoInfo.path,
-              props: gotoInfo.props
-            },
-            routes: userBuild.Routes
-          }
+    // Process alerts AFTER build but BEFORE creating return object
+    // Only process on refresh or if has alerts
+    if (userBuild._hasAlerts || this.AlertStorage.has(props.session.UniqueID)) {
+      this.ProcessAlerts(props.session.UniqueID);
+    }
 
-          this.Builds.delete(props.session.UniqueID)
-          return obj_return
-        }
+    if (userBuild && userBuild.GotoNow) {
+      const gotoInfo = userBuild.GotoNow
 
-        let obj_return = {
-          hud_obj: {
-            title: this.Builds.get(props.session.UniqueID).Text,
-            options: this.Builds.get(props.session.UniqueID).Buttons
-          },
-          wait_input: this.Builds.get(props.session.UniqueID).WaitInput,
-          input_obj: {
-            path: this.Builds.get(props.session.UniqueID).InputPath,
-            props: this.Builds.get(props.session.UniqueID).InputProps,
-            question: this.Builds.get(props.session.UniqueID).InputQuestion,
-            password: this.Builds.get(props.session.UniqueID).InputPassword
-          },
-          goto_now: undefined,
-          routes: this.Builds.get(props.session.UniqueID).Routes
-        }
+      let obj_return = {
+        hud_obj: {
+          title: '',
+          options: []
+        },
+        wait_input: false,
+        input_obj: {},
+        goto_now: {
+          path: gotoInfo.path,
+          props: gotoInfo.props
+        },
+        routes: userBuild.Routes
+      }
 
-        this.Builds.delete(props.session.UniqueID)
-        return obj_return
+      this.Builds.delete(props.session.UniqueID)
+      return obj_return
+    }
 
-      } catch (error) {
-        if (error.message === 'GOTO_NOW_BREAK' && error.gotoInfo) {
-          this.Builds.delete(props.session.UniqueID)
+    let obj_return = {
+      hud_obj: {
+        title: this.Builds.get(props.session.UniqueID).Text,
+        options: this.Builds.get(props.session.UniqueID).Buttons
+      },
+      wait_input: this.Builds.get(props.session.UniqueID).WaitInput,
+      input_obj: {
+        path: this.Builds.get(props.session.UniqueID).InputPath,
+        props: this.Builds.get(props.session.UniqueID).InputProps,
+        question: this.Builds.get(props.session.UniqueID).InputQuestion,
+        password: this.Builds.get(props.session.UniqueID).InputPassword
+      },
+      goto_now: undefined,
+      routes: this.Builds.get(props.session.UniqueID).Routes
+    }
 
-          return {
-            hud_obj: {
-              title: '',
-              options: []
-            },
-            wait_input: false,
-            input_obj: {},
-            goto_now: {
-              path: error.gotoInfo.path,
-              props: error.gotoInfo.props
-            },
-            routes: {}
-          }
-        }
+    this.Builds.delete(props.session.UniqueID)
+    return obj_return
 
-        throw error
+  } catch (error) {
+    if (error.message === 'GOTO_NOW_BREAK' && error.gotoInfo) {
+      this.Builds.delete(props.session.UniqueID)
+
+      return {
+        hud_obj: {
+          title: '',
+          options: []
+        },
+        wait_input: false,
+        input_obj: {},
+        goto_now: {
+          path: error.gotoInfo.path,
+          props: error.gotoInfo.props
+        },
+        routes: {}
       }
     }
+
+    throw error
+  }
+}
 
     // --------------------------- Route Discovery Method ---------------------------
 
@@ -4584,30 +4908,29 @@ class SyAPP {
       includeFuncName: userConfig.includeFuncName !== false
     };
 
-    if(userConfig.RefreshMode){
-      this.Refresher = setInterval(async () => {  
-        
-        let sessions = [...this.Sessions.keys()]
-        //console.log(this.Sessions.get(sessions[0]))
-        //await this.WaitLog([...this.Sessions.keys()])  
-        
-        sessions.forEach(k => {
-          if(this.Sessions.get(k).ActualProps.page){
-            this.LoadScreen(this.Sessions.get(k).ActualPath,{props : {page : this.Sessions.get(k).ActualProps.page}})
-          } else {
-            this.LoadScreen(this.Sessions.get(k).ActualPath)
+    // In the SyAPP constructor, RefreshMode section:
+if(userConfig.RefreshMode){
+  this.Refresher = setInterval(async () => {  
+    let sessions = [...this.Sessions.keys()]
+    
+    sessions.forEach(k => {
+      if(this.Sessions.get(k).ActualProps.page){
+        this.LoadScreen(this.Sessions.get(k).ActualPath, {
+          props: {
+            page: this.Sessions.get(k).ActualProps.page,
+            _isRefresh: true // Mark as refresh
           }
-      
         })
-       
-
-        
-        //this.LoadScreen()
-
-
-
-      }, config.RefreshInterval || 500);
-    }
+      } else {
+        this.LoadScreen(this.Sessions.get(k).ActualPath, {
+          props: {
+            _isRefresh: true // Mark as refresh
+          }
+        })
+      }
+    })
+  }, config.RefreshInterval || 500);
+}
 
     /**
      * Process and register a function class
