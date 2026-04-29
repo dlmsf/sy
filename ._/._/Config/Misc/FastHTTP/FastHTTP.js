@@ -404,10 +404,11 @@ class FastHTTP extends SyAPP.Func() {
 
 
                         if(props.requestaddroutes){
-                            let group = await Group.New()
+                            let appname = this.Storages.Get(uid,'request_data').appname || undefined
+                            let group = await Group.New(appname)
                             for(const routestring of this.Storages.Get(uid,'request_data').available){
                                 let reqobj = parseHttpRequest(routestring)
-                                await Route.New({Method : reqobj.Method,Url : `http://localhost:3000${reqobj.Route}`,GroupID : group.id})
+                                await Route.New({Method : reqobj.Method,Url : `http://localhost:${this.Storages.Get(uid,'request_data').port}${reqobj.Route}`,GroupID : group.id})
                             }
                             this.Text(uid,' ')
                             this.Text(uid,this.TextColor.green('Group with routes created !'))
@@ -628,10 +629,11 @@ class FastHTTP extends SyAPP.Func() {
                         
 
                         if(props.requestaddroutes){
-                            let group = await Group.New()
+                            let appname = this.Storages.Get(uid,'request_data').appname || undefined
+                            let group = await Group.New(appname)
                             for(const routestring of this.Storages.Get(uid,'request_data').available){
                                 let reqobj = parseHttpRequest(routestring)
-                                await Route.New({Method : reqobj.Method,Url : `http://localhost:3000${reqobj.Route}`,GroupID : group.id})
+                                await Route.New({Method : reqobj.Method,Url : `http://localhost:${this.Storages.Get(uid,'request_data').port}${reqobj.Route}`,GroupID : group.id})
                             }
                         }
 

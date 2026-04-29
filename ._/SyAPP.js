@@ -5422,6 +5422,8 @@ async handleRequest(req, res) {
     res.end(JSON.stringify({ 
       error: 'Route not found',
       requested: `${method} ${path}`,
+      appname: this.MainFunc.Name,
+      port : this.serverConfig.port,
       available: this.routeStorage.getAllRoutes().map(r => `${r.method} ${r.path}`)
     }));
     return;
