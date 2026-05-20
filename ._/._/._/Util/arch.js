@@ -1371,6 +1371,213 @@ function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// ========== IMPROVEMENT: Rich block tree analysis ==========
+function extractKeywordsInBlock(lines, startLine, endLine) {
+    const keywords = new Set();
+    const patterns = {
+        'return': /\breturn\b/,
+        'throw': /\bthrow\b/,
+        'await': /\bawait\b/,
+        'new': /\bnew\s+\w+/,
+        'import': /\bimport\b/,
+        'require': /\brequire\b/,
+        'console.log': /\bconsole\.log\b/,
+        'console.error': /\bconsole\.error\b/,
+        'fetch': /\bfetch\b/,
+        'async': /\basync\b/,
+        'this': /\bthis\./,
+        'super': /\bsuper\b/,
+        'typeof': /\btypeof\b/,
+        'instanceof': /\binstanceof\b/,
+        'delete': /\bdelete\b/,
+        'yield': /\byield\b/,
+        'break': /\bbreak\b/,
+        'continue': /\bcontinue\b/,
+        'var': /\bvar\s+/,
+        'let': /\blet\s+/,
+        'const': /\bconst\s+/,
+    };
+    
+    for (let i = startLine - 1; i < Math.min(endLine, lines.length); i++) {
+        const line = lines[i] || '';
+        for (const [name, regex] of Object.entries(patterns)) {
+            if (regex.test(line)) keywords.add(name);
+        }
+    }
+    return Array.from(keywords);
+}
+
+function countCallsInBlock(lines, startLine, endLine) {
+    let count = 0;
+    for (let i = startLine - 1; i < Math.min(endLine, lines.length); i++) {
+        const line = lines[i] || '';
+        // Count function calls: word followed by (
+        const matches = line.match(/\b\w+\s*\(/g);
+        if (matches) count += matches.length;
+        // Count method calls: .word(
+        const methodMatches = line.match(/\.\w+\s*\(/g);
+        if (methodMatches) count += methodMatches.length;
+    }
+    return count;
+}
+
+function extractCommentsInBlock(lines, startLine, endLine) {
+    const comments = [];
+    for (let i = startLine - 1; i < Math.min(endLine, lines.length); i++) {
+        const trimmed = (lines[i] || '').trim();
+        if (trimmed.startsWith('//')) {
+            comments.push(trimmed.substring(2).trim());
+        } else if (trimmed.startsWith('/*')) {
+            comments.push(trimmed.substring(2).replace('*/', '').trim());
+        } else if (trimmed.startsWith('*') && !trimmed.startsWith('*/')) {
+            comments.push(trimmed.substring(1).trim());
+        }
+    }
+    return comments.slice(0, 3); // limit to 3 comments per block
+}
+
+// Build a rich hierarchical block tree from source code (for languages with braces)
+function buildBlockTree(filePath, commitHash = null) {
+    const content = getFileContent(filePath, commitHash);
+    if (!content) return null;
+    
+    const lines = content.split('\n');
+    const ext = path.extname(filePath).toLowerCase();
+    
+    // Only support curly-brace languages (not Python, Ruby, etc.)
+    const braceLanguages = ['.js', '.ts', '.jsx', '.tsx', '.java', '.c', '.cpp', '.h', '.hpp', '.cs', '.go', '.rs', '.swift', '.kt', '.php', '.scala', '.dart', '.groovy'];
+    if (!braceLanguages.includes(ext)) {
+        return { supported: false, reason: 'Block explorer only supports curly-brace languages' };
+    }
+    
+    const blocks = [];
+    const stack = [];
+    let root = { children: [], startLine: 0, endLine: lines.length + 1, depth: 0, type: 'file' };
+    let currentBlock = null;
+    let inString = false;
+    let stringChar = '';
+    let inLineComment = false;
+    let inBlockComment = false;
+    
+    function findBlockType(startLine) {
+        const headerLine = startLine > 0 ? lines[startLine - 2] : '';
+        if (!headerLine) return 'block';
+        
+        const trimmed = headerLine.trim();
+        if (/\b(if|else\s*if|else)\b/.test(trimmed)) return 'conditional';
+        if (/\b(for|while|do)\b/.test(trimmed)) return 'loop';
+        if (/\b(switch|case)\b/.test(trimmed)) return 'switch';
+        if (/\b(try|catch|finally)\b/.test(trimmed)) return 'exception';
+        if (/\b(function|=>|def|fn|fun|func)\b/.test(trimmed)) return 'function';
+        if (/\bclass\b/.test(trimmed)) return 'class';
+        return 'block';
+    }
+    
+    function extractHeaderContent(startLine) {
+        // Get the header line that contains the opening brace
+        const headerLine = startLine > 0 ? lines[startLine - 2] : '';
+        if (!headerLine) return '';
+        const trimmed = headerLine.trim();
+        // Remove leading keywords and get the condition/signature
+        let result = trimmed
+            .replace(/^(if|else\s*if|else|for|while|do|switch|try|catch|finally|function|class)\s*/, '')
+            .replace(/\s*{\s*$/, '')
+            .trim();
+        if (result.length > 80) result = result.substring(0, 77) + '...';
+        return result;
+    }
+    
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const lineNum = i + 1;
+        
+        let j = 0;
+        while (j < line.length) {
+            const ch = line[j];
+            if (inString) {
+                if (ch === '\\') {
+                    j += 2;
+                    continue;
+                }
+                if (ch === stringChar) {
+                    inString = false;
+                }
+            } else if (inLineComment) {
+                break;
+            } else if (inBlockComment) {
+                if (ch === '*' && line[j+1] === '/') {
+                    inBlockComment = false;
+                    j += 2;
+                    continue;
+                }
+            } else {
+                if (ch === '"' || ch === "'" || ch === '`') {
+                    inString = true;
+                    stringChar = ch;
+                } else if (ch === '/' && line[j+1] === '/') {
+                    inLineComment = true;
+                    break;
+                } else if (ch === '/' && line[j+1] === '*') {
+                    inBlockComment = true;
+                    j += 2;
+                    continue;
+                } else if (ch === '{') {
+                    const block = {
+                        startLine: lineNum,
+                        endLine: null,
+                        depth: stack.length + 1,
+                        children: [],
+                        type: findBlockType(lineNum),
+                        header: extractHeaderContent(lineNum),
+                        totalLines: 0,
+                        childCount: 0,
+                        keywords: [],
+                        callCount: 0,
+                        comments: [],
+                    };
+                    if (stack.length === 0) {
+                        root.children.push(block);
+                    } else {
+                        const parent = stack[stack.length - 1];
+                        parent.children.push(block);
+                    }
+                    stack.push(block);
+                } else if (ch === '}') {
+                    if (stack.length > 0) {
+                        const block = stack.pop();
+                        block.endLine = lineNum;
+                        // Enrich block with information
+                        block.totalLines = block.endLine - block.startLine + 1;
+                        block.childCount = block.children.length;
+                        block.keywords = extractKeywordsInBlock(lines, block.startLine, block.endLine);
+                        block.callCount = countCallsInBlock(lines, block.startLine, block.endLine);
+                        block.comments = extractCommentsInBlock(lines, block.startLine, block.endLine);
+                    }
+                }
+            }
+            j++;
+        }
+        inLineComment = false;
+    }
+    
+    // Set endLine for any unclosed blocks
+    for (const block of stack) {
+        block.endLine = lines.length;
+        block.totalLines = block.endLine - block.startLine + 1;
+        block.childCount = block.children.length;
+        block.keywords = extractKeywordsInBlock(lines, block.startLine, block.endLine);
+        block.callCount = countCallsInBlock(lines, block.startLine, block.endLine);
+        block.comments = extractCommentsInBlock(lines, block.startLine, block.endLine);
+    }
+    
+    // Set root info
+    root.totalLines = lines.length;
+    root.childCount = root.children.length;
+    
+    return { supported: true, root, totalLines: lines.length };
+}
+// ========== END IMPROVEMENT ==========
+
 // Generate HTML
 function generateHTML(initialTree, isGitRepo, commits) {
     const mapData = calculateMapData(initialTree);
@@ -1469,6 +1676,32 @@ function generateHTML(initialTree, isGitRepo, commits) {
         .map-tooltip { position: absolute; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 10px; color: #c9d1d9; font-size: 12px; pointer-events: none; opacity: 0; transition: opacity 0.2s; z-index: 1000; max-width: 300px; }
         .map-controls { position: absolute; bottom: 20px; right: 20px; display: flex; gap: 5px; z-index: 10; }
         
+        /* Rich block explorer styles */
+        .block-tree { font-family: 'Courier New', monospace; font-size: 12px; }
+        .block-node { margin-left: 16px; }
+        .block-line { display: flex; align-items: flex-start; padding: 4px 6px; cursor: pointer; border-radius: 4px; margin-bottom: 2px; transition: background 0.15s; }
+        .block-line:hover { background: #1c2128; }
+        .block-toggle { background: none; border: none; color: #58a6ff; cursor: pointer; font-size: 11px; width: 16px; text-align: center; margin-right: 4px; flex-shrink: 0; padding: 0; }
+        .block-toggle:hover { color: #79c0ff; }
+        .block-icon { margin-right: 6px; width: 18px; text-align: center; flex-shrink: 0; font-size: 13px; }
+        .block-info { flex: 1; min-width: 0; }
+        .block-header-row { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+        .block-type { font-weight: 600; text-transform: uppercase; font-size: 10px; padding: 1px 6px; border-radius: 3px; letter-spacing: 0.3px; }
+        .block-type-function { background: #1f1e33; color: #d2a8ff; }
+        .block-type-class { background: #3d1f00; color: #f0883e; }
+        .block-type-conditional { background: #1b3826; color: #3fb950; }
+        .block-type-loop { background: #1f2d3d; color: #79c0ff; }
+        .block-type-switch { background: #3d2e00; color: #d2991d; }
+        .block-type-exception { background: #3d1119; color: #f85149; }
+        .block-type-block { background: #21262d; color: #8b949e; }
+        .block-header { color: #e6edf3; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .block-range { color: #484f58; font-size: 10px; flex-shrink: 0; }
+        .block-details { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+        .block-keyword { background: #1c2128; color: #8b949e; font-size: 9px; padding: 1px 6px; border-radius: 8px; border: 1px solid #30363d; }
+        .block-comment { color: #6e7681; font-size: 10px; font-style: italic; margin-top: 2px; padding-left: 4px; border-left: 2px solid #30363d; }
+        .block-summary { margin-bottom: 8px; padding: 8px 10px; background: #1c2128; border-radius: 4px; border: 1px solid #30363d; font-size: 11px; color: #8b949e; }
+        .block-summary strong { color: #58a6ff; }
+        
         /* Custom scrollbar */
         .tab-content::-webkit-scrollbar,
         .file-content-preview::-webkit-scrollbar {
@@ -1544,6 +1777,7 @@ function generateHTML(initialTree, isGitRepo, commits) {
                     <button class="tab-btn" onclick="switchDetailTab('structure')">🏗️ Structure</button>
                     <button class="tab-btn" onclick="switchDetailTab('map')">🗺️ Map</button>
                     <button class="tab-btn" onclick="switchDetailTab('code')">💻 Code</button>
+                    <button class="tab-btn" onclick="switchDetailTab('blocks')">🔍 Blocks</button>
                 </div>
                 <div class="file-detail-content" id="fileDetailContent">
                     <div class="tab-content active" id="tab-overview">
@@ -1569,6 +1803,10 @@ function generateHTML(initialTree, isGitRepo, commits) {
                             <pre id="fileContentCode"></pre>
                         </div>
                         <div class="empty-detail-message" id="emptyCodeMessage">Code preview will appear here</div>
+                    </div>
+                    <div class="tab-content" id="tab-blocks">
+                        <div class="empty-detail-message" id="emptyBlocksMessage">Loading block structure...</div>
+                        <div id="blocksContent" style="display:none;" class="block-tree"></div>
                     </div>
                 </div>
             </div>
@@ -1631,6 +1869,9 @@ function generateHTML(initialTree, isGitRepo, commits) {
             
             if (tab === 'map' && currentFileDetailData) {
                 setTimeout(() => renderMap(currentFileDetailData, 'fileDetailSvg', 'fileDetailTooltip', fileDetailMapTransform, 'file-detail'), 100);
+            }
+            if (tab === 'blocks' && currentSelectedFile) {
+                loadBlockView(currentSelectedFile);
             }
         }
         
@@ -1997,6 +2238,218 @@ function generateHTML(initialTree, isGitRepo, commits) {
             return html;
         }
         
+        // Rich block view functions
+        function loadBlockView(filePath) {
+            const emptyMsg = document.getElementById('emptyBlocksMessage');
+            const contentDiv = document.getElementById('blocksContent');
+            emptyMsg.style.display = 'flex';
+            contentDiv.style.display = 'none';
+            emptyMsg.textContent = 'Loading block structure...';
+            
+            fetchBlockData(filePath).then(blockData => {
+                if (!blockData) {
+                    emptyMsg.textContent = 'Failed to load block data.';
+                    return;
+                }
+                if (!blockData.supported) {
+                    emptyMsg.textContent = blockData.reason || 'Block view not supported for this file type.';
+                    return;
+                }
+                emptyMsg.style.display = 'none';
+                contentDiv.style.display = 'block';
+                renderRichBlockTree(blockData, contentDiv);
+            }).catch(err => {
+                emptyMsg.textContent = 'Error loading blocks: ' + err.message;
+            });
+        }
+        
+        async function fetchBlockData(filePath) {
+            let commitHash = null;
+            if (isGitRepo && commits.length > 0 && currentCommitIndex >= 0) {
+                commitHash = commits[currentCommitIndex].hash;
+            }
+            let url = '/file-blocks/' + encodeURIComponent(filePath);
+            if (commitHash) url += '?commit=' + commitHash;
+            const response = await fetch(url);
+            if (!response.ok) throw new Error('Failed to fetch blocks');
+            return await response.json();
+        }
+        
+        function renderRichBlockTree(blockData, container) {
+            container.innerHTML = '';
+            
+            // Add summary
+            const summary = document.createElement('div');
+            summary.className = 'block-summary';
+            const rootChildren = blockData.root.children || [];
+            summary.innerHTML = \`<strong>Total blocks:</strong> \${countAllBlocks(blockData.root)} &nbsp;|&nbsp; <strong>Max depth:</strong> \${maxDepth(blockData.root)} &nbsp;|&nbsp; <strong>File lines:</strong> \${blockData.totalLines || 'N/A'}\`;
+            container.appendChild(summary);
+            
+            // Build tree
+            const treeContainer = document.createElement('div');
+            treeContainer.className = 'block-tree';
+            buildRichBlockDOM(blockData.root, treeContainer, 0);
+            container.appendChild(treeContainer);
+        }
+        
+        function countAllBlocks(node) {
+            let count = 0;
+            if (node.children) {
+                count += node.children.length;
+                node.children.forEach(child => {
+                    count += countAllBlocks(child);
+                });
+            }
+            return count;
+        }
+        
+        function maxDepth(node) {
+            let max = node.depth || 0;
+            if (node.children) {
+                node.children.forEach(child => {
+                    const childDepth = maxDepth(child);
+                    if (childDepth > max) max = childDepth;
+                });
+            }
+            return max;
+        }
+        
+        function buildRichBlockDOM(node, parent, depth) {
+            if (!node) return;
+            
+            if (node.type === 'file') {
+                // Root node - file level
+                if (node.children) {
+                    node.children.forEach(child => buildRichBlockDOM(child, parent, depth));
+                }
+                return;
+            }
+            
+            const blockDiv = document.createElement('div');
+            blockDiv.className = 'block-node';
+            
+            const lineDiv = document.createElement('div');
+            lineDiv.className = 'block-line';
+            
+            const toggle = document.createElement('span');
+            toggle.className = 'block-toggle';
+            const hasChildren = node.children && node.children.length > 0;
+            toggle.textContent = hasChildren ? '▶' : '·';
+            if (!hasChildren) toggle.style.visibility = 'hidden';
+            
+            const icon = document.createElement('span');
+            icon.className = 'block-icon';
+            switch(node.type) {
+                case 'function': icon.innerHTML = '⚡'; break;
+                case 'class': icon.innerHTML = '🏗️'; break;
+                case 'conditional': icon.innerHTML = '🔀'; break;
+                case 'loop': icon.innerHTML = '🔄'; break;
+                case 'switch': icon.innerHTML = '🔢'; break;
+                case 'exception': icon.innerHTML = '⚠️'; break;
+                default: icon.innerHTML = '📦';
+            }
+            
+            const infoDiv = document.createElement('div');
+            infoDiv.className = 'block-info';
+            
+            const headerRow = document.createElement('div');
+            headerRow.className = 'block-header-row';
+            
+            const typeSpan = document.createElement('span');
+            typeSpan.className = 'block-type block-type-' + node.type;
+            typeSpan.textContent = node.type;
+            
+            const headerSpan = document.createElement('span');
+            headerSpan.className = 'block-header';
+            headerSpan.textContent = node.header || '';
+            headerSpan.title = node.header || '';
+            
+            const rangeSpan = document.createElement('span');
+            rangeSpan.className = 'block-range';
+            rangeSpan.textContent = 'L' + node.startLine + '-' + node.endLine + ' (' + (node.totalLines || 0) + ' lines)';
+            
+            headerRow.appendChild(typeSpan);
+            if (node.header) headerRow.appendChild(headerSpan);
+            headerRow.appendChild(rangeSpan);
+            
+            infoDiv.appendChild(headerRow);
+            
+            // Details row with keywords, calls, children
+            if (node.keywords && node.keywords.length > 0 || node.callCount > 0 || node.childCount > 0) {
+                const detailsDiv = document.createElement('div');
+                detailsDiv.className = 'block-details';
+                
+                if (node.keywords && node.keywords.length > 0) {
+                    node.keywords.forEach(kw => {
+                        const kwSpan = document.createElement('span');
+                        kwSpan.className = 'block-keyword';
+                        kwSpan.textContent = kw;
+                        detailsDiv.appendChild(kwSpan);
+                    });
+                }
+                
+                if (node.callCount > 0) {
+                    const callSpan = document.createElement('span');
+                    callSpan.className = 'block-keyword';
+                    callSpan.textContent = node.callCount + ' calls';
+                    callSpan.style.background = '#1f2d3d';
+                    callSpan.style.color = '#79c0ff';
+                    detailsDiv.appendChild(callSpan);
+                }
+                
+                if (node.childCount > 0) {
+                    const childSpan = document.createElement('span');
+                    childSpan.className = 'block-keyword';
+                    childSpan.textContent = node.childCount + ' children';
+                    childSpan.style.background = '#1b3826';
+                    childSpan.style.color = '#3fb950';
+                    detailsDiv.appendChild(childSpan);
+                }
+                
+                infoDiv.appendChild(detailsDiv);
+            }
+            
+            // Comments
+            if (node.comments && node.comments.length > 0) {
+                node.comments.forEach(comment => {
+                    if (comment) {
+                        const commentDiv = document.createElement('div');
+                        commentDiv.className = 'block-comment';
+                        commentDiv.textContent = '// ' + comment;
+                        infoDiv.appendChild(commentDiv);
+                    }
+                });
+            }
+            
+            lineDiv.appendChild(toggle);
+            lineDiv.appendChild(icon);
+            lineDiv.appendChild(infoDiv);
+            
+            const childrenContainer = document.createElement('div');
+            childrenContainer.className = 'block-node';
+            childrenContainer.style.display = 'none';
+            
+            if (hasChildren) {
+                node.children.forEach(child => buildRichBlockDOM(child, childrenContainer, depth + 1));
+                
+                toggle.style.cursor = 'pointer';
+                toggle.style.visibility = 'visible';
+                lineDiv.addEventListener('click', function() {
+                    if (childrenContainer.style.display === 'none') {
+                        childrenContainer.style.display = 'block';
+                        toggle.textContent = '▼';
+                    } else {
+                        childrenContainer.style.display = 'none';
+                        toggle.textContent = '▶';
+                    }
+                });
+            }
+            
+            blockDiv.appendChild(lineDiv);
+            blockDiv.appendChild(childrenContainer);
+            parent.appendChild(blockDiv);
+        }
+        
         // File detail functions
         async function openFileDetail(filePath) {
             currentSelectedFile = filePath;
@@ -2024,6 +2477,8 @@ function generateHTML(initialTree, isGitRepo, commits) {
             document.getElementById('fileDetailControls').style.display = 'none';
             document.getElementById('fileContentPreview').style.display = 'none';
             document.getElementById('emptyCodeMessage').style.display = 'flex';
+            document.getElementById('emptyBlocksMessage').style.display = 'flex';
+            document.getElementById('blocksContent').style.display = 'none';
             
             document.getElementById('loading').style.display = 'inline';
             
@@ -2085,6 +2540,9 @@ function generateHTML(initialTree, isGitRepo, commits) {
                 } catch (contentError) {
                     console.error('Error loading file content:', contentError);
                 }
+                
+                document.getElementById('emptyBlocksMessage').textContent = 'Click on the Blocks tab to load block structure';
+                
             } catch (error) {
                 console.error('Error loading file detail:', error);
                 document.getElementById('emptyOverviewMessage').style.display = 'flex';
@@ -2396,6 +2854,13 @@ const server = http.createServer(async (req, res) => {
                 path: filePath,
                 commit: commitHash
             }));
+        } else if (pathname.startsWith('/file-blocks/')) {
+            const filePath = decodeURIComponent(pathname.split('/file-blocks/')[1]);
+            const commitHash = query.commit || null;
+            
+            const blockData = buildBlockTree(filePath, commitHash);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(blockData));
         } else {
             res.writeHead(404, { 'Content-Type': 'text/plain' });
             res.end('Not Found');
@@ -2433,10 +2898,12 @@ server.listen(PORT, () => {
         console.log(`📜 Git repository detected with ${commits.length} commits`);
         console.log(`🔄 Use the slider to navigate through commit history`);
         console.log(`🗺️  Toggle between Tree and Map views`);
-        console.log(`📄 Click on files to view detailed structure analysis with multi-language support\n`);
+        console.log(`📄 Click on files to view detailed structure analysis with multi-language support`);
+        console.log(`🔍 Rich Block Explorer tab now shows block type, header, line range, keywords, call counts, child counts, and inline comments\n`);
     } else {
         console.log(`ℹ️  Not a git repository - showing current file structure only`);
-        console.log(`📄 Click on files to view detailed structure analysis with multi-language support\n`);
+        console.log(`📄 Click on files to view detailed structure analysis with multi-language support`);
+        console.log(`🔍 Rich Block Explorer tab now shows block type, header, line range, keywords, call counts, child counts, and inline comments\n`);
     }
 });
 
