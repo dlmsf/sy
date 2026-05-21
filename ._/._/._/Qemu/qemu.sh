@@ -828,13 +828,33 @@ add_to_bridge() {
     esac
 }
 
+# --- Check and install iptables if needed ---
+install_iptables() {
+    if command -v apt-get >/dev/null 2>&1; then
+        echo "[INSTALL] Installing iptables..."
+        smart_apt_install "iptables" "iptables" && return 0
+        echo "[NET] Failed to install iptables; VMs will have local network only"
+        return 1
+    elif command -v apk >/dev/null 2>&1; then
+        echo "[INSTALL] Installing iptables via apk..."
+        apk add --no-cache iptables && return 0
+        echo "[NET] Failed to install iptables via apk; VMs will have local network only"
+        return 1
+    else
+        echo "[NET] iptables not available and no supported package manager found."
+        echo "[NET] VMs will have local network only"
+        return 1
+    fi
+}
+
 # --- Setup NAT for internet access ---
 setup_nat() {
     echo "[NET] Configuring NAT..."
     
     if ! command -v iptables >/dev/null 2>&1; then
-        echo "[NET] iptables not available, VMs will have local network only"
-        return 0
+        if ! install_iptables; then
+            return 0   # iptables still missing -> local-only
+        fi
     fi
     
     local out_iface=""
