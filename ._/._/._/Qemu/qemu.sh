@@ -193,7 +193,7 @@ get_os_config() {
             OS_TYPE="alpine"
             ;;
         ubuntu)
-            IMG_URL="https://cloud-images.ubuntu.com/noble/20260216/noble-server-cloudimg-amd64.img"
+            IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
             IMG_FILE="noble-server-cloudimg-amd64.img"
             ISO_FILE="noble-cloud-init.iso"
             DEFAULT_PASSWORD="123"
