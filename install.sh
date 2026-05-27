@@ -169,10 +169,387 @@ SKIP_DEBS=false
 LOCAL_DIR_MODE=false
 PRESERVE_DATA=true
 INSTALL_NODE=false
+BUILD_MODE=false
+BUILD_TAR=false
+BUILD_CONFIG=false
+BUILD_DIR="$REPO_DIR/build"
 
 # External dependencies (uncomment and configure if needed)
 # PM2_TAR_GZ="$ARCHIVE_DIR/pm2.tar.gz"              # Uncomment if using pm2
 # PM2_EXTRACT_DIR="$INSTALL_DIR/vendor/pm2"         # Uncomment if using pm2
+
+# =============================================================================
+# BUILD SYSTEM FUNCTIONS
+# =============================================================================
+
+# Sanitize string for filesystem (remove/replace invalid characters)
+sanitize_filename() {
+    input="$1"
+    # Replace spaces with underscores
+    # Replace invalid filesystem characters with underscores
+    # Keep only alphanumeric, dots, dashes, underscores
+    sanitized=$(echo "$input" | tr ' ' '_' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_//' | sed 's/_$//')
+    
+    # If empty after sanitization, use default
+    [ -z "$sanitized" ] && sanitized="build"
+    
+    echo "$sanitized"
+}
+
+# Get last commit message and sanitize for filename
+get_commit_filename() {
+    if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
+        commit_msg=$(git log -1 --pretty=%B 2>/dev/null | head -n1)
+        if [ -n "$commit_msg" ]; then
+            sanitize_filename "$commit_msg"
+        else
+            echo "initial_build"
+        fi
+    else
+        echo "build_$(date +%Y%m%d_%H%M%S)"
+    fi
+}
+
+# Interactive configuration interface for build exclusion
+build_config_interface() {
+    echo ""
+    echo "========================================="
+    echo "  BUILD CONFIGURATION"
+    echo "========================================="
+    echo ""
+    echo "Select files to EXCLUDE from the build"
+    echo "Files are sorted by size (largest first)"
+    echo ""
+    
+    # Get list of files from last commit sorted by size
+    if ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
+        echo "Error: Not in a git repository"
+        return 1
+    fi
+    
+    # Create temp file for exclusion list
+    EXCLUDE_LIST="/tmp/build_exclude_$$.txt"
+    > "$EXCLUDE_LIST"
+    
+    # Create temp file for build files list
+    BUILD_FILES_LIST="/tmp/build_files_$$.txt"
+    > "$BUILD_FILES_LIST"
+    
+    # Get files from last commit with sizes
+    git ls-tree -r -l HEAD 2>/dev/null | while IFS=' ' read -r mode type hash size filename; do
+        # Skip if size is not available (it's a submodule or special)
+        [ "$size" = "-" ] && size=0
+        
+        # Format size for display
+        if [ "$size" -gt 1048576 ]; then
+            size_display="$((size / 1048576))MB"
+        elif [ "$size" -gt 1024 ]; then
+            size_display="$((size / 1024))KB"
+        else
+            size_display="${size}B"
+        fi
+        
+        # Determine if it's code or binary/data
+        case "$filename" in
+            *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
+                file_type="CODE"
+                ;;
+            *)
+                file_type="BINARY/DATA"
+                ;;
+        esac
+        
+        echo "$size|$filename|$file_type|$size_display" >> "$BUILD_FILES_LIST"
+    done
+    
+    # Sort by size (largest first)
+    sort -t'|' -k1 -n -r "$BUILD_FILES_LIST" > "${BUILD_FILES_LIST}.sorted"
+    mv "${BUILD_FILES_LIST}.sorted" "$BUILD_FILES_LIST"
+    
+    # Interactive selection loop
+    show_non_code=false
+    
+    while true; do
+        clear
+        echo "========================================="
+        echo "  BUILD CONFIGURATION - EXCLUDE FILES"
+        echo "========================================="
+        echo ""
+        [ "$show_non_code" = true ] && echo "Showing: ALL files (including non-code)" || echo "Showing: CODE files only (toggle with 't')"
+        echo ""
+        echo "Currently excluded files:"
+        if [ -s "$EXCLUDE_LIST" ]; then
+            cat "$EXCLUDE_LIST" | while IFS= read -r file; do
+                echo "  ✗ $file"
+            done
+        else
+            echo "  (none)"
+        fi
+        echo ""
+        echo "Available files (largest first):"
+        echo ""
+        
+        # Clear mapping file
+        MAPPING_FILE="/tmp/build_mapping_$$.txt"
+        > "$MAPPING_FILE"
+        
+        # Display files with numbers
+        counter=1
+        while IFS='|' read -r size file type size_display; do
+            [ -z "$file" ] && continue
+            
+            # Apply filter
+            if [ "$show_non_code" = false ] && [ "$type" = "BINARY/DATA" ]; then
+                continue
+            fi
+            
+            # Check if already excluded
+            already_excluded=false
+            if grep -q "^${file}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                already_excluded=true
+            fi
+            
+            printf "%3d. [%s] %s - %s" "$counter" "$type" "$size_display" "$file"
+            [ "$already_excluded" = true ] && printf " (EXCLUDED)"
+            printf "\n"
+            
+            # Save mapping
+            echo "$counter|$file" >> "$MAPPING_FILE"
+            counter=$((counter + 1))
+        done < "$BUILD_FILES_LIST"
+        
+        echo ""
+        echo "Commands:"
+        echo "  <number>  - Toggle exclusion for that file"
+        echo "  t         - Toggle show/hide non-code files"
+        echo "  a         - Exclude ALL currently shown files"
+        echo "  c         - Clear all exclusions"
+        echo "  d         - Done, continue with build"
+        echo "  q         - Quit build process"
+        echo ""
+        printf "Enter command: "
+        read cmd
+        
+        case "$cmd" in
+            t)
+                if [ "$show_non_code" = true ]; then
+                    show_non_code=false
+                else
+                    show_non_code=true
+                fi
+                ;;
+            a)
+                # Exclude all shown files
+                while IFS='|' read -r size file type size_display; do
+                    [ -z "$file" ] && continue
+                    if [ "$show_non_code" = false ] && [ "$type" = "BINARY/DATA" ]; then
+                        continue
+                    fi
+                    if ! grep -q "^${file}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                        echo "$file" >> "$EXCLUDE_LIST"
+                    fi
+                done < "$BUILD_FILES_LIST"
+                ;;
+            c)
+                > "$EXCLUDE_LIST"
+                ;;
+            d)
+                break
+                ;;
+            q)
+                rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST" "$MAPPING_FILE"
+                echo "Build cancelled."
+                exit 0
+                ;;
+            *)
+                if echo "$cmd" | grep -q '^[0-9]\+$'; then
+                    # Find file by number
+                    file_to_toggle=$(grep "^${cmd}|" "$MAPPING_FILE" 2>/dev/null | cut -d'|' -f2)
+                    if [ -n "$file_to_toggle" ]; then
+                        if grep -q "^${file_to_toggle}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                            # Remove from exclude list
+                            grep -v "^${file_to_toggle}$" "$EXCLUDE_LIST" > "${EXCLUDE_LIST}.tmp" 2>/dev/null
+                            mv "${EXCLUDE_LIST}.tmp" "$EXCLUDE_LIST" 2>/dev/null
+                        else
+                            # Add to exclude list
+                            echo "$file_to_toggle" >> "$EXCLUDE_LIST"
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    done
+    
+    echo ""
+    echo "Exclusion list created:"
+    cat "$EXCLUDE_LIST" 2>/dev/null
+    echo ""
+    
+    return 0
+}
+
+# Main build function
+do_build() {
+    log_message "Starting build process..."
+    
+    # Check if we're in a git repository
+    if ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
+        log_message "Error: Not in a git repository. Build requires git."
+        echo "Error: Build mode requires a git repository"
+        exit 1
+    fi
+    
+    # Use the directory where the script was called from
+    build_base_dir="$REPO_DIR/build"
+    mkdir -p "$build_base_dir"
+    
+    # Get sanitized commit message for naming
+    build_name=$(get_commit_filename)
+    build_path="$build_base_dir/$build_name"
+    
+    log_message "Build name: $build_name"
+    log_message "Build path: $build_path"
+    
+    # Run configuration interface if requested
+    if [ "$BUILD_CONFIG" = true ]; then
+        build_config_interface
+    fi
+    
+    # Create temporary directory for build
+    temp_build="/tmp/build_$$"
+    rm -rf "$temp_build"
+    mkdir -p "$temp_build"
+    
+    # Get list of files from last commit and extract them
+    log_message "Extracting files from last commit..."
+    
+    # Use git archive for efficient extraction
+    if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
+        # With exclusions: extract all then remove excluded
+        git archive HEAD 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
+        
+        if [ $? -eq 0 ]; then
+            # Remove excluded files
+            while IFS= read -r excluded_file; do
+                [ -z "$excluded_file" ] && continue
+                if [ -e "$temp_build/$excluded_file" ]; then
+                    rm -rf "$temp_build/$excluded_file"
+                    log_message "  Excluded: $excluded_file"
+                fi
+            done < "$EXCLUDE_LIST"
+            
+            # Remove empty directories
+            find "$temp_build" -type d -empty -delete 2>/dev/null
+        else
+            log_message "Error: Failed to extract files from git"
+            echo "Error: Failed to extract files from git"
+            rm -rf "$temp_build"
+            exit 1
+        fi
+    else
+        # No exclusions: simple archive extraction
+        git archive HEAD 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
+        
+        if [ $? -ne 0 ]; then
+            log_message "Error: Failed to extract files from git"
+            echo "Error: Failed to extract files from git"
+            rm -rf "$temp_build"
+            exit 1
+        fi
+    fi
+    
+    # Count files
+    file_count=$(find "$temp_build" -type f 2>/dev/null | wc -l)
+    log_message "Extracted $file_count files"
+    
+    # Clean up temp files
+    rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST" "$MAPPING_FILE"
+    
+    # Create the build
+    if [ "$BUILD_TAR" = true ]; then
+        # Create tar.gz
+        tar_file="$build_path.tar.gz"
+        log_message "Creating tar.gz archive: $tar_file"
+        
+        # Remove existing archive if present
+        [ -f "$tar_file" ] && rm -f "$tar_file"
+        
+        cd "$temp_build" || exit 1
+        tar -czf "$tar_file" . 2>/dev/null
+        
+        if [ $? -eq 0 ]; then
+            log_message "Build archive created successfully: $tar_file"
+            echo ""
+            echo "========================================="
+            echo "  BUILD COMPLETE"
+            echo "========================================="
+            echo ""
+            echo "Archive: $tar_file"
+            echo "Size: $(ls -lh "$tar_file" | awk '{print $5}')"
+            echo "Files: $file_count"
+            echo ""
+        else
+            log_message "Error: Failed to create tar.gz archive"
+            echo "Error: Failed to create archive"
+            cd "$REPO_DIR" > /dev/null 2>&1
+            rm -rf "$temp_build"
+            exit 1
+        fi
+        
+        cd "$REPO_DIR" > /dev/null 2>&1
+        
+        # Clean up temp directory
+        rm -rf "$temp_build"
+        
+        # Add build info alongside the tar.gz
+        cat > "${tar_file}.info" << EOF
+Build Name: $build_name
+Build Date: $(date)
+Commit: $(git rev-parse HEAD 2>/dev/null)
+Commit Message: $(git log -1 --pretty=%B 2>/dev/null)
+Files: $file_count
+EOF
+    else
+        # Create directory build
+        log_message "Creating directory build: $build_path"
+        
+        # Remove existing if present
+        [ -d "$build_path" ] && rm -rf "$build_path"
+        
+        mv "$temp_build" "$build_path"
+        
+        if [ $? -eq 0 ]; then
+            log_message "Build directory created successfully: $build_path"
+            
+            # Add build info file
+            cat > "$build_path/BUILD_INFO.txt" << EOF
+Build Name: $build_name
+Build Date: $(date)
+Commit: $(git rev-parse HEAD 2>/dev/null)
+Commit Message: $(git log -1 --pretty=%B 2>/dev/null)
+Files: $file_count
+EOF
+            
+            echo ""
+            echo "========================================="
+            echo "  BUILD COMPLETE"
+            echo "========================================="
+            echo ""
+            echo "Directory: $build_path"
+            echo "Files: $file_count"
+            echo "Size: $(du -sh "$build_path" | awk '{print $1}')"
+            echo ""
+        else
+            log_message "Error: Failed to create build directory"
+            echo "Error: Failed to create build directory"
+            rm -rf "$temp_build"
+            exit 1
+        fi
+    fi
+    
+    log_message "Build process completed"
+    exit 0
+}
 
 # =============================================================================
 # FUNCTION DEFINITIONS (Ash-compatible versions)
@@ -190,6 +567,15 @@ show_help() {
     echo "  --no-preserve    Don't preserve files during update"
     echo "  --node           Auto-install Node.js if missing (requires internet)"
     echo "  --nodejs         Same as --node"
+    echo "  --build          Create a build from the last commit"
+    echo "  --tar            Create a tar.gz archive (use with --build)"
+    echo "  --config         Interactive file exclusion (use with --build)"
+    echo
+    echo "Build examples:"
+    echo "  $0 --build                    Create build directory from last commit"
+    echo "  $0 --build --tar              Create tar.gz archive from last commit"
+    echo "  $0 --build --config           Interactive exclusion before directory build"
+    echo "  $0 --build --tar --config     Interactive exclusion before tar.gz build"
     echo
     echo "Commands will be created for:"
     
@@ -1531,8 +1917,16 @@ for arg in "$@"; do
         --local-dir) LOCAL_DIR_MODE=true ;;
         --no-preserve) PRESERVE_DATA=false ;;
         --node|--nodejs) INSTALL_NODE=true ;;
+        --build) BUILD_MODE=true ;;
+        --tar) BUILD_TAR=true ;;
+        --config) BUILD_CONFIG=true ;;
     esac
 done
+
+# Handle build mode (exit early if only building)
+if [ "$BUILD_MODE" = true ]; then
+    do_build
+fi
 
 log_message "Starting $PROJECT_NAME installation..."
 

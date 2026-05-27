@@ -13,6 +13,7 @@ test_sydb.c
 *.sqlite
 sypm_sydb_*
 generate-jsinfo*
+build/
 
 # Ubuntu cloud image downloads
 noble-server-cloudimg-amd64.img
