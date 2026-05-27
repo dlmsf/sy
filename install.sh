@@ -231,34 +231,77 @@ build_config_interface() {
     BUILD_FILES_LIST="/tmp/build_files_$$.txt"
     > "$BUILD_FILES_LIST"
     
+    # Store selected commit (empty = HEAD/latest)
+    SELECTED_COMMIT=""
+    SELECTED_COMMIT_MSG=""
+    
+    # Cache file for commit metadata
+    COMMIT_CACHE="/tmp/build_commits_cache_$$.txt"
+    MONTH_CACHE="/tmp/build_months_cache_$$.txt"
+    
     echo "Loading files..."
     
-    git ls-files 2>/dev/null | while IFS= read -r filename; do
-        [ -z "$filename" ] && continue
+    # Function to load files from a specific commit
+    load_files_from_commit() {
+        commit=$1
+        > "$BUILD_FILES_LIST"
         
-        if [ -f "$filename" ]; then
-            size=$(wc -c < "$filename" 2>/dev/null || echo 0)
+        if [ -z "$commit" ]; then
+            # Use current working tree - much faster
+            git ls-files -z 2>/dev/null | xargs -0 -I{} sh -c '
+                if [ -f "$1" ]; then
+                    size=$(wc -c < "$1" 2>/dev/null || echo 0)
+                else
+                    size=0
+                fi
+                case "$1" in
+                    *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
+                        printf "%s|%s|C\n" "$size" "$1" ;;
+                    *)
+                        printf "%s|%s|D\n" "$size" "$1" ;;
+                esac
+            ' _ {} 2>/dev/null | sort -t'|' -k1 -n -r > "$BUILD_FILES_LIST"
         else
-            size=0
+            # Use files from specific commit
+            git ls-tree -r -l "$commit" 2>/dev/null | while IFS=' ' read -r mode type hash rest; do
+                # Parse the remaining part to get size and filename
+                # git ls-tree -r -l output format:
+                # <mode> SP <type> SP <hash> TAB <size> TAB <filename>
+                # We need to handle both tab-separated and space-separated formats
+                
+                # Extract size and filename using awk for better parsing
+                size=$(echo "$rest" | awk '{print $1}')
+                filename=$(echo "$rest" | cut -d' ' -f2-)
+                
+                # If size is "-" or empty (submodules, etc.), set to 0
+                if [ "$size" = "-" ] || [ -z "$size" ]; then
+                    size=0
+                fi
+                
+                [ -z "$filename" ] && continue
+                
+                case "$filename" in
+                    *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
+                        file_type="C"
+                        ;;
+                    *)
+                        file_type="D"
+                        ;;
+                esac
+                
+                echo "${size}|${filename}|${file_type}" >> "$BUILD_FILES_LIST"
+            done
+            
+            # Sort by size numerically (largest first)
+            if [ -s "$BUILD_FILES_LIST" ]; then
+                sort -t'|' -k1 -n -r "$BUILD_FILES_LIST" > "${BUILD_FILES_LIST}.sorted"
+                mv "${BUILD_FILES_LIST}.sorted" "$BUILD_FILES_LIST"
+            fi
         fi
-        
-        size=$(echo "$size" | tr -d ' ')
-        [ -z "$size" ] && size=0
-        
-        case "$filename" in
-            *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
-                file_type="C"
-                ;;
-            *)
-                file_type="D"
-                ;;
-        esac
-        
-        echo "${size}|${filename}|${file_type}" >> "$BUILD_FILES_LIST"
-    done
+    }
     
-    sort -t'|' -k1 -n -r "$BUILD_FILES_LIST" > "${BUILD_FILES_LIST}.sorted"
-    mv "${BUILD_FILES_LIST}.sorted" "$BUILD_FILES_LIST"
+    # Load current files
+    load_files_from_commit ""
     
     format_size() {
         bytes=$1
@@ -266,14 +309,61 @@ build_config_interface() {
             ''|*[!0-9]*) echo "0B" ; return ;;
         esac
         
-        if [ "$bytes" -ge 1048576 ]; then
-            mb=$((bytes * 10 / 1048576))
-            echo "$((mb / 10)).$((mb % 10))MB"
+        if [ "$bytes" -ge 1073741824 ]; then
+            gb=$(echo "scale=1; $bytes / 1073741824" | bc 2>/dev/null || echo "$((bytes / 1073741824))")
+            echo "${gb}GB"
+        elif [ "$bytes" -ge 1048576 ]; then
+            mb=$(echo "scale=1; $bytes / 1048576" | bc 2>/dev/null || echo "$((bytes / 1048576))")
+            echo "${mb}MB"
         elif [ "$bytes" -ge 1024 ]; then
-            kb=$((bytes * 10 / 1024))
-            echo "$((kb / 10)).$((kb % 10))KB"
+            kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+            echo "${kb}KB"
         else
             echo "${bytes}B"
+        fi
+    }
+    
+    # Build month cache for date navigation
+    build_month_cache() {
+        > "$MONTH_CACHE"
+        
+        # Extract unique year-month combinations from the commit cache
+        if [ -f "$COMMIT_CACHE" ]; then
+            while IFS='|' read -r csize hash date msg is_version; do
+                [ -z "$hash" ] && continue
+                year_month=$(echo "$date" | cut -d'-' -f1-2)
+                echo "$year_month" >> "/tmp/build_months_raw_$$.txt"
+            done < "$COMMIT_CACHE"
+            
+            # Get unique months, sorted in reverse (newest first)
+            sort -ru "/tmp/build_months_raw_$$.txt" | while IFS= read -r ym; do
+                year=$(echo "$ym" | cut -d'-' -f1)
+                month=$(echo "$ym" | cut -d'-' -f2)
+                
+                # Convert month number to name
+                case "$month" in
+                    01) month_name="January" ;;
+                    02) month_name="February" ;;
+                    03) month_name="March" ;;
+                    04) month_name="April" ;;
+                    05) month_name="May" ;;
+                    06) month_name="June" ;;
+                    07) month_name="July" ;;
+                    08) month_name="August" ;;
+                    09) month_name="September" ;;
+                    10) month_name="October" ;;
+                    11) month_name="November" ;;
+                    12) month_name="December" ;;
+                    *) month_name="Unknown" ;;
+                esac
+                
+                # Count commits for this month
+                commit_count=$(grep "^[^|]*|[^|]*|${ym}-" "$COMMIT_CACHE" | wc -l)
+                
+                echo "${ym}|${year}|${month_name}|${commit_count}" >> "$MONTH_CACHE"
+            done
+            
+            rm -f "/tmp/build_months_raw_$$.txt"
         fi
     }
     
@@ -286,8 +376,17 @@ build_config_interface() {
         echo "  ╚══════════════════════════════════════════════════════╝"
         echo ""
         
+        # Show current commit info
+        if [ -z "$SELECTED_COMMIT" ]; then
+            echo "  Source: HEAD (current working tree)"
+        else
+            short_hash=$(echo "$SELECTED_COMMIT" | cut -c1-7)
+            echo "  Source: $short_hash - $SELECTED_COMMIT_MSG"
+        fi
+        echo ""
+        
         # Count stats
-        total_files=$(wc -l < "$BUILD_FILES_LIST")
+        total_files=$(wc -l < "$BUILD_FILES_LIST" 2>/dev/null || echo 0)
         excluded_count=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
         
         echo "  Total files: $total_files  |  Excluded: $excluded_count"
@@ -300,7 +399,6 @@ build_config_interface() {
             counter=1
             while IFS= read -r file; do
                 [ -z "$file" ] && continue
-                # Get size for display
                 file_size=0
                 while IFS='|' read -r sz fn ft; do
                     [ "$fn" = "$file" ] && file_size="$sz" && break
@@ -322,10 +420,11 @@ build_config_interface() {
         echo "    2. Search and add specific files"
         echo "    3. Remove files from exclusion list"
         echo "    4. Clear all exclusions"
-        echo "    5. Done - continue with build"
-        echo "    6. Quit"
+        echo "    5. Change source commit"
+        echo "    6. Done - continue with build"
+        echo "    7. Quit"
         echo ""
-        printf "  Choose [1-6]: "
+        printf "  Choose [1-7]: "
         read action
         
         case "$action" in
@@ -335,7 +434,6 @@ build_config_interface() {
                 ITEMS_PER_PAGE=10
                 
                 while true; do
-                    # Build list of non-excluded files
                     AVAILABLE_LIST="/tmp/build_available_$$.txt"
                     > "$AVAILABLE_LIST"
                     
@@ -521,6 +619,7 @@ build_config_interface() {
                     echo ""
                     
                     counter=1
+                    > "/tmp/build_remove_$$.txt"
                     while IFS= read -r file; do
                         [ -z "$file" ] && continue
                         file_size=0
@@ -566,11 +665,339 @@ build_config_interface() {
                 ;;
             
             5)
-                break
+                # Change source commit - OPTIMIZED WITH DATE FILTER AND CORRECT SIZE
+                # Build commit cache if it doesn't exist
+                if [ ! -f "$COMMIT_CACHE" ]; then
+                    echo ""
+                    echo "  Building commit cache..."
+                    echo "  (This may take a moment for large repositories)"
+                    echo ""
+                    
+                    # Progress indicator
+                    total_commits=$(git rev-list --all --count 2>/dev/null || echo 0)
+                    current=0
+                    
+                    # Get ALL commit info with CORRECT total sizes
+                    git log --all --format="%H|%ai|%s" 2>/dev/null | while IFS='|' read -r hash date msg; do
+                        [ -z "$hash" ] && continue
+                        
+                        # Calculate TOTAL size of all files in this commit
+                        # Use git diff-tree to get all files and sum their sizes
+                        commit_size=$(git diff-tree -r -l "$hash" 2>/dev/null | awk '{
+                            # Extract size from lines like: :100644 100644 abc123 def456 M<tab><size><tab><filename>
+                            # The size is after the status letter and before the filename
+                            for(i=1;i<=NF;i++) {
+                                if($i ~ /^[0-9]+$/ && $(i-1) ~ /^[MADRC][0-9]*$/) {
+                                    sum += $i
+                                }
+                            }
+                        } END { print sum+0 }')
+                        
+                        # If diff-tree didn't work, fall back to summing all blob sizes
+                        if [ "$commit_size" = "0" ] || [ -z "$commit_size" ]; then
+                            commit_size=$(git ls-tree -r -l "$hash" 2>/dev/null | awk '{
+                                # Extract size from ls-tree output
+                                # Format: <mode> SP <type> SP <hash> SP <size> SP <filename>
+                                # or: <mode> SP <type> SP <hash> TAB <size> TAB <filename>
+                                for(i=1;i<=NF;i++) {
+                                    if($i ~ /^[0-9]+$/ && i > 3) {
+                                        sum += $i
+                                        break  # Take first number after hash
+                                    }
+                                }
+                            } END { print sum+0 }')
+                        fi
+                        
+                        [ -z "$commit_size" ] && commit_size=0
+                        
+                        # Check if message is a version (only numbers and dots)
+                        is_version=" "
+                        case "$msg" in
+                            *[!0-9.]*) ;;
+                            *) 
+                                case "$msg" in
+                                    *.*) is_version="V" ;;
+                                esac
+                                ;;
+                        esac
+                        
+                        short_date=$(echo "$date" | cut -d' ' -f1)
+                        echo "${commit_size}|${hash}|${short_date}|${msg}|${is_version}" >> "$COMMIT_CACHE"
+                        
+                        # Show progress every 50 commits
+                        current=$((current + 1))
+                        if [ $((current % 50)) -eq 0 ] && [ "$total_commits" -gt 0 ]; then
+                            printf "\r  Processing: %d/%d commits..." "$current" "$total_commits"
+                        fi
+                    done
+                    
+                    # Sort by date in reverse (newest first)
+                    if [ -s "$COMMIT_CACHE" ]; then
+                        sort -t'|' -k3 -r "$COMMIT_CACHE" > "${COMMIT_CACHE}.sorted"
+                        mv "${COMMIT_CACHE}.sorted" "$COMMIT_CACHE"
+                    fi
+                    
+                    # Build month cache
+                    build_month_cache
+                    
+                    echo ""
+                    echo "  Cache built with $(wc -l < "$COMMIT_CACHE") commits"
+                    sleep 1
+                fi
+                
+                current_page=1
+                ITEMS_PER_PAGE=10
+                show_versions_only=false
+                date_filter=""  # Format: YYYY-MM
+                
+                while true; do
+                    FILTERED_COMMITS="/tmp/build_commits_filtered_$$.txt"
+                    > "$FILTERED_COMMITS"
+                    
+                    while IFS='|' read -r csize hash date msg is_version; do
+                        [ -z "$hash" ] && continue
+                        
+                        # Apply version filter
+                        if [ "$show_versions_only" = true ] && [ "$is_version" != "V" ]; then
+                            continue
+                        fi
+                        
+                        # Apply date filter
+                        if [ -n "$date_filter" ]; then
+                            case "$date" in
+                                ${date_filter}*) ;;
+                                *) continue ;;
+                            esac
+                        fi
+                        
+                        echo "${csize}|${hash}|${date}|${msg}|${is_version}" >> "$FILTERED_COMMITS"
+                    done < "$COMMIT_CACHE"
+                    
+                    total_commits=$(wc -l < "$FILTERED_COMMITS" 2>/dev/null || echo 0)
+                    
+                    if [ "$total_commits" -eq 0 ]; then
+                        echo ""
+                        echo "  No commits found with current filters."
+                        sleep 1
+                        date_filter=""
+                        continue
+                    fi
+                    
+                    total_pages=$(( (total_commits + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
+                    [ "$current_page" -gt "$total_pages" ] && current_page="$total_pages"
+                    [ "$current_page" -lt 1 ] && current_page=1
+                    
+                    start_line=$(( (current_page - 1) * ITEMS_PER_PAGE + 1 ))
+                    end_line=$(( current_page * ITEMS_PER_PAGE ))
+                    
+                    clear
+                    echo ""
+                    echo "  ╔══════════════════════════════════════════════════════╗"
+                    echo "  ║              SELECT SOURCE COMMIT                     ║"
+                    echo "  ╚══════════════════════════════════════════════════════╝"
+                    echo ""
+                    
+                    # Build filter description
+                    filter_desc=""
+                    [ "$show_versions_only" = true ] && filter_desc="${filter_desc} VERSIONS"
+                    if [ -n "$date_filter" ]; then
+                        year=$(echo "$date_filter" | cut -d'-' -f1)
+                        month=$(echo "$date_filter" | cut -d'-' -f2)
+                        case "$month" in
+                            01) mname="January" ;;
+                            02) mname="February" ;;
+                            03) mname="March" ;;
+                            04) mname="April" ;;
+                            05) mname="May" ;;
+                            06) mname="June" ;;
+                            07) mname="July" ;;
+                            08) mname="August" ;;
+                            09) mname="September" ;;
+                            10) mname="October" ;;
+                            11) mname="November" ;;
+                            12) mname="December" ;;
+                        esac
+                        filter_desc="${filter_desc} ${mname} ${year}"
+                    fi
+                    [ -z "$filter_desc" ] && filter_desc="ALL COMMITS"
+                    filter_desc=$(echo "$filter_desc" | sed 's/^ //')
+                    
+                    echo "  Filter: $filter_desc | Page: $current_page/$total_pages | Commits: $total_commits"
+                    echo "  ─────────────────────────────────────────────────────"
+                    echo ""
+                    
+                    line_num=0
+                    counter=1
+                    > "/tmp/build_commit_map_$$.txt"
+                    while IFS='|' read -r csize hash date msg is_version; do
+                        line_num=$((line_num + 1))
+                        [ "$line_num" -lt "$start_line" ] && continue
+                        [ "$line_num" -gt "$end_line" ] && break
+                        [ -z "$hash" ] && continue
+                        
+                        size_display=$(format_size "$csize")
+                        short_hash=$(echo "$hash" | cut -c1-7)
+                        
+                        if [ -n "$SELECTED_COMMIT" ] && [ "$hash" = "$SELECTED_COMMIT" ]; then
+                            printf "  %2s. %8s  [%s] %s %s  << SELECTED\n" "$counter" "$size_display" "$is_version" "$date" "$msg"
+                        else
+                            printf "  %2s. %8s  [%s] %s %s\n" "$counter" "$size_display" "$is_version" "$date" "$msg"
+                        fi
+                        echo "${counter}|${hash}|${msg}" >> "/tmp/build_commit_map_$$.txt"
+                        counter=$((counter + 1))
+                    done < "$FILTERED_COMMITS"
+                    
+                    echo ""
+                    echo "  ─────────────────────────────────────────────────────"
+                    echo "  Navigation: n=next p=prev | j=jump to page"
+                    echo "  Filters: v=versions only a=all commits m=select month"
+                    echo "  Actions: c=clear (use HEAD) r=refresh cache b=back"
+                    echo ""
+                    printf "  > "
+                    read cmd
+                    
+                    case "$cmd" in
+                        n|N) [ "$current_page" -lt "$total_pages" ] && current_page=$((current_page + 1)) ;;
+                        p|P) [ "$current_page" -gt 1 ] && current_page=$((current_page - 1)) ;;
+                        j|J)
+                            # Jump to specific page
+                            echo ""
+                            printf "  Jump to page (1-%s): " "$total_pages"
+                            read page_num
+                            if echo "$page_num" | grep -q '^[0-9]\+$'; then
+                                [ "$page_num" -ge 1 ] && [ "$page_num" -le "$total_pages" ] && current_page="$page_num"
+                            fi
+                            ;;
+                        v|V) 
+                            show_versions_only=true
+                            date_filter=""
+                            current_page=1
+                            ;;
+                        a|A) 
+                            show_versions_only=false
+                            date_filter=""
+                            current_page=1
+                            ;;
+                        m|M)
+                            # Month selection interface
+                            if [ ! -f "$MONTH_CACHE" ]; then
+                                build_month_cache
+                            fi
+                            
+                            month_page=1
+                            MONTHS_PER_PAGE=12
+                            total_months=$(wc -l < "$MONTH_CACHE" 2>/dev/null || echo 0)
+                            total_month_pages=$(( (total_months + MONTHS_PER_PAGE - 1) / MONTHS_PER_PAGE ))
+                            
+                            while true; do
+                                clear
+                                echo ""
+                                echo "  ╔══════════════════════════════════════════════════════╗"
+                                echo "  ║              SELECT MONTH                             ║"
+                                echo "  ╚══════════════════════════════════════════════════════╝"
+                                echo ""
+                                echo "  Page $month_page/$total_month_pages"
+                                echo "  ─────────────────────────────────────────────────────"
+                                echo ""
+                                
+                                month_start=$(( (month_page - 1) * MONTHS_PER_PAGE + 1 ))
+                                month_end=$(( month_page * MONTHS_PER_PAGE ))
+                                month_counter=1
+                                while IFS='|' read -r ym year month_name commit_count; do
+                                    [ -z "$ym" ] && continue
+                                    [ "$month_counter" -lt "$month_start" ] && month_counter=$((month_counter + 1)) && continue
+                                    [ "$month_counter" -gt "$month_end" ] && break
+                                    
+                                    # Mark currently selected month
+                                    if [ "$ym" = "$date_filter" ]; then
+                                        printf "  %2s. %s %s (%s commits) << SELECTED\n" "$month_counter" "$month_name" "$year" "$commit_count"
+                                    else
+                                        printf "  %2s. %s %s (%s commits)\n" "$month_counter" "$month_name" "$year" "$commit_count"
+                                    fi
+                                    month_counter=$((month_counter + 1))
+                                done < "$MONTH_CACHE"
+                                
+                                echo ""
+                                echo "  ─────────────────────────────────────────────────────"
+                                echo "  Select month number | n=next p=prev | c=clear filter | b=back"
+                                echo ""
+                                printf "  > "
+                                read month_cmd
+                                
+                                case "$month_cmd" in
+                                    n|N) [ "$month_page" -lt "$total_month_pages" ] && month_page=$((month_page + 1)) ;;
+                                    p|P) [ "$month_page" -gt 1 ] && month_page=$((month_page - 1)) ;;
+                                    c|C) 
+                                        date_filter=""
+                                        current_page=1
+                                        break
+                                        ;;
+                                    b|B) break ;;
+                                    *)
+                                        if echo "$month_cmd" | grep -q '^[0-9]\+$'; then
+                                            selected_month=$(sed -n "${month_cmd}p" "$MONTH_CACHE" 2>/dev/null | cut -d'|' -f1)
+                                            if [ -n "$selected_month" ]; then
+                                                date_filter="$selected_month"
+                                                current_page=1
+                                                echo ""
+                                                echo "  Filter set to: $(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f3) $(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f2)"
+                                                sleep 1
+                                                break
+                                            fi
+                                        fi
+                                        ;;
+                                esac
+                            done
+                            ;;
+                        r|R) 
+                            # Refresh cache
+                            rm -f "$COMMIT_CACHE" "$MONTH_CACHE"
+                            echo ""
+                            echo "  Cache cleared. Will rebuild on next visit."
+                            sleep 1
+                            break
+                            ;;
+                        c|C) 
+                            SELECTED_COMMIT=""
+                            SELECTED_COMMIT_MSG=""
+                            date_filter=""
+                            > "$EXCLUDE_LIST"
+                            load_files_from_commit ""
+                            echo ""
+                            echo "  Switched to HEAD (current working tree)"
+                            sleep 1
+                            break
+                            ;;
+                        b|B) break ;;
+                        *)
+                            if echo "$cmd" | grep -q '^[0-9]\+$'; then
+                                selected=$(grep "^${cmd}|" "/tmp/build_commit_map_$$.txt" 2>/dev/null | head -1)
+                                if [ -n "$selected" ]; then
+                                    SELECTED_COMMIT=$(echo "$selected" | cut -d'|' -f2)
+                                    SELECTED_COMMIT_MSG=$(echo "$selected" | cut -d'|' -f3)
+                                    > "$EXCLUDE_LIST"
+                                    load_files_from_commit "$SELECTED_COMMIT"
+                                    echo ""
+                                    echo "  Switched to commit: $SELECTED_COMMIT_MSG"
+                                    sleep 1
+                                    break
+                                fi
+                            fi
+                            ;;
+                    esac
+                    
+                    rm -f "/tmp/build_commit_map_$$.txt"
+                done
+                
+                rm -f "$FILTERED_COMMITS" "/tmp/build_commit_map_$$.txt"
                 ;;
             
             6)
-                rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST"
+                break
+                ;;
+            
+            7)
+                rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
                 echo ""
                 echo "  Build cancelled."
                 exit 0
@@ -584,11 +1011,23 @@ build_config_interface() {
         esac
     done
     
+    # Export selected commit for do_build to use
+    export BUILD_SELECTED_COMMIT="$SELECTED_COMMIT"
+    export BUILD_SELECTED_COMMIT_MSG="$SELECTED_COMMIT_MSG"
+    
     echo ""
     echo "  ╔══════════════════════════════════════════════════════╗"
     echo "  ║              EXCLUSION SUMMARY                        ║"
     echo "  ╚══════════════════════════════════════════════════════╝"
     echo ""
+    
+    if [ -z "$SELECTED_COMMIT" ]; then
+        echo "  Source: HEAD (current working tree)"
+    else
+        echo "  Source: $SELECTED_COMMIT_MSG"
+    fi
+    echo ""
+    
     if [ -s "$EXCLUDE_LIST" ]; then
         echo "  $(wc -l < "$EXCLUDE_LIST") files will be excluded:"
         echo ""
@@ -599,6 +1038,9 @@ build_config_interface() {
         echo "  No files excluded - all files will be included"
     fi
     echo ""
+    
+    # Don't clean up the cache - keep it for potential reuse
+    rm -f "$BUILD_FILES_LIST"
     
     return 0
 }
@@ -614,34 +1056,57 @@ do_build() {
         exit 1
     fi
     
+    # Determine which commit to build from
+    if [ -n "$BUILD_SELECTED_COMMIT" ]; then
+        BUILD_COMMIT="$BUILD_SELECTED_COMMIT"
+        BUILD_COMMIT_MSG="$BUILD_SELECTED_COMMIT_MSG"
+        log_message "Building from selected commit: $BUILD_COMMIT_MSG ($BUILD_COMMIT)"
+    else
+        BUILD_COMMIT="HEAD"
+        BUILD_COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -n1)
+        log_message "Building from HEAD: $BUILD_COMMIT_MSG"
+    fi
+    
+    # Run configuration interface if requested
+    if [ "$BUILD_CONFIG" = true ]; then
+        build_config_interface
+        # Re-check selected commit after config (user might have changed it)
+        if [ -n "$BUILD_SELECTED_COMMIT" ]; then
+            BUILD_COMMIT="$BUILD_SELECTED_COMMIT"
+            BUILD_COMMIT_MSG="$BUILD_SELECTED_COMMIT_MSG"
+        fi
+    fi
+    
     # Use the directory where the script was called from
     build_base_dir="$REPO_DIR/build"
     mkdir -p "$build_base_dir"
     
     # Get sanitized commit message for naming
-    build_name=$(get_commit_filename)
+    if [ -n "$BUILD_COMMIT_MSG" ]; then
+        build_name=$(echo "$BUILD_COMMIT_MSG" | tr ' ' '_' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_//' | sed 's/_$//')
+        [ -z "$build_name" ] && build_name="build"
+    else
+        build_name="build_$(date +%Y%m%d_%H%M%S)"
+    fi
+    
     build_path="$build_base_dir/$build_name"
     
     log_message "Build name: $build_name"
     log_message "Build path: $build_path"
-    
-    # Run configuration interface if requested
-    if [ "$BUILD_CONFIG" = true ]; then
-        build_config_interface
-    fi
+    log_message "Source commit: $BUILD_COMMIT"
     
     # Create temporary directory for build
     temp_build="/tmp/build_$$"
     rm -rf "$temp_build"
     mkdir -p "$temp_build"
     
-    # Get list of files from last commit and extract them
-    log_message "Extracting files from last commit..."
+    # Get list of files from the selected commit and extract them
+    log_message "Extracting files from commit $BUILD_COMMIT..."
     
-    # Use git archive for efficient extraction
     if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
         # With exclusions: extract all then remove excluded
-        git archive HEAD 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
+        log_message "Applying exclusion list ($(wc -l < "$EXCLUDE_LIST") files excluded)..."
+        git archive "$BUILD_COMMIT" 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
         
         if [ $? -eq 0 ]; then
             # Remove excluded files
@@ -663,7 +1128,7 @@ do_build() {
         fi
     else
         # No exclusions: simple archive extraction
-        git archive HEAD 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
+        git archive "$BUILD_COMMIT" 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
         
         if [ $? -ne 0 ]; then
             log_message "Error: Failed to extract files from git"
@@ -678,7 +1143,7 @@ do_build() {
     log_message "Extracted $file_count files"
     
     # Clean up temp files
-    rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST" "$MAPPING_FILE"
+    rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST"
     
     # Create the build
     if [ "$BUILD_TAR" = true ]; then
@@ -694,14 +1159,19 @@ do_build() {
         
         if [ $? -eq 0 ]; then
             log_message "Build archive created successfully: $tar_file"
+            
+            # Calculate archive size
+            archive_size=$(ls -lh "$tar_file" | awk '{print $5}')
+            
             echo ""
             echo "========================================="
             echo "  BUILD COMPLETE"
             echo "========================================="
             echo ""
-            echo "Archive: $tar_file"
-            echo "Size: $(ls -lh "$tar_file" | awk '{print $5}')"
-            echo "Files: $file_count"
+            echo "  Archive: $tar_file"
+            echo "  Size: $archive_size"
+            echo "  Files: $file_count"
+            echo "  Source: $BUILD_COMMIT_MSG"
             echo ""
         else
             log_message "Error: Failed to create tar.gz archive"
@@ -720,9 +1190,10 @@ do_build() {
         cat > "${tar_file}.info" << EOF
 Build Name: $build_name
 Build Date: $(date)
-Commit: $(git rev-parse HEAD 2>/dev/null)
-Commit Message: $(git log -1 --pretty=%B 2>/dev/null)
+Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
+Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
+Excluded: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
     else
         # Create directory build
@@ -736,13 +1207,17 @@ EOF
         if [ $? -eq 0 ]; then
             log_message "Build directory created successfully: $build_path"
             
+            # Calculate directory size
+            dir_size=$(du -sh "$build_path" 2>/dev/null | awk '{print $1}')
+            
             # Add build info file
             cat > "$build_path/BUILD_INFO.txt" << EOF
 Build Name: $build_name
 Build Date: $(date)
-Commit: $(git rev-parse HEAD 2>/dev/null)
-Commit Message: $(git log -1 --pretty=%B 2>/dev/null)
+Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
+Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
+Excluded: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
             
             echo ""
@@ -750,9 +1225,10 @@ EOF
             echo "  BUILD COMPLETE"
             echo "========================================="
             echo ""
-            echo "Directory: $build_path"
-            echo "Files: $file_count"
-            echo "Size: $(du -sh "$build_path" | awk '{print $1}')"
+            echo "  Directory: $build_path"
+            echo "  Size: $dir_size"
+            echo "  Files: $file_count"
+            echo "  Source: $BUILD_COMMIT_MSG"
             echo ""
         else
             log_message "Error: Failed to create build directory"
