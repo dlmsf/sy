@@ -218,176 +218,391 @@ build_config_interface() {
     echo "========================================="
     echo ""
     echo "Select files to EXCLUDE from the build"
-    echo "Files are sorted by size (largest first)"
     echo ""
     
-    # Get list of files from last commit sorted by size
     if ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
         echo "Error: Not in a git repository"
         return 1
     fi
     
-    # Create temp file for exclusion list
     EXCLUDE_LIST="/tmp/build_exclude_$$.txt"
     > "$EXCLUDE_LIST"
     
-    # Create temp file for build files list
     BUILD_FILES_LIST="/tmp/build_files_$$.txt"
     > "$BUILD_FILES_LIST"
     
-    # Get files from last commit with sizes
-    git ls-tree -r -l HEAD 2>/dev/null | while IFS=' ' read -r mode type hash size filename; do
-        # Skip if size is not available (it's a submodule or special)
-        [ "$size" = "-" ] && size=0
+    echo "Loading files..."
+    
+    git ls-files 2>/dev/null | while IFS= read -r filename; do
+        [ -z "$filename" ] && continue
         
-        # Format size for display
-        if [ "$size" -gt 1048576 ]; then
-            size_display="$((size / 1048576))MB"
-        elif [ "$size" -gt 1024 ]; then
-            size_display="$((size / 1024))KB"
+        if [ -f "$filename" ]; then
+            size=$(wc -c < "$filename" 2>/dev/null || echo 0)
         else
-            size_display="${size}B"
+            size=0
         fi
         
-        # Determine if it's code or binary/data
+        size=$(echo "$size" | tr -d ' ')
+        [ -z "$size" ] && size=0
+        
         case "$filename" in
             *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
-                file_type="CODE"
+                file_type="C"
                 ;;
             *)
-                file_type="BINARY/DATA"
+                file_type="D"
                 ;;
         esac
         
-        echo "$size|$filename|$file_type|$size_display" >> "$BUILD_FILES_LIST"
+        echo "${size}|${filename}|${file_type}" >> "$BUILD_FILES_LIST"
     done
     
-    # Sort by size (largest first)
     sort -t'|' -k1 -n -r "$BUILD_FILES_LIST" > "${BUILD_FILES_LIST}.sorted"
     mv "${BUILD_FILES_LIST}.sorted" "$BUILD_FILES_LIST"
     
-    # Interactive selection loop
-    show_non_code=false
+    format_size() {
+        bytes=$1
+        case "$bytes" in
+            ''|*[!0-9]*) echo "0B" ; return ;;
+        esac
+        
+        if [ "$bytes" -ge 1048576 ]; then
+            mb=$((bytes * 10 / 1048576))
+            echo "$((mb / 10)).$((mb % 10))MB"
+        elif [ "$bytes" -ge 1024 ]; then
+            kb=$((bytes * 10 / 1024))
+            echo "$((kb / 10)).$((kb % 10))KB"
+        else
+            echo "${bytes}B"
+        fi
+    }
     
+    # Main loop
     while true; do
         clear
-        echo "========================================="
-        echo "  BUILD CONFIGURATION - EXCLUDE FILES"
-        echo "========================================="
         echo ""
-        [ "$show_non_code" = true ] && echo "Showing: ALL files (including non-code)" || echo "Showing: CODE files only (toggle with 't')"
+        echo "  ╔══════════════════════════════════════════════════════╗"
+        echo "  ║           SELECT FILES TO EXCLUDE FROM BUILD         ║"
+        echo "  ╚══════════════════════════════════════════════════════╝"
         echo ""
-        echo "Currently excluded files:"
+        
+        # Count stats
+        total_files=$(wc -l < "$BUILD_FILES_LIST")
+        excluded_count=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
+        
+        echo "  Total files: $total_files  |  Excluded: $excluded_count"
+        echo "  ─────────────────────────────────────────────────────"
+        echo ""
+        
+        # Show current exclusions
         if [ -s "$EXCLUDE_LIST" ]; then
-            cat "$EXCLUDE_LIST" | while IFS= read -r file; do
-                echo "  ✗ $file"
-            done
+            echo "  CURRENTLY EXCLUDED:"
+            counter=1
+            while IFS= read -r file; do
+                [ -z "$file" ] && continue
+                # Get size for display
+                file_size=0
+                while IFS='|' read -r sz fn ft; do
+                    [ "$fn" = "$file" ] && file_size="$sz" && break
+                done < "$BUILD_FILES_LIST"
+                size_display=$(format_size "$file_size")
+                printf "    %2s. [X] %8s  %s\n" "$counter" "$size_display" "$file"
+                counter=$((counter + 1))
+            done < "$EXCLUDE_LIST"
+            echo ""
         else
-            echo "  (none)"
+            echo "  No files excluded yet."
+            echo ""
         fi
-        echo ""
-        echo "Available files (largest first):"
-        echo ""
         
-        # Clear mapping file
-        MAPPING_FILE="/tmp/build_mapping_$$.txt"
-        > "$MAPPING_FILE"
-        
-        # Display files with numbers
-        counter=1
-        while IFS='|' read -r size file type size_display; do
-            [ -z "$file" ] && continue
-            
-            # Apply filter
-            if [ "$show_non_code" = false ] && [ "$type" = "BINARY/DATA" ]; then
-                continue
-            fi
-            
-            # Check if already excluded
-            already_excluded=false
-            if grep -q "^${file}$" "$EXCLUDE_LIST" 2>/dev/null; then
-                already_excluded=true
-            fi
-            
-            printf "%3d. [%s] %s - %s" "$counter" "$type" "$size_display" "$file"
-            [ "$already_excluded" = true ] && printf " (EXCLUDED)"
-            printf "\n"
-            
-            # Save mapping
-            echo "$counter|$file" >> "$MAPPING_FILE"
-            counter=$((counter + 1))
-        done < "$BUILD_FILES_LIST"
-        
+        echo "  ─────────────────────────────────────────────────────"
         echo ""
-        echo "Commands:"
-        echo "  <number>  - Toggle exclusion for that file"
-        echo "  t         - Toggle show/hide non-code files"
-        echo "  a         - Exclude ALL currently shown files"
-        echo "  c         - Clear all exclusions"
-        echo "  d         - Done, continue with build"
-        echo "  q         - Quit build process"
+        echo "  ACTIONS:"
+        echo "    1. Add files to exclude (browse by size)"
+        echo "    2. Search and add specific files"
+        echo "    3. Remove files from exclusion list"
+        echo "    4. Clear all exclusions"
+        echo "    5. Done - continue with build"
+        echo "    6. Quit"
         echo ""
-        printf "Enter command: "
-        read cmd
+        printf "  Choose [1-6]: "
+        read action
         
-        case "$cmd" in
-            t)
-                if [ "$show_non_code" = true ]; then
-                    show_non_code=false
-                else
-                    show_non_code=true
+        case "$action" in
+            1)
+                # Browse files by size
+                current_page=1
+                ITEMS_PER_PAGE=10
+                
+                while true; do
+                    # Build list of non-excluded files
+                    AVAILABLE_LIST="/tmp/build_available_$$.txt"
+                    > "$AVAILABLE_LIST"
+                    
+                    while IFS='|' read -r size_bytes filename file_type; do
+                        [ -z "$filename" ] && continue
+                        if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                            echo "${size_bytes}|${filename}|${file_type}" >> "$AVAILABLE_LIST"
+                        fi
+                    done < "$BUILD_FILES_LIST"
+                    
+                    total_items=$(wc -l < "$AVAILABLE_LIST")
+                    
+                    if [ "$total_items" -eq 0 ]; then
+                        echo ""
+                        echo "  All files are already excluded!"
+                        sleep 1
+                        break
+                    fi
+                    
+                    total_pages=$(( (total_items + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
+                    [ "$current_page" -gt "$total_pages" ] && current_page="$total_pages"
+                    [ "$current_page" -lt 1 ] && current_page=1
+                    
+                    start_line=$(( (current_page - 1) * ITEMS_PER_PAGE + 1 ))
+                    end_line=$(( current_page * ITEMS_PER_PAGE ))
+                    
+                    clear
+                    echo ""
+                    echo "  ╔══════════════════════════════════════════════════════╗"
+                    echo "  ║              BROWSE FILES (largest first)             ║"
+                    echo "  ╚══════════════════════════════════════════════════════╝"
+                    echo ""
+                    printf "  Page %s/%s | Files: %s\n" "$current_page" "$total_pages" "$total_items"
+                    echo "  ─────────────────────────────────────────────────────"
+                    echo ""
+                    
+                    line_num=0
+                    counter=1
+                    while IFS='|' read -r size_bytes filename file_type; do
+                        line_num=$((line_num + 1))
+                        [ "$line_num" -lt "$start_line" ] && continue
+                        [ "$line_num" -gt "$end_line" ] && break
+                        [ -z "$filename" ] && continue
+                        
+                        size_display=$(format_size "$size_bytes")
+                        printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$filename"
+                        counter=$((counter + 1))
+                    done < "$AVAILABLE_LIST"
+                    
+                    echo ""
+                    echo "  ─────────────────────────────────────────────────────"
+                    echo "  Type number to exclude | n=next p=prev | b=back"
+                    echo ""
+                    printf "  > "
+                    read cmd
+                    
+                    case "$cmd" in
+                        n|N) [ "$current_page" -lt "$total_pages" ] && current_page=$((current_page + 1)) ;;
+                        p|P) [ "$current_page" -gt 1 ] && current_page=$((current_page - 1)) ;;
+                        b|B) break ;;
+                        *)
+                            if echo "$cmd" | grep -q '^[0-9]\+$'; then
+                                line_num=0
+                                counter=1
+                                while IFS='|' read -r size_bytes filename file_type; do
+                                    line_num=$((line_num + 1))
+                                    [ "$line_num" -lt "$start_line" ] && continue
+                                    [ "$line_num" -gt "$end_line" ] && break
+                                    [ -z "$filename" ] && continue
+                                    
+                                    if [ "$counter" = "$cmd" ]; then
+                                        if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                                            echo "$filename" >> "$EXCLUDE_LIST"
+                                            echo ""
+                                            echo "  Excluded: $filename"
+                                            sleep 0.5
+                                        fi
+                                        break
+                                    fi
+                                    counter=$((counter + 1))
+                                done < "$AVAILABLE_LIST"
+                            fi
+                            ;;
+                    esac
+                done
+                rm -f "$AVAILABLE_LIST"
+                ;;
+            
+            2)
+                # Search and add
+                clear
+                echo ""
+                echo "  ╔══════════════════════════════════════════════════════╗"
+                echo "  ║              SEARCH FILES TO EXCLUDE                  ║"
+                echo "  ╚══════════════════════════════════════════════════════╝"
+                echo ""
+                printf "  Search term (or empty to cancel): "
+                read search_term
+                
+                if [ -n "$search_term" ]; then
+                    SEARCH_RESULTS="/tmp/build_search_$$.txt"
+                    > "$SEARCH_RESULTS"
+                    
+                    while IFS='|' read -r size_bytes filename file_type; do
+                        [ -z "$filename" ] && continue
+                        case "$filename" in
+                            *"$search_term"*) 
+                                if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                                    echo "${size_bytes}|${filename}" >> "$SEARCH_RESULTS"
+                                fi
+                                ;;
+                        esac
+                    done < "$BUILD_FILES_LIST"
+                    
+                    result_count=$(wc -l < "$SEARCH_RESULTS")
+                    
+                    if [ "$result_count" -eq 0 ]; then
+                        echo ""
+                        echo "  No matching files found."
+                        sleep 1
+                    else
+                        echo ""
+                        echo "  Found $result_count matching files:"
+                        echo ""
+                        
+                        counter=1
+                        while IFS='|' read -r size_bytes filename; do
+                            [ -z "$filename" ] && continue
+                            size_display=$(format_size "$size_bytes")
+                            printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$filename"
+                            counter=$((counter + 1))
+                        done < "$SEARCH_RESULTS"
+                        
+                        echo ""
+                        echo "  Type number to exclude | a=exclude all | b=back"
+                        echo ""
+                        printf "  > "
+                        read search_cmd
+                        
+                        case "$search_cmd" in
+                            a|A)
+                                while IFS='|' read -r size_bytes filename; do
+                                    [ -z "$filename" ] && continue
+                                    echo "$filename" >> "$EXCLUDE_LIST"
+                                done < "$SEARCH_RESULTS"
+                                echo "  All matching files excluded!"
+                                sleep 1
+                                ;;
+                            b|B) ;;
+                            *)
+                                if echo "$search_cmd" | grep -q '^[0-9]\+$'; then
+                                    counter=1
+                                    while IFS='|' read -r size_bytes filename; do
+                                        [ -z "$filename" ] && continue
+                                        if [ "$counter" = "$search_cmd" ]; then
+                                            echo "$filename" >> "$EXCLUDE_LIST"
+                                            echo "  Excluded: $filename"
+                                            sleep 0.5
+                                            break
+                                        fi
+                                        counter=$((counter + 1))
+                                    done < "$SEARCH_RESULTS"
+                                fi
+                                ;;
+                        esac
+                    fi
+                    rm -f "$SEARCH_RESULTS"
                 fi
                 ;;
-            a)
-                # Exclude all shown files
-                while IFS='|' read -r size file type size_display; do
-                    [ -z "$file" ] && continue
-                    if [ "$show_non_code" = false ] && [ "$type" = "BINARY/DATA" ]; then
-                        continue
-                    fi
-                    if ! grep -q "^${file}$" "$EXCLUDE_LIST" 2>/dev/null; then
-                        echo "$file" >> "$EXCLUDE_LIST"
-                    fi
-                done < "$BUILD_FILES_LIST"
+            
+            3)
+                # Remove from exclusion list
+                if [ ! -s "$EXCLUDE_LIST" ]; then
+                    echo ""
+                    echo "  No files to remove."
+                    sleep 1
+                else
+                    clear
+                    echo ""
+                    echo "  ╔══════════════════════════════════════════════════════╗"
+                    echo "  ║            REMOVE FROM EXCLUSION LIST                 ║"
+                    echo "  ╚══════════════════════════════════════════════════════╝"
+                    echo ""
+                    
+                    counter=1
+                    while IFS= read -r file; do
+                        [ -z "$file" ] && continue
+                        file_size=0
+                        while IFS='|' read -r sz fn ft; do
+                            [ "$fn" = "$file" ] && file_size="$sz" && break
+                        done < "$BUILD_FILES_LIST"
+                        size_display=$(format_size "$file_size")
+                        printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$file"
+                        echo "${counter}|${file}" >> "/tmp/build_remove_$$.txt"
+                        counter=$((counter + 1))
+                    done < "$EXCLUDE_LIST"
+                    
+                    echo ""
+                    echo "  Type number to remove | a=remove all | b=back"
+                    echo ""
+                    printf "  > "
+                    read remove_cmd
+                    
+                    case "$remove_cmd" in
+                        a|A) > "$EXCLUDE_LIST"; echo "  All exclusions removed!"; sleep 1 ;;
+                        b|B) ;;
+                        *)
+                            if echo "$remove_cmd" | grep -q '^[0-9]\+$'; then
+                                file_to_remove=$(grep "^${remove_cmd}|" "/tmp/build_remove_$$.txt" 2>/dev/null | cut -d'|' -f2)
+                                if [ -n "$file_to_remove" ]; then
+                                    grep -v "^${file_to_remove}$" "$EXCLUDE_LIST" > "${EXCLUDE_LIST}.tmp" 2>/dev/null
+                                    mv "${EXCLUDE_LIST}.tmp" "$EXCLUDE_LIST" 2>/dev/null
+                                    echo "  Removed: $file_to_remove"
+                                    sleep 0.5
+                                fi
+                            fi
+                            ;;
+                    esac
+                    rm -f "/tmp/build_remove_$$.txt"
+                fi
                 ;;
-            c)
+            
+            4)
                 > "$EXCLUDE_LIST"
+                echo ""
+                echo "  All exclusions cleared!"
+                sleep 1
                 ;;
-            d)
+            
+            5)
                 break
                 ;;
-            q)
-                rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST" "$MAPPING_FILE"
-                echo "Build cancelled."
+            
+            6)
+                rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST"
+                echo ""
+                echo "  Build cancelled."
                 exit 0
                 ;;
+            
             *)
-                if echo "$cmd" | grep -q '^[0-9]\+$'; then
-                    # Find file by number
-                    file_to_toggle=$(grep "^${cmd}|" "$MAPPING_FILE" 2>/dev/null | cut -d'|' -f2)
-                    if [ -n "$file_to_toggle" ]; then
-                        if grep -q "^${file_to_toggle}$" "$EXCLUDE_LIST" 2>/dev/null; then
-                            # Remove from exclude list
-                            grep -v "^${file_to_toggle}$" "$EXCLUDE_LIST" > "${EXCLUDE_LIST}.tmp" 2>/dev/null
-                            mv "${EXCLUDE_LIST}.tmp" "$EXCLUDE_LIST" 2>/dev/null
-                        else
-                            # Add to exclude list
-                            echo "$file_to_toggle" >> "$EXCLUDE_LIST"
-                        fi
-                    fi
-                fi
+                echo ""
+                echo "  Invalid choice. Press any key..."
+                read dummy
                 ;;
         esac
     done
     
     echo ""
-    echo "Exclusion list created:"
-    cat "$EXCLUDE_LIST" 2>/dev/null
+    echo "  ╔══════════════════════════════════════════════════════╗"
+    echo "  ║              EXCLUSION SUMMARY                        ║"
+    echo "  ╚══════════════════════════════════════════════════════╝"
+    echo ""
+    if [ -s "$EXCLUDE_LIST" ]; then
+        echo "  $(wc -l < "$EXCLUDE_LIST") files will be excluded:"
+        echo ""
+        while IFS= read -r file; do
+            echo "    - $file"
+        done < "$EXCLUDE_LIST"
+    else
+        echo "  No files excluded - all files will be included"
+    fi
     echo ""
     
     return 0
 }
-
+    
 # Main build function
 do_build() {
     log_message "Starting build process..."
