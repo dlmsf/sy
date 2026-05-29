@@ -25,8 +25,8 @@ MAIN_SOURCE_DIR="$REPO_DIR"                         # Root of your project files
 # NODE.JS COMMAND MAPPING (REQUIRED - define your commands)
 # =============================================================================
 # Using space-separated lists for ash compatibility (no associative arrays)
-NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js"
-NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc"
+NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js"
+NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc labssh"
 
 # =============================================================================
 # SHELL SCRIPT COMMAND MAPPING (OPTIONAL - for .sh files with bash→ash fallback)
@@ -73,7 +73,8 @@ get_command_working_dir() {
         "git-config") echo "global" ;;
         "qemu") echo "file" ;;
         "lay") echo "caller" ;;   
-        "arc") echo "caller" ;;   
+        "arc") echo "caller" ;;  
+        "labssh") echo "global" ;; 
         
         # =====================================================================
         # SHELL SCRIPT COMMANDS - ADD YOURS HERE

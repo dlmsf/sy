@@ -304,16 +304,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 Usage: node ssh-lab.mjs <method> [args]
 
 Methods:
-  setup                              One-time SSH config + key generation
-  copyKey <host> <password> [user]   Copy SSH key to remote host
-  checkAccess <host> [port]          Check if SSH port is open
-  fullSetup <host> <password> [user] Run setup + copyKey + verify
+  setup                       One-time SSH config + key generation
+  copy <host> <password> [user]   Copy SSH key to remote host
+  check <host> [port]             Check if SSH port is open
+  full <host> <password> [user]   Run setup + copyKey + verify
 
 Examples:
   node ssh-lab.mjs setup
-  node ssh-lab.mjs copyKey 10.10.10.10 password123 root
-  node ssh-lab.mjs checkAccess 10.10.10.10
-  node ssh-lab.mjs fullSetup 10.10.10.10 password123 root
+  node ssh-lab.mjs copy 10.10.10.10 password123 root
+  node ssh-lab.mjs check 10.10.10.10
+  node ssh-lab.mjs full 10.10.10.10 password123 root
 `;
 
   if (!method) {
@@ -330,30 +330,30 @@ Examples:
           result = await SSH.setup();
           break;
           
-        case 'copyKey': {
+        case 'copy': {
           const [host, password, user = 'root'] = args;
           if (!host || !password) {
-            console.error('Usage: node ssh-lab.mjs copyKey <host> <password> [user]');
+            console.error('Usage: node ssh-lab.mjs copy <host> <password> [user]');
             process.exit(1);
           }
           result = await SSH.copyKey(host, password, user);
           break;
         }
           
-        case 'checkAccess': {
+        case 'check': {
           const [host, port = 22] = args;
           if (!host) {
-            console.error('Usage: node ssh-lab.mjs checkAccess <host> [port]');
+            console.error('Usage: node ssh-lab.mjs check <host> [port]');
             process.exit(1);
           }
           result = await SSH.checkAccess(host, parseInt(port));
           break;
         }
           
-        case 'fullSetup': {
+        case 'full': {
           const [host, password, user = 'root'] = args;
           if (!host || !password) {
-            console.error('Usage: node ssh-lab.mjs fullSetup <host> <password> [user]');
+            console.error('Usage: node ssh-lab.mjs full <host> <password> [user]');
             process.exit(1);
           }
           result = await SSH.fullSetup(host, password, user);
