@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import { mkdir, writeFile, chmod, access, readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { networkInterfaces } from 'os';
 
 const execAsync = promisify(exec);
 
@@ -294,6 +295,270 @@ exit $?`;
       method: copyResult.method
     };
   }
+
+  /**
+   * Check if SSH connection is fully unlocked (passwordless access working)
+   * @param {string} host - Target host IP
+   * @param {string} user - SSH username (default: root)
+   * @returns {Promise<Object>} Result with status and details
+   */
+  static async checkUnlocked(host, user = 'root') {
+    console.error(`[checkUnlocked] Testing unlocked access to ${user}@${host}...`);
+    
+    // First check if host is reachable
+    const reachable = await this.checkAccess(host);
+    if (!reachable) {
+      return {
+        host,
+        user,
+        accessible: false,
+        unlocked: false,
+        message: 'Host not reachable on port 22'
+      };
+    }
+
+    // Test passwordless connection
+    const testResult = await this._testConnection(host, user, true);
+    
+    if (testResult.success) {
+      return {
+        host,
+        user,
+        accessible: true,
+        unlocked: true,
+        message: 'SSH fully unlocked - passwordless access working',
+        details: testResult.output
+      };
+    }
+
+    // Try to determine if SSH is accessible but not unlocked
+    const sshTest = await this._exec(
+      `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes ${user}@${host} "exit" 2>&1`
+    );
+    
+    if (sshTest.stderr.includes('Permission denied') || 
+        sshTest.stderr.includes('password')) {
+      return {
+        host,
+        user,
+        accessible: true,
+        unlocked: false,
+        message: 'SSH accessible but requires password - not unlocked',
+        details: sshTest.stderr
+      };
+    }
+    
+    if (sshTest.stderr.includes('Connection refused')) {
+      return {
+        host,
+        user,
+        accessible: false,
+        unlocked: false,
+        message: 'SSH port open but connection refused',
+        details: sshTest.stderr
+      };
+    }
+
+    return {
+      host,
+      user,
+      accessible: true,
+      unlocked: false,
+      message: 'SSH accessible but unlock status unclear',
+      details: testResult.error || sshTest.stderr
+    };
+  }
+
+  /**
+   * Fast check if host has SSH accessible (port check only)
+   * @param {string} host - Target IP
+   * @returns {Promise<Object|null>} Host info or null if not accessible
+   */
+  static async _fastCheckAccess(host) {
+    const result = await this._exec(
+      `timeout 2 bash -c "echo >/dev/tcp/${host}/22" 2>&1`,
+      { timeout: 3000 }
+    );
+    
+    if (result.success) {
+      return {
+        host,
+        accessible: true,
+        unlocked: false,
+        type: 'accessible'
+      };
+    }
+    
+    // Quick nc fallback
+    const ncResult = await this._exec(
+      `nc -zv -w1 ${host} 22 2>&1`,
+      { timeout: 2000 }
+    );
+    
+    if (ncResult.success || ncResult.stderr.includes('succeeded') || ncResult.stderr.includes('open')) {
+      return {
+        host,
+        accessible: true,
+        unlocked: false,
+        type: 'accessible'
+      };
+    }
+    
+    return null; // Not accessible, don't include
+  }
+
+  /**
+   * Fast check if host is unlocked (passwordless)
+   * @param {string} host - Target IP
+   * @param {string} user - SSH user
+   * @returns {Promise<Object>} Updated host object with unlock status
+   */
+  static async _fastCheckUnlocked(host, user = 'root') {
+    const cmd = `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o PasswordAuthentication=no -o BatchMode=yes ${user}@${host} "echo 'UNLOCKED'" 2>&1`;
+    
+    const result = await this._exec(cmd, { timeout: 4000 });
+    
+    const isUnlocked = result.stdout.includes('UNLOCKED');
+    
+    return {
+      host,
+      accessible: true,
+      unlocked: isUnlocked,
+      type: isUnlocked ? 'unlocked' : 'accessible',
+      user: user,
+      message: isUnlocked ? 'SSH unlocked - passwordless access' : 'SSH accessible but requires password'
+    };
+  }
+
+  /**
+   * Get all local network IPs from network interfaces
+   * @returns {Array<string>} Array of IP addresses with netmask
+   */
+  static _getLocalIPs() {
+    const interfaces = networkInterfaces();
+    const ips = [];
+    
+    for (const [name, nets] of Object.entries(interfaces)) {
+      if (!nets) continue;
+      for (const net of nets) {
+        // Skip internal and non-IPv4 addresses
+        if (net.family === 'IPv4' && !net.internal) {
+          ips.push({ ip: net.address, netmask: net.netmask });
+        }
+      }
+    }
+    
+    return ips;
+  }
+
+  /**
+   * Generate IP range from IP and netmask
+   * @param {string} ip - IP address
+   * @param {string} netmask - Netmask
+   * @returns {Array<string>} Array of IPs in range
+   */
+  static _generateIPRange(ip, netmask) {
+    const ipParts = ip.split('.').map(Number);
+    const maskParts = netmask.split('.').map(Number);
+    
+    const network = ipParts.map((octet, i) => octet & maskParts[i]);
+    const broadcast = network.map((octet, i) => octet | (~maskParts[i] & 255));
+    
+    const ips = [];
+    
+    // Generate all IPs in range, skip network and broadcast addresses
+    for (let a = network[0]; a <= broadcast[0]; a++) {
+      for (let b = (a === network[0] ? network[1] : 0); b <= (a === broadcast[0] ? broadcast[1] : 255); b++) {
+        for (let c = (a === network[0] && b === network[1] ? network[2] : 0); 
+             c <= (a === broadcast[0] && b === broadcast[1] ? broadcast[2] : 255); c++) {
+          for (let d = (a === network[0] && b === network[1] && c === network[2] ? network[3] + 1 : 1); 
+               d <= (a === broadcast[0] && b === broadcast[1] && c === broadcast[2] ? broadcast[3] - 1 : 254); d++) {
+            ips.push(`${a}.${b}.${c}.${d}`);
+          }
+        }
+      }
+    }
+    
+    return ips;
+  }
+
+  /**
+   * Scan network for SSH hosts - ultra fast with full parallelism
+   * Only returns hosts that have SSH accessible or unlocked
+   * @returns {Promise<Object>} Scan results with accessible/unlocked hosts
+   */
+  static async scanNetwork() {
+    console.error('[scanNetwork] Starting ultra-fast network SSH scan...');
+    const startTime = Date.now();
+    
+    // Get all local interfaces and generate IP ranges
+    const localIPs = this._getLocalIPs();
+    const allIPs = new Set();
+    
+    for (const { ip, netmask } of localIPs) {
+      console.error(`[scanNetwork] Interface: ${ip}/${netmask}`);
+      const rangeIPs = this._generateIPRange(ip, netmask);
+      rangeIPs.forEach(ip => allIPs.add(ip));
+    }
+    
+    const ipArray = Array.from(allIPs);
+    console.error(`[scanNetwork] Scanning ${ipArray.length} IPs in FULL PARALLEL...`);
+    
+    // PHASE 1: Check all IPs for SSH port accessibility in full parallel
+    const accessResults = await Promise.allSettled(
+      ipArray.map(ip => this._fastCheckAccess(ip))
+    );
+    
+    // Filter only accessible hosts
+    const accessibleHosts = accessResults
+      .filter(r => r.status === 'fulfilled' && r.value !== null)
+      .map(r => r.value);
+    
+    console.error(`[scanNetwork] Phase 1 complete: ${accessibleHosts.length} hosts with SSH open`);
+    
+    if (accessibleHosts.length === 0) {
+      const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+      return {
+        success: true,
+        duration: `${duration}s`,
+        total_scanned: ipArray.length,
+        accessible: 0,
+        unlocked: 0,
+        hosts: []
+      };
+    }
+    
+    // PHASE 2: Check all accessible hosts for unlock status in full parallel
+    console.error(`[scanNetwork] Phase 2: Checking unlock status for ${accessibleHosts.length} hosts...`);
+    
+    const unlockResults = await Promise.allSettled(
+      accessibleHosts.map(host => this._fastCheckUnlocked(host.host))
+    );
+    
+    const finalHosts = unlockResults
+      .filter(r => r.status === 'fulfilled' && r.value !== null)
+      .map(r => r.value)
+      .sort((a, b) => b.unlocked - a.unlocked); // Unlocked first
+    
+    const unlockedCount = finalHosts.filter(h => h.unlocked).length;
+    const accessibleCount = finalHosts.filter(h => !h.unlocked).length;
+    
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    
+    console.error(`\n[scanNetwork] Scan complete in ${duration}s`);
+    console.error(`[scanNetwork] Total scanned: ${ipArray.length}`);
+    console.error(`[scanNetwork] SSH accessible: ${accessibleCount}`);
+    console.error(`[scanNetwork] SSH unlocked: ${unlockedCount}`);
+    
+    return {
+      success: true,
+      duration: `${duration}s`,
+      total_scanned: ipArray.length,
+      accessible: accessibleCount,
+      unlocked: unlockedCount,
+      hosts: finalHosts
+    };
+  }
 }
 
 // CLI interface
@@ -308,12 +573,16 @@ Methods:
   copy <host> <password> [user]   Copy SSH key to remote host
   check <host> [port]             Check if SSH port is open
   full <host> <password> [user]   Run setup + copyKey + verify
+  unlock-check <host> [user]      Check if SSH is fully unlocked (passwordless)
+  scan                            Scan all network interfaces for SSH hosts
 
 Examples:
   node ssh-lab.mjs setup
   node ssh-lab.mjs copy 10.10.10.10 password123 root
   node ssh-lab.mjs check 10.10.10.10
   node ssh-lab.mjs full 10.10.10.10 password123 root
+  node ssh-lab.mjs unlock-check 10.10.10.10 root
+  node ssh-lab.mjs scan
 `;
 
   if (!method) {
@@ -357,6 +626,21 @@ Examples:
             process.exit(1);
           }
           result = await SSH.fullSetup(host, password, user);
+          break;
+        }
+
+        case 'unlock-check': {
+          const [host, user = 'root'] = args;
+          if (!host) {
+            console.error('Usage: node ssh-lab.mjs unlock-check <host> [user]');
+            process.exit(1);
+          }
+          result = await SSH.checkUnlocked(host, user);
+          break;
+        }
+
+        case 'scan': {
+          result = await SSH.scanNetwork();
           break;
         }
           
