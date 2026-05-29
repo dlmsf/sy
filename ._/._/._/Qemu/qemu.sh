@@ -14,6 +14,12 @@ MAX_RETRY_ATTEMPTS=18
 RETRY_DELAY_SECONDS=3
 DEFAULT_CPU_CORES=1
 
+# --- SSH auto-setup defaults ---
+SSH_AUTO_SETUP="true"
+SSH_LOOP_INTERVAL=3
+SSH_LOOP_MAX_ATTEMPTS=120
+SSH_NODE_SCRIPT="../Util/SSH.js"
+
 # --- Network Configuration ---
 BRIDGE_NAME="qemubr0"
 TAP_PREFIX="qemutap"
@@ -44,6 +50,9 @@ mkdir -p "$DOWNLOAD_LOCK_DIR" 2>/dev/null
 # --- Cleanup tracking for partial downloads ---
 PARTIAL_DOWNLOAD_PID_FILE="/tmp/qemu_vm_download_pid_$$"
 
+# --- Temporary log for silent SSH setup ---
+SSH_SETUP_LOG="/tmp/qemu_vm_ssh_setup_$$.log"
+
 # --- Helper: Show help message ---
 show_help() {
     cat << 'HELPEOF'
@@ -66,6 +75,7 @@ OPTIONS:
   --cpu N             Number of CPU cores (default: 1, auto-capped to host max)
   --no-kvm            Disable KVM acceleration
   --no-bridge         Force port forwarding (disable bridge/networking)
+  --no-ssh-setup      Skip automatic SSH key deployment after boot
   --retry-attempts N  Max retry attempts on port conflict (default: 18)
   --retry-delay N     Delay between retries in seconds (default: 3)
   -h, --help          Show this help
@@ -77,6 +87,9 @@ COMMANDS:
 ACCESS:  ssh root@localhost -p PORT  (password: 123)
          OR if bridge networking is available:
          ssh root@VM_IP  (password: 123)
+
+         After boot, the script will automatically deploy your SSH key
+         (unless --no-ssh-setup is given).
 
 HELPEOF
     exit 0
@@ -1451,6 +1464,81 @@ CLOUDEOF
     fi
 }
 
+# --- SSH wait and setup functions ---
+check_tcp_port() {
+    local host="$1"
+    local port="$2"
+    (echo >/dev/tcp/${host}/${port}) 2>/dev/null && return 0
+    return 1
+}
+
+wait_for_ssh_port() {
+    local host="$1"
+    local port="$2"
+    local qemu_pid="$3"
+    local max_attempts="$4"
+    local interval="$5"
+    local silent="$6"
+    
+    local attempt=1
+    local log_target="/dev/stdout"
+    if [ "$silent" = "true" ]; then
+        log_target="$SSH_SETUP_LOG"
+    fi
+    
+    echo "[SSH] Waiting for SSH on ${host}:${port} (QEMU PID ${qemu_pid})..." >> "$log_target"
+    
+    while [ $attempt -le $max_attempts ]; do
+        if [ -n "$qemu_pid" ] && ! kill -0 "$qemu_pid" 2>/dev/null; then
+            echo "[SSH] QEMU process ${qemu_pid} has died." >> "$log_target"
+            return 1
+        fi
+        
+        if check_tcp_port "$host" "$port"; then
+            echo "[SSH] Port ${host}:${port} is now open after ${attempt} attempt(s)." >> "$log_target"
+            return 0
+        fi
+        
+        sleep "$interval"
+        attempt=$((attempt + 1))
+    done
+    
+    echo "[SSH] Timeout waiting for SSH port after ${max_attempts} attempts." >> "$log_target"
+    return 1
+}
+
+run_ssh_full_setup() {
+    local host="$1"
+    local port="$2"
+    local user="$3"
+    local password="$4"
+    local silent="$5"
+    
+    local log_target="/dev/stdout"
+    if [ "$silent" = "true" ]; then
+        log_target="$SSH_SETUP_LOG"
+    fi
+    
+    echo "[SSH-SETUP] Running Node.js SSH full setup for ${user}@${host}:${port}..." >> "$log_target"
+    local script_dir="$(cd "$(dirname "$0")" && pwd)"
+    local node_script="${script_dir}/${SSH_NODE_SCRIPT}"
+    
+    if [ ! -f "$node_script" ]; then
+        echo "[SSH-SETUP] Node script not found at ${node_script}, skipping" >> "$log_target"
+        return 1
+    fi
+    
+    node "$node_script" full "$host" "$password" "$user" "$port" >> "$log_target" 2>&1
+    local ret=$?
+    if [ $ret -eq 0 ]; then
+        echo "[SSH-SETUP] SSH key deployment succeeded." >> "$log_target"
+        return 0
+    else
+        echo "[SSH-SETUP] SSH key deployment failed (exit code $ret)." >> "$log_target"
+        return 1
+    fi
+}
+
 run_vm_with_retry() {
     local img_path="$1"
     local iso_path="$2"
@@ -1623,6 +1711,7 @@ CUSTOM_MEMORY=""
 CUSTOM_CPU_CORES=""
 NO_KVM=""
 NO_BRIDGE=""
+NO_SSH_SETUP=""
 USE_BRIDGE="false"
 VM_IP=""
 TAP_NAME=""
@@ -1686,6 +1775,10 @@ while [ $# -gt 0 ]; do
             ;;
         --no-bridge)
             NO_BRIDGE="true"
+            shift
+            ;;
+        --no-ssh-setup)
+            NO_SSH_SETUP="true"
             shift
             ;;
         --retry-attempts)
@@ -1902,10 +1995,17 @@ cleanup_vm() {
         delete_tap_interface "$TAP_NAME"
     fi
     
+    # Kill background SSH setup process if still running
+    if [ -n "$SSH_SETUP_BG_PID" ] && kill -0 "$SSH_SETUP_BG_PID" 2>/dev/null; then
+        kill "$SSH_SETUP_BG_PID" 2>/dev/null
+    fi
+    
     if [ -z "$VM_NAME" ] && [ -n "$TMPDIR" ]; then
         echo "[TEMP MODE] Cleaning up temporary files..."
         rm -rf "${TMPDIR}"
     fi
+    
+    rm -f "$SSH_SETUP_LOG"
 }
 trap cleanup_vm EXIT
 
@@ -1920,7 +2020,45 @@ if [ -z "$VM_NAME" ]; then
     
     create_cloud_init_iso "${TMPDIR}" "$VM_IP" "$OS_TYPE"
     
+    # Determine SSH target info for background setup
+    if [ "$USE_BRIDGE" = "true" ] && [ -n "$VM_IP" ]; then
+        SSH_TARGET_HOST="$VM_IP"
+        SSH_TARGET_PORT="22"
+    else
+        SSH_TARGET_HOST="localhost"
+        SSH_TARGET_PORT="$SSH_PORT"
+    fi
+    
+    # Start SSH auto-setup in background before launching QEMU
+    if [ "$SSH_AUTO_SETUP" = "true" ] && [ "$NO_SSH_SETUP" != "true" ]; then
+        > "$SSH_SETUP_LOG"
+        (
+            sleep 5
+            if wait_for_ssh_port "$SSH_TARGET_HOST" "$SSH_TARGET_PORT" "" "$SSH_LOOP_MAX_ATTEMPTS" "$SSH_LOOP_INTERVAL" "true"; then
+                run_ssh_full_setup "$SSH_TARGET_HOST" "$SSH_TARGET_PORT" "root" "$DEFAULT_PASSWORD" "true"
+            fi
+            echo "DONE" > /tmp/qemu_vm_ssh_done_$$.marker
+        ) &
+        SSH_SETUP_BG_PID=$!
+    fi
+    
     run_vm_with_retry "${TMPDIR}/${IMG_FILE}" "${TMPDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}" "${USE_BRIDGE}" "${VM_IP}" "${TAP_NAME}"
+    
+    # Check if SSH setup completed
+    if [ -f /tmp/qemu_vm_ssh_done_$$.marker ]; then
+        echo ""
+        echo "================================================"
+        echo "  SSH SETUP COMPLETE"
+        echo "================================================"
+        if grep -q "SSH key deployment succeeded" "$SSH_SETUP_LOG" 2>/dev/null; then
+            echo "  Passwordless SSH: READY"
+            echo "  Connect: ssh root@${SSH_TARGET_HOST} -p ${SSH_TARGET_PORT}"
+        else
+            echo "  SSH setup may have failed - check ${SSH_SETUP_LOG}"
+        fi
+        echo "================================================"
+        rm -f /tmp/qemu_vm_ssh_done_$$.marker
+    fi
 else
     # Persistent mode
     VMDIR="${BASE_DIR}/${HOSTNAME_PREFIX}-vm-${VM_NAME}"
@@ -1942,6 +2080,45 @@ else
     
     create_cloud_init_iso "${VMDIR}" "$VM_IP" "$OS_TYPE"
     
+    # Determine SSH target info for background setup
+    if [ "$USE_BRIDGE" = "true" ] && [ -n "$VM_IP" ]; then
+        SSH_TARGET_HOST="$VM_IP"
+        SSH_TARGET_PORT="22"
+    else
+        SSH_TARGET_HOST="localhost"
+        SSH_TARGET_PORT="$SSH_PORT"
+    fi
+    
+    # Start SSH auto-setup in background before launching QEMU
+    if [ "$SSH_AUTO_SETUP" = "true" ] && [ "$NO_SSH_SETUP" != "true" ]; then
+        > "$SSH_SETUP_LOG"
+        (
+            sleep 5
+            if wait_for_ssh_port "$SSH_TARGET_HOST" "$SSH_TARGET_PORT" "" "$SSH_LOOP_MAX_ATTEMPTS" "$SSH_LOOP_INTERVAL" "true"; then
+                run_ssh_full_setup "$SSH_TARGET_HOST" "$SSH_TARGET_PORT" "root" "$DEFAULT_PASSWORD" "true"
+            fi
+            echo "DONE" > /tmp/qemu_vm_ssh_done_$$.marker
+        ) &
+        SSH_SETUP_BG_PID=$!
+    fi
+    
     run_vm_with_retry "${VMDIR}/${IMG_FILE}" "${VMDIR}/${ISO_FILE}" "${SSH_PORT}" "${VM_MEMORY}" "${USE_KVM}" "${VM_CPU_CORES}" "${USE_BRIDGE}" "${VM_IP}" "${TAP_NAME}"
+    
+    # Check if SSH setup completed
+    if [ -f /tmp/qemu_vm_ssh_done_$$.marker ]; then
+        echo ""
+        echo "================================================"
+        echo "  SSH SETUP COMPLETE"
+        echo "================================================"
+        if grep -q "SSH key deployment succeeded" "$SSH_SETUP_LOG" 2>/dev/null; then
+            echo "  Passwordless SSH: READY"
+            echo "  Connect: ssh root@${SSH_TARGET_HOST} -p ${SSH_TARGET_PORT}"
+        else
+            echo "  SSH setup may have failed - check ${SSH_SETUP_LOG}"
+        fi
+        echo "================================================"
+        rm -f /tmp/qemu_vm_ssh_done_$$.marker
+    fi
+    
     echo "[PERSISTENT MODE] VM data preserved in: ${VMDIR}"
 fi
