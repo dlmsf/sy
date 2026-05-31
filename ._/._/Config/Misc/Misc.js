@@ -6,6 +6,7 @@ import { exec } from 'child_process'
 import { promisify } from 'util'
 import os from 'os'
 import FastHTTP from './FastHTTP/FastHTTP.js'
+import RacksLab from './RacksLab/RacksLab.js'
 
 const execAsync = promisify(exec)
 
@@ -60,8 +61,9 @@ class Misc extends SyAPP.Func() {
 
                 this.Text(uid,'• Misc Menu')
                 
-                this.Button(uid,{name : 'DownloadHUD',props : {downloadhub : true}})
+                this.Button(uid,'RacksLab',{path : 'rackslab'})
                 this.Button(uid,'FastHTTP',{path : 'fasthttp'})
+                this.Button(uid,{name : 'DownloadHUD',props : {downloadhub : true}})
                 this.Button(uid,{name : 'Git Config',props : {gitconfig : true}})
                 await this.DropDown(uid,'windows-drop',async () => {
                     this.Button(uid,{name : 'Clip',props : {clip : true}})
@@ -72,7 +74,7 @@ class Misc extends SyAPP.Func() {
                 this.Button(uid,{name : '← Return',path : 'config'})
 
             }
-        ,{linked : [FastHTTP]})
+        ,{linked : [FastHTTP,RacksLab]})
     }
 }
 
