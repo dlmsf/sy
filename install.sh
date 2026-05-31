@@ -173,31 +173,206 @@ INSTALL_NODE=false
 BUILD_MODE=false
 BUILD_TAR=false
 BUILD_CONFIG=false
+BUILD_MESSAGE_MODE=false           # NEW: use commit message for build naming
+BUILD_VERSION=""                    # NEW: specific version or "latest"
+BUILD_SAVE_NAME=""                  # NEW: saved configuration to load
 BUILD_DIR="$REPO_DIR/build"
+BUILD_SAVE_FILE="$REPO_DIR/buildsaves.cfg"   # NEW: persistent build configurations
 
 # External dependencies (uncomment and configure if needed)
 # PM2_TAR_GZ="$ARCHIVE_DIR/pm2.tar.gz"              # Uncomment if using pm2
 # PM2_EXTRACT_DIR="$INSTALL_DIR/vendor/pm2"         # Uncomment if using pm2
 
 # =============================================================================
-# BUILD SYSTEM FUNCTIONS
+# BUILD SAVE/LOAD FUNCTIONS - Pure bash, no external dependencies
 # =============================================================================
 
-# Sanitize string for filesystem (remove/replace invalid characters)
+save_build_configuration() {
+    save_name="$1"
+    tmp_file="${BUILD_SAVE_FILE}.tmp.$$"
+   
+    # Copy existing saves, skipping the one being overwritten
+    if [ -f "$BUILD_SAVE_FILE" ]; then
+        skip_section=false
+        while IFS= read -r line; do
+            case "$line" in
+                "[SAVE:${save_name}]")
+                    skip_section=true
+                    continue
+                    ;;
+                "[/SAVE:${save_name}]")
+                    skip_section=false
+                    continue
+                    ;;
+            esac
+            [ "$skip_section" = false ] && echo "$line" >> "$tmp_file"
+        done < "$BUILD_SAVE_FILE"
+    else
+        > "$tmp_file"
+    fi
+   
+    # Count current exclusions
+    excl_file_count=0
+    excl_dir_count=0
+    [ -f "$EXCLUDE_LIST" ] && excl_file_count=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
+    [ -f "$EXCLUDE_DIRS_LIST" ] && excl_dir_count=$(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0)
+   
+    # Write new save section
+    {
+        echo "[SAVE:${save_name}]"
+        echo "DATE=$(date)"
+        echo "TAR=${BUILD_TAR}"
+        echo "COMMIT=${BUILD_SELECTED_COMMIT:-HEAD}"
+        echo "COMMIT_MESSAGE=${BUILD_SELECTED_COMMIT_MSG:-HEAD}"
+        echo "EXCLUDED_FILES_COUNT=${excl_file_count}"
+        echo "EXCLUDED_DIRECTORIES_COUNT=${excl_dir_count}"
+       
+        if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
+            while IFS= read -r f; do
+                [ -n "$f" ] && echo "EXCLUDED_FILE=${f}"
+            done < "$EXCLUDE_LIST"
+        fi
+       
+        if [ -f "$EXCLUDE_DIRS_LIST" ] && [ -s "$EXCLUDE_DIRS_LIST" ]; then
+            while IFS= read -r d; do
+                [ -n "$d" ] && echo "EXCLUDED_DIRECTORY=${d}"
+            done < "$EXCLUDE_DIRS_LIST"
+        fi
+       
+        echo "[/SAVE:${save_name}]"
+    } >> "$tmp_file"
+   
+    mv "$tmp_file" "$BUILD_SAVE_FILE"
+    echo "Build configuration saved as: $save_name"
+    return 0
+}
+
+load_build_configuration() {
+    save_name="$1"
+   
+    if [ ! -f "$BUILD_SAVE_FILE" ]; then
+        echo "Error: No saved configurations file found"
+        return 1
+    fi
+   
+    if ! grep -q "^\[SAVE:${save_name}\]$" "$BUILD_SAVE_FILE"; then
+        echo "Error: Saved configuration '${save_name}' not found"
+        return 1
+    fi
+   
+    # Clear current exclusions
+    > "$EXCLUDE_LIST"
+    > "$EXCLUDE_DIRS_LIST"
+   
+    # Extract save section
+    in_section=false
+    while IFS= read -r line; do
+        case "$line" in
+            "[SAVE:${save_name}]")
+                in_section=true
+                continue
+                ;;
+            "[/SAVE:${save_name}]")
+                in_section=false
+                break
+                ;;
+        esac
+       
+        if [ "$in_section" = true ]; then
+            case "$line" in
+                TAR=*)
+                    val=$(echo "$line" | cut -d= -f2-)
+                    [ "$val" = "true" ] && BUILD_TAR=true || BUILD_TAR=false
+                    ;;
+                COMMIT=*)
+                    val=$(echo "$line" | cut -d= -f2-)
+                    if [ "$val" = "HEAD" ] || [ -z "$val" ]; then
+                        BUILD_SELECTED_COMMIT=""
+                    else
+                        BUILD_SELECTED_COMMIT="$val"
+                    fi
+                    ;;
+                COMMIT_MESSAGE=*)
+                    BUILD_SELECTED_COMMIT_MSG=$(echo "$line" | cut -d= -f2-)
+                    ;;
+                EXCLUDED_FILE=*)
+                    echo "$line" | cut -d= -f2- >> "$EXCLUDE_LIST"
+                    ;;
+                EXCLUDED_DIRECTORY=*)
+                    echo "$line" | cut -d= -f2- >> "$EXCLUDE_DIRS_LIST"
+                    ;;
+            esac
+        fi
+    done < "$BUILD_SAVE_FILE"
+   
+    export BUILD_SELECTED_COMMIT
+    export BUILD_SELECTED_COMMIT_MSG
+    export BUILD_EXCLUDE_DIRS_LIST="$EXCLUDE_DIRS_LIST"
+   
+    echo "Loaded build configuration: $save_name"
+    return 0
+}
+
+list_saved_configurations() {
+    [ ! -f "$BUILD_SAVE_FILE" ] && return 1
+   
+    count=0
+    while IFS= read -r line; do
+        case "$line" in
+            \[SAVE:*)
+                name=$(echo "$line" | sed 's/^\[SAVE://;s/\]$//')
+                count=$((count + 1))
+                printf "  %2s. %s
+" "$count" "$name"
+                ;;
+        esac
+    done < "$BUILD_SAVE_FILE"
+   
+    return $count
+}
+
+delete_saved_configuration() {
+    save_name="$1"
+   
+    [ ! -f "$BUILD_SAVE_FILE" ] && return 1
+   
+    tmp_file="${BUILD_SAVE_FILE}.tmp.$$"
+   
+    skip_section=false
+    while IFS= read -r line; do
+        case "$line" in
+            "[SAVE:${save_name}]")
+                skip_section=true
+                continue
+                ;;
+            "[/SAVE:${save_name}]")
+                skip_section=false
+                continue
+                ;;
+        esac
+        [ "$skip_section" = false ] && echo "$line" >> "$tmp_file"
+    done < "$BUILD_SAVE_FILE"
+   
+    mv "$tmp_file" "$BUILD_SAVE_FILE"
+    echo "Deleted saved configuration: $save_name"
+    return 0
+}
+
+# =============================================================================
+# END OF BUILD SAVE/LOAD FUNCTIONS
+# =============================================================================
+
+# =============================================================================
+# BUILD SYSTEM FUNCTIONS - Full implementation (replaces previous simple version)
+# =============================================================================
+
 sanitize_filename() {
     input="$1"
-    # Replace spaces with underscores
-    # Replace invalid filesystem characters with underscores
-    # Keep only alphanumeric, dots, dashes, underscores
     sanitized=$(echo "$input" | tr ' ' '_' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_//' | sed 's/_$//')
-    
-    # If empty after sanitization, use default
     [ -z "$sanitized" ] && sanitized="build"
-    
     echo "$sanitized"
 }
 
-# Get last commit message and sanitize for filename
 get_commit_filename() {
     if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
         commit_msg=$(git log -1 --pretty=%B 2>/dev/null | head -n1)
@@ -211,14 +386,125 @@ get_commit_filename() {
     fi
 }
 
-# Interactive configuration interface for build exclusion
+calculate_build_version() {
+    target_commit="$1"
+    [ -z "$target_commit" ] && target_commit="HEAD"
+    
+    latest_version=""
+    latest_version_commit=""
+    latest_distance=999999999
+    
+    VERSION_CANDIDATES="/tmp/build_version_candidates_$$.txt"
+    > "$VERSION_CANDIDATES"
+    
+    version_tags=$(git tag --sort=-creatordate 2>/dev/null | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' 2>/dev/null)
+    
+    if [ -n "$version_tags" ]; then
+        for tag in $version_tags; do
+            if git merge-base --is-ancestor "$tag" "$target_commit" 2>/dev/null; then
+                distance=$(git rev-list --count "$tag..$target_commit" 2>/dev/null || echo 0)
+                if [ "$distance" -lt "$latest_distance" ]; then
+                    latest_version="$tag"
+                    latest_version_commit="$tag"
+                    latest_distance="$distance"
+                fi
+            fi
+        done
+    fi
+    
+    git log --all --oneline --grep='^[0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?$' --format="%H %s" 2>/dev/null | while IFS=' ' read -r commit_hash version_msg; do
+        if git merge-base --is-ancestor "$commit_hash" "$target_commit" 2>/dev/null; then
+            distance=$(git rev-list --count "$commit_hash..$target_commit" 2>/dev/null || echo 0)
+            echo "${distance}|${version_msg}|${commit_hash}" >> "$VERSION_CANDIDATES"
+        fi
+    done
+    
+    if [ -s "$VERSION_CANDIDATES" ]; then
+        best_candidate=$(sort -t'|' -k1 -n "$VERSION_CANDIDATES" | head -1)
+        if [ -n "$best_candidate" ]; then
+            candidate_distance=$(echo "$best_candidate" | cut -d'|' -f1)
+            candidate_version=$(echo "$best_candidate" | cut -d'|' -f2)
+            candidate_commit=$(echo "$best_candidate" | cut -d'|' -f3)
+            if [ "$candidate_distance" -lt "$latest_distance" ]; then
+                latest_version="$candidate_version"
+                latest_version_commit="$candidate_commit"
+                latest_distance="$candidate_distance"
+            fi
+        fi
+    fi
+    
+    rm -f "$VERSION_CANDIDATES"
+    
+    if [ -n "$latest_version" ]; then
+        if [ "$latest_distance" -gt 0 ]; then
+            echo "${latest_version}.${latest_distance}"
+        else
+            echo "${latest_version}"
+        fi
+    else
+        echo ""
+    fi
+}
+
+format_file_size() {
+    bytes=$1
+    case "$bytes" in
+        ''|*[!0-9]*) echo "0B" ; return ;;
+    esac
+    if [ "$bytes" -ge 1073741824 ]; then
+        gb=$(echo "scale=1; $bytes / 1073741824" | bc 2>/dev/null || echo "$((bytes / 1073741824))")
+        echo "${gb}GB"
+    elif [ "$bytes" -ge 1048576 ]; then
+        mb=$(echo "scale=1; $bytes / 1048576" | bc 2>/dev/null || echo "$((bytes / 1048576))")
+        echo "${mb}MB"
+    elif [ "$bytes" -ge 1024 ]; then
+        kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
+        echo "${kb}KB"
+    else
+        echo "${bytes}B"
+    fi
+}
+
+is_file_in_excluded_dir() {
+    file_to_check="$1"
+    if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+        while IFS= read -r excluded_dir; do
+            [ -z "$excluded_dir" ] && continue
+            case "$file_to_check" in
+                ${excluded_dir}/*|${excluded_dir})
+                    return 0
+                    ;;
+            esac
+        done < "$EXCLUDE_DIRS_LIST"
+    fi
+    return 1
+}
+
+calculate_build_stats() {
+    total_size=0
+    total_files=0
+    while IFS='|' read -r size name; do
+        [ -z "$name" ] && continue
+        if grep -q "^${name}$" "$EXCLUDE_LIST" 2>/dev/null; then
+            continue
+        fi
+        if is_file_in_excluded_dir "$name"; then
+            continue
+        fi
+        total_size=$((total_size + size))
+        total_files=$((total_files + 1))
+    done < "$BUILD_FILES_LIST"
+    echo "$total_size|$total_files"
+}
+
+# Interactive configuration interface - compact, full-featured
 build_config_interface() {
     echo ""
     echo "========================================="
     echo "  BUILD CONFIGURATION"
     echo "========================================="
     echo ""
-    echo "Select files to EXCLUDE from the build"
+    echo "Select files and directories to EXCLUDE from the build"
     echo ""
     
     if ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
@@ -227,28 +513,30 @@ build_config_interface() {
     fi
     
     EXCLUDE_LIST="/tmp/build_exclude_$$.txt"
+    EXCLUDE_DIRS_LIST="/tmp/build_exclude_dirs_$$.txt"
     > "$EXCLUDE_LIST"
+    > "$EXCLUDE_DIRS_LIST"
     
     BUILD_FILES_LIST="/tmp/build_files_$$.txt"
+    BUILD_DIRS_LIST="/tmp/build_dirs_$$.txt"
     > "$BUILD_FILES_LIST"
+    > "$BUILD_DIRS_LIST"
     
-    # Store selected commit (empty = HEAD/latest)
     SELECTED_COMMIT=""
     SELECTED_COMMIT_MSG=""
     
-    # Cache file for commit metadata
     COMMIT_CACHE="/tmp/build_commits_cache_$$.txt"
     MONTH_CACHE="/tmp/build_months_cache_$$.txt"
     
     echo "Loading files..."
     
-    # Function to load files from a specific commit
     load_files_from_commit() {
-        commit=$1
+        commit="$1"
         > "$BUILD_FILES_LIST"
+        > "$BUILD_DIRS_LIST"
         
         if [ -z "$commit" ]; then
-            # Use current working tree - much faster
+            # Current working tree
             git ls-files -z 2>/dev/null | xargs -0 -I{} sh -c '
                 if [ -f "$1" ]; then
                     size=$(wc -c < "$1" 2>/dev/null || echo 0)
@@ -257,113 +545,141 @@ build_config_interface() {
                 fi
                 case "$1" in
                     *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
-                        printf "%s|%s|C\n" "$size" "$1" ;;
+                        printf "%s|%s|C
+" "$size" "$1" ;;
                     *)
-                        printf "%s|%s|D\n" "$size" "$1" ;;
+                        printf "%s|%s|D
+" "$size" "$1" ;;
                 esac
             ' _ {} 2>/dev/null | sort -t'|' -k1 -n -r > "$BUILD_FILES_LIST"
-        else
-            # Use files from specific commit
-            git ls-tree -r -l "$commit" 2>/dev/null | while IFS=' ' read -r mode type hash rest; do
-                # Parse the remaining part to get size and filename
-                # git ls-tree -r -l output format:
-                # <mode> SP <type> SP <hash> TAB <size> TAB <filename>
-                # We need to handle both tab-separated and space-separated formats
-                
-                # Extract size and filename using awk for better parsing
-                size=$(echo "$rest" | awk '{print $1}')
-                filename=$(echo "$rest" | cut -d' ' -f2-)
-                
-                # If size is "-" or empty (submodules, etc.), set to 0
-                if [ "$size" = "-" ] || [ -z "$size" ]; then
-                    size=0
-                fi
-                
+            
+            TEMP_DIRS="/tmp/build_dirs_temp_$$.txt"
+            > "$TEMP_DIRS"
+            while IFS='|' read -r size filename filetype; do
                 [ -z "$filename" ] && continue
-                
+                dirname "$filename" 2>/dev/null
+            done < "$BUILD_FILES_LIST" | sort -u > "$TEMP_DIRS"
+            
+            top_level_dirs=0
+            while IFS= read -r dir; do
+                [ -z "$dir" ] && continue
+                [ "$dir" = "." ] && continue
+                case "$dir" in
+                    */*) ;;
+                    *) top_level_dirs=$((top_level_dirs + 1)) ;;
+                esac
+            done < "$TEMP_DIRS"
+            
+            while IFS= read -r dir; do
+                [ -z "$dir" ] && continue
+                [ "$dir" = "." ] && continue
+                if [ "$top_level_dirs" -eq 1 ]; then
+                    case "$dir" in
+                        */*) ;;
+                        *) continue ;;
+                    esac
+                fi
+                dir_info=$(grep "|${dir}/" "$BUILD_FILES_LIST" 2>/dev/null | awk -F'|' '{sum+=$1; count++} END {printf "%d|%d", sum+0, count+0}')
+                dir_size=$(echo "$dir_info" | cut -d'|' -f1)
+                file_count=$(echo "$dir_info" | cut -d'|' -f2)
+                echo "${dir_size}|${dir}|${file_count}" >> "$BUILD_DIRS_LIST"
+            done < "$TEMP_DIRS"
+            
+            if [ -s "$BUILD_DIRS_LIST" ]; then
+                sort -t'|' -k1 -n -r "$BUILD_DIRS_LIST" > "${BUILD_DIRS_LIST}.sorted"
+                mv "${BUILD_DIRS_LIST}.sorted" "$BUILD_DIRS_LIST"
+            fi
+            rm -f "$TEMP_DIRS"
+        else
+            TEMP_FILES="/tmp/build_files_temp_$$.txt"
+            > "$TEMP_FILES"
+            git ls-tree -r "$commit" 2>/dev/null | while read -r mode type hash filename; do
+                [ "$type" != "blob" ] && continue
+                [ -z "$filename" ] && continue
+                size=$(git cat-file -s "$hash" 2>/dev/null || echo 0)
+                case "$size" in
+                    ''|*[!0-9]*) size=0 ;;
+                esac
                 case "$filename" in
                     *.js|*.sh|*.py|*.rb|*.php|*.ts|*.jsx|*.tsx|*.css|*.html|*.json|*.xml|*.yml|*.yaml|*.md|*.txt|*.conf|*.cfg|*.ini)
-                        file_type="C"
-                        ;;
+                        file_type="C" ;;
                     *)
-                        file_type="D"
-                        ;;
+                        file_type="D" ;;
                 esac
-                
-                echo "${size}|${filename}|${file_type}" >> "$BUILD_FILES_LIST"
+                echo "${size}|${filename}|${file_type}" >> "$TEMP_FILES"
             done
-            
-            # Sort by size numerically (largest first)
-            if [ -s "$BUILD_FILES_LIST" ]; then
-                sort -t'|' -k1 -n -r "$BUILD_FILES_LIST" > "${BUILD_FILES_LIST}.sorted"
-                mv "${BUILD_FILES_LIST}.sorted" "$BUILD_FILES_LIST"
+            if [ -s "$TEMP_FILES" ]; then
+                sort -t'|' -k1 -n -r "$TEMP_FILES" > "$BUILD_FILES_LIST"
+            else
+                > "$BUILD_FILES_LIST"
             fi
+            rm -f "$TEMP_FILES"
+            
+            TEMP_DIRS="/tmp/build_dirs_temp_$$.txt"
+            > "$TEMP_DIRS"
+            while IFS='|' read -r size filename filetype; do
+                [ -z "$filename" ] && continue
+                dirname "$filename" 2>/dev/null
+            done < "$BUILD_FILES_LIST" | sort -u > "$TEMP_DIRS"
+            
+            top_level_dirs=0
+            while IFS= read -r dir; do
+                [ -z "$dir" ] && continue
+                [ "$dir" = "." ] && continue
+                case "$dir" in
+                    */*) ;;
+                    *) top_level_dirs=$((top_level_dirs + 1)) ;;
+                esac
+            done < "$TEMP_DIRS"
+            
+            while IFS= read -r dir; do
+                [ -z "$dir" ] && continue
+                [ "$dir" = "." ] && continue
+                if [ "$top_level_dirs" -eq 1 ]; then
+                    case "$dir" in
+                        */*) ;;
+                        *) continue ;;
+                    esac
+                fi
+                dir_info=$(grep "|${dir}/" "$BUILD_FILES_LIST" 2>/dev/null | awk -F'|' '{sum+=$1; count++} END {printf "%d|%d", sum+0, count+0}')
+                dir_size=$(echo "$dir_info" | cut -d'|' -f1)
+                file_count=$(echo "$dir_info" | cut -d'|' -f2)
+                echo "${dir_size}|${dir}|${file_count}" >> "$BUILD_DIRS_LIST"
+            done < "$TEMP_DIRS"
+            
+            if [ -s "$BUILD_DIRS_LIST" ]; then
+                sort -t'|' -k1 -n -r "$BUILD_DIRS_LIST" > "${BUILD_DIRS_LIST}.sorted"
+                mv "${BUILD_DIRS_LIST}.sorted" "$BUILD_DIRS_LIST"
+            fi
+            rm -f "$TEMP_DIRS"
         fi
     }
     
-    # Load current files
     load_files_from_commit ""
     
-    format_size() {
-        bytes=$1
-        case "$bytes" in
-            ''|*[!0-9]*) echo "0B" ; return ;;
-        esac
-        
-        if [ "$bytes" -ge 1073741824 ]; then
-            gb=$(echo "scale=1; $bytes / 1073741824" | bc 2>/dev/null || echo "$((bytes / 1073741824))")
-            echo "${gb}GB"
-        elif [ "$bytes" -ge 1048576 ]; then
-            mb=$(echo "scale=1; $bytes / 1048576" | bc 2>/dev/null || echo "$((bytes / 1048576))")
-            echo "${mb}MB"
-        elif [ "$bytes" -ge 1024 ]; then
-            kb=$(echo "scale=1; $bytes / 1024" | bc 2>/dev/null || echo "$((bytes / 1024))")
-            echo "${kb}KB"
-        else
-            echo "${bytes}B"
-        fi
-    }
-    
-    # Build month cache for date navigation
     build_month_cache() {
         > "$MONTH_CACHE"
-        
-        # Extract unique year-month combinations from the commit cache
         if [ -f "$COMMIT_CACHE" ]; then
             while IFS='|' read -r csize hash date msg is_version; do
                 [ -z "$hash" ] && continue
                 year_month=$(echo "$date" | cut -d'-' -f1-2)
                 echo "$year_month" >> "/tmp/build_months_raw_$$.txt"
             done < "$COMMIT_CACHE"
-            
-            # Get unique months, sorted in reverse (newest first)
             sort -ru "/tmp/build_months_raw_$$.txt" | while IFS= read -r ym; do
                 year=$(echo "$ym" | cut -d'-' -f1)
                 month=$(echo "$ym" | cut -d'-' -f2)
-                
-                # Convert month number to name
                 case "$month" in
-                    01) month_name="January" ;;
-                    02) month_name="February" ;;
-                    03) month_name="March" ;;
-                    04) month_name="April" ;;
-                    05) month_name="May" ;;
-                    06) month_name="June" ;;
-                    07) month_name="July" ;;
-                    08) month_name="August" ;;
-                    09) month_name="September" ;;
-                    10) month_name="October" ;;
-                    11) month_name="November" ;;
-                    12) month_name="December" ;;
+                    01) month_name="January" ;; 02) month_name="February" ;;
+                    03) month_name="March" ;; 04) month_name="April" ;;
+                    05) month_name="May" ;; 06) month_name="June" ;;
+                    07) month_name="July" ;; 08) month_name="August" ;;
+                    09) month_name="September" ;; 10) month_name="October" ;;
+                    11) month_name="November" ;; 12) month_name="December" ;;
                     *) month_name="Unknown" ;;
                 esac
-                
-                # Count commits for this month
                 commit_count=$(grep "^[^|]*|[^|]*|${ym}-" "$COMMIT_CACHE" | wc -l)
-                
                 echo "${ym}|${year}|${month_name}|${commit_count}" >> "$MONTH_CACHE"
             done
-            
             rm -f "/tmp/build_months_raw_$$.txt"
         fi
     }
@@ -371,880 +687,864 @@ build_config_interface() {
     # Main loop
     while true; do
         clear
-        echo ""
-        echo "  ╔══════════════════════════════════════════════════════╗"
-        echo "  ║           SELECT FILES TO EXCLUDE FROM BUILD         ║"
-        echo "  ╚══════════════════════════════════════════════════════╝"
-        echo ""
+        stats=$(calculate_build_stats)
+        build_size=$(echo "$stats" | cut -d'|' -f1)
+        build_file_count=$(echo "$stats" | cut -d'|' -f2)
+        excl_files=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
+        excl_dirs=$(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0)
         
-        # Show current commit info
+        echo "=== BUILD CONFIGURATION ==="
         if [ -z "$SELECTED_COMMIT" ]; then
-            echo "  Source: HEAD (current working tree)"
+            echo "Source: HEAD (current working tree)"
         else
             short_hash=$(echo "$SELECTED_COMMIT" | cut -c1-7)
-            echo "  Source: $short_hash - $SELECTED_COMMIT_MSG"
+            shortened_msg=$(echo "$SELECTED_COMMIT_MSG" | cut -c1-30)
+            echo "Source: ${short_hash} ${shortened_msg}"
         fi
-        echo ""
         
-        # Count stats
-        total_files=$(wc -l < "$BUILD_FILES_LIST" 2>/dev/null || echo 0)
-        excluded_count=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
-        
-        echo "  Total files: $total_files  |  Excluded: $excluded_count"
-        echo "  ─────────────────────────────────────────────────────"
-        echo ""
-        
-        # Show current exclusions
-        if [ -s "$EXCLUDE_LIST" ]; then
-            echo "  CURRENTLY EXCLUDED:"
-            counter=1
-            while IFS= read -r file; do
-                [ -z "$file" ] && continue
-                file_size=0
-                while IFS='|' read -r sz fn ft; do
-                    [ "$fn" = "$file" ] && file_size="$sz" && break
-                done < "$BUILD_FILES_LIST"
-                size_display=$(format_size "$file_size")
-                printf "    %2s. [X] %8s  %s\n" "$counter" "$size_display" "$file"
-                counter=$((counter + 1))
-            done < "$EXCLUDE_LIST"
-            echo ""
+        if [ "$BUILD_TAR" = true ]; then
+            out_display="Tar.gz"
         else
-            echo "  No files excluded yet."
-            echo ""
+            out_display="Directory"
         fi
         
-        echo "  ─────────────────────────────────────────────────────"
-        echo ""
-        echo "  ACTIONS:"
-        echo "    1. Add files to exclude (browse by size)"
-        echo "    2. Search and add specific files"
-        echo "    3. Remove files from exclusion list"
-        echo "    4. Clear all exclusions"
-        echo "    5. Change source commit"
-        echo "    6. Done - continue with build"
-        echo "    7. Quit"
-        echo ""
-        printf "  Choose [1-7]: "
+        size_display=$(format_file_size "$build_size")
+        echo "Output: ${out_display} | Size: ${size_display} | Files: ${build_file_count} | Excl: ${excl_files}f/${excl_dirs}d"
+        
+        if [ -s "$EXCLUDE_DIRS_LIST" ] || [ -s "$EXCLUDE_LIST" ]; then
+            echo "Excluded:"
+            if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+                count=0
+                while IFS= read -r dir; do
+                    [ -z "$dir" ] && continue
+                    count=$((count + 1))
+                    if [ $count -le 2 ]; then
+                        echo "  dir: ${dir}"
+                    fi
+                done < "$EXCLUDE_DIRS_LIST"
+                total_dirs=$(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0)
+                [ "$total_dirs" -gt 2 ] && echo "  ... and $((total_dirs - 2)) more dirs"
+            fi
+            if [ -s "$EXCLUDE_LIST" ]; then
+                count=0
+                while IFS= read -r file; do
+                    [ -z "$file" ] && continue
+                    count=$((count + 1))
+                    if [ $count -le 2 ]; then
+                        echo "  file: ${file}"
+                    fi
+                done < "$EXCLUDE_LIST"
+                total_files=$(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
+                [ "$total_files" -gt 2 ] && echo "  ... and $((total_files - 2)) more files"
+            fi
+        else
+            echo "No files or directories excluded"
+        fi
+        
+        echo "---"
+        echo "Actions:"
+        echo "1. Exclude directories"
+        echo "2. Exclude files"
+        echo "3. Search and exclude"
+        echo "4. Remove files from exclusion"
+        echo "5. Remove directories from exclusion"
+        echo "6. Clear all exclusions"
+        echo "7. Change source commit"
+        echo "8. Toggle output format (${out_display})"
+        echo "---"
+        echo "s. Save config | l. Load config | d. Delete config"
+        echo "9. Done | 0. Quit"
+        printf "Choice: "
         read action
         
         case "$action" in
             1)
-                # Browse files by size
+                # Exclude directories (paginated, with parent detection)
                 current_page=1
-                ITEMS_PER_PAGE=10
-                
+                ITEMS_PER_PAGE=5
                 while true; do
-                    AVAILABLE_LIST="/tmp/build_available_$$.txt"
-                    > "$AVAILABLE_LIST"
-                    
-                    while IFS='|' read -r size_bytes filename file_type; do
-                        [ -z "$filename" ] && continue
-                        if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
-                            echo "${size_bytes}|${filename}|${file_type}" >> "$AVAILABLE_LIST"
-                        fi
-                    done < "$BUILD_FILES_LIST"
-                    
-                    total_items=$(wc -l < "$AVAILABLE_LIST")
-                    
-                    if [ "$total_items" -eq 0 ]; then
-                        echo ""
-                        echo "  All files are already excluded!"
-                        sleep 1
-                        break
+                    AVAILABLE_DIRS="/tmp/build_available_dirs_$$.txt"
+                    > "$AVAILABLE_DIRS"
+                    EXCLUDED_FILES_SET="/tmp/build_excluded_files_set_$$.txt"
+                    > "$EXCLUDED_FILES_SET"
+                    if [ -s "$EXCLUDE_LIST" ]; then
+                        while IFS= read -r f; do
+                            echo "$f" >> "$EXCLUDED_FILES_SET"
+                        done < "$EXCLUDE_LIST"
+                    fi
+                    if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+                        while IFS='|' read -r fsize fname ftype; do
+                            while IFS= read -r excluded_dir; do
+                                case "$fname" in
+                                    ${excluded_dir}/*|${excluded_dir})
+                                        echo "$fname" >> "$EXCLUDED_FILES_SET" ; break ;;
+                                esac
+                            done < "$EXCLUDE_DIRS_LIST"
+                        done < "$BUILD_FILES_LIST"
+                    fi
+                    if [ -s "$EXCLUDED_FILES_SET" ]; then
+                        sort -u "$EXCLUDED_FILES_SET" > "${EXCLUDED_FILES_SET}.sorted"
+                        mv "${EXCLUDED_FILES_SET}.sorted" "$EXCLUDED_FILES_SET"
                     fi
                     
+                    while IFS='|' read -r dir_size dir_name file_count; do
+                        [ -z "$dir_name" ] && continue
+                        if grep -q "^${dir_name}$" "$EXCLUDE_DIRS_LIST" 2>/dev/null; then continue; fi
+                        parent_excluded=false
+                        if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+                            while IFS= read -r excluded_dir; do
+                                case "$dir_name" in
+                                    ${excluded_dir}/*)
+                                        parent_excluded=true; break ;;
+                                esac
+                            done < "$EXCLUDE_DIRS_LIST"
+                        fi
+                        [ "$parent_excluded" = true ] && continue
+                        actual_size=0; actual_count=0
+                        while IFS='|' read -r fsize fname ftype; do
+                            case "$fname" in
+                                ${dir_name}/*|${dir_name})
+                                    if ! grep -q "^${fname}$" "$EXCLUDED_FILES_SET" 2>/dev/null; then
+                                        actual_size=$((actual_size + fsize))
+                                        actual_count=$((actual_count + 1))
+                                    fi ;;
+                            esac
+                        done < "$BUILD_FILES_LIST"
+                        [ "$actual_count" -gt 0 ] && echo "${actual_size}|${dir_name}|${actual_count}" >> "$AVAILABLE_DIRS"
+                    done < "$BUILD_DIRS_LIST"
+                    
+                    if [ -s "$AVAILABLE_DIRS" ]; then
+                        sort -t'|' -k1 -n -r "$AVAILABLE_DIRS" > "${AVAILABLE_DIRS}.sorted"
+                        mv "${AVAILABLE_DIRS}.sorted" "$AVAILABLE_DIRS"
+                    fi
+                    total_items=$(wc -l < "$AVAILABLE_DIRS")
+                    [ "$total_items" -eq 0 ] && echo "" && echo "  All directories already excluded!" && sleep 1 && break
                     total_pages=$(( (total_items + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
                     [ "$current_page" -gt "$total_pages" ] && current_page="$total_pages"
                     [ "$current_page" -lt 1 ] && current_page=1
-                    
                     start_line=$(( (current_page - 1) * ITEMS_PER_PAGE + 1 ))
                     end_line=$(( current_page * ITEMS_PER_PAGE ))
-                    
                     clear
-                    echo ""
-                    echo "  ╔══════════════════════════════════════════════════════╗"
-                    echo "  ║              BROWSE FILES (largest first)             ║"
-                    echo "  ╚══════════════════════════════════════════════════════╝"
-                    echo ""
-                    printf "  Page %s/%s | Files: %s\n" "$current_page" "$total_pages" "$total_items"
-                    echo "  ─────────────────────────────────────────────────────"
-                    echo ""
-                    
-                    line_num=0
-                    counter=1
-                    while IFS='|' read -r size_bytes filename file_type; do
+                    echo "=== Select Directories to Exclude (${current_page}/${total_pages}) ==="
+                    line_num=0; counter=1
+                    while IFS='|' read -r dir_size dir_name file_count; do
                         line_num=$((line_num + 1))
                         [ "$line_num" -lt "$start_line" ] && continue
                         [ "$line_num" -gt "$end_line" ] && break
-                        [ -z "$filename" ] && continue
-                        
-                        size_display=$(format_size "$size_bytes")
-                        printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$filename"
+                        [ -z "$dir_name" ] && continue
+                        size_display=$(format_file_size "$dir_size")
+                        printf "  %2s. %8s  %s (%s files)\n" "$counter" "$size_display" "$dir_name" "$file_count"
                         counter=$((counter + 1))
-                    done < "$AVAILABLE_LIST"
-                    
+                    done < "$AVAILABLE_DIRS"
                     echo ""
-                    echo "  ─────────────────────────────────────────────────────"
-                    echo "  Type number to exclude | n=next p=prev | b=back"
-                    echo ""
-                    printf "  > "
+                    echo "n=next p=previous b=back"
+                    printf "> "
                     read cmd
-                    
                     case "$cmd" in
                         n|N) [ "$current_page" -lt "$total_pages" ] && current_page=$((current_page + 1)) ;;
                         p|P) [ "$current_page" -gt 1 ] && current_page=$((current_page - 1)) ;;
                         b|B) break ;;
                         *)
                             if echo "$cmd" | grep -q '^[0-9]\+$'; then
-                                line_num=0
-                                counter=1
-                                while IFS='|' read -r size_bytes filename file_type; do
+                                line_num=0; counter=1; selected_dir=""
+                                while IFS='|' read -r dir_size dir_name file_count; do
                                     line_num=$((line_num + 1))
                                     [ "$line_num" -lt "$start_line" ] && continue
                                     [ "$line_num" -gt "$end_line" ] && break
-                                    [ -z "$filename" ] && continue
-                                    
-                                    if [ "$counter" = "$cmd" ]; then
-                                        if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
-                                            echo "$filename" >> "$EXCLUDE_LIST"
-                                            echo ""
-                                            echo "  Excluded: $filename"
-                                            sleep 0.5
-                                        fi
-                                        break
-                                    fi
+                                    if [ "$counter" = "$cmd" ]; then selected_dir="$dir_name"; break; fi
                                     counter=$((counter + 1))
-                                done < "$AVAILABLE_LIST"
-                            fi
-                            ;;
+                                done < "$AVAILABLE_DIRS"
+                                if [ -n "$selected_dir" ]; then
+                                    echo "$selected_dir" >> "$EXCLUDE_DIRS_LIST"
+                                    # Remove any subdirectories already in list
+                                    if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+                                        TEMP_EXCLUDE_DIRS="/tmp/build_temp_exclude_dirs_$$.txt"
+                                        > "$TEMP_EXCLUDE_DIRS"
+                                        while IFS= read -r existing_dir; do
+                                            case "$existing_dir" in
+                                                ${selected_dir}/*) ;;
+                                                *) echo "$existing_dir" >> "$TEMP_EXCLUDE_DIRS" ;;
+                                            esac
+                                        done < "$EXCLUDE_DIRS_LIST"
+                                        mv "$TEMP_EXCLUDE_DIRS" "$EXCLUDE_DIRS_LIST"
+                                    fi
+                                    # Remove all files under that directory from file exclusions
+                                    if [ -s "$EXCLUDE_LIST" ]; then
+                                        TEMP_EXCLUDE_FILES="/tmp/build_temp_exclude_files_$$.txt"
+                                        > "$TEMP_EXCLUDE_FILES"
+                                        while IFS= read -r existing_file; do
+                                            case "$existing_file" in
+                                                ${selected_dir}/*|${selected_dir}) ;;
+                                                *) echo "$existing_file" >> "$TEMP_EXCLUDE_FILES" ;;
+                                            esac
+                                        done < "$EXCLUDE_LIST"
+                                        mv "$TEMP_EXCLUDE_FILES" "$EXCLUDE_LIST"
+                                    fi
+                                    echo ""; echo "  Excluded directory: $selected_dir"; sleep 0.5
+                                fi
+                            fi ;;
                     esac
                 done
-                rm -f "$AVAILABLE_LIST"
+                rm -f "$AVAILABLE_DIRS" "$EXCLUDED_FILES_SET"
                 ;;
-            
             2)
-                # Search and add
-                clear
-                echo ""
-                echo "  ╔══════════════════════════════════════════════════════╗"
-                echo "  ║              SEARCH FILES TO EXCLUDE                  ║"
-                echo "  ╚══════════════════════════════════════════════════════╝"
-                echo ""
-                printf "  Search term (or empty to cancel): "
-                read search_term
-                
-                if [ -n "$search_term" ]; then
-                    SEARCH_RESULTS="/tmp/build_search_$$.txt"
-                    > "$SEARCH_RESULTS"
+                # Exclude files (paginated)
+                current_page=1
+                ITEMS_PER_PAGE=5
+                while true; do
+                    AVAILABLE_LIST="/tmp/build_available_$$.txt"
+                    > "$AVAILABLE_LIST"
+                    EXCLUDED_FILES_SET="/tmp/build_excluded_files_set_$$.txt"
+                    > "$EXCLUDED_FILES_SET"
+                    if [ -s "$EXCLUDE_LIST" ]; then
+                        while IFS= read -r f; do echo "$f" >> "$EXCLUDED_FILES_SET"; done < "$EXCLUDE_LIST"
+                    fi
+                    if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+                        while IFS='|' read -r fsize fname ftype; do
+                            while IFS= read -r excluded_dir; do
+                                case "$fname" in
+                                    ${excluded_dir}/*|${excluded_dir})
+                                        echo "$fname" >> "$EXCLUDED_FILES_SET"; break ;;
+                                esac
+                            done < "$EXCLUDE_DIRS_LIST"
+                        done < "$BUILD_FILES_LIST"
+                    fi
+                    if [ -s "$EXCLUDED_FILES_SET" ]; then
+                        sort -u "$EXCLUDED_FILES_SET" > "${EXCLUDED_FILES_SET}.sorted"
+                        mv "${EXCLUDED_FILES_SET}.sorted" "$EXCLUDED_FILES_SET"
+                    fi
                     
                     while IFS='|' read -r size_bytes filename file_type; do
                         [ -z "$filename" ] && continue
-                        case "$filename" in
-                            *"$search_term"*) 
-                                if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
-                                    echo "${size_bytes}|${filename}" >> "$SEARCH_RESULTS"
-                                fi
-                                ;;
-                        esac
+                        if grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then continue; fi
+                        in_excluded_dir=false
+                        if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+                            while IFS= read -r excluded_dir; do
+                                case "$filename" in
+                                    ${excluded_dir}/*|${excluded_dir})
+                                        in_excluded_dir=true; break ;;
+                                esac
+                            done < "$EXCLUDE_DIRS_LIST"
+                        fi
+                        [ "$in_excluded_dir" = false ] && echo "${size_bytes}|${filename}|NORMAL" >> "$AVAILABLE_LIST"
                     done < "$BUILD_FILES_LIST"
                     
+                    total_items=$(wc -l < "$AVAILABLE_LIST")
+                    [ "$total_items" -eq 0 ] && echo "" && echo "  All files already excluded!" && sleep 1 && break
+                    total_pages=$(( (total_items + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
+                    [ "$current_page" -gt "$total_pages" ] && current_page="$total_pages"
+                    start_line=$(( (current_page - 1) * ITEMS_PER_PAGE + 1 ))
+                    end_line=$(( current_page * ITEMS_PER_PAGE ))
+                    clear
+                    echo "=== Select Files to Exclude (${current_page}/${total_pages}) ==="
+                    line_num=0; counter=1
+                    while IFS='|' read -r size_bytes filename status; do
+                        line_num=$((line_num + 1))
+                        [ "$line_num" -lt "$start_line" ] && continue
+                        [ "$line_num" -gt "$end_line" ] && break
+                        [ -z "$filename" ] && continue
+                        size_display=$(format_file_size "$size_bytes")
+                        printf "  %2s. %8s  %s
+" "$counter" "$size_display" "$filename"
+                        counter=$((counter + 1))
+                    done < "$AVAILABLE_LIST"
+                    echo ""; echo "n=next p=previous b=back"
+                    printf "> "; read cmd
+                    case "$cmd" in
+                        n|N) [ "$current_page" -lt "$total_pages" ] && current_page=$((current_page + 1)) ;;
+                        p|P) [ "$current_page" -gt 1 ] && current_page=$((current_page - 1)) ;;
+                        b|B) break ;;
+                        *)
+                            if echo "$cmd" | grep -q '^[0-9]\+$'; then
+                                line_num=0; counter=1; selected_file=""
+                                while IFS='|' read -r size_bytes filename status; do
+                                    line_num=$((line_num + 1))
+                                    [ "$line_num" -lt "$start_line" ] && continue
+                                    [ "$line_num" -gt "$end_line" ] && break
+                                    if [ "$counter" = "$cmd" ]; then selected_file="$filename"; break; fi
+                                    counter=$((counter + 1))
+                                done < "$AVAILABLE_LIST"
+                                if [ -n "$selected_file" ]; then
+                                    echo "$selected_file" >> "$EXCLUDE_LIST"
+                                    echo ""; echo "  Excluded: $selected_file"; sleep 0.5
+                                fi
+                            fi ;;
+                    esac
+                done
+                rm -f "$AVAILABLE_LIST" "$EXCLUDED_FILES_SET"
+                ;;
+            3)
+                clear
+                echo "=== Search Files to Exclude ==="
+                printf "Enter search term (or empty to cancel): "; read search_term
+                if [ -n "$search_term" ]; then
+                    SEARCH_RESULTS="/tmp/build_search_$$.txt"
+                    > "$SEARCH_RESULTS"
+                    while IFS='|' read -r size_bytes filename file_type; do
+                        case "$filename" in
+                            *"$search_term"*)
+                                if ! grep -q "^${filename}$" "$EXCLUDE_LIST" 2>/dev/null; then
+                                    echo "${size_bytes}|${filename}" >> "$SEARCH_RESULTS"
+                                fi ;;
+                        esac
+                    done < "$BUILD_FILES_LIST"
                     result_count=$(wc -l < "$SEARCH_RESULTS")
-                    
                     if [ "$result_count" -eq 0 ]; then
-                        echo ""
-                        echo "  No matching files found."
-                        sleep 1
+                        echo ""; echo "  No matching files found."; sleep 1
                     else
-                        echo ""
-                        echo "  Found $result_count matching files:"
-                        echo ""
-                        
+                        echo ""; echo "  Found $result_count matching files:"
                         counter=1
                         while IFS='|' read -r size_bytes filename; do
-                            [ -z "$filename" ] && continue
-                            size_display=$(format_size "$size_bytes")
-                            printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$filename"
+                            size_display=$(format_file_size "$size_bytes")
+                            printf "  %2s. %8s  %s
+" "$counter" "$size_display" "$filename"
                             counter=$((counter + 1))
                         done < "$SEARCH_RESULTS"
-                        
-                        echo ""
-                        echo "  Type number to exclude | a=exclude all | b=back"
-                        echo ""
-                        printf "  > "
-                        read search_cmd
-                        
+                        echo ""; echo "Enter number to exclude | a=exclude all | b=back"
+                        printf "> "; read search_cmd
                         case "$search_cmd" in
                             a|A)
                                 while IFS='|' read -r size_bytes filename; do
-                                    [ -z "$filename" ] && continue
                                     echo "$filename" >> "$EXCLUDE_LIST"
                                 done < "$SEARCH_RESULTS"
-                                echo "  All matching files excluded!"
-                                sleep 1
-                                ;;
+                                echo "  All matching files excluded!"; sleep 1 ;;
                             b|B) ;;
                             *)
                                 if echo "$search_cmd" | grep -q '^[0-9]\+$'; then
                                     counter=1
                                     while IFS='|' read -r size_bytes filename; do
-                                        [ -z "$filename" ] && continue
                                         if [ "$counter" = "$search_cmd" ]; then
                                             echo "$filename" >> "$EXCLUDE_LIST"
-                                            echo "  Excluded: $filename"
-                                            sleep 0.5
-                                            break
+                                            echo "  Excluded: $filename"; sleep 0.5; break
                                         fi
                                         counter=$((counter + 1))
                                     done < "$SEARCH_RESULTS"
-                                fi
-                                ;;
+                                fi ;;
                         esac
                     fi
                     rm -f "$SEARCH_RESULTS"
                 fi
                 ;;
-            
-            3)
-                # Remove from exclusion list
+            4)
                 if [ ! -s "$EXCLUDE_LIST" ]; then
-                    echo ""
-                    echo "  No files to remove."
-                    sleep 1
+                    echo ""; echo "  No files in exclusion list."; sleep 1
                 else
                     clear
-                    echo ""
-                    echo "  ╔══════════════════════════════════════════════════════╗"
-                    echo "  ║            REMOVE FROM EXCLUSION LIST                 ║"
-                    echo "  ╚══════════════════════════════════════════════════════╝"
-                    echo ""
-                    
+                    echo "=== Remove Files from Exclusion ==="
                     counter=1
                     > "/tmp/build_remove_$$.txt"
                     while IFS= read -r file; do
-                        [ -z "$file" ] && continue
-                        file_size=0
-                        while IFS='|' read -r sz fn ft; do
-                            [ "$fn" = "$file" ] && file_size="$sz" && break
-                        done < "$BUILD_FILES_LIST"
-                        size_display=$(format_size "$file_size")
-                        printf "  %2s. %8s  %s\n" "$counter" "$size_display" "$file"
+                        printf "  %2s. %s
+" "$counter" "$file"
                         echo "${counter}|${file}" >> "/tmp/build_remove_$$.txt"
                         counter=$((counter + 1))
                     done < "$EXCLUDE_LIST"
-                    
-                    echo ""
-                    echo "  Type number to remove | a=remove all | b=back"
-                    echo ""
-                    printf "  > "
-                    read remove_cmd
-                    
+                    echo ""; echo "Enter number | a=remove all | b=back"
+                    printf "> "; read remove_cmd
                     case "$remove_cmd" in
-                        a|A) > "$EXCLUDE_LIST"; echo "  All exclusions removed!"; sleep 1 ;;
+                        a|A) > "$EXCLUDE_LIST"; echo "  All file exclusions removed!"; sleep 1 ;;
                         b|B) ;;
                         *)
                             if echo "$remove_cmd" | grep -q '^[0-9]\+$'; then
-                                file_to_remove=$(grep "^${remove_cmd}|" "/tmp/build_remove_$$.txt" 2>/dev/null | cut -d'|' -f2)
+                                file_to_remove=$(grep "^${remove_cmd}|" "/tmp/build_remove_$$.txt" | cut -d'|' -f2)
                                 if [ -n "$file_to_remove" ]; then
-                                    grep -v "^${file_to_remove}$" "$EXCLUDE_LIST" > "${EXCLUDE_LIST}.tmp" 2>/dev/null
-                                    mv "${EXCLUDE_LIST}.tmp" "$EXCLUDE_LIST" 2>/dev/null
-                                    echo "  Removed: $file_to_remove"
-                                    sleep 0.5
+                                    grep -v "^${file_to_remove}$" "$EXCLUDE_LIST" > "${EXCLUDE_LIST}.tmp"
+                                    mv "${EXCLUDE_LIST}.tmp" "$EXCLUDE_LIST"
+                                    echo "  Removed: $file_to_remove"; sleep 0.5
                                 fi
-                            fi
-                            ;;
+                            fi ;;
                     esac
                     rm -f "/tmp/build_remove_$$.txt"
                 fi
                 ;;
-            
-            4)
-                > "$EXCLUDE_LIST"
-                echo ""
-                echo "  All exclusions cleared!"
-                sleep 1
-                ;;
-            
             5)
-                # Change source commit - OPTIMIZED WITH DATE FILTER AND CORRECT SIZE
-                # Build commit cache if it doesn't exist
+                if [ ! -s "$EXCLUDE_DIRS_LIST" ]; then
+                    echo ""; echo "  No directories in exclusion list."; sleep 1
+                else
+                    clear
+                    echo "=== Remove Directories from Exclusion ==="
+                    counter=1
+                    > "/tmp/build_remove_dirs_$$.txt"
+                    while IFS= read -r dir; do
+                        printf "  %2s. %s
+" "$counter" "$dir"
+                        echo "${counter}|${dir}" >> "/tmp/build_remove_dirs_$$.txt"
+                        counter=$((counter + 1))
+                    done < "$EXCLUDE_DIRS_LIST"
+                    echo ""; echo "NOTE: Also removes files under that directory"
+                    echo "Enter number | a=remove all | b=back"
+                    printf "> "; read remove_cmd
+                    case "$remove_cmd" in
+                        a|A)
+                            > "$EXCLUDE_DIRS_LIST"
+                            > "$EXCLUDE_LIST"
+                            echo "  All exclusions removed!"; sleep 1 ;;
+                        b|B) ;;
+                        *)
+                            if echo "$remove_cmd" | grep -q '^[0-9]\+$'; then
+                                dir_to_remove=$(grep "^${remove_cmd}|" "/tmp/build_remove_dirs_$$.txt" | cut -d'|' -f2)
+                                if [ -n "$dir_to_remove" ]; then
+                                    grep -v "^${dir_to_remove}$" "$EXCLUDE_DIRS_LIST" > "${EXCLUDE_DIRS_LIST}.tmp"
+                                    mv "${EXCLUDE_DIRS_LIST}.tmp" "$EXCLUDE_DIRS_LIST"
+                                    grep -v "^${dir_to_remove}/" "$EXCLUDE_LIST" > "${EXCLUDE_LIST}.tmp"
+                                    mv "${EXCLUDE_LIST}.tmp" "$EXCLUDE_LIST"
+                                    echo "  Removed directory and its files: $dir_to_remove"; sleep 0.5
+                                fi
+                            fi ;;
+                    esac
+                    rm -f "/tmp/build_remove_dirs_$$.txt"
+                fi
+                ;;
+            6)
+                > "$EXCLUDE_LIST"
+                > "$EXCLUDE_DIRS_LIST"
+                echo ""; echo "  All exclusions cleared!"; sleep 1
+                ;;
+            7)
+                # Change source commit (with month and version filters)
                 if [ ! -f "$COMMIT_CACHE" ]; then
-                    echo ""
-                    echo "  Building commit cache..."
-                    echo "  (This may take a moment for large repositories)"
-                    echo ""
-                    
-                    # Progress indicator
+                    echo ""; echo "  Building commit cache..."; echo ""
                     total_commits=$(git rev-list --all --count 2>/dev/null || echo 0)
                     current=0
-                    
-                    # Get ALL commit info with CORRECT total sizes
                     git log --all --format="%H|%ai|%s" 2>/dev/null | while IFS='|' read -r hash date msg; do
-                        [ -z "$hash" ] && continue
-                        
-                        # Calculate TOTAL size of all files in this commit
-                        # Use git diff-tree to get all files and sum their sizes
-                        commit_size=$(git diff-tree -r -l "$hash" 2>/dev/null | awk '{
-                            # Extract size from lines like: :100644 100644 abc123 def456 M<tab><size><tab><filename>
-                            # The size is after the status letter and before the filename
-                            for(i=1;i<=NF;i++) {
-                                if($i ~ /^[0-9]+$/ && $(i-1) ~ /^[MADRC][0-9]*$/) {
-                                    sum += $i
-                                }
-                            }
+                        commit_size=$(git ls-tree -r -l "$hash" 2>/dev/null | awk '{
+                            if ($4 ~ /^[0-9]+$/) { sum += $4 }
                         } END { print sum+0 }')
-                        
-                        # If diff-tree didn't work, fall back to summing all blob sizes
                         if [ "$commit_size" = "0" ] || [ -z "$commit_size" ]; then
-                            commit_size=$(git ls-tree -r -l "$hash" 2>/dev/null | awk '{
-                                # Extract size from ls-tree output
-                                # Format: <mode> SP <type> SP <hash> SP <size> SP <filename>
-                                # or: <mode> SP <type> SP <hash> TAB <size> TAB <filename>
-                                for(i=1;i<=NF;i++) {
-                                    if($i ~ /^[0-9]+$/ && i > 3) {
-                                        sum += $i
-                                        break  # Take first number after hash
-                                    }
-                                }
-                            } END { print sum+0 }')
+                            commit_size=$(git ls-tree -r "$hash" 2>/dev/null | while read mode type hash filename; do
+                                [ "$type" = "blob" ] && git cat-file -s "$hash" 2>/dev/null
+                            done | awk '{sum+=$1}END{print sum+0}')
                         fi
-                        
                         [ -z "$commit_size" ] && commit_size=0
-                        
-                        # Check if message is a version (only numbers and dots)
-                        is_version=" "
-                        case "$msg" in
-                            *[!0-9.]*) ;;
-                            *) 
-                                case "$msg" in
-                                    *.*) is_version="V" ;;
-                                esac
-                                ;;
-                        esac
-                        
+                        is_version=" "; case "$msg" in *[!0-9.]*) ;; *) case "$msg" in *.*) is_version="V" ;; esac ;; esac
                         short_date=$(echo "$date" | cut -d' ' -f1)
                         echo "${commit_size}|${hash}|${short_date}|${msg}|${is_version}" >> "$COMMIT_CACHE"
-                        
-                        # Show progress every 50 commits
-                        current=$((current + 1))
-                        if [ $((current % 50)) -eq 0 ] && [ "$total_commits" -gt 0 ]; then
-                            printf "\r  Processing: %d/%d commits..." "$current" "$total_commits"
-                        fi
+                        current=$((current+1))
+                        [ $((current % 50)) -eq 0 ] && printf "\r  Processing: %d/%d commits..." "$current" "$total_commits"
                     done
-                    
-                    # Sort by date in reverse (newest first)
                     if [ -s "$COMMIT_CACHE" ]; then
                         sort -t'|' -k3 -r "$COMMIT_CACHE" > "${COMMIT_CACHE}.sorted"
                         mv "${COMMIT_CACHE}.sorted" "$COMMIT_CACHE"
                     fi
-                    
-                    # Build month cache
                     build_month_cache
-                    
-                    echo ""
-                    echo "  Cache built with $(wc -l < "$COMMIT_CACHE") commits"
-                    sleep 1
+                    echo ""; echo "  Cache built with $(wc -l < "$COMMIT_CACHE") commits"; sleep 1
                 fi
-                
-                current_page=1
-                ITEMS_PER_PAGE=10
-                show_versions_only=false
-                date_filter=""  # Format: YYYY-MM
-                
+                current_page=1; ITEMS_PER_PAGE=5; show_versions_only=false; date_filter=""
                 while true; do
                     FILTERED_COMMITS="/tmp/build_commits_filtered_$$.txt"
                     > "$FILTERED_COMMITS"
-                    
                     while IFS='|' read -r csize hash date msg is_version; do
-                        [ -z "$hash" ] && continue
-                        
-                        # Apply version filter
-                        if [ "$show_versions_only" = true ] && [ "$is_version" != "V" ]; then
-                            continue
-                        fi
-                        
-                        # Apply date filter
-                        if [ -n "$date_filter" ]; then
-                            case "$date" in
-                                ${date_filter}*) ;;
-                                *) continue ;;
-                            esac
-                        fi
-                        
+                        [ "$show_versions_only" = true ] && [ "$is_version" != "V" ] && continue
+                        [ -n "$date_filter" ] && case "$date" in ${date_filter}*) ;; *) continue ;; esac
                         echo "${csize}|${hash}|${date}|${msg}|${is_version}" >> "$FILTERED_COMMITS"
                     done < "$COMMIT_CACHE"
-                    
-                    total_commits=$(wc -l < "$FILTERED_COMMITS" 2>/dev/null || echo 0)
-                    
+                    total_commits=$(wc -l < "$FILTERED_COMMITS")
                     if [ "$total_commits" -eq 0 ]; then
-                        echo ""
-                        echo "  No commits found with current filters."
-                        sleep 1
-                        date_filter=""
-                        continue
+                        echo ""; echo "  No commits with current filters."; sleep 1; date_filter=""; continue
                     fi
-                    
                     total_pages=$(( (total_commits + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE ))
-                    [ "$current_page" -gt "$total_pages" ] && current_page="$total_pages"
-                    [ "$current_page" -lt 1 ] && current_page=1
-                    
                     start_line=$(( (current_page - 1) * ITEMS_PER_PAGE + 1 ))
                     end_line=$(( current_page * ITEMS_PER_PAGE ))
-                    
                     clear
-                    echo ""
-                    echo "  ╔══════════════════════════════════════════════════════╗"
-                    echo "  ║              SELECT SOURCE COMMIT                     ║"
-                    echo "  ╚══════════════════════════════════════════════════════╝"
-                    echo ""
-                    
-                    # Build filter description
-                    filter_desc=""
-                    [ "$show_versions_only" = true ] && filter_desc="${filter_desc} VERSIONS"
+                    echo "=== Select Source Commit (${current_page}/${total_pages}) ==="
+                    filter_desc=""; [ "$show_versions_only" = true ] && filter_desc="VERSIONS "
                     if [ -n "$date_filter" ]; then
-                        year=$(echo "$date_filter" | cut -d'-' -f1)
-                        month=$(echo "$date_filter" | cut -d'-' -f2)
-                        case "$month" in
-                            01) mname="January" ;;
-                            02) mname="February" ;;
-                            03) mname="March" ;;
-                            04) mname="April" ;;
-                            05) mname="May" ;;
-                            06) mname="June" ;;
-                            07) mname="July" ;;
-                            08) mname="August" ;;
-                            09) mname="September" ;;
-                            10) mname="October" ;;
-                            11) mname="November" ;;
-                            12) mname="December" ;;
-                        esac
-                        filter_desc="${filter_desc} ${mname} ${year}"
+                        year=$(echo "$date_filter" | cut -d'-' -f1); month=$(echo "$date_filter" | cut -d'-' -f2)
+                        case "$month" in 01) mname="January" ;; 02) mname="February" ;; 03) mname="March" ;; 04) mname="April" ;; 05) mname="May" ;; 06) mname="June" ;; 07) mname="July" ;; 08) mname="August" ;; 09) mname="September" ;; 10) mname="October" ;; 11) mname="November" ;; 12) mname="December" ;; esac
+                        filter_desc="${filter_desc}${mname} ${year}"
                     fi
                     [ -z "$filter_desc" ] && filter_desc="ALL COMMITS"
-                    filter_desc=$(echo "$filter_desc" | sed 's/^ //')
-                    
-                    echo "  Filter: $filter_desc | Page: $current_page/$total_pages | Commits: $total_commits"
-                    echo "  ─────────────────────────────────────────────────────"
-                    echo ""
-                    
-                    line_num=0
-                    counter=1
+                    echo "Filter: $filter_desc"
+                    line_num=0; counter=1
                     > "/tmp/build_commit_map_$$.txt"
                     while IFS='|' read -r csize hash date msg is_version; do
-                        line_num=$((line_num + 1))
+                        line_num=$((line_num+1))
                         [ "$line_num" -lt "$start_line" ] && continue
                         [ "$line_num" -gt "$end_line" ] && break
-                        [ -z "$hash" ] && continue
-                        
-                        size_display=$(format_size "$csize")
+                        size_display=$(format_file_size "$csize")
                         short_hash=$(echo "$hash" | cut -c1-7)
-                        
-                        if [ -n "$SELECTED_COMMIT" ] && [ "$hash" = "$SELECTED_COMMIT" ]; then
-                            printf "  %2s. %8s  [%s] %s %s  << SELECTED\n" "$counter" "$size_display" "$is_version" "$date" "$msg"
-                        else
-                            printf "  %2s. %8s  [%s] %s %s\n" "$counter" "$size_display" "$is_version" "$date" "$msg"
-                        fi
+                        shortened_msg=$(echo "$msg" | cut -c1-30)
+                        marker=""; [ -n "$SELECTED_COMMIT" ] && [ "$hash" = "$SELECTED_COMMIT" ] && marker=" << SELECTED"
+                        printf "  %2s. %8s %s %s %s%s
+" "$counter" "$size_display" "$short_hash" "$date" "$shortened_msg" "$marker"
                         echo "${counter}|${hash}|${msg}" >> "/tmp/build_commit_map_$$.txt"
-                        counter=$((counter + 1))
+                        counter=$((counter+1))
                     done < "$FILTERED_COMMITS"
-                    
-                    echo ""
-                    echo "  ─────────────────────────────────────────────────────"
-                    echo "  Navigation: n=next p=prev | j=jump to page"
-                    echo "  Filters: v=versions only a=all commits m=select month"
-                    echo "  Actions: c=clear (use HEAD) r=refresh cache b=back"
-                    echo ""
-                    printf "  > "
-                    read cmd
-                    
+                    echo ""; echo "n=next p=previous v=versions a=all m=month c=HEAD r=refresh b=back"
+                    printf "> "; read cmd
                     case "$cmd" in
-                        n|N) [ "$current_page" -lt "$total_pages" ] && current_page=$((current_page + 1)) ;;
-                        p|P) [ "$current_page" -gt 1 ] && current_page=$((current_page - 1)) ;;
-                        j|J)
-                            # Jump to specific page
-                            echo ""
-                            printf "  Jump to page (1-%s): " "$total_pages"
-                            read page_num
-                            if echo "$page_num" | grep -q '^[0-9]\+$'; then
-                                [ "$page_num" -ge 1 ] && [ "$page_num" -le "$total_pages" ] && current_page="$page_num"
-                            fi
-                            ;;
-                        v|V) 
-                            show_versions_only=true
-                            date_filter=""
-                            current_page=1
-                            ;;
-                        a|A) 
-                            show_versions_only=false
-                            date_filter=""
-                            current_page=1
-                            ;;
+                        n|N) [ "$current_page" -lt "$total_pages" ] && current_page=$((current_page+1)) ;;
+                        p|P) [ "$current_page" -gt 1 ] && current_page=$((current_page-1)) ;;
+                        v|V) show_versions_only=true; date_filter=""; current_page=1 ;;
+                        a|A) show_versions_only=false; date_filter=""; current_page=1 ;;
                         m|M)
-                            # Month selection interface
-                            if [ ! -f "$MONTH_CACHE" ]; then
-                                build_month_cache
-                            fi
-                            
-                            month_page=1
-                            MONTHS_PER_PAGE=12
-                            total_months=$(wc -l < "$MONTH_CACHE" 2>/dev/null || echo 0)
+                            if [ ! -f "$MONTH_CACHE" ]; then build_month_cache; fi
+                            month_page=1; MONTHS_PER_PAGE=5
+                            total_months=$(wc -l < "$MONTH_CACHE")
                             total_month_pages=$(( (total_months + MONTHS_PER_PAGE - 1) / MONTHS_PER_PAGE ))
-                            
                             while true; do
-                                clear
-                                echo ""
-                                echo "  ╔══════════════════════════════════════════════════════╗"
-                                echo "  ║              SELECT MONTH                             ║"
-                                echo "  ╚══════════════════════════════════════════════════════╝"
-                                echo ""
-                                echo "  Page $month_page/$total_month_pages"
-                                echo "  ─────────────────────────────────────────────────────"
-                                echo ""
-                                
-                                month_start=$(( (month_page - 1) * MONTHS_PER_PAGE + 1 ))
-                                month_end=$(( month_page * MONTHS_PER_PAGE ))
+                                clear; echo "=== Select Month ==="
+                                month_start=$(( (month_page-1)*MONTHS_PER_PAGE+1 )); month_end=$(( month_page*MONTHS_PER_PAGE ))
                                 month_counter=1
                                 while IFS='|' read -r ym year month_name commit_count; do
-                                    [ -z "$ym" ] && continue
-                                    [ "$month_counter" -lt "$month_start" ] && month_counter=$((month_counter + 1)) && continue
+                                    [ "$month_counter" -lt "$month_start" ] && month_counter=$((month_counter+1)) && continue
                                     [ "$month_counter" -gt "$month_end" ] && break
-                                    
-                                    # Mark currently selected month
-                                    if [ "$ym" = "$date_filter" ]; then
-                                        printf "  %2s. %s %s (%s commits) << SELECTED\n" "$month_counter" "$month_name" "$year" "$commit_count"
-                                    else
-                                        printf "  %2s. %s %s (%s commits)\n" "$month_counter" "$month_name" "$year" "$commit_count"
-                                    fi
-                                    month_counter=$((month_counter + 1))
+                                    marker=""; [ "$ym" = "$date_filter" ] && marker=" << SELECTED"
+                                    printf "  %2s. %s %s (%s commits)%s
+" "$month_counter" "$month_name" "$year" "$commit_count" "$marker"
+                                    month_counter=$((month_counter+1))
                                 done < "$MONTH_CACHE"
-                                
-                                echo ""
-                                echo "  ─────────────────────────────────────────────────────"
-                                echo "  Select month number | n=next p=prev | c=clear filter | b=back"
-                                echo ""
-                                printf "  > "
-                                read month_cmd
-                                
+                                echo ""; echo "n=next p=previous c=clear b=back"
+                                printf "> "; read month_cmd
                                 case "$month_cmd" in
-                                    n|N) [ "$month_page" -lt "$total_month_pages" ] && month_page=$((month_page + 1)) ;;
-                                    p|P) [ "$month_page" -gt 1 ] && month_page=$((month_page - 1)) ;;
-                                    c|C) 
-                                        date_filter=""
-                                        current_page=1
-                                        break
-                                        ;;
+                                    n|N) [ "$month_page" -lt "$total_month_pages" ] && month_page=$((month_page+1)) ;;
+                                    p|P) [ "$month_page" -gt 1 ] && month_page=$((month_page-1)) ;;
+                                    c|C) date_filter=""; current_page=1; break ;;
                                     b|B) break ;;
                                     *)
                                         if echo "$month_cmd" | grep -q '^[0-9]\+$'; then
-                                            selected_month=$(sed -n "${month_cmd}p" "$MONTH_CACHE" 2>/dev/null | cut -d'|' -f1)
+                                            selected_month=$(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f1)
                                             if [ -n "$selected_month" ]; then
-                                                date_filter="$selected_month"
-                                                current_page=1
-                                                echo ""
-                                                echo "  Filter set to: $(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f3) $(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f2)"
-                                                sleep 1
-                                                break
+                                                date_filter="$selected_month"; current_page=1
+                                                echo ""; echo "  Filter set to: $(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f3) $(sed -n "${month_cmd}p" "$MONTH_CACHE" | cut -d'|' -f2)"
+                                                sleep 1; break
                                             fi
-                                        fi
-                                        ;;
+                                        fi ;;
                                 esac
                             done
                             ;;
-                        r|R) 
-                            # Refresh cache
-                            rm -f "$COMMIT_CACHE" "$MONTH_CACHE"
-                            echo ""
-                            echo "  Cache cleared. Will rebuild on next visit."
-                            sleep 1
-                            break
-                            ;;
-                        c|C) 
-                            SELECTED_COMMIT=""
-                            SELECTED_COMMIT_MSG=""
-                            date_filter=""
-                            > "$EXCLUDE_LIST"
-                            load_files_from_commit ""
-                            echo ""
-                            echo "  Switched to HEAD (current working tree)"
-                            sleep 1
-                            break
-                            ;;
+                        r|R) rm -f "$COMMIT_CACHE" "$MONTH_CACHE"; echo ""; echo "  Cache cleared."; sleep 1; break ;;
+                        c|C) SELECTED_COMMIT=""; SELECTED_COMMIT_MSG=""; date_filter=""
+                            > "$EXCLUDE_LIST"; > "$EXCLUDE_DIRS_LIST"; load_files_from_commit ""
+                            echo ""; echo "  Switched to HEAD"; sleep 1; break ;;
                         b|B) break ;;
                         *)
                             if echo "$cmd" | grep -q '^[0-9]\+$'; then
-                                selected=$(grep "^${cmd}|" "/tmp/build_commit_map_$$.txt" 2>/dev/null | head -1)
+                                selected=$(grep "^${cmd}|" "/tmp/build_commit_map_$$.txt" | head -1)
                                 if [ -n "$selected" ]; then
                                     SELECTED_COMMIT=$(echo "$selected" | cut -d'|' -f2)
                                     SELECTED_COMMIT_MSG=$(echo "$selected" | cut -d'|' -f3)
-                                    > "$EXCLUDE_LIST"
-                                    load_files_from_commit "$SELECTED_COMMIT"
-                                    echo ""
-                                    echo "  Switched to commit: $SELECTED_COMMIT_MSG"
-                                    sleep 1
-                                    break
+                                    > "$EXCLUDE_LIST"; > "$EXCLUDE_DIRS_LIST"; load_files_from_commit "$SELECTED_COMMIT"
+                                    echo ""; echo "  Switched to commit: $SELECTED_COMMIT_MSG"; sleep 1; break
                                 fi
-                            fi
-                            ;;
+                            fi ;;
                     esac
-                    
                     rm -f "/tmp/build_commit_map_$$.txt"
                 done
-                
                 rm -f "$FILTERED_COMMITS" "/tmp/build_commit_map_$$.txt"
                 ;;
-            
-            6)
-                break
+            8)
+                if [ "$BUILD_TAR" = true ]; then
+                    BUILD_TAR=false; echo ""; echo "  Output: Directory"
+                else
+                    BUILD_TAR=true; echo ""; echo "  Output: Tar.gz Archive"
+                fi
+                sleep 1
                 ;;
-            
-            7)
-                rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
-                echo ""
-                echo "  Build cancelled."
-                exit 0
+            s|S)
+                clear; echo "=== Save Build Configuration ==="
+                list_saved_configurations || echo "No saved configurations yet."
+                echo ""; printf "Enter save name (alphanumeric, dashes, underscores, empty to cancel): "; read save_name
+                if [ -n "$save_name" ]; then
+                    save_name=$(echo "$save_name" | sed 's/[^a-zA-Z0-9_-]/_/g')
+                    save_build_configuration "$save_name"; sleep 1
+                fi
                 ;;
-            
-            *)
-                echo ""
-                echo "  Invalid choice. Press any key..."
-                read dummy
+            l|L)
+                clear; echo "=== Load Build Configuration ==="
+                SAVE_COUNT_FILE="/tmp/build_save_count_$$.txt"; > "$SAVE_COUNT_FILE"
+                save_number=1
+                while IFS= read -r line; do
+                    case "$line" in
+                        \[SAVE:*) name=$(echo "$line" | sed 's/^\[SAVE://;s/\]$//')
+                            printf "  %2s. %s
+" "$save_number" "$name"
+                            echo "${save_number}|${name}" >> "$SAVE_COUNT_FILE"
+                            save_number=$((save_number+1)) ;;
+                    esac
+                done < "$BUILD_SAVE_FILE"
+                total_saves=$((save_number-1))
+                if [ "$total_saves" -eq 0 ]; then
+                    echo "No saved configurations found."; rm -f "$SAVE_COUNT_FILE"; sleep 1
+                else
+                    echo ""; echo "Enter number to load, name, or b=cancel"
+                    printf "> "; read load_input
+                    if [ "$load_input" != "b" ] && [ -n "$load_input" ]; then
+                        load_name=""
+                        if echo "$load_input" | grep -q '^[0-9]\+$'; then
+                            load_name=$(grep "^${load_input}|" "$SAVE_COUNT_FILE" | cut -d'|' -f2)
+                            [ -z "$load_name" ] && echo "Invalid number." && rm -f "$SAVE_COUNT_FILE" && sleep 1 && continue
+                        else
+                            load_name="$load_input"
+                            if ! grep -q "^\[SAVE:${load_name}\]$" "$BUILD_SAVE_FILE"; then
+                                echo "Save '${load_name}' not found."; rm -f "$SAVE_COUNT_FILE"; sleep 1; continue
+                            fi
+                        fi
+                        if load_build_configuration "$load_name"; then
+                            if [ -n "$BUILD_SELECTED_COMMIT" ]; then
+                                load_files_from_commit "$BUILD_SELECTED_COMMIT"
+                            else
+                                load_files_from_commit ""
+                            fi
+                            echo "Configuration loaded: $load_name"; sleep 1
+                        else
+                            echo "Failed to load configuration."; sleep 1
+                        fi
+                    fi
+                fi
+                rm -f "$SAVE_COUNT_FILE"
                 ;;
+            d|D)
+                clear; echo "=== Delete Build Configuration ==="
+                SAVE_COUNT_FILE="/tmp/build_save_count_$$.txt"; > "$SAVE_COUNT_FILE"
+                save_number=1
+                while IFS= read -r line; do
+                    case "$line" in
+                        \[SAVE:*) name=$(echo "$line" | sed 's/^\[SAVE://;s/\]$//')
+                            printf "  %2s. %s
+" "$save_number" "$name"
+                            echo "${save_number}|${name}" >> "$SAVE_COUNT_FILE"
+                            save_number=$((save_number+1)) ;;
+                    esac
+                done < "$BUILD_SAVE_FILE"
+                total_saves=$((save_number-1))
+                if [ "$total_saves" -eq 0 ]; then
+                    echo "No saved configurations found."; rm -f "$SAVE_COUNT_FILE"; sleep 1
+                else
+                    echo ""; echo "Enter number or name to delete (b=cancel)"
+                    printf "> "; read delete_input
+                    if [ "$delete_input" != "b" ] && [ -n "$delete_input" ]; then
+                        delete_name=""
+                        if echo "$delete_input" | grep -q '^[0-9]\+$'; then
+                            delete_name=$(grep "^${delete_input}|" "$SAVE_COUNT_FILE" | cut -d'|' -f2)
+                            [ -z "$delete_name" ] && echo "Invalid number." && rm -f "$SAVE_COUNT_FILE" && sleep 1 && continue
+                        else
+                            delete_name="$delete_input"
+                        fi
+                        printf "Are you sure you want to delete '%s'? (y/n): " "$delete_name"; read confirm
+                        if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+                            delete_saved_configuration "$delete_name"; sleep 1
+                        fi
+                    fi
+                fi
+                rm -f "$SAVE_COUNT_FILE"
+                ;;
+            9) break ;;
+            0)
+                rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
+                echo ""; echo "  Build cancelled."; exit 0
+                ;;
+            *) echo ""; echo "  Invalid choice. Press Enter..."; read dummy ;;
         esac
     done
     
-    # Export selected commit for do_build to use
     export BUILD_SELECTED_COMMIT="$SELECTED_COMMIT"
     export BUILD_SELECTED_COMMIT_MSG="$SELECTED_COMMIT_MSG"
+    export BUILD_EXCLUDE_DIRS_LIST="$EXCLUDE_DIRS_LIST"
     
-    echo ""
-    echo "  ╔══════════════════════════════════════════════════════╗"
-    echo "  ║              EXCLUSION SUMMARY                        ║"
-    echo "  ╚══════════════════════════════════════════════════════╝"
-    echo ""
-    
-    if [ -z "$SELECTED_COMMIT" ]; then
-        echo "  Source: HEAD (current working tree)"
-    else
-        echo "  Source: $SELECTED_COMMIT_MSG"
+    clear
+    stats=$(calculate_build_stats)
+    build_size=$(echo "$stats" | cut -d'|' -f1)
+    build_file_count=$(echo "$stats" | cut -d'|' -f2)
+    echo "=== FINAL BUILD SUMMARY ==="
+    if [ -z "$SELECTED_COMMIT" ]; then echo "Source: HEAD (current working tree)"
+    else echo "Source: $(echo "$SELECTED_COMMIT_MSG" | cut -c1-30)"; fi
+    echo "Output: $([ "$BUILD_TAR" = true ] && echo "Tar.gz Archive" || echo "Directory")"
+    echo "Size: $(format_file_size "$build_size") | Files: $build_file_count"
+    echo "Excluded: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0) files, $(wc -l < "$EXCLUDE_DIRS_LIST" 2>/dev/null || echo 0) directories"
+    if [ -s "$EXCLUDE_DIRS_LIST" ]; then
+        echo "Excluded directories:"; disp_count=0
+        while IFS= read -r dir; do
+            [ $disp_count -ge 5 ] && { echo "  ... more"; break; }
+            echo "  ${dir}"; disp_count=$((disp_count+1))
+        done < "$EXCLUDE_DIRS_LIST"
     fi
-    echo ""
-    
-    if [ -s "$EXCLUDE_LIST" ]; then
-        echo "  $(wc -l < "$EXCLUDE_LIST") files will be excluded:"
-        echo ""
-        while IFS= read -r file; do
-            echo "    - $file"
-        done < "$EXCLUDE_LIST"
-    else
-        echo "  No files excluded - all files will be included"
+    echo ""; printf "Save this configuration? (y/n): "; read save_choice
+    if [ "$save_choice" = "y" ] || [ "$save_choice" = "Y" ]; then
+        printf "Enter save name: "; read save_name
+        save_name=$(echo "$save_name" | sed 's/[^a-zA-Z0-9_-]/_/g')
+        [ -n "$save_name" ] && save_build_configuration "$save_name"
     fi
-    echo ""
-    
-    # Don't clean up the cache - keep it for potential reuse
-    rm -f "$BUILD_FILES_LIST"
-    
+    rm -f "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$COMMIT_CACHE" "$MONTH_CACHE"
     return 0
 }
-    
-# Main build function
+
+# Main build function (full version)
 do_build() {
     log_message "Starting build process..."
     
-    # Check if we're in a git repository
     if ! command -v git >/dev/null 2>&1 || ! git rev-parse --git-dir >/dev/null 2>&1; then
-        log_message "Error: Not in a git repository. Build requires git."
+        log_message "Error: Not in a git repository."
         echo "Error: Build mode requires a git repository"
         exit 1
     fi
     
-    # Determine which commit to build from
-    if [ -n "$BUILD_SELECTED_COMMIT" ]; then
-        BUILD_COMMIT="$BUILD_SELECTED_COMMIT"
-        BUILD_COMMIT_MSG="$BUILD_SELECTED_COMMIT_MSG"
-        log_message "Building from selected commit: $BUILD_COMMIT_MSG ($BUILD_COMMIT)"
-    else
+    # Determine commit
+    if [ -z "$BUILD_SELECTED_COMMIT" ]; then
         BUILD_COMMIT="HEAD"
-        BUILD_COMMIT_MSG=$(git log -1 --pretty=%B 2>/dev/null | head -n1)
-        log_message "Building from HEAD: $BUILD_COMMIT_MSG"
+    else
+        BUILD_COMMIT="$BUILD_SELECTED_COMMIT"
     fi
     
-    # Run configuration interface if requested
-    if [ "$BUILD_CONFIG" = true ]; then
-        build_config_interface
-        # Re-check selected commit after config (user might have changed it)
-        if [ -n "$BUILD_SELECTED_COMMIT" ]; then
-            BUILD_COMMIT="$BUILD_SELECTED_COMMIT"
-            BUILD_COMMIT_MSG="$BUILD_SELECTED_COMMIT_MSG"
+    # Build name
+    if [ "$BUILD_MESSAGE_MODE" = true ]; then
+        BUILD_COMMIT_MSG=$(git log -1 --pretty=%B "$BUILD_COMMIT" | head -n1)
+        if [ -n "$BUILD_COMMIT_MSG" ]; then
+            build_name=$(echo "$BUILD_COMMIT_MSG" | tr ' ' '_' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_//' | sed 's/_$//')
+            [ -z "$build_name" ] && build_name="build"
+        else
+            build_name="build_$(date +%Y%m%d_%H%M%S)"
+        fi
+    else
+        build_version=$(calculate_build_version "$BUILD_COMMIT")
+        if [ -n "$build_version" ]; then
+            build_name="$build_version"
+        else
+            BUILD_COMMIT_MSG=$(git log -1 --pretty=%B "$BUILD_COMMIT" | head -n1)
+            if [ -n "$BUILD_COMMIT_MSG" ]; then
+                build_name=$(echo "$BUILD_COMMIT_MSG" | tr ' ' '_' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_//' | sed 's/_$//')
+            fi
+            [ -z "$build_name" ] && build_name="build_$(date +%Y%m%d_%H%M%S)"
         fi
     fi
     
-    # Use the directory where the script was called from
-    build_base_dir="$REPO_DIR/build"
-    mkdir -p "$build_base_dir"
+    BUILD_COMMIT_MSG=$(git log -1 --pretty=%B "$BUILD_COMMIT" | head -n1)
     
-    # Get sanitized commit message for naming
-    if [ -n "$BUILD_COMMIT_MSG" ]; then
-        build_name=$(echo "$BUILD_COMMIT_MSG" | tr ' ' '_' | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | sed 's/^_//' | sed 's/_$//')
-        [ -z "$build_name" ] && build_name="build"
-    else
-        build_name="build_$(date +%Y%m%d_%H%M%S)"
+    # --version handling
+    if [ -n "$BUILD_VERSION" ]; then
+        if [ "$BUILD_VERSION" = "latest" ]; then
+            version_tags=$(git tag --sort=-creatordate | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$')
+            if [ -n "$version_tags" ]; then
+                latest_tag=$(echo "$version_tags" | head -1)
+                BUILD_COMMIT=$(git rev-list -n 1 "$latest_tag" 2>/dev/null)
+                BUILD_COMMIT_MSG="$latest_tag"
+            else
+                version_commit=$(git log --all --oneline --grep='^[0-9]\+\.[0-9]\+\(\.[0-9]\+\)\?$' --format="%H|%s" | head -1)
+                if [ -n "$version_commit" ]; then
+                    BUILD_COMMIT=$(echo "$version_commit" | cut -d'|' -f1)
+                    BUILD_COMMIT_MSG=$(echo "$version_commit" | cut -d'|' -f2)
+                else
+                    echo "Error: No version tags or commit messages found."; exit 1
+                fi
+            fi
+        else
+            if git rev-parse "$BUILD_VERSION" >/dev/null 2>&1; then
+                BUILD_COMMIT=$(git rev-list -n 1 "$BUILD_VERSION" 2>/dev/null)
+            else
+                BUILD_COMMIT=$(git log --all --oneline --grep="^${BUILD_VERSION}$" --format="%H" | head -1)
+                [ -z "$BUILD_COMMIT" ] && BUILD_COMMIT=$(git log --all --oneline --grep="${BUILD_VERSION}" --format="%H" | head -1)
+                if [ -z "$BUILD_COMMIT" ]; then
+                    echo "Error: Version '$BUILD_VERSION' not found."; exit 1
+                fi
+            fi
+            BUILD_COMMIT_MSG="$BUILD_VERSION"
+        fi
+        if [ "$BUILD_MESSAGE_MODE" != true ]; then
+            build_version=$(calculate_build_version "$BUILD_COMMIT")
+            [ -n "$build_version" ] && build_name="$build_version"
+        fi
     fi
     
+    if [ "$BUILD_CONFIG" = true ]; then
+        build_config_interface
+        if [ -n "$BUILD_SELECTED_COMMIT" ]; then
+            BUILD_COMMIT="$BUILD_SELECTED_COMMIT"
+            BUILD_COMMIT_MSG="$BUILD_SELECTED_COMMIT_MSG"
+            if [ "$BUILD_MESSAGE_MODE" != true ]; then
+                build_version=$(calculate_build_version "$BUILD_COMMIT")
+                [ -n "$build_version" ] && build_name="$build_version"
+            fi
+        fi
+    fi
+    
+    build_base_dir="$REPO_DIR/build"
+    mkdir -p "$build_base_dir"
     build_path="$build_base_dir/$build_name"
     
     log_message "Build name: $build_name"
     log_message "Build path: $build_path"
-    log_message "Source commit: $BUILD_COMMIT"
     
-    # Create temporary directory for build
     temp_build="/tmp/build_$$"
-    rm -rf "$temp_build"
-    mkdir -p "$temp_build"
+    rm -rf "$temp_build"; mkdir -p "$temp_build"
     
-    # Get list of files from the selected commit and extract them
-    log_message "Extracting files from commit $BUILD_COMMIT..."
+    has_exclusions=false
+    [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ] && has_exclusions=true
+    [ -n "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -f "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -s "$BUILD_EXCLUDE_DIRS_LIST" ] && has_exclusions=true
     
-    if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
-        # With exclusions: extract all then remove excluded
-        log_message "Applying exclusion list ($(wc -l < "$EXCLUDE_LIST") files excluded)..."
-        git archive "$BUILD_COMMIT" 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
-        
-        if [ $? -eq 0 ]; then
-            # Remove excluded files
-            while IFS= read -r excluded_file; do
-                [ -z "$excluded_file" ] && continue
-                if [ -e "$temp_build/$excluded_file" ]; then
-                    rm -rf "$temp_build/$excluded_file"
-                    log_message "  Excluded: $excluded_file"
-                fi
-            done < "$EXCLUDE_LIST"
-            
-            # Remove empty directories
-            find "$temp_build" -type d -empty -delete 2>/dev/null
-        else
-            log_message "Error: Failed to extract files from git"
-            echo "Error: Failed to extract files from git"
-            rm -rf "$temp_build"
-            exit 1
-        fi
-    else
-        # No exclusions: simple archive extraction
-        git archive "$BUILD_COMMIT" 2>/dev/null | (cd "$temp_build" && tar xf - 2>/dev/null)
-        
+    if [ "$has_exclusions" = true ]; then
+        git archive "$BUILD_COMMIT" | (cd "$temp_build" && tar xf -)
         if [ $? -ne 0 ]; then
-            log_message "Error: Failed to extract files from git"
-            echo "Error: Failed to extract files from git"
-            rm -rf "$temp_build"
-            exit 1
+            echo "Error: Failed to extract files from git"; rm -rf "$temp_build"; exit 1
         fi
-    fi
-    
-    # Count files
-    file_count=$(find "$temp_build" -type f 2>/dev/null | wc -l)
-    log_message "Extracted $file_count files"
-    
-    # Clean up temp files
-    rm -f "$EXCLUDE_LIST" "$BUILD_FILES_LIST"
-    
-    # Create the build
-    if [ "$BUILD_TAR" = true ]; then
-        # Create tar.gz
-        tar_file="$build_path.tar.gz"
-        log_message "Creating tar.gz archive: $tar_file"
-        
-        # Remove existing archive if present
-        [ -f "$tar_file" ] && rm -f "$tar_file"
-        
-        cd "$temp_build" || exit 1
-        tar -czf "$tar_file" . 2>/dev/null
-        
-        if [ $? -eq 0 ]; then
-            log_message "Build archive created successfully: $tar_file"
-            
-            # Calculate archive size
-            archive_size=$(ls -lh "$tar_file" | awk '{print $5}')
-            
-            echo ""
-            echo "========================================="
-            echo "  BUILD COMPLETE"
-            echo "========================================="
-            echo ""
-            echo "  Archive: $tar_file"
-            echo "  Size: $archive_size"
-            echo "  Files: $file_count"
-            echo "  Source: $BUILD_COMMIT_MSG"
-            echo ""
-        else
-            log_message "Error: Failed to create tar.gz archive"
-            echo "Error: Failed to create archive"
-            cd "$REPO_DIR" > /dev/null 2>&1
-            rm -rf "$temp_build"
-            exit 1
+        if [ -n "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -f "$BUILD_EXCLUDE_DIRS_LIST" ] && [ -s "$BUILD_EXCLUDE_DIRS_LIST" ]; then
+            while IFS= read -r excluded_dir; do
+                [ -e "$temp_build/$excluded_dir" ] && rm -rf "$temp_build/$excluded_dir"
+            done < "$BUILD_EXCLUDE_DIRS_LIST"
         fi
-        
-        cd "$REPO_DIR" > /dev/null 2>&1
-        
-        # Clean up temp directory
-        rm -rf "$temp_build"
-        
-        # Add build info alongside the tar.gz
-        cat > "${tar_file}.info" << EOF
-Build Name: $build_name
-Build Date: $(date)
-Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
-Commit Message: $BUILD_COMMIT_MSG
-Files: $file_count
-Excluded: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
-EOF
+        if [ -f "$EXCLUDE_LIST" ] && [ -s "$EXCLUDE_LIST" ]; then
+            while IFS= read -r excluded_file; do
+                [ -e "$temp_build/$excluded_file" ] && rm -rf "$temp_build/$excluded_file"
+            done < "$EXCLUDE_LIST"
+        fi
+        find "$temp_build" -type d -empty -delete 2>/dev/null
     else
-        # Create directory build
-        log_message "Creating directory build: $build_path"
-        
-        # Remove existing if present
-        [ -d "$build_path" ] && rm -rf "$build_path"
-        
-        mv "$temp_build" "$build_path"
-        
+        git archive "$BUILD_COMMIT" | (cd "$temp_build" && tar xf -)
+        [ $? -ne 0 ] && echo "Error: Failed to extract files" && rm -rf "$temp_build" && exit 1
+    fi
+    
+    file_count=$(find "$temp_build" -type f | wc -l)
+    rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$BUILD_EXCLUDE_DIRS_LIST"
+    
+    if [ "$BUILD_TAR" = true ]; then
+        tar_file="$build_path.tar.gz"
+        [ -f "$tar_file" ] && rm -f "$tar_file"
+        (cd "$temp_build" && tar -czf "$tar_file" .)
         if [ $? -eq 0 ]; then
-            log_message "Build directory created successfully: $build_path"
-            
-            # Calculate directory size
-            dir_size=$(du -sh "$build_path" 2>/dev/null | awk '{print $1}')
-            
-            # Add build info file
-            cat > "$build_path/BUILD_INFO.txt" << EOF
+            archive_size=$(ls -lh "$tar_file" | awk '{print $5}')
+            echo ""; echo "========================================="; echo "  BUILD COMPLETE"; echo "========================================="
+            echo "  Archive: $tar_file"; echo "  Size: $archive_size"; echo "  Files: $file_count"; echo "  Source: $BUILD_COMMIT_MSG"
+            echo ""
+            cat > "${tar_file}.info" <<EOF
 Build Name: $build_name
 Build Date: $(date)
 Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
 Commit Message: $BUILD_COMMIT_MSG
 Files: $file_count
-Excluded: $(wc -l < "$EXCLUDE_LIST" 2>/dev/null || echo 0)
 EOF
-            
-            echo ""
-            echo "========================================="
-            echo "  BUILD COMPLETE"
-            echo "========================================="
-            echo ""
-            echo "  Directory: $build_path"
-            echo "  Size: $dir_size"
-            echo "  Files: $file_count"
-            echo "  Source: $BUILD_COMMIT_MSG"
-            echo ""
         else
-            log_message "Error: Failed to create build directory"
-            echo "Error: Failed to create build directory"
-            rm -rf "$temp_build"
-            exit 1
+            echo "Error: Failed to create tar.gz archive"; cd "$REPO_DIR"; rm -rf "$temp_build"; exit 1
+        fi
+        cd "$REPO_DIR" >/dev/null 2>&1
+        rm -rf "$temp_build"
+    else
+        [ -d "$build_path" ] && rm -rf "$build_path"
+        mv "$temp_build" "$build_path"
+        if [ $? -eq 0 ]; then
+            dir_size=$(du -sh "$build_path" 2>/dev/null | awk '{print $1}')
+            echo ""; echo "========================================="; echo "  BUILD COMPLETE"; echo "========================================="
+            echo "  Directory: $build_path"; echo "  Size: $dir_size"; echo "  Files: $file_count"; echo "  Source: $BUILD_COMMIT_MSG"
+            echo ""
+            cat > "$build_path/BUILD_INFO.txt" <<EOF
+Build Name: $build_name
+Build Date: $(date)
+Source Commit: $(git rev-parse "$BUILD_COMMIT" 2>/dev/null)
+Commit Message: $BUILD_COMMIT_MSG
+Files: $file_count
+EOF
+        else
+            echo "Error: Failed to create build directory"; rm -rf "$temp_build"; exit 1
         fi
     fi
-    
     log_message "Build process completed"
     exit 0
 }
 
 # =============================================================================
-# FUNCTION DEFINITIONS (Ash-compatible versions)
+# END OF BUILD SYSTEM FUNCTIONS
+# =============================================================================
+
+# =============================================================================
+# FUNCTION DEFINITIONS (Ash-compatible versions - UNCHANGED)
 # =============================================================================
 
 show_help() {
@@ -1262,21 +1562,23 @@ show_help() {
     echo "  --build          Create a build from the last commit"
     echo "  --tar            Create a tar.gz archive (use with --build)"
     echo "  --config         Interactive file exclusion (use with --build)"
+    echo "  --message        Use commit message for build naming (default: version-based)"
+    echo "  --version [VER]  Build from a specific version or latest version (use with --build)"
     echo
     echo "Build examples:"
     echo "  $0 --build                    Create build directory from last commit"
     echo "  $0 --build --tar              Create tar.gz archive from last commit"
     echo "  $0 --build --config           Interactive exclusion before directory build"
     echo "  $0 --build --tar --config     Interactive exclusion before tar.gz build"
+    echo "  $0 --build --message          Use commit message for naming"
+    echo "  $0 --build mybuild            Build using saved configuration 'mybuild'"
     echo
     echo "Commands will be created for:"
     
-    # Display Node.js commands
     for cmd in $NODE_ENTRY_POINTS_CMD; do
         echo "  $cmd"
     done
     
-    # Display Shell script commands
     if [ -n "$SHELL_SCRIPTS_CMD" ]; then
         for cmd in $SHELL_SCRIPTS_CMD; do
             echo "  $cmd (shell script)"
@@ -1288,13 +1590,11 @@ show_help() {
     echo
     echo "Working directory configuration:"
     
-    # Display working directories for Node.js commands
     for cmd in $NODE_ENTRY_POINTS_CMD; do
         working_dir=$(get_command_working_dir "$cmd")
         echo "  $cmd: $working_dir"
     done
     
-    # Display working directories for Shell commands
     if [ -n "$SHELL_SCRIPTS_CMD" ]; then
         for cmd in $SHELL_SCRIPTS_CMD; do
             working_dir=$(get_command_working_dir "$cmd")
@@ -2600,7 +2900,8 @@ interrupt_handler() {
 
 trap interrupt_handler INT TERM
 
-# Parse command line arguments
+# Parse command line arguments (enhanced with new build flags)
+prev_arg=""
 for arg in "$@"; do
     case "$arg" in
         -h|--help) show_help ;;
@@ -2612,11 +2913,35 @@ for arg in "$@"; do
         --build) BUILD_MODE=true ;;
         --tar) BUILD_TAR=true ;;
         --config) BUILD_CONFIG=true ;;
+        --message) BUILD_MESSAGE_MODE=true ;;
+        --version) BUILD_MODE=true; BUILD_VERSION="latest" ;;
     esac
+    # Handle --build with optional save name
+    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
+        BUILD_SAVE_NAME="$arg"
+    fi
+    # Handle --version with specific version number
+    if [ "$prev_arg" = "--version" ] && [ "$arg" != "--version" ] && echo "$arg" | grep -qE '^[0-9]+\.[0-9]+'; then
+        BUILD_VERSION="$arg"
+    fi
+    prev_arg="$arg"
 done
 
 # Handle build mode (exit early if only building)
 if [ "$BUILD_MODE" = true ]; then
+    # If save name is provided, load it before building
+    if [ -n "$BUILD_SAVE_NAME" ]; then
+        EXCLUDE_LIST="/tmp/build_exclude_$$.txt"
+        EXCLUDE_DIRS_LIST="/tmp/build_exclude_dirs_$$.txt"
+        > "$EXCLUDE_LIST"
+        > "$EXCLUDE_DIRS_LIST"
+        if load_build_configuration "$BUILD_SAVE_NAME"; then
+            log_message "Loaded build configuration: $BUILD_SAVE_NAME"
+        else
+            log_message "Error: Could not load save '$BUILD_SAVE_NAME'"
+            exit 1
+        fi
+    fi
     do_build
 fi
 
@@ -2627,7 +2952,8 @@ ensure_nodejs
 
 if [ -d "$INSTALL_DIR" ]; then
     log_message "Existing installation found."
-    printf "Choose: 1=Update, 2=Remove, 3=Exit\n"
+    printf "Choose: 1=Update, 2=Remove, 3=Exit
+"
     printf "Enter choice: "
     read choice
     case "$choice" in
