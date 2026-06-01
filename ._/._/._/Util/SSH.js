@@ -14,6 +14,7 @@ const __filename = fileURLToPath(import.meta.url);
 // Background scan state management
 const SCAN_STATE_FILE = join(homedir(), '.ssh-lab-scan-state.json');
 const SCAN_PID_FILE = join(homedir(), '.ssh-lab-scan.pid');
+const PERSISTENT_HOSTS_FILE = join(homedir(), '.ssh-lab-persistent-hosts.json');
 
 export default class SSH {
   /**
@@ -544,6 +545,31 @@ exit 1`;
   }
 
   /**
+   * Enhanced TCP check with bigger timeout and more retries for persistent hosts
+   * @param {string} host - Target IP
+   * @returns {Promise<Object|null>} Host info or null if not accessible
+   */
+  static async _enhancedFastCheckAccess(host) {
+    try {
+      // Use increased timeout (3000ms) and more retries (6) for hosts that were previously found
+      const isOpen = await this._tcpCheck(host, 22, 3000, 6);
+      
+      if (isOpen) {
+        return {
+          host,
+          accessible: true,
+          unlocked: null,
+          type: 'pending'
+        };
+      }
+      
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
    * Check if host is unlocked using native SSH with short timeout
    * Uses a separate SSH process to avoid blocking
    * @param {string} host - Target IP
@@ -832,6 +858,32 @@ exit 1`;
   }
 
   /**
+   * Save persistent hosts data (for hosts that weren't found in current scan)
+   */
+  static async _savePersistentHosts(persistentHosts) {
+    try {
+      await mkdir(dirname(PERSISTENT_HOSTS_FILE), { recursive: true });
+      const tmpFile = PERSISTENT_HOSTS_FILE + '.tmp';
+      await writeFile(tmpFile, JSON.stringify(persistentHosts, null, 2), 'utf8');
+      await rename(tmpFile, PERSISTENT_HOSTS_FILE);
+    } catch (error) {
+      console.error('[persistentHosts] Failed to save persistent hosts:', error.message);
+    }
+  }
+
+  /**
+   * Load persistent hosts data
+   */
+  static async _loadPersistentHosts() {
+    try {
+      const data = await readFile(PERSISTENT_HOSTS_FILE, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      return {};
+    }
+  }
+
+  /**
    * Check if background scan is running
    */
   static async _isBackgroundScanRunning() {
@@ -875,8 +927,17 @@ exit 1`;
    */
   static async _performScan(config = {}) {
     const startTime = Date.now();
+    const persistentRetryConfig = config.persistentRetryConfig || {
+      maxRetriesScans: 1,  // Default: maintain for 1 more scan
+      enhancedTimeout: 3000,
+      enhancedRetries: 6
+    };
     
     try {
+      // Load persistent hosts from previous scans
+      const persistentHosts = await this._loadPersistentHosts();
+      console.error(`[scanNetwork] Loaded ${Object.keys(persistentHosts).length} persistent hosts from previous scans`);
+      
       // Get all local interfaces and generate IP ranges
       const localIPs = this._getLocalIPs();
       
@@ -956,6 +1017,87 @@ exit 1`;
       console.error(`[scanNetwork] Phase 1 complete in ${((Date.now() - startTime)/1000).toFixed(2)}s: ${accessibleHosts.length} unique hosts with SSH open`);
       console.error(`[scanNetwork] Hosts found: ${accessibleHosts.map(h => h.host).join(', ') || 'none'}`);
       
+      // PHASE 1c: Enhanced scan for persistent hosts that weren't found
+      const currentFoundIPs = new Set(accessibleHosts.map(h => h.host));
+      const notFoundPersistentHosts = [];
+      const updatedPersistentHosts = {};
+      
+      for (const [persistentIP, persistentData] of Object.entries(persistentHosts)) {
+        if (!currentFoundIPs.has(persistentIP)) {
+          // This persistent host wasn't found in current scan
+          if (persistentData.retriesLeft === undefined || persistentData.retriesLeft > 0) {
+            // Still has retries left, attempt enhanced scan
+            notFoundPersistentHosts.push({ ip: persistentIP, data: persistentData });
+          } else {
+            // No more retries, mark as no longer active
+            updatedPersistentHosts[persistentIP] = {
+              ...persistentData,
+              retriesLeft: 0,
+              noLongerActive: true,
+              lastSeen: persistentData.lastSeen || new Date().toISOString()
+            };
+          }
+        } else {
+          // Host was found in current scan, reset its retry count
+          updatedPersistentHosts[persistentIP] = {
+            ...persistentData,
+            retriesLeft: persistentRetryConfig.maxRetriesScans,
+            lastSeen: new Date().toISOString(),
+            noLongerActive: false
+          };
+        }
+      }
+      
+      // Perform enhanced scan for persistent hosts not found in normal scan
+      if (notFoundPersistentHosts.length > 0) {
+        console.error(`[scanNetwork] Phase 1c: Enhanced scan for ${notFoundPersistentHosts.length} persistent hosts...`);
+        
+        const enhancedResults = await this._batchProcess(
+          notFoundPersistentHosts.map(h => h.ip),
+          (ip) => this._enhancedFastCheckAccess(ip),
+          Math.min(concurrency, notFoundPersistentHosts.length)
+        );
+        
+        const enhancedFoundIPs = new Set(enhancedResults.filter(r => r !== null).map(r => r.host));
+        
+        // Update accessible hosts with enhanced scan results
+        for (const result of enhancedResults) {
+          if (result && result.host) {
+            // Check if this host is already in accessibleHosts
+            const existingHost = accessibleHosts.find(h => h.host === result.host);
+            if (!existingHost) {
+              accessibleHosts.push(result);
+            }
+          }
+        }
+        
+        // Update persistent hosts based on enhanced scan results
+        for (const { ip, data } of notFoundPersistentHosts) {
+          if (enhancedFoundIPs.has(ip)) {
+            // Found with enhanced scan
+            updatedPersistentHosts[ip] = {
+              ...data,
+              retriesLeft: persistentRetryConfig.maxRetriesScans,
+              lastSeen: new Date().toISOString(),
+              foundWithEnhancedScan: true,
+              noLongerActive: false
+            };
+          } else {
+            // Still not found even with enhanced scan
+            const retriesLeft = (data.retriesLeft || persistentRetryConfig.maxRetriesScans) - 1;
+            updatedPersistentHosts[ip] = {
+              ...data,
+              retriesLeft: retriesLeft,
+              lastAttempt: new Date().toISOString(),
+              noLongerActive: retriesLeft <= 0
+            };
+          }
+        }
+      }
+      
+      // Save updated persistent hosts
+      await this._savePersistentHosts(updatedPersistentHosts);
+      
       if (accessibleHosts.length === 0) {
         const emptyResult = {
           success: true,
@@ -1000,8 +1142,56 @@ exit 1`;
           return a.host.localeCompare(b.host, undefined, { numeric: true });
         });
       
-      const unlockedCount = finalHosts.filter(h => h.unlocked).length;
-      const accessibleCount = finalHosts.filter(h => !h.unlocked).length;
+      // Add persistent host information to final results
+      for (const host of finalHosts) {
+        if (updatedPersistentHosts[host.host]) {
+          host.persistentHostInfo = updatedPersistentHosts[host.host];
+        }
+        
+        // Initialize new persistent hosts for found hosts
+        if (!updatedPersistentHosts[host.host]) {
+          updatedPersistentHosts[host.host] = {
+            firstSeen: new Date().toISOString(),
+            lastSeen: new Date().toISOString(),
+            retriesLeft: persistentRetryConfig.maxRetriesScans,
+            noLongerActive: false
+          };
+        }
+      }
+      
+      // Add hosts from persistent storage that are no longer active
+      const noLongerActiveHosts = [];
+      for (const [ip, data] of Object.entries(updatedPersistentHosts)) {
+        if (data.noLongerActive && !finalHostMap.has(ip)) {
+          noLongerActiveHosts.push({
+            host: ip,
+            accessible: false,
+            unlocked: false,
+            type: 'inactive',
+            message: 'Previously found host is no longer accessible',
+            noLongerActive: true,
+            persistentHostInfo: data
+          });
+        }
+      }
+      
+      // Merge all hosts
+      const allFinalHosts = [...finalHosts, ...noLongerActiveHosts]
+        .sort((a, b) => {
+          // Sort: active first, then unlocked, then by IP
+          if (b.noLongerActive !== a.noLongerActive) return b.noLongerActive ? -1 : 1;
+          if (!a.noLongerActive && !b.noLongerActive) {
+            if (b.unlocked !== a.unlocked) return b.unlocked - a.unlocked;
+          }
+          return a.host.localeCompare(b.host, undefined, { numeric: true });
+        });
+      
+      // Save updated persistent hosts
+      await this._savePersistentHosts(updatedPersistentHosts);
+      
+      const unlockedCount = allFinalHosts.filter(h => h.unlocked && !h.noLongerActive).length;
+      const accessibleCount = allFinalHosts.filter(h => !h.unlocked && !h.noLongerActive).length;
+      const inactiveCount = allFinalHosts.filter(h => h.noLongerActive).length;
       
       const finalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
       
@@ -1009,7 +1199,8 @@ exit 1`;
       console.error(`[scanNetwork] Total scanned: ${ipArray.length}`);
       console.error(`[scanNetwork] SSH accessible (locked): ${accessibleCount}`);
       console.error(`[scanNetwork] SSH unlocked: ${unlockedCount}`);
-      console.error(`[scanNetwork] All hosts found: ${finalHosts.map(h => `${h.host} (${h.type})`).join(', ')}`);
+      console.error(`[scanNetwork] Previously found, now inactive: ${inactiveCount}`);
+      console.error(`[scanNetwork] All hosts found: ${allFinalHosts.map(h => `${h.host} (${h.type})${h.noLongerActive ? ' [INACTIVE]' : ''}`).join(', ')}`);
       
       const finalResult = {
         success: true,
@@ -1018,7 +1209,8 @@ exit 1`;
         total_scanned: ipArray.length,
         accessible: accessibleCount,
         unlocked: unlockedCount,
-        hosts: finalHosts,
+        inactive: inactiveCount,
+        hosts: allFinalHosts,
         scanComplete: true,
         scanInProgress: false
       };
@@ -1089,11 +1281,16 @@ exit 1`;
       background = false,
       forceNew = false,
       concurrency = 500,
-      cacheTimeout = 0
+      cacheTimeout = 0,
+      persistentRetryConfig = {
+        maxRetriesScans: 1,  // Default: maintain for 1 more scan
+        enhancedTimeout: 3000,
+        enhancedRetries: 6
+      }
     } = config;
 
     if (!background) {
-      return await this._performScan({ concurrency });
+      return await this._performScan({ concurrency, persistentRetryConfig });
     }
 
     // BACKGROUND MODE
@@ -1118,6 +1315,7 @@ exit 1`;
           total_scanned: 0,
           accessible: 0,
           unlocked: 0,
+          inactive: 0,
           hosts: [],
           scanComplete: false,
           scanInProgress: true
@@ -1139,6 +1337,7 @@ exit 1`;
         total_scanned: 0,
         accessible: 0,
         unlocked: 0,
+        inactive: 0,
         hosts: [],
         scanComplete: false,
         scanInProgress: true
@@ -1157,7 +1356,7 @@ exit 1`;
     };
 
     if (shouldStartNewScan()) {
-      this._startDetachedBackgroundScan({ concurrency });
+      this._startDetachedBackgroundScan({ concurrency, persistentRetryConfig });
     }
 
     return returnState;
@@ -1200,11 +1399,12 @@ exit 1`;
   }
 
   /**
-   * Clear saved scan state
+   * Clear saved scan state and persistent hosts
    */
   static async clearScanCache() {
     try {
       await writeFile(SCAN_STATE_FILE, JSON.stringify({}), 'utf8');
+      await writeFile(PERSISTENT_HOSTS_FILE, JSON.stringify({}), 'utf8');
       await this._clearScanPid();
       return true;
     } catch (error) {
@@ -1235,6 +1435,7 @@ Scan Options (for 'scan' method):
   --background          Enable background scanning mode
   --force              Force start new scan even if one is running
   --concurrency=<n>    Max concurrent connections (default: 500)
+  --persistent-retries=<n>  Max retry scans for persistent hosts (default: 1)
 
 Examples:
   node ssh-lab.mjs setup
@@ -1245,6 +1446,7 @@ Examples:
   node ssh-lab.mjs scan
   node ssh-lab.mjs scan --background
   node ssh-lab.mjs scan --background --force
+  node ssh-lab.mjs scan --persistent-retries=2
   node ssh-lab.mjs scan-status
 `;
 
@@ -1311,6 +1513,16 @@ Examples:
           const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
           if (concurrencyArg) {
             scanConfig.concurrency = parseInt(concurrencyArg.split('=')[1]) || 500;
+          }
+          
+          const persistentRetriesArg = args.find(a => a.startsWith('--persistent-retries='));
+          if (persistentRetriesArg) {
+            const retries = parseInt(persistentRetriesArg.split('=')[1]) || 1;
+            scanConfig.persistentRetryConfig = {
+              maxRetriesScans: retries,
+              enhancedTimeout: 3000,
+              enhancedRetries: 6
+            };
           }
           
           result = await SSH.scanNetwork(scanConfig);

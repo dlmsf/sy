@@ -1,5 +1,6 @@
 import SyAPP from "../../../../SyAPP.js";
 import SSH from '../../../._/Util/SSH.js'
+import ColorText from '../../../._/Util/ColorText.js'
 
 class RacksLab extends SyAPP.Func(){
     constructor(){
@@ -11,12 +12,19 @@ class RacksLab extends SyAPP.Func(){
 
                  let racks = await SSH.scanNetwork({background : true})
 
-                 this.Text(uid,'• Racks Lab')
+                 //await this.WaitLog(racks)
+
+                 this.Text(uid,`• Racks Lab | ${racks.cacheAge}`)
 
                 racks.hosts.forEach(e => {
-                    this.Button(uid,e.host)
+                    if(e.unlocked){
+                        this.Button(uid,ColorText.green(e.host))
+                    } else {
+                        this.Button(uid,ColorText.red(e.host))
+                    }
+                   
                 })
-
+                this.Button(uid,' ')
                  this.Button(uid,{name :'<- Return',path : this.Storages.Get(uid,'parentfunc')})
 
             }
