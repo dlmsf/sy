@@ -16,6 +16,9 @@ const SCAN_STATE_FILE = join(homedir(), '.ssh-lab-scan-state.json');
 const SCAN_PID_FILE = join(homedir(), '.ssh-lab-scan.pid');
 const PERSISTENT_HOSTS_FILE = join(homedir(), '.ssh-lab-persistent-hosts.json');
 
+// QEMU default networks
+const QEMU_NETWORKS = ['10.10.10.0/24', '10.10.11.0/24'];
+
 export default class SSH {
   /**
    * Execute command and return full output even on error
@@ -728,13 +731,99 @@ exit 1`;
           if (net.address.startsWith('127.') || net.address.startsWith('169.254.')) continue;
           
           if (!ipMap.has(net.address)) {
-            ipMap.set(net.address, { ip: net.address, netmask: net.netmask });
+            ipMap.set(net.address, { ip: net.address, netmask: net.netmask, interface: name });
           }
         }
       }
     }
     
     return Array.from(ipMap.values());
+  }
+
+  /**
+   * List all network interfaces with their IP and netmask
+   * @param {Object} options - Filter options
+   * @param {Array<string>} options.whitelist - Network CIDRs to include
+   * @param {Array<string>} options.blacklist - Network CIDRs to exclude
+   * @param {boolean} options.qemuOnly - Only show QEMU networks (10.10.10.0/24 and 10.10.11.0/24)
+   * @returns {Array<Object>} Array of interface objects
+   */
+  static listInterfaces(options = {}) {
+    const { whitelist = [], blacklist = [], qemuOnly = false } = options;
+    const interfaces = networkInterfaces();
+    const results = [];
+    
+    // Parse CIDR networks for filtering
+    const parseCidr = (cidr) => {
+      const [ip, prefix] = cidr.split('/');
+      const ipParts = ip.split('.').map(Number);
+      const mask = ~(2 ** (32 - (parseInt(prefix) || 24)) - 1);
+      const network = ipParts.reduce((acc, octet, i) => (acc << 8) | (octet & ((mask >> (24 - i * 8)) & 0xFF)), 0) >>> 0;
+      return { network, mask: mask >>> 0, prefix: parseInt(prefix) || 24 };
+    };
+    
+    const whitelistNets = whitelist.map(parseCidr);
+    const blacklistNets = blacklist.map(parseCidr);
+    const qemuNets = QEMU_NETWORKS.map(parseCidr);
+    
+    // Helper to check if IP is in a network
+    const isInNetwork = (ipStr, net) => {
+      const ipParts = ipStr.split('.').map(Number);
+      const ipNum = ipParts.reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0;
+      return (ipNum & net.mask) === net.network;
+    };
+    
+    for (const [name, nets] of Object.entries(interfaces)) {
+      if (!nets) continue;
+      
+      for (const net of nets) {
+        if (net.family !== 'IPv4' || net.internal) continue;
+        
+        // Apply QEMU-only filter
+        if (qemuOnly) {
+          const isQemu = qemuNets.some(qnet => isInNetwork(net.address, qnet));
+          if (!isQemu) continue;
+        }
+        
+        // Apply whitelist filter
+        if (whitelistNets.length > 0) {
+          const isWhitelisted = whitelistNets.some(wnet => isInNetwork(net.address, wnet));
+          if (!isWhitelisted) continue;
+        }
+        
+        // Apply blacklist filter
+        if (blacklistNets.length > 0) {
+          const isBlacklisted = blacklistNets.some(bnet => isInNetwork(net.address, bnet));
+          if (isBlacklisted) continue;
+        }
+        
+        results.push({
+          interface: name,
+          ip: net.address,
+          netmask: net.netmask,
+          cidr: net.cidr || `${net.address}/${this._netmaskToCIDR(net.netmask)}`,
+          mac: net.mac,
+          type: qemuNets.some(qnet => isInNetwork(net.address, qnet)) ? 'qemu' : 'other'
+        });
+      }
+    }
+    
+    return results.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'qemu' ? -1 : 1;
+      return a.ip.localeCompare(b.ip, undefined, { numeric: true });
+    });
+  }
+
+  /**
+   * Convert netmask to CIDR prefix
+   */
+  static _netmaskToCIDR(netmask) {
+    const parts = netmask.split('.').map(Number);
+    let cidr = 0;
+    for (const part of parts) {
+      cidr += part.toString(2).split('1').length - 1;
+    }
+    return cidr;
   }
 
   /**
@@ -789,6 +878,69 @@ exit 1`;
     }
     
     return Array.from(ips);
+  }
+
+  /**
+   * Get IP ranges filtered by network configuration
+   * @param {Object} networkFilter - Network filter configuration
+   * @param {Array<string>} networkFilter.whitelist - Network CIDRs to include
+   * @param {Array<string>} networkFilter.blacklist - Network CIDRs to exclude
+   * @param {boolean} networkFilter.qemuOnly - Only use QEMU networks
+   * @returns {Set<string>} Set of IPs to scan
+   */
+  static _getFilteredIPRange(networkFilter = {}) {
+    const { whitelist = [], blacklist = [], qemuOnly = false } = networkFilter;
+    const allIPs = new Set();
+    const localIPs = this._getLocalIPs();
+    
+    const parseCidr = (cidr) => {
+      const [ip, prefix] = cidr.split('/');
+      const ipParts = ip.split('.').map(Number);
+      const mask = ~(2 ** (32 - (parseInt(prefix) || 24)) - 1);
+      const network = ipParts.reduce((acc, octet, i) => (acc << 8) | (octet & ((mask >> (24 - i * 8)) & 0xFF)), 0) >>> 0;
+      return { network, mask: mask >>> 0, prefix: parseInt(prefix) || 24 };
+    };
+    
+    const qemuNets = QEMU_NETWORKS.map(parseCidr);
+    const whitelistNets = whitelist.map(parseCidr);
+    const blacklistNets = blacklist.map(parseCidr);
+    
+    const isInNetwork = (ipStr, net) => {
+      const ipParts = ipStr.split('.').map(Number);
+      const ipNum = ipParts.reduce((acc, octet) => (acc << 8) | octet, 0) >>> 0;
+      return (ipNum & net.mask) === net.network;
+    };
+    
+    for (const { ip, netmask, interface: ifName } of localIPs) {
+      // Skip excluded interfaces
+      const skipPatterns = ['docker', 'veth', 'br-', 'lo', 'virbr', 'vboxnet', 'vmnet'];
+      if (skipPatterns.some(pattern => ifName.startsWith(pattern))) continue;
+      
+      // Apply QEMU-only filter
+      if (qemuOnly) {
+        const isQemu = qemuNets.some(qnet => isInNetwork(ip, qnet));
+        if (!isQemu) continue;
+      }
+      
+      // Apply whitelist
+      if (whitelistNets.length > 0) {
+        const isWhitelisted = whitelistNets.some(wnet => isInNetwork(ip, wnet));
+        if (!isWhitelisted) continue;
+      }
+      
+      // Apply blacklist
+      if (blacklistNets.length > 0) {
+        const isBlacklisted = blacklistNets.some(bnet => isInNetwork(ip, bnet));
+        if (isBlacklisted) continue;
+      }
+      
+      const rangeIPs = this._generateIPRange(ip, netmask);
+      for (const rangeIP of rangeIPs) {
+        allIPs.add(rangeIP);
+      }
+    }
+    
+    return allIPs;
   }
 
   /**
@@ -941,34 +1093,38 @@ exit 1`;
       const persistentHosts = await this._loadPersistentHosts();
       console.error(`[scanNetwork] Loaded ${Object.keys(persistentHosts).length} persistent hosts from previous scans`);
       
-      // Get all local interfaces and generate IP ranges
-      const localIPs = this._getLocalIPs();
+      // Get filtered IP ranges based on network configuration
+      const networkFilter = config.networkFilter || {};
+      const allIPs = this._getFilteredIPRange(networkFilter);
+      const ipArray = Array.from(allIPs);
+      const concurrency = config.concurrency || 500;
       
-      if (localIPs.length === 0) {
-        console.error('[scanNetwork] No network interfaces found');
+      if (ipArray.length === 0) {
+        console.error('[scanNetwork] No IPs to scan after applying network filters');
         return {
-          success: false,
-          message: 'No network interfaces found',
+          success: true,
+          message: 'No IPs to scan after network filtering',
           timestamp: new Date().toISOString(),
           scanComplete: true,
-          scanInProgress: false
+          scanInProgress: false,
+          total_scanned: 0,
+          accessible: 0,
+          unlocked: 0,
+          hosts: []
         };
       }
       
-      // Generate unique IPs using a Set for absolute deduplication
-      const allIPs = new Set();
-      
-      for (const { ip, netmask } of localIPs) {
-        console.error(`[scanNetwork] Interface: ${ip}/${netmask}`);
-        const rangeIPs = this._generateIPRange(ip, netmask);
-        for (const rangeIP of rangeIPs) {
-          allIPs.add(rangeIP);
-        }
-      }
-      
-      const ipArray = Array.from(allIPs);
-      const concurrency = config.concurrency || 500;
       console.error(`[scanNetwork] Scanning ${ipArray.length} unique IPs with ${concurrency} concurrent TCP connections...`);
+      
+      if (networkFilter.qemuOnly) {
+        console.error('[scanNetwork] QEMU-only mode: scanning 10.10.10.0/24 and 10.10.11.0/24');
+      }
+      if (networkFilter.whitelist?.length > 0) {
+        console.error(`[scanNetwork] Whitelist: ${networkFilter.whitelist.join(', ')}`);
+      }
+      if (networkFilter.blacklist?.length > 0) {
+        console.error(`[scanNetwork] Blacklist: ${networkFilter.blacklist.join(', ')}`);
+      }
       
       // PHASE 1: TCP port scanning on ALL IPs
       console.error('[scanNetwork] Phase 1: TCP port scanning (pass 1)...');
@@ -1237,7 +1393,8 @@ exit 1`;
         unlocked: unlockedCount,
         hosts: allFinalHosts,
         scanComplete: true,
-        scanInProgress: false
+        scanInProgress: false,
+        networkFilter: networkFilter
       };
       
       await this._saveScanState(finalResult);
@@ -1311,11 +1468,34 @@ exit 1`;
         enhancedTimeout: 3000,
         enhancedRetries: 6,
         maxInactiveScans: 3
-      }
+      },
+      networkFilter = {},
+      qemu = false,
+      whitelist,
+      blacklist
     } = config;
 
+    // Build network filter from convenience flags
+    const effectiveNetworkFilter = { ...networkFilter };
+    
+    if (qemu) {
+      effectiveNetworkFilter.qemuOnly = true;
+    }
+    if (whitelist) {
+      effectiveNetworkFilter.whitelist = Array.isArray(whitelist) ? whitelist : [whitelist];
+    }
+    if (blacklist) {
+      effectiveNetworkFilter.blacklist = Array.isArray(blacklist) ? blacklist : [blacklist];
+    }
+
+    const scanConfig = {
+      concurrency,
+      persistentRetryConfig,
+      networkFilter: effectiveNetworkFilter
+    };
+
     if (!background) {
-      return await this._performScan({ concurrency, persistentRetryConfig });
+      return await this._performScan(scanConfig);
     }
 
     // BACKGROUND MODE
@@ -1381,7 +1561,7 @@ exit 1`;
     };
 
     if (shouldStartNewScan()) {
-      this._startDetachedBackgroundScan({ concurrency, persistentRetryConfig });
+      this._startDetachedBackgroundScan(scanConfig);
     }
 
     return returnState;
@@ -1408,8 +1588,25 @@ exit 1`;
         maxInactiveScans: 3
       },
       minUnlocked = 0,
-      minAccessible = 0
+      minAccessible = 0,
+      networkFilter = {},
+      qemu = false,
+      whitelist,
+      blacklist
     } = config;
+
+    // Build network filter from convenience flags
+    const effectiveNetworkFilter = { ...networkFilter };
+    
+    if (qemu) {
+      effectiveNetworkFilter.qemuOnly = true;
+    }
+    if (whitelist) {
+      effectiveNetworkFilter.whitelist = Array.isArray(whitelist) ? whitelist : [whitelist];
+    }
+    if (blacklist) {
+      effectiveNetworkFilter.blacklist = Array.isArray(blacklist) ? blacklist : [blacklist];
+    }
 
     // Suppress stderr for clean output
     const originalStderrWrite = process.stderr.write;
@@ -1420,6 +1617,9 @@ exit 1`;
     console.log('SSH Lab Test Mode - Ctrl+C to stop');
     if (trackingEnabled) {
       console.log(`Tracking: min-unlocked=${minUnlocked}, min-accessible=${minAccessible}`);
+    }
+    if (Object.keys(effectiveNetworkFilter).length > 0) {
+      console.log(`Network filter: ${JSON.stringify(effectiveNetworkFilter)}`);
     }
     console.log('');
 
@@ -1471,7 +1671,8 @@ exit 1`;
       try {
         const scanResult = await this._performScan({
           concurrency,
-          persistentRetryConfig
+          persistentRetryConfig,
+          networkFilter: effectiveNetworkFilter
         });
         
         if (scanResult.success && scanResult.scanComplete) {
@@ -1629,11 +1830,17 @@ Methods:
   check <host> [port]             Check if SSH port is open
   full <host> <password> [user]   Run setup + copyKey + verify
   unlock-check <host> [user]      Check if SSH is fully unlocked (passwordless)
+  interfaces                      List all network interfaces
   scan                            Scan all network interfaces for SSH hosts
   scan-status                    Get current background scan status
   scan-stop                      Stop running background scan
   scan-clear                     Clear scan cache
   test                           Run continuous scans until Ctrl+C, tracking statistics
+
+Network Filter Options (for 'scan' and 'test' methods):
+  --qemu                        Only scan QEMU networks (10.10.10.0/24, 10.10.11.0/24)
+  --whitelist=<cidr>            Only scan networks matching this CIDR (can be repeated)
+  --blacklist=<cidr>            Exclude networks matching this CIDR (can be repeated)
 
 Scan Options (for 'scan' method):
   --background              Enable background scanning mode
@@ -1648,7 +1855,6 @@ Test Options (for 'test' method):
   --max-inactive-scans=<n>  Max consecutive inactive scans before removal (default: 3)
   --min-unlocked=<n>        Minimum unlocked IPs required for success (default: 0, disabled)
   --min-accessible=<n>      Minimum accessible IPs required for success (default: 0, disabled)
-                            When set, success % is calculated based on meeting minimum counts
 
 Examples:
   node ssh-lab.mjs setup
@@ -1656,18 +1862,25 @@ Examples:
   node ssh-lab.mjs check 10.10.10.10
   node ssh-lab.mjs full 10.10.10.10 password123 root
   node ssh-lab.mjs unlock-check 10.10.10.10 root
+  node ssh-lab.mjs interfaces
+  node ssh-lab.mjs interfaces --qemu
   node ssh-lab.mjs scan
+  node ssh-lab.mjs scan --qemu
+  node ssh-lab.mjs scan --whitelist=10.10.10.0/24
+  node ssh-lab.mjs scan --blacklist=192.168.0.0/16
+  node ssh-lab.mjs scan --qemu --whitelist=10.10.11.0/24
   node ssh-lab.mjs scan --background
-  node ssh-lab.mjs scan --background --force
+  node ssh-lab.mjs scan --background --force --qemu
   node ssh-lab.mjs scan --persistent-retries=2
   node ssh-lab.mjs scan --max-inactive-scans=2
-  node ssh-lab.mjs scan --persistent-retries=2 --max-inactive-scans=5
   node ssh-lab.mjs scan-status
   node ssh-lab.mjs test
+  node ssh-lab.mjs test --qemu
+  node ssh-lab.mjs test --whitelist=10.10.10.0/24
   node ssh-lab.mjs test --min-unlocked=3
-  node ssh-lab.mjs test --min-unlocked=3 --min-accessible=5
+  node ssh-lab.mjs test --qemu --min-unlocked=3 --min-accessible=5
   node ssh-lab.mjs test --persistent-retries=2 --min-unlocked=3 --max-inactive-scans=5
-  node ssh-lab.mjs test --concurrency=1000
+  node ssh-lab.mjs test --concurrency=1000 --qemu
 `;
 
   if (!method) {
@@ -1724,10 +1937,24 @@ Examples:
           break;
         }
 
+        case 'interfaces': {
+          const interfaceOptions = {
+            qemuOnly: args.includes('--qemu'),
+            whitelist: args.filter(a => a.startsWith('--whitelist=')).map(a => a.split('=')[1]),
+            blacklist: args.filter(a => a.startsWith('--blacklist=')).map(a => a.split('=')[1])
+          };
+          
+          result = SSH.listInterfaces(interfaceOptions);
+          break;
+        }
+
         case 'scan': {
           const scanConfig = {
             background: args.includes('--background'),
-            forceNew: args.includes('--force')
+            forceNew: args.includes('--force'),
+            qemu: args.includes('--qemu'),
+            whitelist: args.filter(a => a.startsWith('--whitelist=')).map(a => a.split('=')[1]),
+            blacklist: args.filter(a => a.startsWith('--blacklist=')).map(a => a.split('=')[1])
           };
           
           const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
@@ -1755,7 +1982,10 @@ Examples:
           const testConfig = {
             concurrency: 500,
             minUnlocked: 0,
-            minAccessible: 0
+            minAccessible: 0,
+            qemu: args.includes('--qemu'),
+            whitelist: args.filter(a => a.startsWith('--whitelist=')).map(a => a.split('=')[1]),
+            blacklist: args.filter(a => a.startsWith('--blacklist=')).map(a => a.split('=')[1])
           };
           
           const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
