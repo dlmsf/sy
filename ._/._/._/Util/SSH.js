@@ -1,7 +1,7 @@
-// ssh-lab.mjs - ULTRA RELIABLE VERSION
+// ssh-lab.mjs - ULTRA RELIABLE VERSION WITH TOGGLE BACKGROUND SCAN
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
-import { mkdir, writeFile, chmod, access, readFile, unlink, rename } from 'fs/promises';
+import { mkdir, writeFile, chmod, access, readFile, unlink, rename, rm } from 'fs/promises';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { networkInterfaces } from 'os';
@@ -15,6 +15,25 @@ const __filename = fileURLToPath(import.meta.url);
 const SCAN_STATE_FILE = join(homedir(), '.ssh-lab-scan-state.json');
 const SCAN_PID_FILE = join(homedir(), '.ssh-lab-scan.pid');
 const PERSISTENT_HOSTS_FILE = join(homedir(), '.ssh-lab-persistent-hosts.json');
+
+// Toggle background scan state management
+const TOGGLE_STATE_FILE = join(homedir(), '.ssh-lab-toggle-state.json');
+const TOGGLE_PID_FILE = join(homedir(), '.ssh-lab-toggle.pid');
+const TOGGLE_RESULT_FILE = join(homedir(), '.ssh-lab-toggle-result.json');
+
+// All files related to this interface (for cleanup/hard reset)
+const ALL_SSH_LAB_FILES = [
+  SCAN_STATE_FILE,
+  SCAN_PID_FILE,
+  PERSISTENT_HOSTS_FILE,
+  TOGGLE_STATE_FILE,
+  TOGGLE_PID_FILE,
+  TOGGLE_RESULT_FILE,
+  join(homedir(), '.ssh-lab-scan-state.json.tmp'),
+  join(homedir(), '.ssh-lab-toggle-state.json.tmp'),
+  join(homedir(), '.ssh-lab-toggle-result.json.tmp'),
+  join(homedir(), '.ssh-lab-persistent-hosts.json.tmp'),
+];
 
 // QEMU default networks
 const QEMU_NETWORKS = ['10.10.10.0/24', '10.10.11.0/24'];
@@ -1455,7 +1474,268 @@ exit 1`;
   }
 
   /**
-   * Scan network for SSH hosts with optional background mode
+   * --------------------------------------------------------------------------
+   * TOGGLE BACKGROUND SCAN - NEW FEATURE
+   * --------------------------------------------------------------------------
+   */
+
+  /**
+   * Compare two scan configurations for equivalence (ignoring non-scan params)
+   */
+  static _configsMatch(configA, configB) {
+    const normalize = (cfg) => ({
+      concurrency: cfg.concurrency || 500,
+      networkFilter: cfg.networkFilter || {},
+      persistentRetryConfig: cfg.persistentRetryConfig || {
+        maxRetriesScans: 1,
+        enhancedTimeout: 3000,
+        enhancedRetries: 6,
+        maxInactiveScans: 3
+      }
+    });
+    const a = normalize(configA);
+    const b = normalize(configB);
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  /**
+   * Read toggle state from disk
+   */
+  static async _readToggleState() {
+    try {
+      const data = await readFile(TOGGLE_STATE_FILE, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      return { enabled: false, config: {} };
+    }
+  }
+
+  /**
+   * Write toggle state to disk
+   */
+  static async _writeToggleState(state) {
+    await mkdir(dirname(TOGGLE_STATE_FILE), { recursive: true });
+    const tmp = TOGGLE_STATE_FILE + '.tmp';
+    await writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
+    await rename(tmp, TOGGLE_STATE_FILE);
+  }
+
+  /**
+   * Check if toggle process is running (by PID)
+   */
+  static async _isToggleProcessRunning() {
+    try {
+      const pidData = await readFile(TOGGLE_PID_FILE, 'utf8');
+      const pid = parseInt(pidData.trim());
+      if (!pid || isNaN(pid)) return false;
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (e) {
+        // Process not found, clean up
+        try { await unlink(TOGGLE_PID_FILE); } catch (_) {}
+        return false;
+      }
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Kill toggle process if running
+   */
+  static async _killToggleProcess() {
+    try {
+      const pidData = await readFile(TOGGLE_PID_FILE, 'utf8');
+      const pid = parseInt(pidData.trim());
+      if (pid) {
+        try { process.kill(pid, 'SIGTERM'); } catch (e) { /* ignore */ }
+      }
+    } catch (e) { /* ignore */ }
+    try { await unlink(TOGGLE_PID_FILE); } catch (_) {}
+  }
+
+  /**
+   * Start the toggle loop as a detached Node.js process
+   */
+  static _startToggleLoop() {
+    const loopScript = `
+      import { readFile, writeFile, unlink, mkdir, rename } from 'fs/promises';
+      import { join, dirname } from 'path';
+      import { homedir } from 'os';
+      const TOGGLE_STATE_FILE = join(homedir(), '.ssh-lab-toggle-state.json');
+      const TOGGLE_RESULT_FILE = join(homedir(), '.ssh-lab-toggle-result.json');
+      const TOGGLE_PID_FILE = join(homedir(), '.ssh-lab-toggle.pid');
+      
+      (async () => {
+        try {
+          await writeFile(TOGGLE_PID_FILE, String(process.pid));
+        } catch (e) {
+          process.exit(1);
+        }
+        
+        const SSH = (await import('${__filename.replace(/'/g, "\\'")}')).default;
+        
+        const readState = async () => {
+          try {
+            const data = await readFile(TOGGLE_STATE_FILE, 'utf8');
+            return JSON.parse(data);
+          } catch { return { enabled: false }; }
+        };
+        
+        while (true) {
+          const state = await readState();
+          if (!state.enabled) {
+            break;
+          }
+          
+          const config = state.config || {};
+          try {
+            const result = await SSH._performScan(config);
+            const tmpFile = TOGGLE_RESULT_FILE + '.tmp';
+            await mkdir(dirname(TOGGLE_RESULT_FILE), { recursive: true });
+            await writeFile(tmpFile, JSON.stringify(result), 'utf8');
+            await rename(tmpFile, TOGGLE_RESULT_FILE);
+          } catch (err) {
+            // Silently continue
+          }
+          
+          // Small pause between scans to allow config updates
+          await new Promise(r => setTimeout(r, 200));
+        }
+        
+        try { await unlink(TOGGLE_PID_FILE); } catch (_) {}
+        process.exit(0);
+      })();
+    `;
+    
+    const child = spawn('node', ['--input-type=module', '-e', loopScript], {
+      detached: true,
+      stdio: 'ignore',
+      env: { ...process.env }
+    });
+    child.unref();
+    return child;
+  }
+
+  /**
+   * Load the latest toggle scan result
+   */
+  static async _readToggleResult() {
+    try {
+      const data = await readFile(TOGGLE_RESULT_FILE, 'utf8');
+      return JSON.parse(data);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Enable the toggle background scan with given configuration.
+   * If already enabled with a different config, it will restart the loop.
+   */
+  static async toggleOn(config = {}) {
+    const scanConfig = {
+      concurrency: config.concurrency || 500,
+      networkFilter: config.networkFilter || {},
+      persistentRetryConfig: config.persistentRetryConfig || {
+        maxRetriesScans: 1,
+        enhancedTimeout: 3000,
+        enhancedRetries: 6,
+        maxInactiveScans: 3
+      }
+    };
+
+    const currentState = await this._readToggleState();
+    const isRunning = await this._isToggleProcessRunning();
+
+    if (currentState.enabled && isRunning && this._configsMatch(currentState.config, scanConfig)) {
+      return { success: true, message: 'Toggle already active with same configuration', config: scanConfig };
+    }
+
+    // Stop any existing loop
+    if (isRunning || currentState.enabled) {
+      await this._killToggleProcess();
+    }
+
+    // Write new state
+    await this._writeToggleState({ enabled: true, config: scanConfig });
+
+    // Start loop
+    this._startToggleLoop();
+
+    return { success: true, message: 'Toggle background scan activated', config: scanConfig };
+  }
+
+  /**
+   * Disable the toggle background scan.
+   */
+  static async toggleOff() {
+    const currentState = await this._readToggleState();
+    if (!currentState.enabled) {
+      return { success: true, message: 'Toggle already inactive' };
+    }
+
+    await this._writeToggleState({ enabled: false, config: currentState.config || {} });
+    await this._killToggleProcess();
+
+    return { success: true, message: 'Toggle background scan deactivated' };
+  }
+
+  /**
+   * Get current toggle status: enabled, config, and latest scan result.
+   */
+  static async getToggleStatus() {
+    const state = await this._readToggleState();
+    const isRunning = await this._isToggleProcessRunning();
+    const lastResult = await this._readToggleResult();
+
+    return {
+      enabled: state.enabled,
+      running: isRunning,
+      config: state.config || {},
+      lastResult: lastResult || null
+    };
+  }
+
+  /**
+   * Update the configuration of the toggle scan. If currently enabled, restarts the loop.
+   */
+  static async updateToggleConfig(config = {}) {
+    const currentState = await this._readToggleState();
+    const scanConfig = {
+      concurrency: config.concurrency || 500,
+      networkFilter: config.networkFilter || {},
+      persistentRetryConfig: config.persistentRetryConfig || {
+        maxRetriesScans: 1,
+        enhancedTimeout: 3000,
+        enhancedRetries: 6,
+        maxInactiveScans: 3
+      }
+    };
+
+    if (currentState.enabled) {
+      // Restart with new config
+      await this._killToggleProcess();
+      await this._writeToggleState({ enabled: true, config: scanConfig });
+      this._startToggleLoop();
+      return { success: true, message: 'Toggle config updated and loop restarted', config: scanConfig };
+    } else {
+      await this._writeToggleState({ enabled: false, config: scanConfig });
+      return { success: true, message: 'Toggle config updated (toggle is off)', config: scanConfig };
+    }
+  }
+
+  /**
+   * --------------------------------------------------------------------------
+   * MODIFIED scanNetwork TO USE TOGGLE IF CONFIG MATCHES
+   * --------------------------------------------------------------------------
+   */
+
+  /**
+   * Scan network for SSH hosts with optional background mode.
+   * If the toggle is active and the requested scan config matches the toggle config,
+   * it returns the latest result from the toggle instead of starting a new scan.
    */
   static async scanNetwork(config = {}) {
     const {
@@ -1488,17 +1768,49 @@ exit 1`;
       effectiveNetworkFilter.blacklist = Array.isArray(blacklist) ? blacklist : [blacklist];
     }
 
-    const scanConfig = {
+    const requestedScanConfig = {
       concurrency,
       persistentRetryConfig,
       networkFilter: effectiveNetworkFilter
     };
 
-    if (!background) {
-      return await this._performScan(scanConfig);
+    // --- CHECK TOGGLE ---
+    const toggleState = await this._readToggleState();
+    if (toggleState.enabled && this._configsMatch(toggleState.config, requestedScanConfig)) {
+      const toggleResult = await this._readToggleResult();
+      if (toggleResult) {
+        // Add source indicator and return cached result
+        return {
+          ...toggleResult,
+          source: 'toggle',
+          scanComplete: true,
+          scanInProgress: false,
+          toggleActive: true
+        };
+      } else {
+        // Toggle hasn't produced a result yet, return placeholder
+        return {
+          success: true,
+          message: 'Toggle active but no scan result yet',
+          timestamp: new Date().toISOString(),
+          duration: '0s',
+          total_scanned: 0,
+          accessible: 0,
+          unlocked: 0,
+          hosts: [],
+          scanComplete: false,
+          scanInProgress: true,
+          source: 'toggle'
+        };
+      }
     }
 
-    // BACKGROUND MODE
+    // --- PROCEED WITH NORMAL SCAN ---
+    if (!background) {
+      return await this._performScan(requestedScanConfig);
+    }
+
+    // BACKGROUND MODE (existing logic)
     const savedState = await this._loadScanState();
     const isScanRunning = await this._isBackgroundScanRunning();
     
@@ -1561,7 +1873,7 @@ exit 1`;
     };
 
     if (shouldStartNewScan()) {
-      this._startDetachedBackgroundScan(scanConfig);
+      this._startDetachedBackgroundScan(requestedScanConfig);
     }
 
     return returnState;
@@ -1815,6 +2127,106 @@ exit 1`;
       return false;
     }
   }
+
+  /**
+   * --------------------------------------------------------------------------
+   * HARD RESET - Complete cleanup of all SSH Lab state
+   * --------------------------------------------------------------------------
+   * Removes all files, kills all running processes (background scan + toggle loop),
+   * and resets everything to a pristine state.
+   * Only touches files specifically belonging to this interface (no directory deletion).
+   */
+  static async hardReset() {
+    const results = {
+      filesRemoved: [],
+      filesFailed: [],
+      processesKilled: [],
+      processesFailed: []
+    };
+
+    // 1. Kill toggle loop process if running
+    const toggleState = await this._readToggleState();
+    if (toggleState.enabled || await this._isToggleProcessRunning()) {
+      try {
+        const pidData = await readFile(TOGGLE_PID_FILE, 'utf8').catch(() => null);
+        if (pidData) {
+          const pid = parseInt(pidData.trim());
+          if (pid) {
+            try {
+              process.kill(pid, 'SIGKILL');
+              results.processesKilled.push({ type: 'toggle-loop', pid });
+            } catch (e) {
+              results.processesFailed.push({ type: 'toggle-loop', pid, error: e.message });
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    // 2. Kill background scan process if running
+    const bgScanRunning = await this._isBackgroundScanRunning();
+    if (bgScanRunning) {
+      try {
+        const pidData = await readFile(SCAN_PID_FILE, 'utf8').catch(() => null);
+        if (pidData) {
+          const pid = parseInt(pidData.trim());
+          if (pid) {
+            try {
+              process.kill(pid, 'SIGKILL');
+              results.processesKilled.push({ type: 'background-scan', pid });
+            } catch (e) {
+              results.processesFailed.push({ type: 'background-scan', pid, error: e.message });
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    // 3. Remove all known SSH Lab files (including .tmp files)
+    for (const filePath of ALL_SSH_LAB_FILES) {
+      try {
+        await unlink(filePath);
+        results.filesRemoved.push(filePath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          results.filesFailed.push({ path: filePath, error: error.message });
+        }
+        // ENOENT (file doesn't exist) is fine, just skip
+      }
+    }
+
+    // 4. Also try to remove any orphaned .tmp files that might exist
+    try {
+      const homeDir = homedir();
+      const { readdir } = await import('fs/promises');
+      const files = await readdir(homeDir).catch(() => []);
+      for (const file of files) {
+        if (file.startsWith('.ssh-lab-') && file.endsWith('.tmp')) {
+          const fullPath = join(homeDir, file);
+          try {
+            await unlink(fullPath);
+            if (!results.filesRemoved.includes(fullPath)) {
+              results.filesRemoved.push(fullPath);
+            }
+          } catch (e) {
+            // Ignore
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore
+    }
+
+    return {
+      success: true,
+      message: 'Hard reset complete - all SSH Lab state cleared',
+      details: results
+    };
+  }
 }
 
 // CLI interface
@@ -1836,13 +2248,18 @@ Methods:
   scan-stop                      Stop running background scan
   scan-clear                     Clear scan cache
   test                           Run continuous scans until Ctrl+C, tracking statistics
+  toggle-on                      Enable toggle background scan (continuously scans)
+  toggle-off                     Disable toggle background scan
+  toggle-status                  Show toggle status and latest result
+  toggle-config                  Update toggle scan configuration (restarts if on)
+  hard-reset                     Complete cleanup: kill all processes, remove all files
 
-Network Filter Options (for 'scan' and 'test' methods):
+Network Filter Options (for 'scan', 'test', 'toggle-on', 'toggle-config'):
   --qemu                        Only scan QEMU networks (10.10.10.0/24, 10.10.11.0/24)
   --whitelist=<cidr>            Only scan networks matching this CIDR (can be repeated)
   --blacklist=<cidr>            Exclude networks matching this CIDR (can be repeated)
 
-Scan Options (for 'scan' method):
+Scan Options (for 'scan', 'toggle-on', 'toggle-config'):
   --background              Enable background scanning mode
   --force                   Force start new scan even if one is running
   --concurrency=<n>         Max concurrent connections (default: 500)
@@ -1856,31 +2273,15 @@ Test Options (for 'test' method):
   --min-unlocked=<n>        Minimum unlocked IPs required for success (default: 0, disabled)
   --min-accessible=<n>      Minimum accessible IPs required for success (default: 0, disabled)
 
-Examples:
-  node ssh-lab.mjs setup
-  node ssh-lab.mjs copy 10.10.10.10 password123 root
-  node ssh-lab.mjs check 10.10.10.10
-  node ssh-lab.mjs full 10.10.10.10 password123 root
-  node ssh-lab.mjs unlock-check 10.10.10.10 root
-  node ssh-lab.mjs interfaces
-  node ssh-lab.mjs interfaces --qemu
-  node ssh-lab.mjs scan
-  node ssh-lab.mjs scan --qemu
-  node ssh-lab.mjs scan --whitelist=10.10.10.0/24
-  node ssh-lab.mjs scan --blacklist=192.168.0.0/16
-  node ssh-lab.mjs scan --qemu --whitelist=10.10.11.0/24
-  node ssh-lab.mjs scan --background
-  node ssh-lab.mjs scan --background --force --qemu
-  node ssh-lab.mjs scan --persistent-retries=2
-  node ssh-lab.mjs scan --max-inactive-scans=2
-  node ssh-lab.mjs scan-status
-  node ssh-lab.mjs test
-  node ssh-lab.mjs test --qemu
-  node ssh-lab.mjs test --whitelist=10.10.10.0/24
-  node ssh-lab.mjs test --min-unlocked=3
-  node ssh-lab.mjs test --qemu --min-unlocked=3 --min-accessible=5
-  node ssh-lab.mjs test --persistent-retries=2 --min-unlocked=3 --max-inactive-scans=5
-  node ssh-lab.mjs test --concurrency=1000 --qemu
+Toggle Examples:
+  node ssh-lab.mjs toggle-on --qemu
+  node ssh-lab.mjs toggle-on --whitelist=10.10.10.0/24 --concurrency=1000
+  node ssh-lab.mjs toggle-off
+  node ssh-lab.mjs toggle-status
+  node ssh-lab.mjs toggle-config --blacklist=192.168.0.0/16
+
+Hard Reset:
+  node ssh-lab.mjs hard-reset
 `;
 
   if (!method) {
@@ -2017,6 +2418,83 @@ Examples:
           
           await SSH.testMode(testConfig);
           process.exit(0);
+          break;
+        }
+
+        case 'toggle-on': {
+          const toggleConfig = {
+            concurrency: 500,
+            networkFilter: {
+              qemuOnly: args.includes('--qemu'),
+              whitelist: args.filter(a => a.startsWith('--whitelist=')).map(a => a.split('=')[1]),
+              blacklist: args.filter(a => a.startsWith('--blacklist=')).map(a => a.split('=')[1])
+            }
+          };
+          
+          const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
+          if (concurrencyArg) {
+            toggleConfig.concurrency = parseInt(concurrencyArg.split('=')[1]) || 500;
+          }
+          
+          const persistentRetriesArg = args.find(a => a.startsWith('--persistent-retries='));
+          const maxInactiveScansArg = args.find(a => a.startsWith('--max-inactive-scans='));
+          
+          if (persistentRetriesArg || maxInactiveScansArg) {
+            toggleConfig.persistentRetryConfig = {
+              maxRetriesScans: persistentRetriesArg ? (parseInt(persistentRetriesArg.split('=')[1]) || 1) : 1,
+              enhancedTimeout: 3000,
+              enhancedRetries: 6,
+              maxInactiveScans: maxInactiveScansArg ? (parseInt(maxInactiveScansArg.split('=')[1]) || 3) : 3
+            };
+          }
+          
+          result = await SSH.toggleOn(toggleConfig);
+          break;
+        }
+
+        case 'toggle-off': {
+          result = await SSH.toggleOff();
+          break;
+        }
+
+        case 'toggle-status': {
+          result = await SSH.getToggleStatus();
+          break;
+        }
+
+        case 'toggle-config': {
+          const toggleConfig = {
+            concurrency: 500,
+            networkFilter: {
+              qemuOnly: args.includes('--qemu'),
+              whitelist: args.filter(a => a.startsWith('--whitelist=')).map(a => a.split('=')[1]),
+              blacklist: args.filter(a => a.startsWith('--blacklist=')).map(a => a.split('=')[1])
+            }
+          };
+          
+          const concurrencyArg = args.find(a => a.startsWith('--concurrency='));
+          if (concurrencyArg) {
+            toggleConfig.concurrency = parseInt(concurrencyArg.split('=')[1]) || 500;
+          }
+          
+          const persistentRetriesArg = args.find(a => a.startsWith('--persistent-retries='));
+          const maxInactiveScansArg = args.find(a => a.startsWith('--max-inactive-scans='));
+          
+          if (persistentRetriesArg || maxInactiveScansArg) {
+            toggleConfig.persistentRetryConfig = {
+              maxRetriesScans: persistentRetriesArg ? (parseInt(persistentRetriesArg.split('=')[1]) || 1) : 1,
+              enhancedTimeout: 3000,
+              enhancedRetries: 6,
+              maxInactiveScans: maxInactiveScansArg ? (parseInt(maxInactiveScansArg.split('=')[1]) || 3) : 3
+            };
+          }
+          
+          result = await SSH.updateToggleConfig(toggleConfig);
+          break;
+        }
+
+        case 'hard-reset': {
+          result = await SSH.hardReset();
           break;
         }
 
