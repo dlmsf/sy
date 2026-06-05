@@ -1,7 +1,7 @@
 // ssh-lab.mjs - ULTRA RELIABLE VERSION WITH TOGGLE BACKGROUND SCAN
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
-import { mkdir, writeFile, chmod, access, readFile, unlink, rename } from 'fs/promises';
+import { mkdir, writeFile, chmod, access, readFile, unlink, rename, rm } from 'fs/promises';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { networkInterfaces } from 'os';
@@ -20,6 +20,20 @@ const PERSISTENT_HOSTS_FILE = join(homedir(), '.ssh-lab-persistent-hosts.json');
 const TOGGLE_STATE_FILE = join(homedir(), '.ssh-lab-toggle-state.json');
 const TOGGLE_PID_FILE = join(homedir(), '.ssh-lab-toggle.pid');
 const TOGGLE_RESULT_FILE = join(homedir(), '.ssh-lab-toggle-result.json');
+
+// All files related to this interface (for cleanup/hard reset)
+const ALL_SSH_LAB_FILES = [
+  SCAN_STATE_FILE,
+  SCAN_PID_FILE,
+  PERSISTENT_HOSTS_FILE,
+  TOGGLE_STATE_FILE,
+  TOGGLE_PID_FILE,
+  TOGGLE_RESULT_FILE,
+  join(homedir(), '.ssh-lab-scan-state.json.tmp'),
+  join(homedir(), '.ssh-lab-toggle-state.json.tmp'),
+  join(homedir(), '.ssh-lab-toggle-result.json.tmp'),
+  join(homedir(), '.ssh-lab-persistent-hosts.json.tmp'),
+];
 
 // QEMU default networks
 const QEMU_NETWORKS = ['10.10.10.0/24', '10.10.11.0/24'];
@@ -2113,6 +2127,106 @@ exit 1`;
       return false;
     }
   }
+
+  /**
+   * --------------------------------------------------------------------------
+   * HARD RESET - Complete cleanup of all SSH Lab state
+   * --------------------------------------------------------------------------
+   * Removes all files, kills all running processes (background scan + toggle loop),
+   * and resets everything to a pristine state.
+   * Only touches files specifically belonging to this interface (no directory deletion).
+   */
+  static async hardReset() {
+    const results = {
+      filesRemoved: [],
+      filesFailed: [],
+      processesKilled: [],
+      processesFailed: []
+    };
+
+    // 1. Kill toggle loop process if running
+    const toggleState = await this._readToggleState();
+    if (toggleState.enabled || await this._isToggleProcessRunning()) {
+      try {
+        const pidData = await readFile(TOGGLE_PID_FILE, 'utf8').catch(() => null);
+        if (pidData) {
+          const pid = parseInt(pidData.trim());
+          if (pid) {
+            try {
+              process.kill(pid, 'SIGKILL');
+              results.processesKilled.push({ type: 'toggle-loop', pid });
+            } catch (e) {
+              results.processesFailed.push({ type: 'toggle-loop', pid, error: e.message });
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    // 2. Kill background scan process if running
+    const bgScanRunning = await this._isBackgroundScanRunning();
+    if (bgScanRunning) {
+      try {
+        const pidData = await readFile(SCAN_PID_FILE, 'utf8').catch(() => null);
+        if (pidData) {
+          const pid = parseInt(pidData.trim());
+          if (pid) {
+            try {
+              process.kill(pid, 'SIGKILL');
+              results.processesKilled.push({ type: 'background-scan', pid });
+            } catch (e) {
+              results.processesFailed.push({ type: 'background-scan', pid, error: e.message });
+            }
+          }
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+
+    // 3. Remove all known SSH Lab files (including .tmp files)
+    for (const filePath of ALL_SSH_LAB_FILES) {
+      try {
+        await unlink(filePath);
+        results.filesRemoved.push(filePath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          results.filesFailed.push({ path: filePath, error: error.message });
+        }
+        // ENOENT (file doesn't exist) is fine, just skip
+      }
+    }
+
+    // 4. Also try to remove any orphaned .tmp files that might exist
+    try {
+      const homeDir = homedir();
+      const { readdir } = await import('fs/promises');
+      const files = await readdir(homeDir).catch(() => []);
+      for (const file of files) {
+        if (file.startsWith('.ssh-lab-') && file.endsWith('.tmp')) {
+          const fullPath = join(homeDir, file);
+          try {
+            await unlink(fullPath);
+            if (!results.filesRemoved.includes(fullPath)) {
+              results.filesRemoved.push(fullPath);
+            }
+          } catch (e) {
+            // Ignore
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore
+    }
+
+    return {
+      success: true,
+      message: 'Hard reset complete - all SSH Lab state cleared',
+      details: results
+    };
+  }
 }
 
 // CLI interface
@@ -2138,6 +2252,7 @@ Methods:
   toggle-off                     Disable toggle background scan
   toggle-status                  Show toggle status and latest result
   toggle-config                  Update toggle scan configuration (restarts if on)
+  hard-reset                     Complete cleanup: kill all processes, remove all files
 
 Network Filter Options (for 'scan', 'test', 'toggle-on', 'toggle-config'):
   --qemu                        Only scan QEMU networks (10.10.10.0/24, 10.10.11.0/24)
@@ -2164,6 +2279,9 @@ Toggle Examples:
   node ssh-lab.mjs toggle-off
   node ssh-lab.mjs toggle-status
   node ssh-lab.mjs toggle-config --blacklist=192.168.0.0/16
+
+Hard Reset:
+  node ssh-lab.mjs hard-reset
 `;
 
   if (!method) {
@@ -2372,6 +2490,11 @@ Toggle Examples:
           }
           
           result = await SSH.updateToggleConfig(toggleConfig);
+          break;
+        }
+
+        case 'hard-reset': {
+          result = await SSH.hardReset();
           break;
         }
 
