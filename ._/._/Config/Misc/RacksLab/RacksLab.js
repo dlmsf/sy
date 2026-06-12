@@ -18,6 +18,13 @@ class RacksLab extends SyAPP.Func(){
                     this.Alert(uid,this.TextColor.green('Alpine lauched !'))
                  }
 
+                 if(props.ubuntu){
+                    
+                    Qemu.startVM({os : 'ubuntu'})
+                    this.Alert(uid,' ')
+                    this.Alert(uid,this.TextColor.green('Ubuntu lauched !'))
+                 }
+
                  let racks = await SSH.scanNetwork({background : true,qemu : true})
 
                  //await this.WaitLog(racks)
