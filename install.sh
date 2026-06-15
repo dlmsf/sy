@@ -51,6 +51,36 @@ SHELL_SCRIPTS_SRC="./._/._/._/Qemu/qemu.sh ._/._/._/Util/lay.sh"    # ← Add yo
 SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 
 # =============================================================================
+# POST-INSTALL SCRIPTS CONFIGURATION
+# =============================================================================
+# Format: Each line specifies a script to execute after installation completes.
+#         Script paths are relative to the installation directory ($INSTALL_DIR).
+#         Arguments after the script path will be passed directly to the script.
+#
+# Supported script types by extension:
+#   .sh  - Executed with /bin/sh
+#   .js  - Executed with node
+#   .py  - Executed with python3
+#   (other extensions default to /bin/sh execution)
+#
+# Lines starting with # are treated as comments and ignored.
+# Empty lines are ignored.
+#
+# Examples:
+#   scripts/deploy_model.sh
+#   core/setup.js --port 3000 --database postgres
+#   utils/migrate.sh --force --no-backup
+#   scripts/seed_data.js --env production --count 1000
+#
+POST_INSTALL_SCRIPTS="
+# scripts/deploy_model.sh
+# scripts/setup_config.js --port 8080 --env production
+# core/init_database.sh --force
+# utils/health_check.js --timeout 30
+"
+# =============================================================================
+
+# =============================================================================
 # COMMAND WORKING DIRECTORY CONFIGURATION
 # =============================================================================
 # WORKING DIRECTORY TYPES:
@@ -1676,7 +1706,7 @@ check_node() {
 
 # =============================================================================
 # NODE.JS INSTALLATION FUNCTIONS
-# Pattern: Try direct install first → if fails, update → retry install
+# Pattern: Try direct install first → if fails → update → retry install
 # =============================================================================
 
 # Install Node.js using apt (Ubuntu/Debian/Mint/Pop/Elementary/Zorin)
@@ -2891,6 +2921,161 @@ EOF
     create_shell_command_links "$install_dir"
 }
 
+# =============================================================================
+# POST-INSTALL SCRIPTS EXECUTION
+# =============================================================================
+# Executes user-configured scripts after installation completes.
+# Supports .sh, .js, .py and other script types.
+# Scripts run from the installation directory context.
+# Arguments can be passed to individual scripts.
+# Failure of one script does not halt execution of remaining scripts.
+
+execute_post_install_scripts() {
+    install_dir="$1"
+    
+    # Skip if no post-install scripts are configured
+    if [ -z "$POST_INSTALL_SCRIPTS" ]; then
+        return 0
+    fi
+    
+    log_message "========================================="
+    log_message "Executing post-installation scripts..."
+    log_message "========================================="
+    
+    original_directory=$(pwd)
+    
+    # Change to installation directory since script paths are relative to it
+    cd "$install_dir" || {
+        log_message "Error: Cannot change to installation directory: $install_dir"
+        return 1
+    }
+    
+    scripts_executed=0
+    scripts_succeeded=0
+    scripts_failed=0
+    scripts_skipped=0
+    
+    echo "$POST_INSTALL_SCRIPTS" | while IFS= read -r line; do
+        # Skip empty lines
+        if [ -z "$line" ]; then
+            continue
+        fi
+        
+        # Remove leading and trailing whitespace
+        line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        
+        # Skip lines that are still empty after trimming
+        if [ -z "$line" ]; then
+            continue
+        fi
+        
+        # Skip comment lines (lines starting with #)
+        case "$line" in
+            \#*)
+                continue
+                ;;
+        esac
+        
+        # Extract the script path (first token)
+        script_path=$(echo "$line" | awk '{print $1}')
+        
+        # Extract any additional arguments (all tokens after the first)
+        script_arguments=$(echo "$line" | cut -d' ' -f2-)
+        
+        # Check if the script argument extraction is the same as the script path (no arguments case)
+        if [ "$script_arguments" = "$script_path" ]; then
+            script_arguments=""
+        fi
+        
+        # Determine the executor based on file extension
+        executor=""
+        case "$script_path" in
+            *.js)
+                executor="node"
+                ;;
+            *.sh)
+                executor="sh"
+                ;;
+            *.py)
+                executor="python3"
+                ;;
+            *.rb)
+                executor="ruby"
+                ;;
+            *.pl)
+                executor="perl"
+                ;;
+            *)
+                # Default to sh for unknown extensions
+                executor="sh"
+                ;;
+        esac
+        
+        # Validate that the script file exists
+        if [ ! -f "$script_path" ]; then
+            log_message "  ⚠ WARNING: Post-install script not found: $script_path"
+            scripts_skipped=$((scripts_skipped + 1))
+            continue
+        fi
+        
+        # Make the script executable if it isn't already
+        chmod +x "$script_path" 2>/dev/null || true
+        
+        # Log the script being executed
+        if [ -n "$script_arguments" ]; then
+            log_message "  Executing: $executor $script_path $script_arguments"
+        else
+            log_message "  Executing: $executor $script_path"
+        fi
+        
+        # Execute the script with its arguments
+        scripts_executed=$((scripts_executed + 1))
+        
+        if [ "$LOG_MODE" = true ]; then
+            # In log mode, capture output to log file
+            if $executor "$script_path" $script_arguments >> "$LOG_FILE" 2>&1; then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+        else
+            # In normal mode, show output
+            if $executor "$script_path" $script_arguments; then
+                exit_code=0
+            else
+                exit_code=$?
+            fi
+        fi
+        
+        # Report the result
+        if [ "$exit_code" -eq 0 ]; then
+            log_message "  ✓ SUCCESS: $script_path completed successfully"
+            scripts_succeeded=$((scripts_succeeded + 1))
+        else
+            log_message "  ✗ FAILED: $script_path exited with code $exit_code"
+            scripts_failed=$((scripts_failed + 1))
+        fi
+        
+    done
+    
+    # Return to original directory
+    cd "$original_directory" || true
+    
+    log_message "========================================="
+    log_message "Post-install scripts summary:"
+    log_message "  Total executed: $scripts_executed"
+    log_message "  Succeeded: $scripts_succeeded"
+    log_message "  Failed: $scripts_failed"
+    log_message "  Skipped (not found): $scripts_skipped"
+    log_message "========================================="
+    
+    return 0
+}
+
+# =============================================================================
+# END OF POST-INSTALL SCRIPTS EXECUTION
+# =============================================================================
+
 cleanup() {
     sudo dpkg --configure -a > /dev/null 2>&1 || true
 }
@@ -2988,6 +3173,10 @@ preserve_files_from_backup
 [ -n "$PM2_TAR_GZ" ] && extract_archive "$PM2_TAR_GZ" "$PM2_EXTRACT_DIR"
 
 create_command_links "$INSTALL_DIR"
+
+# Execute post-installation scripts after all main installation steps are complete
+execute_post_install_scripts "$INSTALL_DIR"
+
 cleanup
 
 log_message "$PROJECT_NAME installation completed!"
