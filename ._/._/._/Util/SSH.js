@@ -190,6 +190,145 @@ static async connect(host, options = {}) {
   });
 }
 
+/**
+ * Send files via SCP to remote host
+ * @param {string} host - Target IP
+ * @param {string|Array<string>} paths - File(s) to send
+ * @param {Object} options - Options
+ * @param {string} options.user - SSH user (default: 'root')
+ * @param {string} options.password - SSH password (optional)
+ * @param {string} options.dest - Remote destination (default: /home/)
+ * @param {number} options.port - SSH port (default: 22)
+ * @returns {Promise<Object>}
+ */
+static async scp(host, paths, options = {}) {
+  const { user = 'root', password = null, dest = '/home/', port = 22 } = options;
+  
+  if (!host || !paths) return { success: false, message: 'Host and paths required' };
+
+  const sources = Array.isArray(paths) ? paths : [paths];
+  const destPath = dest.endsWith('/') ? dest : dest + '/';
+  
+  console.error(`[scp] Sending ${sources.length} file(s) to ${user}@${host}:${destPath}`);
+
+  // Build base SCP args
+  const scpArgs = [
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'UserKnownHostsFile=/dev/null',
+    '-o', 'ConnectTimeout=10',
+    '-r', '-p', '-C',
+    '-P', String(port)
+  ];
+
+  // Authentication
+  let useSshpass = false;
+  if (password) {
+    const hasSshpass = await this._ensureSshpass();
+    if (hasSshpass) useSshpass = true;
+    else scpArgs.push('-i', join(homedir(), '.ssh', 'id_rsa'));
+  } else {
+    scpArgs.push('-i', join(homedir(), '.ssh', 'id_rsa'), '-o', 'BatchMode=yes');
+  }
+
+  // Create dest directory
+  const mkdirCmd = password 
+    ? `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -p ${port} ${user}@${host} "mkdir -p ${destPath}"`
+    : `ssh -o StrictHostKeyChecking=no -o BatchMode=yes -p ${port} ${user}@${host} "mkdir -p ${destPath}"`;
+  await this._exec(mkdirCmd);
+
+  // Transfer files
+  const results = [];
+  for (const source of sources) {
+    const cmd = useSshpass 
+      ? `sshpass -p '${password.replace(/'/g, "'\\''")}' scp ${scpArgs.join(' ')} "${source}" ${user}@${host}:"${destPath}"`
+      : `scp ${scpArgs.join(' ')} "${source}" ${user}@${host}:"${destPath}"`;
+    
+    const result = await this._exec(cmd, { timeout: 300000 });
+    results.push({
+      file: source,
+      success: result.success,
+      error: result.success ? null : (result.stderr || result.error)
+    });
+    
+    console.error(`[scp] ${result.success ? '✓' : '✗'} ${source}`);
+  }
+
+  const successCount = results.filter(r => r.success).length;
+  return {
+    success: successCount === sources.length,
+    message: `${successCount}/${sources.length} files sent to ${host}:${destPath}`,
+    files: results
+  };
+}
+
+/**
+ * Execute command(s) on remote host in background (nohup)
+ * @param {string} host - Target IP
+ * @param {string|Array<string>} commands - Command(s) to execute
+ * @param {Object} options - Options
+ * @param {string} options.user - SSH user (default: 'root')
+ * @param {string} options.password - SSH password (optional)
+ * @param {number} options.port - SSH port (default: 22)
+ * @returns {Promise<Object>}
+ */
+static async execBg(host, commands, options = {}) {
+  const { user = 'root', password = null, port = 22 } = options;
+  
+  if (!host || !commands) return { success: false, message: 'Host and commands required' };
+
+  const cmds = Array.isArray(commands) ? commands : [commands];
+  const script = cmds.map(c => `nohup sh -c '${c.replace(/'/g, "'\\''")}' > /dev/null 2>&1 &`).join('\n');
+  
+  console.error(`[execBg] Running ${cmds.length} command(s) on ${user}@${host}`);
+
+  const sshCmd = password
+    ? `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${port} ${user}@${host} '${script}'`
+    : `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -p ${port} ${user}@${host} '${script}'`;
+
+  const result = await this._exec(sshCmd);
+  
+  return {
+    success: result.success,
+    message: result.success ? `${cmds.length} command(s) started in background` : 'Failed to execute',
+    error: result.success ? null : (result.stderr || result.error)
+  };
+}
+
+/**
+ * Execute command(s) on remote host and wait for result
+ * @param {string} host - Target IP
+ * @param {string|Array<string>} commands - Command(s) to execute
+ * @param {Object} options - Options
+ * @param {string} options.user - SSH user (default: 'root')
+ * @param {string} options.password - SSH password (optional)
+ * @param {number} options.port - SSH port (default: 22)
+ * @param {number} options.timeout - Timeout in ms (default: 30000)
+ * @returns {Promise<Object>}
+ */
+static async exec(host, commands, options = {}) {
+  const { user = 'root', password = null, port = 22, timeout = 30000 } = options;
+  
+  if (!host || !commands) return { success: false, message: 'Host and commands required' };
+
+  const cmds = Array.isArray(commands) ? commands : [commands];
+  const script = cmds.join(' && ');
+  
+  console.error(`[exec] Running ${cmds.length} command(s) on ${user}@${host}`);
+
+  const sshCmd = password
+    ? `sshpass -p '${password.replace(/'/g, "'\\''")}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${port} ${user}@${host} '${script}'`
+    : `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes -p ${port} ${user}@${host} '${script}'`;
+
+  const result = await this._exec(sshCmd, { timeout });
+  
+  return {
+    success: result.success,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    message: result.success ? 'Commands executed successfully' : 'Command execution failed'
+  };
+}
+
   /**
    * Setup SSH directory and config
    */
@@ -2362,6 +2501,9 @@ Methods:
   toggle-status                  Show toggle status and latest result
   toggle-config                  Update toggle scan configuration (restarts if on)
   hard-reset                     Complete cleanup: kill all processes, remove all files
+  scp <host> <files...>        Send files via SCP (default dest: /home/)
+  exec <host> <commands...>    Execute commands and wait for result
+  exec-bg <host> <commands...> Execute commands in background (nohup)
 
 Network Filter Options (for 'scan', 'test', 'toggle-on', 'toggle-config'):
   --qemu                        Only scan QEMU networks (10.10.10.0/24, 10.10.11.0/24)
@@ -2434,6 +2576,82 @@ Hard Reset:
             process.exit(1);
           }
           result = await SSH.fullSetup(host, password, user);
+          break;
+        }
+
+        case 'exec': {
+          const pathArgs = args.filter(a => !a.startsWith('--'));
+          
+          if (pathArgs.length < 2) {
+            console.error('Usage: node ssh-lab.mjs exec <host> <command> [command2...] [--user=<user>] [--password=<pass>] [--timeout=<ms>]');
+            console.error('Examples:');
+            console.error('  node ssh-lab.mjs exec 10.10.10.100 "ls -la /home"');
+            console.error('  node ssh-lab.mjs exec 10.10.10.100 "whoami" "id" "pwd"');
+            console.error('  node ssh-lab.mjs exec 192.168.1.100 "cat /etc/passwd" --password=secret123');
+            process.exit(1);
+          }
+          
+          const host = pathArgs[0];
+          const commands = pathArgs.slice(1);
+          
+          const execOptions = {
+            user: args.find(a => a.startsWith('--user='))?.split('=')[1] || 'root',
+            port: parseInt(args.find(a => a.startsWith('--port='))?.split('=')[1] || '22'),
+            password: args.find(a => a.startsWith('--password='))?.split('=')[1] || null,
+            timeout: parseInt(args.find(a => a.startsWith('--timeout='))?.split('=')[1] || '30000')
+          };
+          
+          result = await SSH.exec(host, commands.length === 1 ? commands[0] : commands, execOptions);
+          break;
+        }
+        
+        case 'exec-bg': {
+          const pathArgs = args.filter(a => !a.startsWith('--'));
+          
+          if (pathArgs.length < 2) {
+            console.error('Usage: node ssh-lab.mjs exec-bg <host> <command> [command2...] [--user=<user>] [--password=<pass>]');
+            console.error('Examples:');
+            console.error('  node ssh-lab.mjs exec-bg 10.10.10.100 "sleep 3600"');
+            console.error('  node ssh-lab.mjs exec-bg 10.10.10.100 "curl http://example.com" "wget http://test.com"');
+            process.exit(1);
+          }
+          
+          const host = pathArgs[0];
+          const commands = pathArgs.slice(1);
+          
+          const execOptions = {
+            user: args.find(a => a.startsWith('--user='))?.split('=')[1] || 'root',
+            port: parseInt(args.find(a => a.startsWith('--port='))?.split('=')[1] || '22'),
+            password: args.find(a => a.startsWith('--password='))?.split('=')[1] || null
+          };
+          
+          result = await SSH.execBg(host, commands.length === 1 ? commands[0] : commands, execOptions);
+          break;
+        }
+
+        case 'scp': {
+          const pathArgs = args.filter(a => !a.startsWith('--'));
+          
+          if (pathArgs.length < 2) {
+            console.error('Usage: node ssh-lab.mjs scp <host> <file1> [file2...] [--dest=<path>] [--user=<user>] [--password=<pass>]');
+            console.error('Examples:');
+            console.error('  node ssh-lab.mjs scp 10.10.10.100 ./myfile.txt');
+            console.error('  node ssh-lab.mjs scp 10.10.10.100 file1.txt file2.txt --dest=/opt/app/');
+            console.error('  node ssh-lab.mjs scp 192.168.1.100 script.sh --password=secret123');
+            process.exit(1);
+          }
+          
+          const host = pathArgs[0];
+          const files = pathArgs.slice(1);
+          
+          const scpOptions = {
+            user: args.find(a => a.startsWith('--user='))?.split('=')[1] || 'root',
+            port: parseInt(args.find(a => a.startsWith('--port='))?.split('=')[1] || '22'),
+            password: args.find(a => a.startsWith('--password='))?.split('=')[1] || null,
+            dest: args.find(a => a.startsWith('--dest='))?.split('=')[1] || '/home/'
+          };
+          
+          result = await SSH.scp(host, files.length === 1 ? files[0] : files, scpOptions);
           break;
         }
 
