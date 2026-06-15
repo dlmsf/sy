@@ -1495,10 +1495,17 @@ do_build() {
     file_count=$(find "$temp_build" -type f | wc -l)
     rm -f "$EXCLUDE_LIST" "$EXCLUDE_DIRS_LIST" "$BUILD_FILES_LIST" "$BUILD_DIRS_LIST" "$BUILD_EXCLUDE_DIRS_LIST"
     
-    if [ "$BUILD_TAR" = true ]; then
+       if [ "$BUILD_TAR" = true ]; then
         tar_file="$build_path.tar.gz"
         [ -f "$tar_file" ] && rm -f "$tar_file"
-        (cd "$temp_build" && tar -czf "$tar_file" .)
+        # Wrap files in directory to prevent tar bomb on extraction
+        mkdir -p "$temp_build/$build_name"
+        for item in "$temp_build"/* "$temp_build"/.[!.]* "$temp_build"/..?*; do
+            [ -e "$item" ] || continue
+            [ "$item" = "$temp_build/$build_name" ] && continue
+            mv "$item" "$temp_build/$build_name/" 2>/dev/null
+        done
+        (cd "$temp_build" && tar -czf "$tar_file" "$build_name")
         if [ $? -eq 0 ]; then
             archive_size=$(ls -lh "$tar_file" | awk '{print $5}')
             echo ""; echo "========================================="; echo "  BUILD COMPLETE"; echo "========================================="
