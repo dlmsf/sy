@@ -3128,13 +3128,15 @@ class SyAPP_Func {
    * @param {boolean} [config.log=false] - Enable logging
    * @param {Array<Function>} [config.linked=[]] - Linked functions
    * @param {string} [config.group=''] - Group name for routes
+   * @param {boolean|null} [config.refreshMode=null] - Refresh mode override (null=use global, true=force on, false=force off)
    */
   constructor(name, build = async (props = { session: new Session }) => { }, config = {
     routes: [{ name: '', stream: false, method: '', input_model: {}, output_model: {}, input_validate: {} }],
     userid_only: false,
     log: false,
     linked: [],
-    group: ''
+    group: '',
+    refreshMode: null
   }) {
     /** @type {string} */
     this.Name = name
@@ -3148,6 +3150,8 @@ class SyAPP_Func {
     this.Routes = config.routes || []
     /** @type {string} */
     this.Group = config.group || ''
+    /** @type {boolean|null} Refresh mode override */
+    this.RefreshMode = config.refreshMode !== undefined ? config.refreshMode : null
 
 /** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
 this.AlertStorage = new Map()
@@ -5314,6 +5318,9 @@ class NotFounded extends SyAPP_Func {
         let uid = props.session.UniqueID
         this.Text(uid, `Func ${this.TextColor.brightRed(props.notfounded_func)} not founded !`)
         this.Button(uid, { name: '← Return', path: props.session.PreviousPath, props: props.session.PreviousProps })
+      },
+      {
+        refreshMode: false // Error pages shouldn't auto-refresh
       }
     )
   }
@@ -5335,6 +5342,9 @@ class Error extends SyAPP_Func {
         if (props.error_message) { this.Alert(uid, props.error_message.toString()) }
         this.SideButton(uid, { name: '← Return', path: props.session.PreviousPath })
         this.SideButton(uid, { name: '⌂ Main Func', path: props.mainfunc })
+      },
+      {
+        refreshMode: false // Error pages shouldn't auto-refresh
       }
     )
   }
@@ -5621,6 +5631,7 @@ class AdminManager {
       baseRoute: this.syapp.serverConfig.baseRoute,
       includeFuncName: this.syapp.serverConfig.includeFuncName,
       hasRefresher: !!this.syapp.Refresher,
+      globalRefreshMode: this.syapp.GlobalRefreshMode,
       refreshInterval: this.syapp._refreshInterval || 500,
       timestamp: new Date().toISOString()
     };
@@ -5733,6 +5744,9 @@ class AdminManager {
       useridOnly: func.UserID_Only || false,
       hasLogging: func.Log || false,
       hasAlertConfig: !!func.AlertConfig,
+      refreshMode: func.RefreshMode,
+      refreshStatus: func.RefreshMode === null ? 'using global' : 
+                     func.RefreshMode === true ? 'always on' : 'always off',
       storageStats: {
         userStorage: func.UserStorage ? func.UserStorage.size : 0,
         alertStorage: func.AlertStorage ? func.AlertStorage.size : 0,
@@ -5993,28 +6007,109 @@ class SyAPP {
     // Store refresh interval for admin stats
     this._refreshInterval = userConfig.RefreshInterval || 500;
 
+    // Store global refresh mode setting
+    this.GlobalRefreshMode = userConfig.RefreshMode !== false; // true by default if not set to false
+
+    // Per-function refreshers storage
+    this._perFunctionRefreshers = new Map();
+
+    /**
+     * Start a per-function refresher for functions with RefreshMode = true
+     * @param {string} funcName - Function name
+     * @param {SyAPP_Func} funcInstance - Function instance
+     * @private
+     */
+    this._startPerFunctionRefresher = (funcName, funcInstance) => {
+      if (this._perFunctionRefreshers.has(funcName)) {
+        return; // Already running
+      }
+      
+      const intervalId = setInterval(() => {
+        // Find all sessions currently on this function
+        for (const [sessionId, session] of this.Sessions) {
+          if (session.ActualPath === funcName) {
+            if (session.ActualProps?.page) {
+              this.LoadScreen(funcName, {
+                props: {
+                  page: session.ActualProps.page,
+                  _isRefresh: true
+                }
+              });
+            } else {
+              this.LoadScreen(funcName, {
+                props: {
+                  _isRefresh: true
+                }
+              });
+            }
+          }
+        }
+      }, this._refreshInterval);
+      
+      this._perFunctionRefreshers.set(funcName, intervalId);
+    };
+
+    /**
+     * Stop a per-function refresher
+     * @param {string} funcName - Function name
+     * @private
+     */
+    this._stopPerFunctionRefresher = (funcName) => {
+      const intervalId = this._perFunctionRefreshers.get(funcName);
+      if (intervalId) {
+        clearInterval(intervalId);
+        this._perFunctionRefreshers.delete(funcName);
+      }
+    };
+
+    /**
+     * Check if a function should be refreshed
+     * @param {string} funcName - Function name
+     * @returns {boolean} Whether the function should refresh
+     * @private
+     */
+    this._shouldRefreshFunction = (funcName) => {
+      const func = this.Funcs.get(funcName);
+      if (!func) return this.GlobalRefreshMode; // Use global if function not found
+      
+      if (func.RefreshMode !== null) {
+        return func.RefreshMode; // Function has explicit setting
+      }
+      
+      return this.GlobalRefreshMode; // Use global setting
+    };
+
     // Refresh mode
-    if (!userConfig.RefreshMode) {
+    if (this.GlobalRefreshMode) {
       this.Refresher = setInterval(async () => {  
         let sessions = [...this.Sessions.keys()]
         
         sessions.forEach(k => {
-          if (this.Sessions.get(k).ActualProps.page) {
-            this.LoadScreen(this.Sessions.get(k).ActualPath, {
-              props: {
-                page: this.Sessions.get(k).ActualProps.page,
-                _isRefresh: true
-              }
-            })
-          } else {
-            this.LoadScreen(this.Sessions.get(k).ActualPath, {
-              props: {
-                _isRefresh: true
-              }
-            })
+          const session = this.Sessions.get(k);
+          const currentFuncName = session.ActualPath;
+          
+          // Check if the current function allows refresh
+          if (this._shouldRefreshFunction(currentFuncName)) {
+            if (session.ActualProps?.page) {
+              this.LoadScreen(currentFuncName, {
+                props: {
+                  page: session.ActualProps.page,
+                  _isRefresh: true
+                }
+              })
+            } else {
+              this.LoadScreen(currentFuncName, {
+                props: {
+                  _isRefresh: true
+                }
+              })
+            }
           }
         })
       }, this._refreshInterval);
+    } else {
+      // Global refresh is disabled, but we'll start per-function refreshers
+      // for functions that explicitly enable it (handled in ProcessFuncs)
     }
 
     /**
@@ -6035,6 +6130,11 @@ class SyAPP {
           originalInstance.CustomName = this.serverConfig.mainFuncName;
           originalInstance._syappInstance = this;
           this.Funcs.set(funcName, originalInstance);
+          
+          // Start per-function refresher if needed
+          if (!this.GlobalRefreshMode && originalInstance.RefreshMode === true) {
+            this._startPerFunctionRefresher(funcName, originalInstance);
+          }
         }
         
         // Register with custom name
@@ -6049,6 +6149,11 @@ class SyAPP {
             configurable: true
           });
           this.Funcs.set(this.serverConfig.mainFuncName, customInstance);
+          
+          // Start per-function refresher if needed
+          if (!this.GlobalRefreshMode && customInstance.RefreshMode === true) {
+            this._startPerFunctionRefresher(this.serverConfig.mainFuncName, customInstance);
+          }
         }
         
         // Process linked functions
@@ -6070,6 +6175,11 @@ class SyAPP {
       const instance = new FuncClass();
       instance._syappInstance = this;
       this.Funcs.set(funcName, instance);
+      
+      // Start per-function refresher if needed
+      if (!this.GlobalRefreshMode && instance.RefreshMode === true) {
+        this._startPerFunctionRefresher(funcName, instance);
+      }
 
       instance.Linked.forEach(linkedFunc => {
         const linkedTemp = new linkedFunc();
@@ -6128,6 +6238,17 @@ class SyAPP {
           config.props.notfounded_func = funcname;
           targetFuncName = 'notfounded';
         }
+        
+        // Check if this is a refresh request and if the function allows it
+        const isRefreshRequest = config.props._isRefresh === true;
+        if (isRefreshRequest) {
+          const targetFunc = this.Funcs.get(targetFuncName);
+          if (targetFunc && !this._shouldRefreshFunction(targetFuncName)) {
+            session.InAction = false;
+            return;
+          }
+        }
+        
         config.props.mainfunc = this.MainFunc.Name;
 
         // Pass HTTP config to the build function if available
@@ -6728,6 +6849,21 @@ class SyAPP {
       this.httpServer.close();
       console.log('HTTP Server stopped');
     }
+  }
+
+  /**
+   * Stop all per-function refreshers
+   */
+  stopAllRefreshers() {
+    if (this.Refresher) {
+      clearInterval(this.Refresher);
+      this.Refresher = null;
+    }
+    
+    for (const [funcName, intervalId] of this._perFunctionRefreshers) {
+      clearInterval(intervalId);
+    }
+    this._perFunctionRefreshers.clear();
   }
 
   /**
