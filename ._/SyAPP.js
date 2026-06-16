@@ -3129,6 +3129,8 @@ class SyAPP_Func {
    * @param {Array<Function>} [config.linked=[]] - Linked functions
    * @param {string} [config.group=''] - Group name for routes
    * @param {boolean|null} [config.refreshMode=null] - Refresh mode override (null=use global, true=force on, false=force off)
+   * @param {Function} [config.onEnter] - Async function executed each time the function is entered (manual navigation, not refresh)
+   * @param {boolean} [config.onEnterOnce=false] - If true, onEnter runs only the first time the function is entered per user session
    */
   constructor(name, build = async (props = { session: new Session }) => { }, config = {
     routes: [{ name: '', stream: false, method: '', input_model: {}, output_model: {}, input_validate: {} }],
@@ -3136,7 +3138,9 @@ class SyAPP_Func {
     log: false,
     linked: [],
     group: '',
-    refreshMode: null
+    refreshMode: null,
+    onEnter: undefined,
+    onEnterOnce: false
   }) {
     /** @type {string} */
     this.Name = name
@@ -3152,6 +3156,10 @@ class SyAPP_Func {
     this.Group = config.group || ''
     /** @type {boolean|null} Refresh mode override */
     this.RefreshMode = config.refreshMode !== undefined ? config.refreshMode : null
+    /** @type {Function|undefined} Hook executed on each manual entry (not on refresh) */
+    this.OnEnter = config.onEnter
+    /** @type {boolean} If true, OnEnter runs only once per user session */
+    this.OnEnterOnce = config.onEnterOnce || false
 
 /** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
 this.AlertStorage = new Map()
@@ -3449,6 +3457,7 @@ this.Admin = {
   /**
    * Get HTTP server configuration (admin only)
    * @param {string} id - User/build ID
+   * @param {string} funcName - Function name to get info about
    * @returns {Object|null} HTTP config or null if not admin
    */
   GetHTTPConfig: (id) => {
@@ -5747,6 +5756,8 @@ class AdminManager {
       refreshMode: func.RefreshMode,
       refreshStatus: func.RefreshMode === null ? 'using global' : 
                      func.RefreshMode === true ? 'always on' : 'always off',
+      hasOnEnter: !!func.OnEnter,
+      onEnterOnce: func.OnEnterOnce || false,
       storageStats: {
         userStorage: func.UserStorage ? func.UserStorage.size : 0,
         alertStorage: func.AlertStorage ? func.AlertStorage.size : 0,
@@ -6262,6 +6273,39 @@ class SyAPP {
         config.props.session = session;
         session.ActualProps = config.props;
 
+        // --- NEW: Execute OnEnter hook if defined and not a refresh ---
+        if (!isRefreshRequest) {
+          const targetFunc = this.Funcs.get(targetFuncName);
+          if (targetFunc && typeof targetFunc.OnEnter === 'function') {
+            const storage = targetFunc.Storages;
+            const userId = session.UniqueID;
+            const onEnterOnceKey = `_onEnter_${targetFuncName}`;
+
+            // If onEnterOnce is true, check if already executed for this user
+            let shouldExecute = true;
+            if (targetFunc.OnEnterOnce) {
+              if (storage.Has(userId, onEnterOnceKey) && storage.Get(userId, onEnterOnceKey) === true) {
+                shouldExecute = false;
+              }
+            }
+
+            if (shouldExecute) {
+              try {
+                await targetFunc.OnEnter(config.props);
+                // Mark as executed if once
+                if (targetFunc.OnEnterOnce) {
+                  storage.Set(userId, onEnterOnceKey, true);
+                }
+              } catch (onEnterError) {
+                // If onEnter fails, we still continue to build (or we could treat as error)
+                console.error(`OnEnter error for function ${targetFuncName}:`, onEnterError);
+                // Optionally could navigate to error function, but for now just log
+              }
+            }
+          }
+        }
+        // --- END OnEnter ---
+
         try {
           const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
 
@@ -6626,7 +6670,8 @@ class SyAPP {
       console.log(`   ${ColorText.brightWhite('URL:')} http://${this.serverConfig.host}:${this.serverConfig.port}/`);
       console.log(`   ${ColorText.brightWhite('Mode:')} ${this.serverConfig.baseRoute ? 'Root level' : 'With function names'}${this.serverConfig.includeFuncName ? '' : ' (no func name)'}`);
       console.log(`   ${ColorText.brightWhite('Routes:')} ${this.routeStorage.getStats().total} total`);
-      console.log(`   ${ColorText.brightWhite('Admin:')} ${this._adminManager.adminIds.size} admin(s) registered\n`);
+      console.log(`   ${ColorText.brightWhite('Admin:')} ${this._adminManager.adminIds.size} admin(s) registered
+`);
       
       console.log(ColorText.brightGreen('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━') + '\n');
     });
