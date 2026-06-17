@@ -3129,8 +3129,8 @@ class SyAPP_Func {
    * @param {Array<Function>} [config.linked=[]] - Linked functions
    * @param {string} [config.group=''] - Group name for routes
    * @param {boolean|null} [config.refreshMode=null] - Refresh mode override (null=use global, true=force on, false=force off)
-   * @param {Function} [config.onEnter] - Async function executed each time the function is entered (manual navigation, not refresh)
-   * @param {boolean} [config.onEnterOnce=false] - If true, onEnter runs only the first time the function is entered per user session
+   * @param {Function} [config.onEnter] - Deprecated: Use Lifecycle hooks instead
+   * @param {boolean} [config.onEnterOnce=false] - Deprecated: Use Lifecycle hooks instead
    */
   constructor(name, build = async (props = { session: new Session }) => { }, config = {
     routes: [{ name: '', stream: false, method: '', input_model: {}, output_model: {}, input_validate: {} }],
@@ -3156,27 +3156,57 @@ class SyAPP_Func {
     this.Group = config.group || ''
     /** @type {boolean|null} Refresh mode override */
     this.RefreshMode = config.refreshMode !== undefined ? config.refreshMode : null
+    
+    // Legacy onEnter support (backward compatibility)
     /** @type {Function|undefined} Hook executed on each manual entry (not on refresh) */
     this.OnEnter = config.onEnter
     /** @type {boolean} If true, OnEnter runs only once per user session */
     this.OnEnterOnce = config.onEnterOnce || false
 
-/** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
-this.AlertStorage = new Map()
+    /** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
+    this.AlertStorage = new Map()
 
-// Alert configuration
-/** @type {Object} */
-this.AlertConfig = {
-  defaultDuration: 5000,
-  maxAlerts: 100,
-  allowDuplicates: false // Default: don't allow duplicate alert names
-}
+    // Alert configuration
+    /** @type {Object} */
+    this.AlertConfig = {
+      defaultDuration: 5000,
+      maxAlerts: 100,
+      allowDuplicates: false // Default: don't allow duplicate alert names
+    }
 
     /** @type {Map<string, userBuild>} */
     this.Builds = new Map()
 
     /** @type {Map<string, Object>} */
     this.UserStorage = new Map()
+
+    // ============================================================
+    // LIFECYCLE HOOKS SYSTEM
+    // ============================================================
+    
+    /**
+     * Lifecycle hooks storage
+     * Organized by level (function/page) and type (enter/leave)
+     * Each stores arrays of { handler: Function, once: boolean, executed: Set }
+     * @private
+     */
+    this._lifecycleHooks = {
+      // Function-level hooks (SyAPP level - execute once globally for the function)
+      function: {
+        enter: [],      // { handler: Function, once: boolean, executed: boolean }
+        leave: [],      // { handler: Function, once: boolean, executed: boolean }
+      },
+      // Session-level hooks (per user/session)
+      session: {
+        enter: [],      // { handler: Function, once: boolean, executedSessions: Set }
+        leave: [],      // { handler: Function, once: boolean, executedSessions: Set }
+      },
+      // Page-level hooks (per page within function)
+      page: {
+        enter: new Map(),  // Map<pageName, Array<{ handler: Function, once: boolean, executedSessions: Set }>>
+        leave: new Map(),  // Map<pageName, Array<{ handler: Function, once: boolean, executedSessions: Set }>>
+      }
+    }
 
     /**
      * Storage utilities for user data
@@ -3525,6 +3555,402 @@ this.Admin = {
   }
 };
 
+    // ============================================================
+    // LIFECYCLE HOOKS - PUBLIC API
+    // ============================================================
+
+    /**
+     * Register a hook to execute when the function is entered for the FIRST TIME by any session
+     * (SyAPP level - executes only once globally, not per session)
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionFirstEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionFirstEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.enter.push({
+        handler: handler,
+        once: true,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME the function is entered by any session
+     * (SyAPP level - executes for each session entry)
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.enter.push({
+        handler: handler,
+        once: false,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME the function is left by any session
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.leave.push({
+        handler: handler,
+        once: false,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when the function is left for the FIRST TIME by any session
+     * (SyAPP level - executes only once globally)
+     * @param {string} id - User/build ID (required for consistency with other methods)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnFunctionFirstLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnFunctionFirstLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.function.leave.push({
+        handler: handler,
+        once: true,
+        executed: false
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION enters the function for the FIRST TIME
+     * (Session level - executes once per unique session/user)
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      const hookEntry = {
+        handler: handler,
+        once: true,
+        executedSessions: new Set()
+      };
+      this._lifecycleHooks.session.enter.push(hookEntry);
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME a session enters the function
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionEveryEnter = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionEveryEnter() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.session.enter.push({
+        handler: handler,
+        once: false,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves the function
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      this._lifecycleHooks.session.leave.push({
+        handler: handler,
+        once: false,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves the function for the FIRST TIME
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnSessionFirstLeave = (id, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnSessionFirstLeave() Error - handler must be a function | BuildID: ${id}`);
+        return this;
+      }
+      const hookEntry = {
+        handler: handler,
+        once: true,
+        executedSessions: new Set()
+      };
+      this._lifecycleHooks.session.leave.push(hookEntry);
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION enters a specific PAGE for the FIRST TIME
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageEnter = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageEnter() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.enter.has(pageName)) {
+        this._lifecycleHooks.page.enter.set(pageName, []);
+      }
+      this._lifecycleHooks.page.enter.get(pageName).push({
+        handler: handler,
+        once: true,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute EVERY TIME a session enters a specific PAGE
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageEveryEnter = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageEveryEnter() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.enter.has(pageName)) {
+        this._lifecycleHooks.page.enter.set(pageName, []);
+      }
+      this._lifecycleHooks.page.enter.get(pageName).push({
+        handler: handler,
+        once: false,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves a specific PAGE
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageLeave = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageLeave() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.leave.has(pageName)) {
+        this._lifecycleHooks.page.leave.set(pageName, []);
+      }
+      this._lifecycleHooks.page.leave.get(pageName).push({
+        handler: handler,
+        once: false,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    /**
+     * Register a hook to execute when a SESSION leaves a specific PAGE for the FIRST TIME
+     * @param {string} id - User/build ID (the session identifier)
+     * @param {string} pageName - Name of the page
+     * @param {Function} handler - Async or sync function to execute: (props) => {} or async (props) => {}
+     * @returns {this} For chaining
+     */
+    this.OnPageFirstLeave = (id, pageName, handler) => {
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`OnPageFirstLeave() Error - handler must be a function | BuildID: ${id} | Page: ${pageName}`);
+        return this;
+      }
+      if (!this._lifecycleHooks.page.leave.has(pageName)) {
+        this._lifecycleHooks.page.leave.set(pageName, []);
+      }
+      this._lifecycleHooks.page.leave.get(pageName).push({
+        handler: handler,
+        once: true,
+        executedSessions: new Set()
+      });
+      return this;
+    };
+
+    // ============================================================
+    // LIFECYCLE EXECUTION METHODS (Internal)
+    // ============================================================
+
+    /**
+     * Execute function-level enter hooks
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeFunctionEnterHooks = async (props) => {
+      const hooks = this._lifecycleHooks.function.enter;
+      for (const hook of hooks) {
+        if (hook.once && hook.executed) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          hook.executed = true;
+        } catch (error) {
+          console.error(`Function enter hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute function-level leave hooks
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeFunctionLeaveHooks = async (props) => {
+      const hooks = this._lifecycleHooks.function.leave;
+      for (const hook of hooks) {
+        if (hook.once && hook.executed) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          hook.executed = true;
+        } catch (error) {
+          console.error(`Function leave hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute session-level enter hooks
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeSessionEnterHooks = async (props) => {
+      const sessionId = props.session.UniqueID;
+      const hooks = this._lifecycleHooks.session.enter;
+      for (const hook of hooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          hook.executedSessions.add(sessionId);
+        } catch (error) {
+          console.error(`Session enter hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute session-level leave hooks
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executeSessionLeaveHooks = async (props) => {
+      const sessionId = props.session.UniqueID;
+      const hooks = this._lifecycleHooks.session.leave;
+      for (const hook of hooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          hook.executedSessions.add(sessionId);
+        } catch (error) {
+          console.error(`Session leave hook error in ${this.Name}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute page-level enter hooks
+     * @param {string} pageName - Page name
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executePageEnterHooks = async (pageName, props) => {
+      const sessionId = props.session.UniqueID;
+      const pageHooks = this._lifecycleHooks.page.enter.get(pageName) || [];
+      for (const hook of pageHooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          hook.executedSessions.add(sessionId);
+        } catch (error) {
+          console.error(`Page enter hook error in ${this.Name} page ${pageName}:`, error);
+        }
+      }
+    };
+
+    /**
+     * Execute page-level leave hooks
+     * @param {string} pageName - Page name
+     * @param {Object} props - Build props
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._executePageLeaveHooks = async (pageName, props) => {
+      const sessionId = props.session.UniqueID;
+      const pageHooks = this._lifecycleHooks.page.leave.get(pageName) || [];
+      for (const hook of pageHooks) {
+        if (hook.once && hook.executedSessions.has(sessionId)) continue;
+        try {
+          const result = hook.handler(props);
+          if (result instanceof Promise) {
+            await result;
+          }
+          hook.executedSessions.add(sessionId);
+        } catch (error) {
+          console.error(`Page leave hook error in ${this.Name} page ${pageName}:`, error);
+        }
+      }
+    };
+
     // --------------------------- HTTP Route Methods ---------------------------
 
     /**
@@ -3683,6 +4109,12 @@ this.Delete = (id, path, handler, config = {
         const userBuild = this.Builds.get(id);
         const currentProps = userBuild.Session.ActualProps || {};
         const currentPage = currentProps.page || '';
+        const previousPage = currentProps._previousPage || '';
+
+        // Handle page leave hooks for previous page
+        if (previousPage && previousPage !== name && name === currentPage) {
+          await this._executePageLeaveHooks(previousPage, { session: userBuild.Session, ...currentProps });
+        }
 
         if (config.lock) {
           const lockKey = config.lockKey || `page-lock-${name}`;
@@ -3705,6 +4137,14 @@ this.Delete = (id, path, handler, config = {
         const shouldExecute = (name === currentPage) || (name === '' && !currentPage);
 
         if (shouldExecute) {
+          // Execute page enter hooks
+          await this._executePageEnterHooks(name, { session: userBuild.Session, ...currentProps });
+
+          // Track page change for leave hooks
+          if (name !== previousPage) {
+            currentProps._previousPage = name;
+          }
+
           if (config.pagelabel) {
             this.Text(id, `• ${config.pagelabel}`);
           }
@@ -4695,6 +5135,21 @@ this.FileManager = {
         if (!userBuild.Session.ActualProps) {
           userBuild.Session.ActualProps = {};
         }
+        
+        // Track previous page for leave hooks
+        const previousPage = userBuild.Session.ActualProps.page;
+        if (previousPage && previousPage !== page) {
+          userBuild.Session.ActualProps._previousPage = previousPage;
+          
+          // Execute leave hooks for the page being left
+          this._executePageLeaveHooks(previousPage, { 
+            session: userBuild.Session, 
+            ...userBuild.Session.ActualProps 
+          }).catch(err => {
+            if (this.Log) console.error(`Page leave hook error:`, err);
+          });
+        }
+        
         userBuild.Session.ActualProps.page = page;
 
         if (unlock && page) {
@@ -5204,17 +5659,62 @@ this.FileManager = {
    // In the Build method, modify it like this:
 
 this.Build = async (props = { session: new Session }) => {
-  this.Builds.set(props.session.UniqueID, new userBuild({ session: props.session }))
+  const sessionId = props.session.UniqueID;
+  const previousFuncName = props.session.PreviousPath;
+  const currentFuncName = props.session.ActualPath || this.Name;
+  const isFirstSessionEntry = !this._lifecycleHooks.session.enter.some(
+    hook => hook.executedSessions.has(sessionId)
+  );
+  
+  // Execute function leave hooks for previous function if changing functions
+  if (previousFuncName && previousFuncName !== currentFuncName) {
+    const previousFunc = this._syappInstance?.Funcs?.get(previousFuncName);
+    if (previousFunc) {
+      await previousFunc._executeSessionLeaveHooks(props);
+      await previousFunc._executeFunctionLeaveHooks(props);
+    }
+  }
+  
+  this.Builds.set(sessionId, new userBuild({ session: props.session }))
 
   try {
+    // Execute function enter hooks
+    await this._executeFunctionEnterHooks(props);
+    
+    // Execute session enter hooks
+    await this._executeSessionEnterHooks(props);
+    
+    // Legacy OnEnter support
+    if (!props._isRefresh && typeof this.OnEnter === 'function') {
+      const onEnterOnceKey = `_onEnter_${this.Name}`;
+      let shouldExecuteLegacy = true;
+      
+      if (this.OnEnterOnce) {
+        if (this.Storages.Has(sessionId, onEnterOnceKey) && 
+            this.Storages.Get(sessionId, onEnterOnceKey) === true) {
+          shouldExecuteLegacy = false;
+        }
+      }
+      
+      if (shouldExecuteLegacy) {
+        try {
+          await this.OnEnter(props);
+          if (this.OnEnterOnce) {
+            this.Storages.Set(sessionId, onEnterOnceKey, true);
+          }
+        } catch (onEnterError) {
+          console.error(`OnEnter error for function ${this.Name}:`, onEnterError);
+        }
+      }
+    }
+
     await build(props)
 
-    const userBuild = this.Builds.get(props.session.UniqueID)
+    const userBuild = this.Builds.get(sessionId)
 
     // Process alerts AFTER build but BEFORE creating return object
-    // Only process on refresh or if has alerts
-    if (userBuild._hasAlerts || this.AlertStorage.has(props.session.UniqueID)) {
-      this.ProcessAlerts(props.session.UniqueID);
+    if (userBuild._hasAlerts || this.AlertStorage.has(sessionId)) {
+      this.ProcessAlerts(sessionId);
     }
 
     if (userBuild && userBuild.GotoNow) {
@@ -5234,32 +5734,32 @@ this.Build = async (props = { session: new Session }) => {
         routes: userBuild.Routes
       }
 
-      this.Builds.delete(props.session.UniqueID)
+      this.Builds.delete(sessionId)
       return obj_return
     }
 
     let obj_return = {
       hud_obj: {
-        title: this.Builds.get(props.session.UniqueID).Text,
-        options: this.Builds.get(props.session.UniqueID).Buttons
+        title: this.Builds.get(sessionId).Text,
+        options: this.Builds.get(sessionId).Buttons
       },
-      wait_input: this.Builds.get(props.session.UniqueID).WaitInput,
+      wait_input: this.Builds.get(sessionId).WaitInput,
       input_obj: {
-        path: this.Builds.get(props.session.UniqueID).InputPath,
-        props: this.Builds.get(props.session.UniqueID).InputProps,
-        question: this.Builds.get(props.session.UniqueID).InputQuestion,
-        password: this.Builds.get(props.session.UniqueID).InputPassword
+        path: this.Builds.get(sessionId).InputPath,
+        props: this.Builds.get(sessionId).InputProps,
+        question: this.Builds.get(sessionId).InputQuestion,
+        password: this.Builds.get(sessionId).InputPassword
       },
       goto_now: undefined,
-      routes: this.Builds.get(props.session.UniqueID).Routes
+      routes: this.Builds.get(sessionId).Routes
     }
 
-    this.Builds.delete(props.session.UniqueID)
+    this.Builds.delete(sessionId)
     return obj_return
 
   } catch (error) {
     if (error.message === 'GOTO_NOW_BREAK' && error.gotoInfo) {
-      this.Builds.delete(props.session.UniqueID)
+      this.Builds.delete(sessionId)
 
       return {
         hud_obj: {
@@ -5758,6 +6258,14 @@ class AdminManager {
                      func.RefreshMode === true ? 'always on' : 'always off',
       hasOnEnter: !!func.OnEnter,
       onEnterOnce: func.OnEnterOnce || false,
+      lifecycleHooks: {
+        functionEnter: func._lifecycleHooks?.function?.enter?.length || 0,
+        functionLeave: func._lifecycleHooks?.function?.leave?.length || 0,
+        sessionEnter: func._lifecycleHooks?.session?.enter?.length || 0,
+        sessionLeave: func._lifecycleHooks?.session?.leave?.length || 0,
+        pageEnter: Array.from(func._lifecycleHooks?.page?.enter?.keys() || []).length,
+        pageLeave: Array.from(func._lifecycleHooks?.page?.leave?.keys() || []).length
+      },
       storageStats: {
         userStorage: func.UserStorage ? func.UserStorage.size : 0,
         alertStorage: func.AlertStorage ? func.AlertStorage.size : 0,
@@ -6267,44 +6775,41 @@ class SyAPP {
           config.props._httpConfig = this.serverConfig.httpConfig;
         }
 
+        // Track previous path and page for lifecycle hooks
+        const previousPath = session.ActualPath;
+        const previousPage = session.ActualProps?.page || '';
+        
         session.PreviousPath = session.ActualPath;
         session.ActualPath = targetFuncName;
         session.PreviousProps = session.ActualProps;
         config.props.session = session;
         session.ActualProps = config.props;
 
-        // --- NEW: Execute OnEnter hook if defined and not a refresh ---
-        if (!isRefreshRequest) {
-          const targetFunc = this.Funcs.get(targetFuncName);
-          if (targetFunc && typeof targetFunc.OnEnter === 'function') {
-            const storage = targetFunc.Storages;
-            const userId = session.UniqueID;
-            const onEnterOnceKey = `_onEnter_${targetFuncName}`;
-
-            // If onEnterOnce is true, check if already executed for this user
-            let shouldExecute = true;
-            if (targetFunc.OnEnterOnce) {
-              if (storage.Has(userId, onEnterOnceKey) && storage.Get(userId, onEnterOnceKey) === true) {
-                shouldExecute = false;
-              }
+        // --- Execute function leave hooks if changing functions ---
+        if (previousPath && previousPath !== targetFuncName) {
+          const previousFunc = this.Funcs.get(previousPath);
+          if (previousFunc) {
+            // Execute page leave hooks for the page being left
+            if (previousPage) {
+              await previousFunc._executePageLeaveHooks(previousPage, { 
+                session: session, 
+                ...session.PreviousProps 
+              });
             }
-
-            if (shouldExecute) {
-              try {
-                await targetFunc.OnEnter(config.props);
-                // Mark as executed if once
-                if (targetFunc.OnEnterOnce) {
-                  storage.Set(userId, onEnterOnceKey, true);
-                }
-              } catch (onEnterError) {
-                // If onEnter fails, we still continue to build (or we could treat as error)
-                console.error(`OnEnter error for function ${targetFuncName}:`, onEnterError);
-                // Optionally could navigate to error function, but for now just log
-              }
-            }
+            
+            // Execute session leave hooks
+            await previousFunc._executeSessionLeaveHooks({ 
+              session: session, 
+              ...session.PreviousProps 
+            });
+            
+            // Execute function leave hooks
+            await previousFunc._executeFunctionLeaveHooks({ 
+              session: session, 
+              ...session.PreviousProps 
+            });
           }
         }
-        // --- END OnEnter ---
 
         try {
           const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
