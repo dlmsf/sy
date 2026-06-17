@@ -2016,6 +2016,28 @@ exit 1`;
       effectiveNetworkFilter.blacklist = Array.isArray(blacklist) ? blacklist : [blacklist];
     }
 
+    // Check if there are any IPs to scan before proceeding
+    const allIPs = this._getFilteredIPRange(effectiveNetworkFilter);
+    
+    if (allIPs.size === 0) {
+      // No active network interfaces found - stop any running scan
+      await this.stopBackgroundScan();
+      
+      return {
+        success: true,
+        message: 'No active network interfaces found to scan',
+        timestamp: new Date().toISOString(),
+        duration: '0s',
+        total_scanned: 0,
+        accessible: 0,
+        unlocked: 0,
+        hosts: [],
+        scanComplete: true,
+        scanInProgress: false,
+        cacheAge: '0s'
+      };
+    }
+
     const requestedScanConfig = {
       concurrency,
       persistentRetryConfig,
