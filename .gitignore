@@ -21,6 +21,7 @@ bundle.output.js
 result
 result.txt
 struct
+clipboard-config.json
 
 # Ubuntu cloud image downloads
 alpine-cloudinit.qcow2.partial
