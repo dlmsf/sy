@@ -12,6 +12,7 @@ class ClipboardMonitor {
         this.outputPath = path.join(process.cwd(), 'result');
         this.lastClipboardContent = '';
         this.isMonitoring = false;
+        this.isPaused = false;
         this.config = {
             profiles: {},
             activeProfile: null,
@@ -171,6 +172,10 @@ class ClipboardMonitor {
     }
 
     async checkClipboard() {
+        if (this.isPaused) {
+            return;
+        }
+        
         const currentContent = await this.getClipboardContent();
         
         if (currentContent && currentContent !== this.lastClipboardContent) {
@@ -356,6 +361,15 @@ class ClipboardMonitor {
         }
     }
 
+    togglePause() {
+        this.isPaused = !this.isPaused;
+        if (this.isPaused) {
+            console.log('\n⏸️  Monitoring PAUSED - Press P to resume');
+        } else {
+            console.log('\n▶️  Monitoring RESUMED');
+        }
+    }
+
     async startMonitoring(profileName) {
         if (profileName) {
             if (this.config.profiles[profileName]) {
@@ -376,6 +390,7 @@ class ClipboardMonitor {
         await this.ensureDirectoryExists();
         this.lastClipboardContent = await this.getClipboardContent();
         this.isMonitoring = true;
+        this.isPaused = false;
         
         const activeProfile = this.config.profiles[this.config.activeProfile];
         
@@ -385,6 +400,7 @@ class ClipboardMonitor {
         console.log(`Active profile: ${this.config.activeProfile}`);
         console.log(`Output file: ${this.outputPath}`);
         console.log(`Commands to execute: ${activeProfile.commands.length}`);
+        console.log('Press P to pause/resume monitoring');
         console.log('Press Ctrl+C to stop monitoring...');
         console.log('='.repeat(60) + '\n');
         
@@ -472,6 +488,27 @@ process.on('uncaughtException', (error) => {
     monitor.isMonitoring = false;
     monitor.rl.close();
     process.exit(1);
+});
+
+// Handle keyboard input for pause/resume
+process.stdin.setRawMode(true);
+process.stdin.resume();
+process.stdin.setEncoding('utf8');
+
+process.stdin.on('data', (key) => {
+    // Check for 'p' or 'P' key
+    if (key === 'p' || key === 'P') {
+        if (monitor.isMonitoring) {
+            monitor.togglePause();
+        }
+    }
+    // Check for Ctrl+C
+    if (key === '\u0003') {
+        console.log('\nReceived Ctrl+C. Stopping...');
+        monitor.isMonitoring = false;
+        monitor.rl.close();
+        process.exit(0);
+    }
 });
 
 // Start the CLI menu
