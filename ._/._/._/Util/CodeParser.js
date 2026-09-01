@@ -872,7 +872,10 @@ class StructureParser {
         return { kind: 'side-effect', name: '(side-effect)', source: this.#importSource(statement) };
     }
 
-    static #importSource() { return null; }
+    static #importSource(statement) {
+        const m = statement.match(/from\s+['"]([^'"]+)['"]/);
+        return m ? m[1] : null;
+    }
 }
 
 /* ============================================================================
@@ -1485,23 +1488,27 @@ class CodeParser {
  * ========================================================================== */
 
 class CLIMenu {
-    constructor() {
-        this.rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        this.sel = Selection.empty();
-        this.outputPath = null;
+    constructor(options = {}) {
+        // Allow injecting an existing readline interface for fluid integration
+        this.rl = options.rl || readline.createInterface({ input: process.stdin, output: process.stdout });
+        this._ownsRL = !options.rl;
+        this.sel = options.selection || Selection.empty();
+        this.outputPath = options.outputPath || null;
 
         this.eof = false;
         this.queue = [];
         this.waiting = [];
-        this.rl.on('line', (line) => {
+        this._lineHandler = (line) => {
             const resolve = this.waiting.shift();
             if (resolve) resolve(line);
             else this.queue.push(line);
-        });
-        this.rl.on('close', () => {
+        };
+        this._closeHandler = () => {
             this.eof = true;
             while (this.waiting.length) this.waiting.shift()('');
-        });
+        };
+        this.rl.on('line', this._lineHandler);
+        this.rl.on('close', this._closeHandler);
     }
 
     async start(filePath, options = {}) {
@@ -1528,7 +1535,7 @@ class CLIMenu {
 
             if (options.auto) {
                 await this.generateFile();
-                this.rl.close();
+                this.close();
                 return;
             }
 
@@ -1536,7 +1543,7 @@ class CLIMenu {
         } catch (e) {
             console.error(`Error: ${e.message}`);
             console.error(e.stack);
-            this.rl.close();
+            this.close();
             process.exit(1);
         }
     }
@@ -1550,7 +1557,7 @@ class CLIMenu {
             console.log('S. Save State   L. Load State   0. Exit');
             console.log('──────────────────────────────────────────');
             const c = (await this.ask('Choose option: ')).trim().toLowerCase();
-            if (this.eof && !c) { console.log('\n(fim da entrada)'); this.rl.close(); return; }
+            if (this.eof && !c) { console.log('\n(fim da entrada)'); this.close(); return; }
             switch (c) {
                 case '1': await this.imports(); break;
                 case '2': await this.exports(); break;
@@ -1563,7 +1570,7 @@ class CLIMenu {
                 case '9': await this.generateFile(); break;
                 case 's': await this.saveState(); break;
                 case 'l': await this.loadState(); break;
-                case '0': console.log('\nGoodbye!'); this.rl.close(); return;
+                case '0': console.log('\nGoodbye!'); this.close(); return;
                 default: console.log('Invalid option');
             }
         }
@@ -1925,6 +1932,19 @@ class CLIMenu {
         return new Promise(resolve => {
             this.waiting.push(resolve);
         });
+    }
+
+    close() {
+        if (this._ownsRL) {
+            this.rl.close();
+        } else {
+            this.rl.off('line', this._lineHandler);
+            this.rl.off('close', this._closeHandler);
+        }
+    }
+
+    getSelection() {
+        return this.sel;
     }
 }
 
@@ -2313,3 +2333,16 @@ Options:
         process.exit(1);
     });
 }
+
+// Export for use in other modules
+export {
+    CodeParser,
+    CLIMenu,
+    Selection,
+    StructureParser,
+    Tokenizer,
+    Scanner,
+    CodeEmitter,
+    CommentStripper,
+    TestRunner
+};
