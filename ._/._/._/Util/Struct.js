@@ -49,12 +49,58 @@ async function readDirectory(directory) {
 //  Check if any path contains ._ pattern
 // ============================================================
 function hasSpecialPathPattern(filePaths) {
-    return filePaths.some(filePath => filePath.split(path.sep).some(part => part.startsWith('._')));
+    return filePaths.some(filePath => 
+        filePath.split(path.sep).some(part => part.startsWith('._'))
+    );
+}
+
+// ============================================================
+//  Generate path preservation enforcement block
+// ============================================================
+function generatePathEnforcement(filePaths, outputFormat) {
+    const specialPaths = filePaths.filter(filePath => 
+        filePath.split(path.sep).some(part => part.startsWith('._'))
+    );
+    
+    if (specialPaths.length === 0) return '';
+    
+    let enforcement = '';
+    enforcement += `${'-'.repeat(50)}\n`;
+    enforcement += `CRITICAL PATH PRESERVATION ENFORCEMENT\n`;
+    enforcement += `${'-'.repeat(50)}\n\n`;
+    enforcement += `The following file paths contain directory names starting with "._":\n\n`;
+    
+    specialPaths.forEach(filePath => {
+        enforcement += `  ACTUAL PATH: ${filePath}\n`;
+    });
+    
+    enforcement += `\nMANDATORY RULES:\n`;
+    enforcement += `1. You MUST copy the PATH='...' value EXACTLY as shown in the FILE: header above.\n`;
+    enforcement += `2. Directory names starting with "._" (like "._backup", "._config", "._") are REAL directory names.\n`;
+    enforcement += `3. "._/" is NOT the same as "./" - they are completely different directories.\n`;
+    enforcement += `4. NEVER convert "._/" to "./" or "././" - this will point to a NON-EXISTENT file.\n`;
+    enforcement += `5. Copy the path character by character, preserving every "._/" exactly.\n`;
+    enforcement += `6. If you see "/._/._/._/", write "/._/._/._/" - not "/././._/" or any other variation.\n\n`;
+    
+    if (outputFormat === 'tagged' || outputFormat === 'both') {
+        enforcement += `SPECIFIC EXAMPLE FOR TAGGED OUTPUT:\n`;
+        enforcement += `  WRONG: PATH='${specialPaths[0].replace(/\._\//g, './')}'  ← THIS WILL FAIL\n`;
+        enforcement += `  CORRECT: PATH='${specialPaths[0]}'  ← THIS IS REQUIRED\n\n`;
+        enforcement += `When generating [CODEREPLACER-START] tags, the PATH attribute must be\n`;
+        enforcement += `copied EXACTLY from the FILE: header. Verify each character before output.\n\n`;
+    }
+    
+    enforcement += `VERIFICATION CHECK:\n`;
+    enforcement += `Before outputting any path, compare it character by character with the FILE: header.\n`;
+    enforcement += `If they don't match exactly, you have made an error and must correct it.\n`;
+    enforcement += `${'-'.repeat(50)}\n\n`;
+    
+    return enforcement;
 }
 
 // ============================================================
 //  Generate struct file from a list of absolute paths
-//  Now supports optional AI instructions
+//  Now supports optional AI instructions with path preservation
 // ============================================================
 async function generateStruct(filePaths, outputFileName = 'struct', options = {}) {
     const {
@@ -78,14 +124,7 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
         structContent += `USER REQUEST:\n${userDemand}\n\n`;
 
         if (needsPathEnforcement) {
-            structContent += `${'-'.repeat(50)}\n`;
-            structContent += `CRITICAL PATH PRESERVATION RULE:\n`;
-            structContent += `Some paths contain directory names starting with "._" (e.g., "._backup", "._config").\n`;
-            structContent += `These are NOT the same as "." or "./" - they are actual directory names.\n`;
-            structContent += `You MUST copy paths EXACTLY as shown in FILE: headers.\n`;
-            structContent += `NEVER convert "._/" to "./" or "././" - this loses directory names.\n`;
-            structContent += `Example: /home/user/._backup/file.js is NOT /home/user/./file.js\n`;
-            structContent += `${'-'.repeat(50)}\n\n`;
+            structContent += generatePathEnforcement(filePaths, outputFormat);
         }
 
         if (outputFormat === 'full') {
@@ -108,12 +147,15 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
             structContent += `[/NEW-REPLACE-END]\n`;
             structContent += `[/CODEREPLACER-END]\n\n`;
             structContent += `You can include multiple [NEW-REPLACE-START] blocks for multiple replacements in the same file.\n`;
-            structContent += `Ensure the original text exactly matches the file content (including whitespace).\n\n`;
+            structContent += `Ensure the original text exactly matches the file content (including whitespace).\n`;
+            structContent += `CRITICAL: In PATH='...', copy the path EXACTLY from the FILE: header.\n`;
+            structContent += `Verify each character matches before outputting.\n\n`;
         } else if (outputFormat === 'both') {
             structContent += `OUTPUT FORMAT: BOTH FULL FILES AND TAGGED REPLACEMENTS\n`;
             structContent += `You may provide either full file contents or tagged replacements, as appropriate.\n`;
             structContent += `For each file, decide which method is cleaner and use that.\n`;
-            structContent += `Clearly separate the two approaches if mixed.\n\n`;
+            structContent += `Clearly separate the two approaches if mixed.\n`;
+            structContent += `CRITICAL: Regardless of format, preserve the exact path in all outputs.\n\n`;
         }
 
         structContent += `${'='.repeat(50)}\n\n`;
@@ -138,6 +180,10 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
 
     await fs.writeFile(outputFileName, structContent, 'utf8');
     console.log(`\nStruct file written to: ${path.resolve(outputFileName)}`);
+    
+    if (needsPathEnforcement && includeInstructions) {
+        console.log(`\n${YELLOW}⚠️  Path preservation enforcement added - paths with ._/ patterns detected${RESET}`);
+    }
 }
 
 // ============================================================
