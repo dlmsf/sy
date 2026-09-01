@@ -47,10 +47,60 @@ async function readDirectory(directory) {
 
 // ============================================================
 //  Generate struct file from a list of absolute paths
+//  Now supports optional AI instructions
 // ============================================================
-async function generateStruct(filePaths, outputFileName = 'struct') {
+async function generateStruct(filePaths, outputFileName = 'struct', options = {}) {
+    const {
+        includeInstructions = false,
+        userDemand = '',
+        outputFormat = 'full', // 'full', 'tagged', or 'both'
+    } = options;
+
     let structContent = '';
 
+    // ---- AI instructions header (if requested) ----
+    if (includeInstructions) {
+        structContent += `${'='.repeat(50)}\n`;
+        structContent += `AI INSTRUCTIONS\n`;
+        structContent += `${'='.repeat(50)}\n`;
+
+        structContent += `You are an AI assistant helping with code modifications.\n`;
+        structContent += `Below are the current contents of the selected files.\n`;
+        structContent += `Your task is to apply the following user request:\n\n`;
+        structContent += `USER REQUEST:\n${userDemand}\n\n`;
+
+        if (outputFormat === 'full') {
+            structContent += `OUTPUT FORMAT: FULL FILES\n`;
+            structContent += `Provide the complete new content for EVERY file that requires changes.\n`;
+            structContent += `Do not abbreviate or omit any parts. Output each file's entire content.\n`;
+            structContent += `Use the same file path headers as provided below.\n\n`;
+        } else if (outputFormat === 'tagged') {
+            structContent += `OUTPUT FORMAT: TAGGED REPLACEMENTS (CODEREPLACER)\n`;
+            structContent += `Use the following tag structure to specify replacements within files:\n\n`;
+            structContent += `[CODEREPLACER-START]\n`;
+            structContent += `PATH='<absolute path to file>'\n`;
+            structContent += `[NEW-REPLACE-START]\n`;
+            structContent += `[ORIGINAL-START]\n`;
+            structContent += `<exact original text to replace>\n`;
+            structContent += `[/ORIGINAL-END]\n`;
+            structContent += `[REPLACE-START]\n`;
+            structContent += `<replacement text>\n`;
+            structContent += `[/REPLACE-END]\n`;
+            structContent += `[/NEW-REPLACE-END]\n`;
+            structContent += `[/CODEREPLACER-END]\n\n`;
+            structContent += `You can include multiple [NEW-REPLACE-START] blocks for multiple replacements in the same file.\n`;
+            structContent += `Ensure the original text exactly matches the file content (including whitespace).\n\n`;
+        } else if (outputFormat === 'both') {
+            structContent += `OUTPUT FORMAT: BOTH FULL FILES AND TAGGED REPLACEMENTS\n`;
+            structContent += `You may provide either full file contents or tagged replacements, as appropriate.\n`;
+            structContent += `For each file, decide which method is cleaner and use that.\n`;
+            structContent += `Clearly separate the two approaches if mixed.\n\n`;
+        }
+
+        structContent += `${'='.repeat(50)}\n\n`;
+    }
+
+    // ---- File contents ----
     for (const filePath of filePaths) {
         try {
             const content = await fs.readFile(filePath, 'utf8');
@@ -320,6 +370,18 @@ async function interactiveMode() {
     };
 
     // --------------------------------------------------------
+    //  Helper: ask a question (line input) while raw mode off
+    // --------------------------------------------------------
+    const askQuestion = (question) => {
+        return new Promise(resolve => {
+            process.stdout.write(question + ' ');
+            process.stdin.once('data', data => {
+                resolve(data.toString().trim());
+            });
+        });
+    };
+
+    // --------------------------------------------------------
     //  Main keypress handler
     // --------------------------------------------------------
     const onKeypress = async (key) => {
@@ -410,20 +472,38 @@ async function interactiveMode() {
                 return;
             }
 
-            await generateStruct([...selectedFiles]);
-
-            // Temporarily disable raw mode for the save-name prompt
+            // Temporarily disable raw mode for interactive prompts
             process.stdin.removeListener('data', onKeypress);
             process.stdin.setRawMode(false);
 
-            console.log('\nSave selected file paths? Enter a filename (or leave empty to skip): ');
-            const saveName = await new Promise(resolve => {
-                process.stdin.once('data', data => {
-                    resolve(data.toString().trim());
-                });
+            // Ask about AI instructions
+            const includeInstrAnswer = await askQuestion('Do you want to add AI instructions? (y/n): ');
+            const includeInstructions = includeInstrAnswer.toLowerCase() === 'y' || includeInstrAnswer.toLowerCase() === 'yes';
+
+            let userDemand = '';
+            let outputFormat = 'full'; // default
+
+            if (includeInstructions) {
+                userDemand = await askQuestion('Enter your request/demand for the AI (single line): ');
+                const formatAnswer = await askQuestion('Output format - (1) Full files, (2) Tagged replacements: ');
+                if (formatAnswer === '2') {
+                    outputFormat = 'tagged';
+                } else if (formatAnswer === '3') {
+                    outputFormat = 'both';
+                } else {
+                    outputFormat = 'full'; // default to full
+                }
+            }
+
+            // Generate the struct file with options
+            await generateStruct([...selectedFiles], 'struct', {
+                includeInstructions,
+                userDemand,
+                outputFormat,
             });
 
-            process.stdin.setRawMode(true);
+            // Ask if save paths
+            const saveName = await askQuestion('\nSave selected file paths? Enter a filename (or leave empty to skip): ');
 
             if (saveName) {
                 await savePaths([...selectedFiles], saveName);
@@ -479,6 +559,7 @@ async function main() {
                 process.exit(1);
             }
 
+            // No interactive prompts in this mode; generate plain struct
             await generateStruct(paths);
         } catch (err) {
             console.error(`Error: ${err.message}`);

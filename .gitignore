@@ -20,6 +20,7 @@ buildsaves.cfg
 bundle.output.js
 result
 result.txt
+struct
 
 # Ubuntu cloud image downloads
 alpine-cloudinit.qcow2.partial
