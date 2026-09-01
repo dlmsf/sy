@@ -11,6 +11,7 @@
 //                     que é o que garante saída sem erro de sintaxe.
 //   CodeParser     -> fachada estática (API pública).
 //   CLIMenu        -> interface de linha de comando.
+//   TestRunner     -> suíte de testes automatizados (ativada com --test).
 
 import fs from 'fs';
 import path from 'path';
@@ -1928,32 +1929,371 @@ class CLIMenu {
 }
 
 /* ============================================================================
- * 9. PONTO DE ENTRADA (CLI)
+ * 9. TEST RUNNER
+ * ========================================================================== */
+
+class TestRunner {
+    static #tests = [];
+    static #results = {};
+
+    static #assert(condition, message) {
+        if (!condition) throw new Error(message || 'Assertion failed');
+    }
+
+    static #addTest(group, name, fn) {
+        this.#tests.push({ group, name, fn });
+    }
+
+    static #runTests() {
+        for (const test of this.#tests) {
+            const group = test.group;
+            if (!this.#results[group]) this.#results[group] = { pass: 0, fail: 0, tests: [] };
+            try {
+                test.fn();
+                this.#results[group].pass++;
+                this.#results[group].tests.push({ name: test.name, status: 'PASS' });
+            } catch (err) {
+                this.#results[group].fail++;
+                this.#results[group].tests.push({ name: test.name, status: 'FAIL', error: err.message });
+            }
+        }
+    }
+
+    static #printReport() {
+        console.log('\n════════════════════════════════════════════');
+        console.log('          TEST REPORT — CODE PARSER v6.0');
+        console.log('════════════════════════════════════════════\n');
+
+        let totalPass = 0, totalFail = 0;
+
+        for (const [group, data] of Object.entries(this.#results)) {
+            const total = data.pass + data.fail;
+            const pct = total ? Math.round((data.pass / total) * 100) : 0;
+            totalPass += data.pass;
+            totalFail += data.fail;
+            console.log(`── ${group} ── ${data.pass}/${total} passed (${pct}%)`);
+            for (const t of data.tests) {
+                const mark = t.status === 'PASS' ? '✓' : '✗';
+                console.log(`   ${mark} ${t.name}${t.error ? ` → ${t.error}` : ''}`);
+            }
+            console.log('');
+        }
+
+        const grandTotal = totalPass + totalFail;
+        const grandPct = grandTotal ? Math.round((totalPass / grandTotal) * 100) : 0;
+        console.log('════════════════════════════════════════════');
+        console.log(`  TOTAL: ${totalPass}/${grandTotal} passed (${grandPct}%)`);
+        console.log('════════════════════════════════════════════\n');
+
+        return totalFail === 0;
+    }
+
+    static run() {
+        console.log('Running test suite...');
+
+        // ----- Tokenizer -----
+        this.#addTest('Tokenizer', 'tokenizes code with comments, strings, templates, regex', () => {
+            const code = `
+// line comment
+const s = "hello"; /* block */
+const t = \`template\`;
+const r = /regex/;
+`;
+            const lines = Tokenizer.tokenize(code);
+            this.#assert(lines.length === 5, `Expected 5 lines, got ${lines.length}`);
+            this.#assert(lines[0].commentOnly === true, 'Line comment should be commentOnly');
+            this.#assert(lines[1].hasCode === true, 'Line with const should have code');
+            this.#assert(lines[1].clean.includes('const s = "hello";'), 'String should be preserved in clean');
+            this.#assert(lines[2].clean.includes('const t = `template`;'), 'Template should be preserved');
+            this.#assert(lines[3].clean.includes('const r = /regex/;'), 'Regex should be preserved');
+        });
+
+        this.#addTest('Tokenizer', 'handles block comments and depth', () => {
+            const code = `/* block */ class A { /* inner */ }`;
+            const lines = Tokenizer.tokenize(code);
+            this.#assert(lines.length === 1, 'Should be one line');
+            this.#assert(lines[0].comments.length === 2, 'Two comments expected');
+            this.#assert(lines[0].clean.includes('class A { }'), 'Clean should have class structure');
+        });
+
+        // ----- Scanner -----
+        this.#addTest('Scanner', 'findBlockEnd works for simple block', () => {
+            const code = `function f() {\n  return 1;\n}`;
+            const lines = Tokenizer.tokenize(code);
+            const bodyStart = Scanner.findBodyStart(lines, 0, 0, lines.length - 1);
+            this.#assert(bodyStart !== null, 'body start should exist');
+            const end = Scanner.findBlockEnd(lines, bodyStart.idx, bodyStart.col, lines.length - 1);
+            this.#assert(end.idx === 2, 'block end should be line 2');
+            this.#assert(end.col === 0, 'block end col should be 0');
+        });
+
+        this.#addTest('Scanner', 'findStatementEnd with continuation', () => {
+            const code = `const x = 1 +\n  2;`;
+            const lines = Tokenizer.tokenize(code);
+            const end = Scanner.findStatementEnd(lines, 0, 0, lines.length - 1);
+            this.#assert(end === 1, `Expected end at line 1, got ${end}`);
+        });
+
+        // ----- StructureParser -----
+        const sampleCode = `
+import fs from 'fs';
+import { readFile } from 'fs/promises';
+
+export const PI = 3.14;
+
+export function add(a, b) {
+    return a + b;
+}
+
+/**
+ * A class doc.
+ */
+class Person {
+    constructor(name) {
+        this.name = name;
+    }
+
+    greet() {
+        console.log('Hello');
+    }
+
+    static create() {
+        return new Person('x');
+    }
+}
+
+interface Shape {
+    area(): number;
+}
+
+enum Color { Red, Green }
+`;
+
+        this.#addTest('StructureParser', 'parses top-level structures correctly', () => {
+            const tree = StructureParser.parse(sampleCode, '<test>');
+            this.#assert(tree.imports.length === 2, `Expected 2 imports, got ${tree.imports.length}`);
+            this.#assert(tree.variables.length === 1, 'Expected 1 variable');
+            this.#assert(tree.functions.length === 1, 'Expected 1 function');
+            this.#assert(tree.containers.length === 3, 'Expected 3 containers (class, interface, enum)');
+            this.#assert(tree.containers[0].name === 'Person', 'First container should be Person');
+            this.#assert(tree.containers[0].members.length === 3, `Person should have 3 members (constructor, greet, static create), got ${tree.containers[0].members.length}`);
+        });
+
+        this.#addTest('StructureParser', 'detects class members with modifiers', () => {
+            const code = `
+class Test {
+    private x = 1;
+    static async method() {}
+    get val() { return 1; }
+    set val(v) {}
+    #privateMethod() {}
+}`;
+            const tree = StructureParser.parse(code, '<test>');
+            const cls = tree.containers[0];
+            this.#assert(cls.members.length === 5, `Expected 5 members, got ${cls.members.length}`);
+            this.#assert(cls.members[0].kind === 'field', 'First member should be field');
+            this.#assert(cls.members[0].accessibility === 'private', 'Should be private');
+            this.#assert(cls.members[1].isStatic === true && cls.members[1].isAsync === true, 'Method should be static async');
+            this.#assert(cls.members[2].kind === 'getter', 'Should be getter');
+            this.#assert(cls.members[3].kind === 'setter', 'Should be setter');
+            this.#assert(cls.members[4].name.startsWith('#'), 'Should be private method');
+        });
+
+        // ----- Selection -----
+        this.#addTest('Selection', 'normalize legacy selection', () => {
+            const legacy = {
+                includeImports: true,
+                includeFunctions: ['add'],
+                includeClasses: ['Person'],
+                includeMethods: ['greet'],
+                includeAllComments: true,
+                includeAllJSDoc: true,
+                autoKeepPrivateRefs: false
+            };
+            const tree = StructureParser.parse(sampleCode, '<test>');
+            const sel = Selection.normalize(legacy, tree);
+            this.#assert(sel.includeImports === true, 'includeImports should be true');
+            this.#assert(sel.functions.includes('add'), 'add should be in functions');
+            this.#assert(sel.containers['Person'] !== undefined, 'Person should be selected');
+            this.#assert(sel.containers['Person'].members.includes(tree.containers[0].members[1].id), 'greet should be selected');
+            this.#assert(sel.commentMode === 'keep', 'comment mode should be keep');
+            this.#assert(sel.jsdocMode === 'keep', 'jsdoc mode should be keep');
+            this.#assert(sel.autoKeepPrivateRefs === false, 'autoKeepPrivateRefs should be false');
+        });
+
+        this.#addTest('Selection', 'toggle container and member', () => {
+            const sel = Selection.empty();
+            const container = { name: 'A' };
+            Selection.toggleContainer(sel, container);
+            this.#assert(Selection.isContainerSelected(sel, 'A'), 'Container should be selected');
+            Selection.toggleMember(sel, container, 'm1');
+            this.#assert(sel.containers['A'].members.includes('m1'), 'Member m1 should be selected');
+        });
+
+        // ----- CommentStripper -----
+        this.#addTest('CommentStripper', 'removes comments according to modes', () => {
+            const code = `// top-level\nclass A {\n  // nested\n  method() {}\n}`;
+            const lines = Tokenizer.tokenize(code);
+            const outLines = lines.map(l => ({ num: l.num, text: l.original }));
+            const keep = CommentStripper.apply(outLines, lines, { commentMode: 'keep', jsdocMode: 'keep' });
+            this.#assert(keep.length === 4, 'keep should keep all');
+            const topLevel = CommentStripper.apply(outLines, lines, { commentMode: 'top-level', jsdocMode: 'top-level' });
+            this.#assert(topLevel.length === 3, 'top-level should remove top-level comment');
+            this.#assert(!topLevel.some(l => l.text.includes('top-level')), 'top-level comment removed');
+            this.#assert(topLevel.some(l => l.text.includes('nested')), 'nested comment kept');
+            const all = CommentStripper.apply(outLines, lines, { commentMode: 'all', jsdocMode: 'all' });
+            this.#assert(all.length === 2, 'all should remove all comments');
+        });
+
+        // ----- CodeEmitter -----
+        this.#addTest('CodeEmitter', 'generates filtered output with validation', () => {
+            const tree = StructureParser.parse(sampleCode, '<test>');
+            const selection = {
+                includeImports: false,
+                includeExports: false,
+                includeVariables: false,
+                functions: [],
+                containers: {
+                    Person: { members: [tree.containers[0].members[1].id] } // only greet
+                },
+                commentMode: 'top-level',
+                jsdocMode: 'top-level',
+                autoKeepPrivateRefs: true
+            };
+            const result = CodeEmitter.generate(tree, selection);
+            this.#assert(result.validation.ok, `Validation should pass, issues: ${result.validation.issues.join(', ')}`);
+            this.#assert(result.text.includes('class Person'), 'Should include class header');
+            this.#assert(result.text.includes('greet()'), 'Should include greet method');
+            this.#assert(!result.text.includes('constructor'), 'Should not include constructor');
+            this.#assert(!result.text.includes('static create'), 'Should not include static create');
+        });
+
+        this.#addTest('CodeEmitter', 'handles private refs auto-keep', () => {
+            const code = `
+class Counter {
+    #count = 0;
+    increment() {
+        this.#count++;
+    }
+    getCount() {
+        return this.#count;
+    }
+}`;
+            const tree = StructureParser.parse(code, '<test>');
+            const selection = {
+                containers: {
+                    Counter: { members: [tree.containers[0].members[1].id] } // increment
+                },
+                autoKeepPrivateRefs: true
+            };
+            const result = CodeEmitter.generate(tree, selection);
+            this.#assert(result.validation.ok, 'Validation should pass');
+            this.#assert(result.text.includes('#count = 0'), 'Should auto-keep private #count');
+            this.#assert(result.text.includes('increment()'), 'Should include increment');
+            this.#assert(!result.text.includes('getCount()'), 'Should not include getCount');
+        });
+
+        // ----- CodeParser facade -----
+        this.#addTest('CodeParser', 'parseSource and getters', () => {
+            CodeParser.parseSource(sampleCode, '<test>');
+            const imports = CodeParser.getImports();
+            this.#assert(imports.length === 2, 'Should have 2 imports');
+            const containers = CodeParser.getContainers();
+            this.#assert(containers.length === 3, 'Should have 3 containers');
+            const functions = CodeParser.getFunctions();
+            this.#assert(functions.length === 1, 'Should have 1 function');
+            const vars = CodeParser.getVariables();
+            this.#assert(vars.length === 1, 'Should have 1 variable');
+            const summary = CodeParser.getSummary();
+            this.#assert(summary.totalLines > 0, 'Summary should have lines');
+        });
+
+        this.#addTest('CodeParser', 'generateFiltered returns output', () => {
+            CodeParser.parseSource(sampleCode, '<test>');
+            const text = CodeParser.generateFiltered({ includeVariables: true });
+            this.#assert(text.includes('PI'), 'Should include variable PI');
+            const report = CodeParser.getLastReport();
+            this.#assert(report.validation.ok, 'Validation should pass');
+        });
+
+        // ----- Validation -----
+        this.#addTest('Validation', 'detects unbalanced braces', () => {
+            const result = CodeEmitter.validate('class A {');
+            this.#assert(!result.ok, 'Should detect unclosed brace');
+            this.#assert(result.issues.length > 0, 'Should have issues');
+        });
+
+        this.#addTest('Validation', 'passes balanced code', () => {
+            const result = CodeEmitter.validate('class A {}\nfunction f() {}');
+            this.#assert(result.ok, 'Should be valid');
+        });
+
+        // ----- Integration -----
+        this.#addTest('Integration', 'full flow parse -> select -> emit -> validate', () => {
+            const code = `
+import x from 'x';
+export function util() {}
+class Main {
+    method1() {}
+    method2() {}
+}
+`;
+            CodeParser.parseSource(code, '<test>');
+            const tree = CodeParser.getTree();
+            const selection = {
+                includeImports: false,
+                includeExports: false,
+                containers: {
+                    Main: { members: [tree.containers[0].members[0].id] }
+                }
+            };
+            const text = CodeParser.generateFiltered(selection);
+            this.#assert(text.includes('class Main'), 'Should include class');
+            this.#assert(text.includes('method1()'), 'Should include method1');
+            this.#assert(!text.includes('method2()'), 'Should not include method2');
+            const validation = CodeParser.validate(text);
+            this.#assert(validation.ok, 'Output should be valid');
+        });
+
+        // Run and report
+        this.#runTests();
+        const success = this.#printReport();
+        process.exit(success ? 0 : 1);
+    }
+}
+
+/* ============================================================================
+ * 10. PONTO DE ENTRADA (CLI)
  * ========================================================================== */
 
 const args = process.argv.slice(2);
-const options = {
-    load: null,
-    output: null,
-    commentMode: null,
-    jsdocMode: null,
-    auto: false
-};
 
-let filePath = null;
+// Se --test for passado, rodar testes e sair
+if (args.includes('--test')) {
+    TestRunner.run();
+} else {
+    const options = {
+        load: null,
+        output: null,
+        commentMode: null,
+        jsdocMode: null,
+        auto: false
+    };
 
-for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === '--load' || arg === '-l') options.load = args[++i];
-    else if (arg === '--output' || arg === '-o') options.output = args[++i];
-    else if (arg === '--comment-mode') options.commentMode = args[++i];
-    else if (arg === '--jsdoc-mode') options.jsdocMode = args[++i];
-    else if (arg === '--auto' || arg === '-a') options.auto = true;
-    else if (!filePath) filePath = arg;
-}
+    let filePath = null;
 
-if (!filePath || args.includes('--help') || args.includes('-h')) {
-    console.log(`
+    for (let i = 0; i < args.length; i++) {
+        const arg = args[i];
+        if (arg === '--load' || arg === '-l') options.load = args[++i];
+        else if (arg === '--output' || arg === '-o') options.output = args[++i];
+        else if (arg === '--comment-mode') options.commentMode = args[++i];
+        else if (arg === '--jsdoc-mode') options.jsdocMode = args[++i];
+        else if (arg === '--auto' || arg === '-a') options.auto = true;
+        else if (!filePath) filePath = arg;
+    }
+
+    if (!filePath || args.includes('--help') || args.includes('-h')) {
+        console.log(`
 Usage: node codeParser.js <file> [options]
 
 Options:
@@ -1964,11 +2304,12 @@ Options:
   --auto, -a               Auto-generate and exit (requires --output)
   --help, -h               Show this help
 `);
-    process.exit(filePath ? 0 : 1);
-}
+        process.exit(filePath ? 0 : 1);
+    }
 
-const menu = new CLIMenu();
-menu.start(filePath, options).catch(err => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-});
+    const menu = new CLIMenu();
+    menu.start(filePath, options).catch(err => {
+        console.error('Fatal error:', err);
+        process.exit(1);
+    });
+}
