@@ -46,6 +46,13 @@ async function readDirectory(directory) {
 }
 
 // ============================================================
+//  Check if any path contains ._ pattern
+// ============================================================
+function hasSpecialPathPattern(filePaths) {
+    return filePaths.some(filePath => filePath.split(path.sep).some(part => part.startsWith('._')));
+}
+
+// ============================================================
 //  Generate struct file from a list of absolute paths
 //  Now supports optional AI instructions
 // ============================================================
@@ -57,6 +64,7 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
     } = options;
 
     let structContent = '';
+    const needsPathEnforcement = hasSpecialPathPattern(filePaths);
 
     // ---- AI instructions header (if requested) ----
     if (includeInstructions) {
@@ -68,6 +76,17 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
         structContent += `Below are the current contents of the selected files.\n`;
         structContent += `Your task is to apply the following user request:\n\n`;
         structContent += `USER REQUEST:\n${userDemand}\n\n`;
+
+        if (needsPathEnforcement) {
+            structContent += `${'-'.repeat(50)}\n`;
+            structContent += `CRITICAL PATH PRESERVATION RULE:\n`;
+            structContent += `Some paths contain directory names starting with "._" (e.g., "._backup", "._config").\n`;
+            structContent += `These are NOT the same as "." or "./" - they are actual directory names.\n`;
+            structContent += `You MUST copy paths EXACTLY as shown in FILE: headers.\n`;
+            structContent += `NEVER convert "._/" to "./" or "././" - this loses directory names.\n`;
+            structContent += `Example: /home/user/._backup/file.js is NOT /home/user/./file.js\n`;
+            structContent += `${'-'.repeat(50)}\n\n`;
+        }
 
         if (outputFormat === 'full') {
             structContent += `OUTPUT FORMAT: FULL FILES\n`;
