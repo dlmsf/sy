@@ -1859,15 +1859,16 @@ if (configuration.remember) {
             if (option.type === 'field') {
                 const maxLen = this.fieldMaxWidth || 20;
                 let val = '';
+                const label = option.label || '';
                 if (this.isEditing && lineIndex === line && columnIndex === column && this.activeField) {
                     val = this.activeField.value;
                     const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
-                    const truncated = val.length > maxLen ? val.slice(-maxLen) : val;  // show last maxLen chars
-                    text = `${option.label || 'Field'}: ░${truncated}${blink}░`;
+                    const truncated = val.length > maxLen ? val.slice(-maxLen) : val;  // show end while editing
+                    text = label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
                 } else {
                     val = option.value || '';
-                    const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
-                    text = `${option.label || 'Field'}: ░${truncated}░`;
+                    const truncated = val.length > maxLen ? val.slice(0, maxLen) : val;  // show beginning when not editing
+                    text = label ? `${label}: ░${truncated}░` : `░${truncated}░`;
                 }
             } else {
                 text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
@@ -1911,17 +1912,8 @@ if (configuration.remember) {
         // Check if the selected option is a field
         const selectedOption = normalizedOptions[line] && normalizedOptions[line][column];
         if (selectedOption && selectedOption.type === 'field') {
-            // Enter editing mode
-            this.activeField = {
-                value: selectedOption.value || '',
-                originalValue: selectedOption.value || '',
-                line, column,
-                onChange: selectedOption.onChange || null
-            };
-            this.isEditing = true;
-            this.inputBuffer = '';
-            this.disableMouseTracking();       // stop mouse interference
-            this.isClickInProgress = false;    // unlock click processing
+            // Enter editing mode with raw input handling
+            this.startFieldEditing(selectedOption, line, column, renderMenu);
             setFocus(line, column);            // keep highlight on the field
             renderMenu();
             return;
@@ -1987,36 +1979,8 @@ this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, l
           inMenu: true
         });
         
-        // --- FIELD EDITING MODE ---
+        // --- FIELD EDITING MODE (handled by raw listener, ignore keypress) ---
         if (this.isEditing && this.activeField) {
-            if (key.name === 'backspace') {
-                if (this.activeField.value.length > 0) {
-                    this.activeField.value = this.activeField.value.slice(0, -1);
-                }
-            } else if (key.name === 'return') {
-                // Confirm edit and save value
-                if (this.activeField.onChange) {
-                    this.activeField.onChange(this.activeField.value);
-                }
-                this.isEditing = false;
-                this.activeField = null;
-                this.isClickInProgress = false;   // ensure clicks are allowed again
-                this.enableMouseTracking();       // restore mouse
-            } else if (key.name === 'escape') {
-                // Cancel edit, revert to original value
-                if (this.activeField.originalValue !== undefined) {
-                    this.activeField.value = this.activeField.originalValue;
-                }
-                this.isEditing = false;
-                this.activeField = null;
-                this.isClickInProgress = false;
-                this.enableMouseTracking();
-            } else if (key.sequence && key.sequence.length === 1 && key.sequence >= ' ') {
-                // Printable character
-                this.activeField.value += key.sequence;
-            }
-            // Always re-render to show changes
-            renderMenu();
             return;
         }
         
@@ -2531,6 +2495,100 @@ getOptionDataForEvent(option) {
       if (!this.isMouseEnabled && this.isInMenu) {
           this.safeEnableMouseTracking();
       }
+  }
+
+  /**
+   * Starts field editing mode with raw input handling.
+   * Disables mouse tracking and attaches a raw data listener that filters mouse sequences.
+   * @private
+   * @param {object} fieldOption - The field option being edited
+   * @param {number} line - Line index of the field
+   * @param {number} column - Column index of the field
+   * @param {Function} renderMenu - Function to re-render the menu
+   */
+  startFieldEditing(fieldOption, line, column, renderMenu) {
+      if (this.isEditing) return; // Already editing
+
+      this.activeField = {
+          value: fieldOption.value || '',
+          originalValue: fieldOption.value || '',
+          line,
+          column,
+          onChange: fieldOption.onChange || null
+      };
+      this.isEditing = true;
+
+      // Disable mouse tracking to stop mouse events
+      this.disableMouseTracking();
+
+      // Attach raw input listener for field editing
+      this.fieldInputHandler = (data) => this.handleFieldInput(data, renderMenu);
+      stdin.on('data', this.fieldInputHandler);
+  }
+
+  /**
+   * Handles raw input during field editing, filtering out mouse sequences.
+   * @private
+   * @param {Buffer|string} data - Raw input data
+   * @param {Function} renderMenu - Function to re-render the menu
+   */
+  handleFieldInput(data, renderMenu) {
+      const str = data.toString();
+
+      // Ignore mouse sequences (SGR or X10)
+      if (str.includes('\x1b[<') || str.includes('\x1b[M')) {
+          return;
+      }
+
+      for (const char of str) {
+          if (char === '\r' || char === '\n') {
+              // Enter: save and exit
+              if (this.activeField.onChange) {
+                  this.activeField.onChange(this.activeField.value);
+              }
+              this.stopFieldEditing(renderMenu);
+              return;
+          } else if (char === '\x7f' || char === '\b') {
+              // Backspace
+              if (this.activeField.value.length > 0) {
+                  this.activeField.value = this.activeField.value.slice(0, -1);
+              }
+          } else if (char === '\x1b') {
+              // Escape: cancel
+              this.activeField.value = this.activeField.originalValue;
+              this.stopFieldEditing(renderMenu);
+              return;
+          } else if (char >= ' ') {
+              // Printable character
+              this.activeField.value += char;
+          }
+      }
+
+      // Re-render after changes
+      if (renderMenu) renderMenu();
+  }
+
+  /**
+   * Stops field editing mode, removes the raw listener, and re-enables mouse tracking.
+   * @private
+   * @param {Function} renderMenu - Function to re-render the menu
+   */
+  stopFieldEditing(renderMenu) {
+      if (this.fieldInputHandler) {
+          stdin.removeListener('data', this.fieldInputHandler);
+          this.fieldInputHandler = null;
+      }
+      this.isEditing = false;
+      this.activeField = null;
+      this.isClickInProgress = false; // Reset to allow future clicks
+
+      // Re-enable mouse tracking if still in menu
+      if (this.isInMenu) {
+          this.enableMouseTracking();
+      }
+
+      // Re-render to show final value
+      if (renderMenu) renderMenu();
   }
 
   /**
@@ -6414,7 +6472,7 @@ this.DropDownManager = {
 
         const fieldObj = {
             type: 'field',
-            label: config.label || 'Value',
+            label: config.label || '', // empty if not provided
             value: value,
             onChange: (newValue) => {
                 this.Storages.Set(id, storageKey, newValue);
@@ -6708,6 +6766,7 @@ class TemplateFunc extends SyAPP_Func {
           this.Text(uid, `Numero digitado : ${props.inputValue}`)
         }
 
+        this.Field(uid, 'teste')
         this.Text(uid, 'Hello World')
         this.Button(uid, { name: 'Button 1' })
         this.Buttons(uid, [
