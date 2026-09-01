@@ -2,6 +2,8 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import process from 'process';
 import os from 'os';
+import readline from 'readline';
+import { CodeParser, Selection, CodeEmitter, CLIMenu } from './CodeParser.js';
 
 // ============================================================
 //  ANSI escape codes for terminal control
@@ -13,6 +15,8 @@ const REVERSE = '\x1b[7m';
 const GREEN = '\x1b[32m';
 const BLUE = '\x1b[34m';
 const YELLOW = '\x1b[33m';
+const RED = '\x1b[31m';
+const MAGENTA = '\x1b[35m';
 
 // ============================================================
 //  Helper: clear screen and move cursor to top-left
@@ -35,7 +39,6 @@ function formatNumber(value) {
 async function readDirectory(directory) {
     const entries = await fs.readdir(directory, { withFileTypes: true });
 
-    // Sort: directories first, then alphabetically
     entries.sort((a, b) => {
         if (a.isDirectory() && !b.isDirectory()) return -1;
         if (!a.isDirectory() && b.isDirectory()) return 1;
@@ -99,20 +102,27 @@ function generatePathEnforcement(filePaths, outputFormat) {
 }
 
 // ============================================================
+//  Check if file is a JavaScript/TypeScript file
+// ============================================================
+function isJavaScriptFile(filePath) {
+    const ext = path.extname(filePath).toLowerCase();
+    return ['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'].includes(ext);
+}
+
+// ============================================================
 //  Generate struct file from a list of absolute paths
-//  Now supports optional AI instructions with path preservation
 // ============================================================
 async function generateStruct(filePaths, outputFileName = 'struct', options = {}) {
     const {
         includeInstructions = false,
         userDemand = '',
-        outputFormat = 'full', // 'full', 'tagged', or 'both'
+        outputFormat = 'full',
+        parsedFiles = null,
     } = options;
 
     let structContent = '';
     const needsPathEnforcement = hasSpecialPathPattern(filePaths);
 
-    // ---- AI instructions header (if requested) ----
     if (includeInstructions) {
         structContent += `${'='.repeat(50)}\n`;
         structContent += `AI INSTRUCTIONS\n`;
@@ -125,6 +135,31 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
 
         if (needsPathEnforcement) {
             structContent += generatePathEnforcement(filePaths, outputFormat);
+        }
+
+        if (parsedFiles && parsedFiles.size > 0) {
+            structContent += `${'!'.repeat(50)}\n`;
+            structContent += `⚠️  WARNING: PARSED FILES DETECTED\n`;
+            structContent += `${'!'.repeat(50)}\n\n`;
+            structContent += `The following files have been PARSED using CodeParser.\n`;
+            structContent += `This means their content has been FILTERED - only selected\n`;
+            structContent += `portions are shown below.\n\n`;
+            for (const [filePath, info] of parsedFiles.entries()) {
+                structContent += `  PARSED FILE: ${filePath}\n`;
+                structContent += `  Original size: ${formatNumber(info.originalSize)} bytes | Parsed size: ${formatNumber(info.parsedSize)} bytes\n`;
+                structContent += `  Stats: ${info.stats.containers} containers, ${info.stats.functions} functions, ${info.stats.totalMembers} members\n`;
+                if (info.notes && info.notes.length > 0) {
+                    structContent += `  Notes:\n`;
+                    info.notes.forEach(note => structContent += `    • ${note}\n`);
+                }
+                structContent += `\n`;
+            }
+            structContent += `IMPORTANT: When making replacements in these files, use the\n`;
+            structContent += `[CODEREPLACER] tagged format. The parsed content shown is a\n`;
+            structContent += `FILTERED version - the actual file on disk contains MORE code\n`;
+            structContent += `than what is shown. Replacements must target the EXACT original\n`;
+            structContent += `text in the actual file.\n\n`;
+            structContent += `${'!'.repeat(50)}\n\n`;
         }
 
         if (outputFormat === 'full') {
@@ -161,7 +196,6 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
         structContent += `${'='.repeat(50)}\n\n`;
     }
 
-    // ---- File contents ----
     for (const filePath of filePaths) {
         try {
             const content = await fs.readFile(filePath, 'utf8');
@@ -169,9 +203,17 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
             structContent += `${'='.repeat(50)}\n`;
             structContent += `FILE: ${filePath}\n`;
             structContent += `${'='.repeat(50)}\n`;
-            structContent += content;
 
-            if (!content.endsWith('\n')) structContent += '\n';
+            const parsedInfo = parsedFiles?.get(filePath);
+            if (parsedInfo) {
+                structContent += `[NOTE: This file has been PARSED - showing FILTERED content only]\n`;
+                structContent += parsedInfo.parsedContent;
+                if (!parsedInfo.parsedContent.endsWith('\n')) structContent += '\n';
+            } else {
+                structContent += content;
+                if (!content.endsWith('\n')) structContent += '\n';
+            }
+            
             structContent += '\n';
         } catch (err) {
             console.error(`\nError reading ${filePath}: ${err.message}`);
@@ -183,6 +225,10 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
     
     if (needsPathEnforcement && includeInstructions) {
         console.log(`\n${YELLOW}⚠️  Path preservation enforcement added - paths with ._/ patterns detected${RESET}`);
+    }
+    
+    if (parsedFiles && parsedFiles.size > 0) {
+        console.log(`\n${MAGENTA}🔍 Parsed ${parsedFiles.size} JavaScript file(s) with CodeParser${RESET}`);
     }
 }
 
@@ -215,7 +261,6 @@ async function loadPaths(saveName) {
 
 // ============================================================
 //  Token-count estimation based on file size
-//  Approximately 1 token per 4 bytes
 // ============================================================
 async function getFileTokenCount(filePath) {
     try {
@@ -255,6 +300,130 @@ async function collectAllFiles(directory) {
 }
 
 // ============================================================
+//  Run CodeParser CLI menu for a specific file
+//  Returns the selection made by the user
+// ============================================================
+async function runParserMenu(filePath) {
+    console.log(`\n${YELLOW}Loading CodeParser for: ${path.basename(filePath)}${RESET}\n`);
+    
+    try {
+        // Parse the file
+        CodeParser.parse(filePath);
+        const summary = CodeParser.getSummary();
+        
+        // Create readline for quick menu
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout,
+            terminal: true
+        });
+        
+        const ask = (question) => new Promise(res => rl.question(question, res));
+        
+        console.log(`${BOLD}─── CODE PARSER QUICK MENU ───${RESET}`);
+        console.log(`File: ${path.basename(filePath)}`);
+        console.log(`Stats: ${summary.totalLines} lines | ${summary.containers} containers | ${summary.functions} functions | ${summary.totalMembers} members\n`);
+        
+        console.log(`Quick options:`);
+        console.log(`  1. Include ALL containers (classes/interfaces/enums)`);
+        console.log(`  2. Include ALL functions`);
+        console.log(`  3. Include ALL variables`);
+        console.log(`  4. Include ALL imports`);
+        console.log(`  5. Custom selection (full CodeParser menu)`);
+        console.log(`  6. Skip parsing (use original file)`);
+        
+        const choice = await ask(`\nChoose option (1-6): `);
+        
+        let finalSelection = Selection.empty();
+        
+        if (choice.trim() === '5') {
+            // For full menu, close quick menu readline first
+            rl.close();
+            
+            console.log(`\n${YELLOW}Launching full CodeParser menu...${RESET}\n`);
+            
+            // Create new readline for full menu
+            const fullRl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+                terminal: true
+            });
+            
+            const menu = new CLIMenu({ 
+                rl: fullRl,
+                integrationMode: true
+            });
+            
+            const completionPromise = menu.waitForCompletion();
+            menu.start(filePath).catch(() => {});
+            finalSelection = await completionPromise;
+            
+            // Close full menu readline
+            fullRl.close();
+            
+        } else if (choice.trim() === '6' || choice.trim() === '') {
+            console.log(`\nSkipping parser - using original file.`);
+            rl.close();
+            return null;
+        } else {
+            // Quick options
+            switch (choice.trim()) {
+                case '1':
+                    CodeParser.getContainers().forEach(c => {
+                        finalSelection.containers[c.name] = { members: null };
+                    });
+                    break;
+                case '2':
+                    finalSelection.functions = CodeParser.getFunctions().map(f => f.name);
+                    break;
+                case '3':
+                    finalSelection.includeVariables = true;
+                    break;
+                case '4':
+                    finalSelection.includeImports = true;
+                    break;
+                default:
+                    console.log(`\nInvalid option - skipping parser.`);
+                    rl.close();
+                    return null;
+            }
+            rl.close();
+        }
+        
+        // Generate filtered content
+        const filtered = CodeParser.generateFiltered(finalSelection);
+        const report = CodeParser.getLastReport();
+        
+        if (filtered && filtered.trim()) {
+            console.log(`\n${GREEN}✓ Parsed! Generated ${filtered.split('\n').length} lines (from ${summary.totalLines} original)${RESET}`);
+            if (report.notes.length) {
+                console.log(`\n${YELLOW}Notes:${RESET}`);
+                report.notes.forEach(n => console.log(`  • ${n}`));
+            }
+            if (!report.validation.ok) {
+                console.log(`\n${RED}⚠️  WARNING: Validation issues detected!${RESET}`);
+                report.validation.issues.forEach(i => console.log(`  • ${i}`));
+            }
+        } else {
+            console.log(`\n${YELLOW}Empty output generated - using original file.${RESET}`);
+            return null;
+        }
+        
+        return {
+            selection: finalSelection,
+            content: filtered,
+            stats: summary,
+            notes: report.notes,
+            validation: report.validation
+        };
+    } catch (err) {
+        console.error(`\n${RED}Error in CodeParser: ${err.message}${RESET}`);
+        console.log(`Using original file.`);
+        return null;
+    }
+}
+
+// ============================================================
 //  Interactive file/directory navigation & selection
 // ============================================================
 async function interactiveMode() {
@@ -271,21 +440,13 @@ async function interactiveMode() {
 
     const selectedFiles = new Set();
     const selectedTokenCounts = new Map();
+    const parsedFiles = new Map();
     let totalTokens = 0;
 
-    // --------------------------------------------------------
-    //  Dynamic pagination based on terminal height
-    // --------------------------------------------------------
     function getMaxEntries() {
         const terminalRows = process.stdout.rows || 24;
-        // Reserve space for:
-        //  1. current directory line
-        //  2. selected files + tokens line
-        //  3. separator
-        //  4. help line
-        //  5. separator
-        //  6. optional pagination footer
-        return Math.max(1, terminalRows - 6);
+        const extraLines = parsedFiles.size > 0 ? 7 : 6;
+        return Math.max(1, terminalRows - extraLines);
     }
 
     function adjustScrollOffset() {
@@ -309,9 +470,6 @@ async function interactiveMode() {
         }
     }
 
-    // --------------------------------------------------------
-    //  Selection helpers
-    // --------------------------------------------------------
     async function selectFile(filePath) {
         if (selectedFiles.has(filePath)) return;
 
@@ -330,6 +488,8 @@ async function interactiveMode() {
         selectedFiles.delete(filePath);
         selectedTokenCounts.delete(filePath);
         totalTokens -= tokenCount;
+        
+        parsedFiles.delete(filePath);
     }
 
     async function toggleFile(filePath) {
@@ -378,9 +538,6 @@ async function interactiveMode() {
         }
     }
 
-    // --------------------------------------------------------
-    //  Render the file browser view
-    // --------------------------------------------------------
     const render = () => {
         clearScreen();
 
@@ -393,18 +550,28 @@ async function interactiveMode() {
 
         console.log(`${BOLD}${BLUE}Current directory:${RESET} ${YELLOW}${currentDirectory}${RESET}`);
         console.log(`${BOLD}Selected: ${selectedFiles.size} file(s) | Tokens: ${formatNumber(totalTokens)}${RESET}`);
+        
+        if (parsedFiles.size > 0) {
+            console.log(`${RED}${BOLD}⚠️  ${parsedFiles.size} file(s) will be PARSED (filtered)${RESET}`);
+        }
+        
         console.log('─'.repeat(process.stdout.columns || 80));
         console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, g gen, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
             const actualIndex = scrollOffset + index;
+            const fullPath = path.join(currentDirectory, entry.name);
             let prefix = ' ';
 
             if (entry.isDirectory()) {
                 prefix = `${BLUE}[DIR]${RESET} `;
-            } else if (selectedFiles.has(path.join(currentDirectory, entry.name))) {
-                prefix = `${GREEN}[✔]${RESET} `;
+            } else if (selectedFiles.has(fullPath)) {
+                if (parsedFiles.has(fullPath)) {
+                    prefix = `${MAGENTA}[🔍]${RESET} `;
+                } else {
+                    prefix = `${GREEN}[✔]${RESET} `;
+                }
             } else {
                 prefix = '[ ] ';
             }
@@ -425,62 +592,54 @@ async function interactiveMode() {
         }
     };
 
-    // --------------------------------------------------------
-    //  Cleanup function to restore terminal and exit
-    // --------------------------------------------------------
     const cleanupAndExit = (code) => {
         process.stdin.setRawMode(originalRawMode);
         process.stdin.pause();
         process.exit(code);
     };
 
-    // --------------------------------------------------------
-    //  Helper: ask a question (line input) while raw mode off
-    // --------------------------------------------------------
     const askQuestion = (question) => {
         return new Promise(resolve => {
-            process.stdout.write(question + ' ');
-            process.stdin.once('data', data => {
-                resolve(data.toString().trim());
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout,
+                terminal: false  // Don't use terminal mode to avoid conflicts
+            });
+            
+            rl.question(question + ' ', (answer) => {
+                rl.close();
+                resolve(answer.trim());
             });
         });
     };
 
-    // --------------------------------------------------------
-    //  Main keypress handler
-    // --------------------------------------------------------
     const onKeypress = async (key) => {
         const maxEntries = getMaxEntries();
 
-        // Arrow up
         if (key === '\u001b[A') {
             if (cursorIndex > 0) cursorIndex--;
             render();
             return;
         }
 
-        // Arrow down
         if (key === '\u001b[B') {
             if (cursorIndex < entries.length - 1) cursorIndex++;
             render();
             return;
         }
 
-        // PageUp
         if (key === '\u001b[5~') {
             cursorIndex = Math.max(0, cursorIndex - maxEntries);
             render();
             return;
         }
 
-        // PageDown
         if (key === '\u001b[6~') {
             cursorIndex = Math.min(entries.length - 1, cursorIndex + maxEntries);
             render();
             return;
         }
 
-        // Space: toggle selection for files only
         if (key === ' ') {
             if (entries.length > 0 && cursorIndex >= 0 && cursorIndex < entries.length) {
                 const entry = entries[cursorIndex];
@@ -495,7 +654,6 @@ async function interactiveMode() {
             return;
         }
 
-        // Enter: navigate into directory or toggle file selection
         if (key === '\r' || key === '\n') {
             if (entries.length > 0 && cursorIndex >= 0 && cursorIndex < entries.length) {
                 const entry = entries[cursorIndex];
@@ -515,21 +673,18 @@ async function interactiveMode() {
             return;
         }
 
-        // 'a': toggle all files in current directory only
         if (key === 'a') {
             await toggleAllInCurrentDirectory();
             render();
             return;
         }
 
-        // 'A': toggle all files recursively under current directory
         if (key === 'A') {
             await toggleAllRecursivelyFromCurrentDirectory();
             render();
             return;
         }
 
-        // 'g' or 'G': generate struct from selected files
         if (key === 'g' || key === 'G') {
             if (selectedFiles.size === 0) {
                 console.log('\nNo files selected.');
@@ -538,37 +693,99 @@ async function interactiveMode() {
             }
 
             // Temporarily disable raw mode for interactive prompts
+            // REMOVE the keypress listener but DO NOT pause stdin
             process.stdin.removeListener('data', onKeypress);
             process.stdin.setRawMode(false);
 
-            // Ask about AI instructions
-            const includeInstrAnswer = await askQuestion('Do you want to add AI instructions? (y/n): ');
+            // STEP 1: Ask about parsing JavaScript files
+            const jsFiles = [...selectedFiles].filter(isJavaScriptFile);
+            
+            if (jsFiles.length > 0) {
+                console.log(`\n${YELLOW}${BOLD}=== CODE PARSER OPTION ===${RESET}`);
+                console.log(`You have ${jsFiles.length} JavaScript/TypeScript file(s) selected.`);
+                console.log(`CodeParser can FILTER these files to include only selected parts.\n`);
+                
+                const parseAnswer = await askQuestion(`Do you want to parse any JavaScript files with CodeParser? (y/n):`);
+                
+                if (parseAnswer.toLowerCase() === 'y' || parseAnswer.toLowerCase() === 'yes') {
+                    console.log(`\n${BOLD}JavaScript files available for parsing:${RESET}`);
+                    jsFiles.forEach((file, idx) => {
+                        const alreadyParsed = parsedFiles.has(file) ? ' (already parsed)' : '';
+                        console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyParsed}`);
+                    });
+                    
+                    const fileChoice = await askQuestion(`\nWhich files? (all | 1,3,5 | 2-4 | none):`);
+                    
+                    if (fileChoice.toLowerCase() !== 'none' && fileChoice.trim() !== '') {
+                        let filesToParse = [];
+                        
+                        if (fileChoice.toLowerCase() === 'all') {
+                            filesToParse = jsFiles;
+                        } else {
+                            const indexes = parseIndexes(fileChoice, jsFiles.length);
+                            filesToParse = indexes.map(idx => jsFiles[idx]);
+                        }
+                        
+                        for (const filePath of filesToParse) {
+                            console.log(`\n${YELLOW}${'='.repeat(50)}${RESET}`);
+                            console.log(`${YELLOW}=== Parsing: ${path.basename(filePath)} ===${RESET}`);
+                            console.log(`${YELLOW}${'='.repeat(50)}${RESET}`);
+                            
+                            const parseResult = await runParserMenu(filePath);
+                            
+                            if (parseResult) {
+                                const originalContent = await fs.readFile(filePath, 'utf8');
+                                parsedFiles.set(filePath, {
+                                    parsedContent: parseResult.content,
+                                    originalSize: originalContent.length,
+                                    parsedSize: parseResult.content.length,
+                                    stats: parseResult.stats,
+                                    notes: parseResult.notes,
+                                    validation: parseResult.validation
+                                });
+                                console.log(`\n${GREEN}✓ ${path.basename(filePath)} parsed successfully${RESET}`);
+                            }
+                        }
+                    }
+                }
+            } else {
+                console.log(`\n${YELLOW}No JavaScript files selected - skipping parser option.${RESET}`);
+            }
+
+            // STEP 2: Ask about AI instructions
+            const includeInstrAnswer = await askQuestion(`\nDo you want to add AI instructions? (y/n):`);
             const includeInstructions = includeInstrAnswer.toLowerCase() === 'y' || includeInstrAnswer.toLowerCase() === 'yes';
 
             let userDemand = '';
-            let outputFormat = 'full'; // default
+            let outputFormat = 'full';
 
             if (includeInstructions) {
-                userDemand = await askQuestion('Enter your request/demand for the AI (single line): ');
-                const formatAnswer = await askQuestion('Output format - (1) Full files, (2) Tagged replacements: ');
+                userDemand = await askQuestion('Enter your request/demand for the AI (single line):');
+                const formatAnswer = await askQuestion('Output format - (1) Full files, (2) Tagged replacements, (3) Both:');
                 if (formatAnswer === '2') {
                     outputFormat = 'tagged';
                 } else if (formatAnswer === '3') {
                     outputFormat = 'both';
                 } else {
-                    outputFormat = 'full'; // default to full
+                    outputFormat = 'full';
+                }
+                
+                if (parsedFiles.size > 0 && outputFormat === 'full') {
+                    console.log(`\n${YELLOW}💡 Tip: You have parsed files. Tagged format (option 2) works better${RESET}`);
+                    console.log(`${YELLOW}   because the parsed content is a filtered subset of the actual file.${RESET}`);
                 }
             }
 
-            // Generate the struct file with options
+            // STEP 3: Generate the struct file with options
             await generateStruct([...selectedFiles], 'struct', {
                 includeInstructions,
                 userDemand,
                 outputFormat,
+                parsedFiles,
             });
 
-            // Ask if save paths
-            const saveName = await askQuestion('\nSave selected file paths? Enter a filename (or leave empty to skip): ');
+            // STEP 4: Ask if save paths
+            const saveName = await askQuestion('\nSave selected file paths? Enter a filename (or leave empty to skip):');
 
             if (saveName) {
                 await savePaths([...selectedFiles], saveName);
@@ -578,7 +795,6 @@ async function interactiveMode() {
             return;
         }
 
-        // 'b' or 'B': go to parent directory
         if (key === 'b' || key === 'B') {
             const parent = path.dirname(currentDirectory);
 
@@ -593,14 +809,36 @@ async function interactiveMode() {
             return;
         }
 
-        // 'q' or 'Q' or Ctrl+C: quit without generating
         if (key === 'q' || key === 'Q' || key === '\u0003') {
             cleanupAndExit(0);
             return;
         }
-
-        // Any other key: ignore
     };
+
+    function parseIndexes(input, max) {
+        const result = new Set();
+        const parts = input.split(',');
+        
+        for (const part of parts) {
+            const range = part.split('-').map(s => s.trim()).filter(Boolean);
+            if (range.length === 2) {
+                const start = parseInt(range[0], 10);
+                const end = parseInt(range[1], 10);
+                if (!isNaN(start) && !isNaN(end)) {
+                    for (let i = Math.max(1, start); i <= Math.min(end, max); i++) {
+                        result.add(i - 1);
+                    }
+                }
+            } else if (range.length === 1) {
+                const idx = parseInt(range[0], 10);
+                if (!isNaN(idx) && idx >= 1 && idx <= max) {
+                    result.add(idx - 1);
+                }
+            }
+        }
+        
+        return [...result];
+    }
 
     process.stdin.on('data', onKeypress);
     render();
@@ -613,7 +851,6 @@ async function main() {
     const args = process.argv.slice(2);
 
     if (args.length > 0) {
-        // Regeneration mode: load saved paths from /tmp and generate struct
         const saveName = args[0];
 
         try {
@@ -624,19 +861,16 @@ async function main() {
                 process.exit(1);
             }
 
-            // No interactive prompts in this mode; generate plain struct
             await generateStruct(paths);
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
         }
     } else {
-        // Interactive mode
         await interactiveMode();
     }
 }
 
-// Run the main function
 main().catch(err => {
     console.error('Fatal error:', err);
     process.exit(1);
