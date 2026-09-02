@@ -6,6 +6,20 @@ export class CodeReplacer {
   static tagBuffer = '';
 
   /**
+   * Normalize and correct common path errors in AI-generated paths.
+   * Specifically fixes patterns like /./ to /._/ when the intent is clearly 
+   * to reference a hidden directory with underscore naming.
+   * 
+   * @param {string} filePath - The raw file path to normalize.
+   * @returns {string} The corrected file path.
+   */
+  static normalizePath(filePath) {
+    // Only correct the specific pattern where /./ appears (not .hidden or ../)
+    // The regex matches "/./" but not "/../" or "/.hidden/"
+    return filePath.replace(/(?<!\.)\/(?=\.\/)/g, '/');
+  }
+
+  /**
    * Replace literal strings in a file.
    * @param {string} filePath - Absolute path to the target file.
    * @param {Object|Object[]} replacements - Single object or array of { original, replace }.
@@ -94,8 +108,11 @@ export class CodeReplacer {
         if (!pathMatch) {
           throw new Error(`Block ${blocksProcessed + 1}: PATH not found.`);
         }
-        const filePath = pathMatch[1];
-
+        
+        // Extract and normalize the file path
+        const rawFilePath = pathMatch[1];
+        const filePath = CodeReplacer.normalizePath(rawFilePath);
+        
         // Extract all replacement blocks
         const replacementBlocks = [];
         const replRegex = /\[NEW-REPLACE-START\]([\s\S]*?)\[\/NEW-REPLACE-END\]/g;
