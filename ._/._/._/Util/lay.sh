@@ -5,10 +5,11 @@
 # Usage: lay [options] [command]
 # Options:
 #   [number]        - Move exact number of layers
+#   [name]          - Switch to layer by custom name (if name is not a number)
 #   reverse, -r, --reverse  - Force reverse direction
 #   back, up, -u, --up     - Go back/up (alternative to reverse)
-#   new [name]      - Create new layer with optional custom name
-#   new --changes [name] - Create new layer with changes and optional custom name
+#   new [name]      - Create new layer (clean copy, only tracked files)
+#   new --changes [name] - Create new layer with changes (includes untracked)
 #   delete          - Delete current layer and return to main repo
 #   swi [N|name]    - Switch to layer by number or custom name (0 = main repo)
 #   reposwi [name|N]- Switch to a different repository (by name or index)
@@ -84,6 +85,7 @@ show_help() {
     printf "${COLOR_YELLOW}Usage:${COLOR_RESET}\n"
     printf "  lay                # Go deep to last layer, or back to top (silent)\n"
     printf "  lay [N]            # Move N layers (deep or back) (silent)\n"
+    printf "  lay [name]         # Switch to layer by custom name (if not a number)\n"
     printf "  lay new [name]     # Create new layer (clean copy, only tracked files)\n"
     printf "  lay new --changes [name] # Create new layer with changes (includes untracked)\n"
     printf "  lay delete         # Delete current layer and return to main repo\n"
@@ -104,6 +106,7 @@ show_help() {
     printf "  ${COLOR_CYAN}lay new feature-x${COLOR_RESET}     # Creates repo_feature-x (only tracked files)\n"
     printf "  ${COLOR_CYAN}lay new --changes bugfix${COLOR_RESET} # Creates repo_bugfix (includes untracked files)\n"
     printf "  ${COLOR_CYAN}lay swi feature-x${COLOR_RESET}      # Switch to repo_feature-x\n"
+    printf "  ${COLOR_CYAN}lay feature-x${COLOR_RESET}          # Switch to repo_feature-x (shorthand)\n"
     printf "\n${COLOR_YELLOW}Note:${COLOR_RESET}\n"
     printf "  By default, 'lay new' only copies git-tracked files (respects .gitignore)\n"
     printf "  Use 'lay new --changes' to include untracked and modified files\n"
@@ -124,6 +127,8 @@ TARGET_REPOSITORY=""
 LIST_ALL_LAYERS=0
 LIST_ALL_REPOSITORIES=0
 RUN_INTERNAL_TESTS=0
+SWITCH_BY_NAME=0
+TARGET_NAME=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -143,7 +148,7 @@ while [ $# -gt 0 ]; do
             CREATE_NEW_LAYER=1
             shift
             # Check for --changes flag
-            if [ "$1" = "--changes" ] || [ "$1" = "-c" ] || [ "$1" = "changes" ]; then
+            if [ $# -gt 0 ] && ( [ "$1" = "--changes" ] || [ "$1" = "-c" ] || [ "$1" = "changes" ] ); then
                 INCLUDE_UNCOMMITTED=1
                 shift
             fi
@@ -202,12 +207,17 @@ while [ $# -gt 0 ]; do
             return 1 2>/dev/null || exit 1
             ;;
         *)
+            # This is the catch-all for numbers or names
+            # Check if argument is a number or a name
             case "$1" in
                 ''|*[!0-9]*)
-                    printf "Invalid argument: %s (expected number or option)\n" "$1"
-                    return 1 2>/dev/null || exit 1
+                    # It's a name (non-numeric) - treat as switch by name
+                    SWITCH_BY_NAME=1
+                    TARGET_NAME="$1"
+                    shift
                     ;;
                 *)
+                    # It's a number - treat as layer count
                     LAYER_COUNT="$1"
                     shift
                     ;;
@@ -415,47 +425,152 @@ is_numeric() {
     esac
 }
 
-# Copy files respecting .gitignore (only tracked files)
+# Get the current branch name
+get_current_branch() {
+    repository_root="$1"
+    if [ -d "$repository_root/.git" ]; then
+        # Try to get current branch from HEAD
+        branch=$(cd "$repository_root" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ -n "$branch" ] && [ "$branch" != "HEAD" ]; then
+            printf "%s" "$branch"
+            return 0
+        fi
+    fi
+    # Fallback to master if we can't determine
+    printf "master"
+    return 0
+}
+
+# Copy files from repository state (clean, no changes)
 copy_tracked_files() {
     source_directory="$1"
     destination_directory="$2"
     
-    # Try using git to list tracked files
+    # Try using git to get clean files from repository
     if [ -d "$source_directory/.git" ] && command -v git >/dev/null 2>&1; then
-        [ $VERBOSE_MODE -eq 1 ] && printf "Using git to copy only tracked files...\n"
+        [ $VERBOSE_MODE -eq 1 ] && printf "Getting clean files from repository state...\n"
         
-        # Get list of tracked files
-        tracked_files_list=$(cd "$source_directory" && git ls-files 2>/dev/null)
+        # Get current branch
+        current_branch=$(cd "$source_directory" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [ -z "$current_branch" ] || [ "$current_branch" = "HEAD" ]; then
+            current_branch="master"
+        fi
+        
+        # Use git archive to get clean state
+        [ $VERBOSE_MODE -eq 1 ] && printf "Using git archive from branch '%s'...\n" "$current_branch"
+        
+        # Create a temporary directory for the archive
+        temp_archive_dir=$(mktemp -d /tmp/lay_archive.XXXXXX 2>/dev/null) || {
+            [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Failed to create temp dir for archive${COLOR_RESET}\n"
+            return 1
+        }
+        
+        # Export clean files using git archive
+        (cd "$source_directory" 2>/dev/null && git archive --format=tar "$current_branch" 2>/dev/null) | (cd "$temp_archive_dir" 2>/dev/null && tar xf - 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$(ls -A "$temp_archive_dir" 2>/dev/null)" ]; then
+            # Copy files from temp dir to destination
+            [ $VERBOSE_MODE -eq 1 ] && printf "Copying clean files to destination...\n"
+            
+            # Copy everything from temp archive to destination
+            for item in "$temp_archive_dir"/* "$temp_archive_dir"/.[!.]*; do
+                [ -e "$item" ] || continue
+                basename_item="$(basename "$item")"
+                if [ "$basename_item" != "." ] && [ "$basename_item" != ".." ]; then
+                    cp -r "$item" "$destination_directory/" 2>/dev/null
+                fi
+            done
+            
+            # Clean up temp dir
+            rm -rf "$temp_archive_dir" 2>/dev/null
+            
+            # Copy .git directory
+            if [ -d "$source_directory/.git" ]; then
+                [ $VERBOSE_MODE -eq 1 ] && printf "Copying .git directory...\n"
+                cp -r "$source_directory/.git" "$destination_directory/.git" 2>/dev/null || {
+                    [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not copy .git directory${COLOR_RESET}\n"
+                }
+            fi
+            
+            return 0
+        fi
+        
+        # Clean up temp dir if archive failed
+        rm -rf "$temp_archive_dir" 2>/dev/null
+        
+        # Fallback: use git checkout-index for clean files
+        [ $VERBOSE_MODE -eq 1 ] && printf "Archive failed, using checkout-index for clean files...\n"
+        
+        # Create a temporary directory for checkout
+        temp_checkout_dir=$(mktemp -d /tmp/lay_checkout.XXXXXX 2>/dev/null) || {
+            [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Failed to create temp dir for checkout${COLOR_RESET}\n"
+            return 1
+        }
+        
+        # Checkout clean files from repository
+        (cd "$source_directory" 2>/dev/null && git checkout-index --prefix="$temp_checkout_dir/" -a 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$(ls -A "$temp_checkout_dir" 2>/dev/null)" ]; then
+            # Copy files from temp dir to destination
+            [ $VERBOSE_MODE -eq 1 ] && printf "Copying checked-out files to destination...\n"
+            
+            # Copy everything from temp checkout to destination
+            for item in "$temp_checkout_dir"/* "$temp_checkout_dir"/.[!.]*; do
+                [ -e "$item" ] || continue
+                basename_item="$(basename "$item")"
+                if [ "$basename_item" != "." ] && [ "$basename_item" != ".." ]; then
+                    cp -r "$item" "$destination_directory/" 2>/dev/null
+                fi
+            done
+            
+            # Clean up temp dir
+            rm -rf "$temp_checkout_dir" 2>/dev/null
+            
+            # Copy .git directory
+            if [ -d "$source_directory/.git" ]; then
+                [ $VERBOSE_MODE -eq 1 ] && printf "Copying .git directory...\n"
+                cp -r "$source_directory/.git" "$destination_directory/.git" 2>/dev/null || {
+                    [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not copy .git directory${COLOR_RESET}\n"
+                }
+            fi
+            
+            return 0
+        fi
+        
+        # Clean up temp dir
+        rm -rf "$temp_checkout_dir" 2>/dev/null
+        
+        # Final fallback: use git ls-files
+        [ $VERBOSE_MODE -eq 1 ] && printf "Using git ls-files as final fallback...\n"
+        
+        tracked_files_list=$(cd "$source_directory" 2>/dev/null && git ls-files 2>/dev/null)
         
         if [ $? -eq 0 ] && [ -n "$tracked_files_list" ]; then
             # Copy each tracked file
             printf "%s\n" "$tracked_files_list" | while IFS= read -r file_path; do
-                # Create parent directory if needed
                 parent_directory="$destination_directory/$(dirname "$file_path")"
-                mkdir -p "$parent_directory"
+                mkdir -p "$parent_directory" 2>/dev/null
                 
-                # Copy the file
                 if [ -f "$source_directory/$file_path" ]; then
                     cp "$source_directory/$file_path" "$destination_directory/$file_path" 2>/dev/null
                 elif [ -d "$source_directory/$file_path" ]; then
-                    # Copy directory recursively
-                    cp -r "$source_directory/$file_path" "$destination_directory/$(dirname "$file_path")/" 2>/dev/null
+                    mkdir -p "$destination_directory/$file_path" 2>/dev/null
+                    cp -r "$source_directory/$file_path"/* "$destination_directory/$file_path/" 2>/dev/null
                 fi
             done
             
-            # Copy .git directory
             if [ -d "$source_directory/.git" ]; then
-                cp -r "$source_directory/.git" "$destination_directory/.git"
+                [ $VERBOSE_MODE -eq 1 ] && printf "Copying .git directory...\n"
+                cp -r "$source_directory/.git" "$destination_directory/.git" 2>/dev/null
             fi
             
             return 0
         fi
     fi
     
-    # Fallback: if git not available or no tracked files, copy everything except .git
-    [ $VERBOSE_MODE -eq 1 ] && printf "Git not available or no tracked files, falling back to copy all...\n"
+    # Ultimate fallback: copy everything except .git
+    [ $VERBOSE_MODE -eq 1 ] && printf "Git not available, copying all files...\n"
     
-    # Copy everything except .git
     for item in "$source_directory"/* "$source_directory"/.[!.]* "$source_directory"/..?*; do
         [ -e "$item" ] || continue
         basename_item="$(basename "$item")"
@@ -464,39 +579,30 @@ copy_tracked_files() {
         fi
     done
     
-    # Copy .git
     if [ -d "$source_directory/.git" ]; then
-        cp -r "$source_directory/.git" "$destination_directory/.git"
+        cp -r "$source_directory/.git" "$destination_directory/.git" 2>/dev/null
     fi
     
     return 0
 }
 
-# Copy all files (including untracked and ignored)
+# Copy all files (including untracked and ignored) - preserve current state
 copy_all_files() {
     source_directory="$1"
     destination_directory="$2"
     
-    [ $VERBOSE_MODE -eq 1 ] && printf "Copying all files including untracked...\n"
+    [ $VERBOSE_MODE -eq 1 ] && printf "Copying all files including untracked (current state)...\n"
     
-    # Copy everything except .git
+    # Copy everything
     for item in "$source_directory"/* "$source_directory"/.[!.]* "$source_directory"/..?*; do
         [ -e "$item" ] || continue
         basename_item="$(basename "$item")"
-        if [ "$basename_item" != ".git" ] && [ "$basename_item" != "." ] && [ "$basename_item" != ".." ]; then
+        if [ "$basename_item" != "." ] && [ "$basename_item" != ".." ]; then
             cp -r "$item" "$destination_directory/" 2>/dev/null || {
                 [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}Warning: Could not copy %s${COLOR_RESET}\n" "$basename_item"
             }
         fi
     done
-    
-    # Copy .git
-    if [ -d "$source_directory/.git" ]; then
-        cp -r "$source_directory/.git" "$destination_directory/.git" || {
-            [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: Could not copy .git directory${COLOR_RESET}\n"
-            return 1
-        }
-    fi
     
     return 0
 }
@@ -559,10 +665,10 @@ create_new_layer() {
     }
     
     if [ $INCLUDE_UNCOMMITTED -eq 1 ]; then
-        # Copy with all files (including untracked)
+        # Copy with all files (including untracked and changes) - current state
         copy_all_files "$repository_root" "$new_layer_directory" || return 1
     else
-        # Copy only tracked files (respecting .gitignore)
+        # Copy only tracked files from the repository (clean state)
         copy_tracked_files "$repository_root" "$new_layer_directory" || return 1
     fi
     
@@ -707,6 +813,20 @@ switch_to_layer() {
     
     [ $VERBOSE_MODE -eq 1 ] && printf "Now at: %s\n" "$PWD"
     return 0
+}
+
+# Switch to layer by name (shorthand for `lay swi <name>`)
+switch_by_name() {
+    # This function uses the same logic as switch_to_layer but sets TARGET_LAYER_NUMBER
+    if [ -z "$TARGET_NAME" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: No name specified${COLOR_RESET}\n"
+        return 1
+    fi
+    
+    # Set TARGET_LAYER_NUMBER to the name and call switch_to_layer
+    TARGET_LAYER_NUMBER="$TARGET_NAME"
+    switch_to_layer
+    return $?
 }
 
 # List all layer instances (full names)
@@ -900,6 +1020,12 @@ switch_to_repository() {
 run_internal_tests() {
     printf "${COLOR_YELLOW}Running internal tests...${COLOR_RESET}\n"
     
+    # Check if git is available
+    if ! command -v git >/dev/null 2>&1; then
+        printf "${COLOR_RED}Error: git is required for tests${COLOR_RESET}\n"
+        return 1
+    fi
+    
     # Create temporary test directory
     TEST_ROOT_DIRECTORY=$(mktemp -d /tmp/lay_test.XXXXXX) || {
         printf "${COLOR_RED}Failed to create temp dir${COLOR_RESET}\n"
@@ -910,54 +1036,34 @@ run_internal_tests() {
     cd "$TEST_ROOT_DIRECTORY" || return 1
     CURRENT_DIRECTORY="$PWD"
     
-    # Setup a fake git repo
-    mkdir -p testrepo/.git
-    cat > testrepo/.git/config <<EOF
-[core]
-	repositoryformatversion = 0
-	filemode = true
-	bare = false
-[remote "origin"]
-	url = https://github.com/testuser/testrepo.git
-	fetch = +refs/heads/*:refs/heads/*
-EOF
-    # Create tracked files
-    echo "tracked content" > testrepo/tracked.txt
-    echo "another tracked" > testrepo/tracked2.txt
+    # Create a real git repository
+    mkdir testrepo
+    cd testrepo
+    git init >/dev/null 2>&1
     
-    # Create untracked files
-    echo "untracked content" > testrepo/untracked.txt
+    # Create tracked files
+    echo "tracked content" > tracked.txt
+    echo "another tracked" > tracked2.txt
+    echo "tracked3" > tracked3.txt
     
     # Create .gitignore with ignored files
-    cat > testrepo/.gitignore <<EOF
-*.log
-ignored/
-EOF
-    echo "ignored content" > testrepo/test.log
-    mkdir -p testrepo/ignored
-    echo "ignored dir content" > testrepo/ignored/ignored.txt
+    echo "*.log" > .gitignore
+    echo "ignored/" >> .gitignore
+    echo "ignored content" > test.log
+    mkdir -p ignored
+    echo "ignored dir content" > ignored/ignored.txt
     
-    # Create a fake HEAD
-    echo "ref: refs/heads/master" > testrepo/.git/HEAD
-
-    # Create mock git to simulate tracked files
-    MOCK_GIT_DIRECTORY="$TEST_ROOT_DIRECTORY/mock_bin"
-    mkdir -p "$MOCK_GIT_DIRECTORY"
-    cat > "$MOCK_GIT_DIRECTORY/git" <<'EOF'
-#!/bin/sh
-if [ "$1" = "ls-files" ]; then
-    echo "tracked.txt"
-    echo "tracked2.txt"
-    echo ".gitignore"
-fi
-EOF
-    chmod +x "$MOCK_GIT_DIRECTORY/git"
-    # Prepend mock git to PATH for the test
-    PATH="$MOCK_GIT_DIRECTORY:$PATH"
-    export PATH
-
-    printf "\n--- Test 1: Create layer with only tracked files ---\n"
-    CURRENT_DIRECTORY="$TEST_ROOT_DIRECTORY/testrepo"
+    # Create untracked file (not added)
+    echo "untracked content" > untracked.txt
+    
+    # Add and commit tracked files
+    git add tracked.txt tracked2.txt tracked3.txt .gitignore >/dev/null 2>&1
+    git commit -m "Initial commit" >/dev/null 2>&1
+    
+    # Set current directory to the repo
+    CURRENT_DIRECTORY="$PWD"
+    
+    printf "\n--- Test 1: Create layer with only tracked files (clean) ---\n"
     CREATE_NEW_LAYER=1
     INCLUDE_UNCOMMITTED=0
     CUSTOM_LAYER_NAME=""
@@ -970,10 +1076,12 @@ EOF
     CURRENT_DIRECTORY="$PWD"
     
     # Check that tracked files are copied
-    if [ -f "tracked.txt" ] && [ -f "tracked2.txt" ] && [ -f ".gitignore" ]; then
+    if [ -f "tracked.txt" ] && [ -f "tracked2.txt" ] && [ -f "tracked3.txt" ] && [ -f ".gitignore" ]; then
         printf "PASS: Tracked files copied\n"
     else
         printf "FAIL: Tracked files not copied\n"
+        printf "Files in current dir:\n"
+        ls -la
         return 1
     fi
     
@@ -1050,7 +1158,27 @@ EOF
         return 1
     fi
     
-    printf "\n--- Test 5: Cleanup ---\n"
+    printf "\n--- Test 5: Switch by name shorthand ---\n"
+    # Switch to testrepo_with-changes by name
+    SWITCH_BY_NAME=1
+    TARGET_NAME="with-changes"
+    if switch_by_name; then
+        printf "PASS: Switched by name to 'with-changes'\n"
+    else
+        printf "FAIL: switch_by_name failed\n"
+        return 1
+    fi
+    
+    # Verify we're in the right directory
+    current_basename="$(basename "$PWD")"
+    if [ "$current_basename" = "testrepo_with-changes" ]; then
+        printf "PASS: Successfully in testrepo_with-changes\n"
+    else
+        printf "FAIL: Not in expected directory (in %s)\n" "$current_basename"
+        return 1
+    fi
+    
+    printf "\n--- Test 6: Cleanup ---\n"
     # Delete both layers
     cd "$TEST_ROOT_DIRECTORY/testrepo_1"
     DELETE_CURRENT_LAYER=1
@@ -1112,6 +1240,14 @@ if [ $SWITCH_TO_LAYER -eq 1 ]; then
     return $? 2>/dev/null || exit $?
 fi
 
+# Handle switch by name (shorthand for `lay swi <name>`)
+if [ $SWITCH_BY_NAME -eq 1 ]; then
+    switch_by_name
+    [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
+    return $? 2>/dev/null || exit $?
+fi
+
+# Default behavior: navigate ._ layers
 layers_above_count=$(count_layers_above "$CURRENT_DIRECTORY")
 deep_layer_information=$(find_deepest_layer "$CURRENT_DIRECTORY")
 available_deep_layers=$(printf "%s" "$deep_layer_information" | cut -d: -f1)
