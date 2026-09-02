@@ -13,6 +13,7 @@ class ClipboardMonitor {
         this.lastClipboardContent = '';
         this.isMonitoring = false;
         this.isPaused = false;
+        this.tagRestrictMode = false; // New: restrict mode flag
         this.config = {
             profiles: {},
             activeProfile: null,
@@ -71,10 +72,9 @@ class ClipboardMonitor {
             try {
                 const stats = await fs.stat(filePath);
                 if (stats.isFile() && stats.size > 0) {
-                    // Check if file size is stable (writing complete)
                     if (stats.size === lastSize) {
                         stableCount++;
-                        if (stableCount >= 3) { // File stable for 3 consecutive checks
+                        if (stableCount >= 3) {
                             return true;
                         }
                     } else {
@@ -83,7 +83,6 @@ class ClipboardMonitor {
                     }
                 }
             } catch (error) {
-                // File doesn't exist yet, keep waiting
                 stableCount = 0;
             }
             await new Promise(resolve => setTimeout(resolve, 100));
@@ -123,7 +122,6 @@ class ClipboardMonitor {
                 console.log(`  ✓ Command completed successfully`);
             } catch (error) {
                 console.error(`  ✗ Command failed: ${error.message}`);
-                // Ask if should continue with next commands
                 const continueExec = await this.question('  Continue with next commands? (y/n): ');
                 if (continueExec.toLowerCase() !== 'y') {
                     console.log('  Stopping command execution.');
@@ -171,6 +169,64 @@ class ClipboardMonitor {
         }
     }
 
+    /**
+     * Checks if content contains CODEREPLACER tags.
+     * @param {string} content - The clipboard content to check.
+     * @returns {boolean} True if tags are present, false otherwise.
+     */
+    hasCodeReplacerTags(content) {
+        const START = '[CODEREPLACER-START]';
+        const END = '[/CODEREPLACER-END]';
+        return content.includes(START) && content.includes(END);
+    }
+
+    /**
+     * Validates that all file paths mentioned inside CODEREPLACER tags
+     * (if any) are within the current working directory.
+     * @param {string} content - The clipboard content to check.
+     * @returns {boolean} True if no tags are present, or if all paths are inside cwd.
+     */
+    validateCodeReplacerPaths(content) {
+        const START = '[CODEREPLACER-START]';
+        const END = '[/CODEREPLACER-END]';
+        const basePath = process.cwd(); // allowed root directory
+
+        let searchPos = 0;
+        let foundAnyTag = false;
+
+        while (true) {
+            const startIdx = content.indexOf(START, searchPos);
+            if (startIdx === -1) break;
+
+            foundAnyTag = true;
+            const endIdx = content.indexOf(END, startIdx + START.length);
+            if (endIdx === -1) {
+                console.error('✗ Validation error: Incomplete CODEREPLACER block detected.');
+                return false;
+            }
+
+            const block = content.slice(startIdx, endIdx + END.length);
+            const pathRegex = /PATH='([^']*)'/g;
+            let match;
+            while ((match = pathRegex.exec(block)) !== null) {
+                const rawPath = match[1];
+                const resolved = path.resolve(rawPath);
+                const relative = path.relative(basePath, resolved);
+
+                if (relative.startsWith('..') || path.isAbsolute(relative)) {
+                    console.error(
+                        `✗ Validation failed: PATH '${rawPath}' is outside the allowed directory '${basePath}'.`
+                    );
+                    return false;
+                }
+            }
+
+            searchPos = endIdx + END.length;
+        }
+
+        return true;
+    }
+
     async checkClipboard() {
         if (this.isPaused) {
             return;
@@ -182,7 +238,24 @@ class ClipboardMonitor {
             this.lastClipboardContent = currentContent;
             console.log('\n' + '='.repeat(60));
             console.log('New clipboard content detected!');
-            
+
+            // Check tag restriction mode
+            if (this.tagRestrictMode) {
+                if (!this.hasCodeReplacerTags(currentContent)) {
+                    console.log('✗ Tag Restrict Mode: Content rejected (no CODEREPLACER tags found).');
+                    console.log('='.repeat(60) + '\n');
+                    return;
+                }
+                console.log('✓ Tag Restrict Mode: CODEREPLACER tags detected.');
+            }
+
+            // Validate CodeReplacer paths before writing or executing anything
+            if (!this.validateCodeReplacerPaths(currentContent)) {
+                console.log('✗ Clipboard content rejected due to path validation failure.');
+                console.log('='.repeat(60) + '\n');
+                return;
+            }
+
             const writeSuccess = await this.writeToFile(currentContent);
             
             if (writeSuccess && this.config.activeProfile) {
@@ -400,6 +473,9 @@ class ClipboardMonitor {
         console.log(`Active profile: ${this.config.activeProfile}`);
         console.log(`Output file: ${this.outputPath}`);
         console.log(`Commands to execute: ${activeProfile.commands.length}`);
+        if (this.tagRestrictMode) {
+            console.log('🔒 TAG RESTRICT MODE: Only content with CODEREPLACER tags will be processed');
+        }
         console.log('Press P to pause/resume monitoring');
         console.log('Press Ctrl+C to stop monitoring...');
         console.log('='.repeat(60) + '\n');
@@ -414,8 +490,21 @@ class ClipboardMonitor {
     async mainMenu() {
         await this.loadOrCreateConfig();
         
-        // Check if profile name provided as argument
-        const argProfile = process.argv[2];
+        // Check for --tag flag in arguments
+        const args = process.argv.slice(2);
+        const tagIndex = args.indexOf('--tag');
+        let argProfile = null;
+        
+        if (tagIndex !== -1) {
+            this.tagRestrictMode = true;
+            console.log('🔒 Tag Restrict Mode enabled: Only content with CODEREPLACER tags will be processed.');
+            // Remove --tag from args to find profile name
+            args.splice(tagIndex, 1);
+            argProfile = args[0];
+        } else {
+            argProfile = args[0];
+        }
+        
         if (argProfile && this.config.profiles[argProfile]) {
             await this.startMonitoring(argProfile);
             return;
@@ -424,6 +513,9 @@ class ClipboardMonitor {
         while (true) {
             console.log('\n' + '='.repeat(60));
             console.log('Clipboard Monitor - Main Menu');
+            if (this.tagRestrictMode) {
+                console.log('🔒 TAG RESTRICT MODE ACTIVE');
+            }
             console.log('='.repeat(60));
             console.log('1. Start monitoring');
             console.log('2. Manage profiles');
@@ -496,13 +588,11 @@ process.stdin.resume();
 process.stdin.setEncoding('utf8');
 
 process.stdin.on('data', (key) => {
-    // Check for 'p' or 'P' key
     if (key === 'p' || key === 'P') {
         if (monitor.isMonitoring) {
             monitor.togglePause();
         }
     }
-    // Check for Ctrl+C
     if (key === '\u0003') {
         console.log('\nReceived Ctrl+C. Stopping...');
         monitor.isMonitoring = false;
