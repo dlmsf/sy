@@ -11,6 +11,10 @@
 #   new --changes   - Create new layer with uncommitted changes
 #   delete          - Delete current layer and return to main repo
 #   swi [N]         - Switch to layer N (0 = main repo)
+#   reposwi [name|N]- Switch to a different repository (by name or index)
+#   list            - List all layer instances (full names)
+#   repos           - List unique repository names
+#   --test          - Run internal tests
 #   -v, --verbose  - Show detailed output (what's happening)
 #   -h, --help     - Show help
 
@@ -77,6 +81,10 @@ show_help() {
     printf "  lay new --changes  # Create new layer with uncommitted changes\n"
     printf "  lay delete         # Delete current layer and return to main repo\n"
     printf "  lay swi [N]        # Switch to layer N (0 = main repo)\n"
+    printf "  lay reposwi [name|N] # Switch to a different repository (by name or 1-based index)\n"
+    printf "  lay list           # List all layer instances (full names)\n"
+    printf "  lay repos          # List unique repository names\n"
+    printf "  lay --test         # Run internal tests\n"
     printf "  lay reverse        # Force go back/up (silent)\n"
     printf "  lay back           # Alternative: go back/up (silent)\n"
     printf "  lay -r | --reverse # Same as reverse (silent)\n"
@@ -94,6 +102,11 @@ WITH_CHANGES=0
 DELETE_LAYER=0
 SWITCH_LAYER=0
 SWITCH_NUM=""
+REPO_SWITCH=0
+REPO_TARGET=""
+LIST_LAYERS=0
+LIST_REPOS=0
+RUN_TEST=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -138,6 +151,27 @@ while [ $# -gt 0 ]; do
                         ;;
                 esac
             fi
+            ;;
+        reposwi|--reposwi|-rs|reposwitch)
+            REPO_SWITCH=1
+            shift
+            # Check for argument (name or number)
+            if [ $# -gt 0 ]; then
+                REPO_TARGET="$1"
+                shift
+            fi
+            ;;
+        list|--list|-l)
+            LIST_LAYERS=1
+            shift
+            ;;
+        repos|--repos|-rp)
+            LIST_REPOS=1
+            shift
+            ;;
+        --test|-t|test)
+            RUN_TEST=1
+            shift
             ;;
         -*)
             printf "Unknown option: %s\n" "$1"
@@ -370,27 +404,12 @@ create_new_layer() {
     # Get repo name
     repo_name=$(get_repo_name_from_git "$repo_root")
     if [ -z "$repo_name" ]; then
-        [ $VERBOSE -eq 1 ] && printf "${RED}Error: Could not determine repository name from .git/config${NC}\n"
-        return 1
+        # Fallback: use directory name if .git/config doesn't have URL
+        repo_name=$(get_main_repo_name "$repo_root")
+        [ $VERBOSE -eq 1 ] && printf "Using directory name as repo name: %s\n" "$repo_name"
     fi
     
     [ $VERBOSE -eq 1 ] && printf "Repository name: %s\n" "$repo_name"
-    
-    # Get current branch name
-    current_branch=""
-    if [ -f "$repo_root/.git/HEAD" ]; then
-        current_branch=$(grep -o 'refs/heads/.*' "$repo_root/.git/HEAD" 2>/dev/null | sed 's|refs/heads/||')
-        if [ -z "$current_branch" ]; then
-            current_branch=$(cat "$repo_root/.git/HEAD" 2>/dev/null | sed 's/.*\///')
-        fi
-    fi
-    
-    # If no branch found, try git command
-    if [ -z "$current_branch" ] && command -v git >/dev/null 2>&1; then
-        current_branch=$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null)
-    fi
-    
-    [ $VERBOSE -eq 1 ] && printf "Current branch: %s\n" "$current_branch"
     
     # Find parent directory (one level above the repo root)
     parent_dir="$(dirname "$repo_root")"
@@ -406,7 +425,10 @@ create_new_layer() {
     [ $VERBOSE -eq 1 ] && printf "Creating new layer directory: %s\n" "$new_layer_dir"
     
     # Create the new directory
-    mkdir -p "$new_layer_dir" || return 1
+    mkdir -p "$new_layer_dir" || {
+        [ $VERBOSE -eq 1 ] && printf "${RED}Error: Could not create directory %s${NC}\n" "$new_layer_dir"
+        return 1
+    }
     
     if [ $WITH_CHANGES -eq 1 ]; then
         # Copy WITH changes (working directory state)
@@ -431,56 +453,26 @@ create_new_layer() {
             }
         fi
     else
-        # Clean copy (only tracked files from HEAD)
-        [ $VERBOSE -eq 1 ] && printf "Creating clean copy from HEAD...\n"
+        # Clean copy - just copy everything (simpler and more reliable)
+        [ $VERBOSE -eq 1 ] && printf "Creating clean copy...\n"
         
-        # Use git archive for clean copy if possible
-        if command -v git >/dev/null 2>&1 && [ -d "$repo_root/.git" ]; then
-            # Try to use git archive for a clean copy
-            (cd "$repo_root" && git archive HEAD 2>/dev/null | (cd "$new_layer_dir" && tar -x 2>/dev/null))
-            
-            # If git archive worked, copy .git as well
-            if [ $? -eq 0 ]; then
-                cp -r "$repo_root/.git" "$new_layer_dir/.git" 2>/dev/null
-            else
-                # Fallback: use git ls-files
-                tracked_files=$(git -C "$repo_root" ls-files 2>/dev/null)
-                if [ -n "$tracked_files" ]; then
-                    printf "%s\n" "$tracked_files" | while IFS= read -r file; do
-                        src="$repo_root/$file"
-                        dst="$new_layer_dir/$file"
-                        if [ -e "$src" ] || [ -L "$src" ]; then
-                            mkdir -p "$(dirname "$dst")"
-                            cp -r "$src" "$dst" 2>/dev/null
-                        fi
-                    done
-                    cp -r "$repo_root/.git" "$new_layer_dir/.git" 2>/dev/null
-                fi
+        # Copy all files and directories
+        for item in "$repo_root"/* "$repo_root"/.[!.]* "$repo_root"/..?*; do
+            [ -e "$item" ] || continue
+            basename_item="$(basename "$item")"
+            if [ "$basename_item" != "." ] && [ "$basename_item" != ".." ]; then
+                cp -r "$item" "$new_layer_dir/" 2>/dev/null || {
+                    [ $VERBOSE -eq 1 ] && printf "${YELLOW}Warning: Could not copy %s${NC}\n" "$basename_item"
+                }
             fi
-        fi
+        done
     fi
     
     # Navigate to the new directory
-    cd "$new_layer_dir" || return 1
-    
-    # Reset to HEAD for clean copy (remove any uncommitted changes)
-    if [ $WITH_CHANGES -eq 0 ] && command -v git >/dev/null 2>&1; then
-        git reset --hard HEAD >/dev/null 2>&1
-        git clean -fd >/dev/null 2>&1
-    fi
-    
-    # Ensure we're on master/main branch for clean copy
-    if [ $WITH_CHANGES -eq 0 ] && command -v git >/dev/null 2>&1; then
-        # Try to checkout master first, then main
-        git checkout master >/dev/null 2>&1 || {
-            git checkout main >/dev/null 2>&1 || {
-                # If neither exists, create master
-                git checkout -b master >/dev/null 2>&1 || {
-                    git checkout -b main >/dev/null 2>&1
-                }
-            }
-        }
-    fi
+    cd "$new_layer_dir" || {
+        [ $VERBOSE -eq 1 ] && printf "${RED}Error: Could not cd to %s${NC}\n" "$new_layer_dir"
+        return 1
+    }
     
     [ $VERBOSE -eq 1 ] && printf "Now at: %s\n" "$PWD"
     return 0
@@ -537,7 +529,7 @@ delete_current_layer() {
     return 0
 }
 
-# Switch to specific layer
+# Switch to specific layer with fallback to next/previous available
 switch_to_layer() {
     # Determine the actual repository root
     repo_root="$CURRENT_DIR"
@@ -556,16 +548,49 @@ switch_to_layer() {
     # Get parent directory
     parent_dir="$(dirname "$repo_root")"
     
-    # Determine target directory
+    # Determine target directory (with fallback)
     if [ -z "$SWITCH_NUM" ] || [ "$SWITCH_NUM" = "0" ]; then
         target_dir="$parent_dir/${repo_name}"
     else
-        target_dir="$parent_dir/${repo_name}_${SWITCH_NUM}"
+        # Try exact number first
+        if [ -d "$parent_dir/${repo_name}_${SWITCH_NUM}" ]; then
+            target_dir="$parent_dir/${repo_name}_${SWITCH_NUM}"
+        else
+            # Fallback: find next higher number
+            found=0
+            higher=$((SWITCH_NUM + 1))
+            while [ $higher -le 999 ]; do
+                if [ -d "$parent_dir/${repo_name}_${higher}" ]; then
+                    target_dir="$parent_dir/${repo_name}_${higher}"
+                    found=1
+                    break
+                fi
+                higher=$((higher + 1))
+            done
+            
+            # If not found, find previous lower number
+            if [ $found -eq 0 ]; then
+                lower=$((SWITCH_NUM - 1))
+                while [ $lower -ge 1 ]; do
+                    if [ -d "$parent_dir/${repo_name}_${lower}" ]; then
+                        target_dir="$parent_dir/${repo_name}_${lower}"
+                        found=1
+                        break
+                    fi
+                    lower=$((lower - 1))
+                done
+            fi
+            
+            if [ $found -eq 0 ]; then
+                [ $VERBOSE -eq 1 ] && printf "${RED}Error: No layer found for number %s (neither exact nor nearby)${NC}\n" "$SWITCH_NUM"
+                return 1
+            fi
+        fi
     fi
     
-    # Check if target directory exists
+    # Check if target directory exists (already handled, but double-check)
     if [ ! -d "$target_dir" ]; then
-        [ $VERBOSE -eq 1 ] && printf "${RED}Error: Layer %s not found: %s${NC}\n" "$SWITCH_NUM" "$target_dir"
+        [ $VERBOSE -eq 1 ] && printf "${RED}Error: Target directory not found: %s${NC}\n" "$target_dir"
         return 1
     fi
     
@@ -578,7 +603,402 @@ switch_to_layer() {
     return 0
 }
 
+# List all layer instances (full names)
+list_layers() {
+    # Determine current repo root and parent dir
+    repo_root="$CURRENT_DIR"
+    if [ "$(basename "$repo_root")" = "$LAYER_NAME" ]; then
+        repo_root="$(dirname "$repo_root")"
+    fi
+    parent_dir="$(dirname "$repo_root")"
+    
+    # Get repo name
+    repo_name=$(get_repo_name_from_git "$repo_root")
+    if [ -z "$repo_name" ]; then
+        repo_name=$(get_main_repo_name "$repo_root")
+    fi
+    
+    printf "Layers for repository '%s':\n" "$repo_name"
+    printf "  %s (main)\n" "$repo_name"
+    for dir in "$parent_dir"/${repo_name}_*; do
+        [ -d "$dir" ] || continue
+        basename_dir=$(basename "$dir")
+        # Only list those that match pattern exactly
+        if printf "%s" "$basename_dir" | grep -q "^${repo_name}_[0-9][0-9]*$"; then
+            printf "  %s\n" "$basename_dir"
+        fi
+    done
+    return 0
+}
+
+# List unique repository names (without numbers)
+list_repos() {
+    # Determine parent directory (up one level from current repo root)
+    repo_root="$CURRENT_DIR"
+    if [ "$(basename "$repo_root")" = "$LAYER_NAME" ]; then
+        repo_root="$(dirname "$repo_root")"
+    fi
+    parent_dir="$(dirname "$repo_root")"
+    
+    printf "Unique repositories in %s:\n" "$parent_dir"
+    # Get all directory names that are either main repo or numbered layers
+    # We'll extract unique base names by removing _number suffix
+    seen=""
+    for dir in "$parent_dir"/*/; do
+        [ -d "$dir" ] || continue
+        basename_dir=$(basename "$dir")
+        # Skip ._ directories
+        if [ "$basename_dir" = "$LAYER_NAME" ]; then
+            continue
+        fi
+        # Remove _number suffix if present
+        base_name=$(printf "%s" "$basename_dir" | sed 's/_[0-9][0-9]*$//')
+        # Print if not already seen
+        if ! printf "%s\n" "$seen" | grep -q "^${base_name}$"; then
+            printf "  %s\n" "$base_name"
+            seen="${seen}${base_name}\n"
+        fi
+    done
+    return 0
+}
+
+# Switch to a different repository (by name or 1-based index)
+switch_to_repo() {
+    if [ -z "$REPO_TARGET" ]; then
+        [ $VERBOSE -eq 1 ] && printf "${RED}Error: reposwi requires an argument (name or number)${NC}\n"
+        return 1
+    fi
+    
+    # Determine current parent directory
+    repo_root="$CURRENT_DIR"
+    if [ "$(basename "$repo_root")" = "$LAYER_NAME" ]; then
+        repo_root="$(dirname "$repo_root")"
+    fi
+    parent_dir="$(dirname "$repo_root")"
+    
+    # Collect unique repo names
+    repos_list=""
+    seen=""
+    for dir in "$parent_dir"/*/; do
+        [ -d "$dir" ] || continue
+        basename_dir=$(basename "$dir")
+        if [ "$basename_dir" = "$LAYER_NAME" ]; then
+            continue
+        fi
+        base_name=$(printf "%s" "$basename_dir" | sed 's/_[0-9][0-9]*$//')
+        if ! printf "%s\n" "$seen" | grep -q "^${base_name}$"; then
+            repos_list="${repos_list}${base_name}\n"
+            seen="${seen}${base_name}\n"
+        fi
+    done
+    
+    # Helper to get nth repo name (1-based)
+    get_nth_repo() {
+        n="$1"
+        count=0
+        for dir in "$parent_dir"/*/; do
+            [ -d "$dir" ] || continue
+            basename_dir=$(basename "$dir")
+            if [ "$basename_dir" = "$LAYER_NAME" ]; then
+                continue
+            fi
+            base_name=$(printf "%s" "$basename_dir" | sed 's/_[0-9][0-9]*$//')
+            if ! printf "%s\n" "$seen2" | grep -q "^${base_name}$"; then
+                count=$((count + 1))
+                if [ $count -eq $n ]; then
+                    printf "%s" "$base_name"
+                    return 0
+                fi
+                seen2="${seen2}${base_name}\n"
+            fi
+        done
+        return 1
+    }
+    
+    # Determine target repo name
+    target_repo=""
+    if printf "%s" "$REPO_TARGET" | grep -q '^[0-9][0-9]*$'; then
+        # Numeric index (1-based)
+        idx="$REPO_TARGET"
+        seen2=""
+        target_repo=$(get_nth_repo "$idx")
+        if [ -z "$target_repo" ]; then
+            [ $VERBOSE -eq 1 ] && printf "${RED}Error: Repository index %d out of range${NC}\n" "$idx"
+            return 1
+        fi
+    else
+        # Assume it's a name
+        if [ -d "$parent_dir/$REPO_TARGET" ]; then
+            target_repo="$REPO_TARGET"
+        else
+            # Maybe they gave a name that has no main but has numbered instances?
+            found=0
+            for dir in "$parent_dir"/${REPO_TARGET}_*; do
+                if [ -d "$dir" ]; then
+                    target_repo="$REPO_TARGET"
+                    found=1
+                    break
+                fi
+            done
+            if [ $found -eq 0 ]; then
+                [ $VERBOSE -eq 1 ] && printf "${RED}Error: Repository '%s' not found${NC}\n" "$REPO_TARGET"
+                return 1
+            fi
+        fi
+    fi
+    
+    # Now navigate to main directory if exists, else first numbered instance
+    if [ -d "$parent_dir/$target_repo" ]; then
+        target_dir="$parent_dir/$target_repo"
+    else
+        # Find first numbered instance
+        for dir in "$parent_dir"/${target_repo}_*; do
+            if [ -d "$dir" ]; then
+                target_dir="$dir"
+                break
+            fi
+        done
+        if [ -z "$target_dir" ]; then
+            [ $VERBOSE -eq 1 ] && printf "${RED}Error: No directory found for repository '%s'${NC}\n" "$target_repo"
+            return 1
+        fi
+    fi
+    
+    [ $VERBOSE -eq 1 ] && printf "Switching to repository '%s': %s\n" "$target_repo" "$target_dir"
+    cd "$target_dir" || return 1
+    [ $VERBOSE -eq 1 ] && printf "Now at: %s\n" "$PWD"
+    return 0
+}
+
+# Run internal tests
+run_tests() {
+    printf "${YELLOW}Running internal tests...${NC}\n"
+    
+    # Create temporary test directory
+    TEST_ROOT=$(mktemp -d /tmp/lay_test.XXXXXX) || {
+        printf "${RED}Failed to create temp dir${NC}\n"
+        return 1
+    }
+    trap 'rm -rf "$TEST_ROOT"' EXIT
+    
+    cd "$TEST_ROOT" || return 1
+    CURRENT_DIR="$PWD"
+    
+    # Setup a fake git repo
+    mkdir -p testrepo/.git
+    cat > testrepo/.git/config <<EOF
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+[remote "origin"]
+	url = https://github.com/testuser/testrepo.git
+	fetch = +refs/heads/*:refs/heads/*
+EOF
+    # Create a dummy file
+    echo "test content" > testrepo/README.md
+    # Create a fake HEAD
+    echo "ref: refs/heads/master" > testrepo/.git/HEAD
+    
+    printf "\n--- Test 1: Create first layer ---\n"
+    CURRENT_DIR="$TEST_ROOT/testrepo"
+    NEW_LAYER=1
+    WITH_CHANGES=0
+    if create_new_layer; then
+        printf "PASS: New layer created\n"
+    else
+        printf "FAIL: create_new_layer failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo_1" ]; then
+        printf "PASS: In testrepo_1 directory\n"
+    else
+        printf "FAIL: Not in testrepo_1 (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "\n--- Test 2: Create second layer ---\n"
+    NEW_LAYER=1
+    if create_new_layer; then
+        printf "PASS: Second layer created\n"
+    else
+        printf "FAIL: create_new_layer failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo_2" ]; then
+        printf "PASS: In testrepo_2 directory\n"
+    else
+        printf "FAIL: Not in testrepo_2 (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "\n--- Test 3: Switch to main repo (swi 0) ---\n"
+    SWITCH_LAYER=1
+    SWITCH_NUM="0"
+    if switch_to_layer; then
+        printf "PASS: Switched to main\n"
+    else
+        printf "FAIL: switch_to_layer failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo" ]; then
+        printf "PASS: In main repo directory\n"
+    else
+        printf "FAIL: Not in main repo (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "\n--- Test 4: Switch to layer 2 (swi 2) ---\n"
+    SWITCH_LAYER=1
+    SWITCH_NUM="2"
+    if switch_to_layer; then
+        printf "PASS: Switched to layer 2\n"
+    else
+        printf "FAIL: switch_to_layer failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo_2" ]; then
+        printf "PASS: In testrepo_2 directory\n"
+    else
+        printf "FAIL: Not in testrepo_2 (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "\n--- Test 5: List layers ---\n"
+    LIST_LAYERS=1
+    output=$(list_layers)
+    printf "%s\n" "$output"
+    if printf "%s" "$output" | grep -q "testrepo_1" && printf "%s" "$output" | grep -q "testrepo_2"; then
+        printf "PASS: list contains both layers\n"
+    else
+        printf "FAIL: list output missing layers\n"
+        return 1
+    fi
+    
+    printf "\n--- Test 6: List repos ---\n"
+    LIST_REPOS=1
+    output=$(list_repos)
+    printf "%s\n" "$output"
+    if printf "%s" "$output" | grep -q "testrepo"; then
+        printf "PASS: repos contains testrepo\n"
+    else
+        printf "FAIL: repos output missing testrepo\n"
+        return 1
+    fi
+    
+    printf "\n--- Test 7: Switch to repo using reposwi (by name) ---\n"
+    REPO_SWITCH=1
+    REPO_TARGET="testrepo"
+    if switch_to_repo; then
+        printf "PASS: reposwi succeeded\n"
+    else
+        printf "FAIL: reposwi failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo" ]; then
+        printf "PASS: In main repo directory\n"
+    else
+        printf "FAIL: Not in main repo (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "\n--- Test 8: Switch to layer 1 (swi 1) ---\n"
+    SWITCH_LAYER=1
+    SWITCH_NUM="1"
+    if switch_to_layer; then
+        printf "PASS: Switched to layer 1\n"
+    else
+        printf "FAIL: switch_to_layer failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo_1" ]; then
+        printf "PASS: In testrepo_1 directory\n"
+    else
+        printf "FAIL: Not in testrepo_1 (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "\n--- Test 9: Delete layer 1 ---\n"
+    DELETE_LAYER=1
+    if delete_current_layer; then
+        printf "PASS: delete_current_layer succeeded\n"
+    else
+        printf "FAIL: delete_current_layer failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo" ]; then
+        printf "PASS: Returned to main repo after delete\n"
+    else
+        printf "FAIL: Not in main repo after delete (in %s)\n" "$PWD"
+        return 1
+    fi
+    if [ ! -d "$TEST_ROOT/testrepo_1" ]; then
+        printf "PASS: Layer 1 directory removed\n"
+    else
+        printf "FAIL: Layer 1 directory still exists\n"
+        return 1
+    fi
+    
+    printf "\n--- Test 10: Fallback switching (layer 1 deleted, layer 2 exists) ---\n"
+    SWITCH_LAYER=1
+    SWITCH_NUM="1"
+    if switch_to_layer; then
+        CURRENT_DIR="$PWD"
+        if [ "$(basename "$PWD")" = "testrepo_2" ]; then
+            printf "PASS: Fallback to layer 2 worked\n"
+        else
+            printf "FAIL: Fallback did not go to layer 2 (in %s)\n" "$PWD"
+            return 1
+        fi
+    else
+        printf "FAIL: switch_to_layer with fallback failed\n"
+        return 1
+    fi
+    
+    printf "\n--- Test 11: Delete remaining layer and cleanup ---\n"
+    DELETE_LAYER=1
+    delete_current_layer >/dev/null 2>&1
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo" ]; then
+        printf "PASS: Final cleanup delete successful\n"
+    else
+        printf "FAIL: Final delete did not return to main (in %s)\n" "$PWD"
+        return 1
+    fi
+    
+    printf "${GREEN}All tests passed!${NC}\n"
+    return 0
+}
+
 # Main logic
+if [ $RUN_TEST -eq 1 ]; then
+    run_tests
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $LIST_LAYERS -eq 1 ]; then
+    list_layers
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $LIST_REPOS -eq 1 ]; then
+    list_repos
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $REPO_SWITCH -eq 1 ]; then
+    switch_to_repo
+    [ $? -eq 0 ] && [ $VERBOSE -eq 0 ] && clear
+    return $? 2>/dev/null || exit $?
+fi
+
 if [ $NEW_LAYER -eq 1 ]; then
     create_new_layer
     [ $? -eq 0 ] && [ $VERBOSE -eq 0 ] && clear
