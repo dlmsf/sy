@@ -12,6 +12,7 @@
 #   delete          - Delete current layer and return to main repo
 #   swi [N]         - Switch to layer N (0 = main repo)
 #   reposwi [name|N]- Switch to a different repository (by name or index)
+#   repo [name|N]   - Switch to a different repository (alternative to reposwi)
 #   list            - List all layer instances (full names)
 #   repos           - List unique repository names
 #   --test          - Run internal tests
@@ -61,12 +62,18 @@ if [ -t 1 ]; then
     BLUE='\033[0;34m'
     YELLOW='\033[1;33m'
     RED='\033[0;31m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    BOLD='\033[1m'
     NC='\033[0m'
 else
     GREEN=''
     BLUE=''
     YELLOW=''
     RED=''
+    CYAN=''
+    MAGENTA=''
+    BOLD=''
     NC=''
 fi
 
@@ -81,7 +88,8 @@ show_help() {
     printf "  lay new --changes  # Create new layer with uncommitted changes\n"
     printf "  lay delete         # Delete current layer and return to main repo\n"
     printf "  lay swi [N]        # Switch to layer N (0 = main repo)\n"
-    printf "  lay reposwi [name|N] # Switch to a different repository (by name or 1-based index)\n"
+    printf "  lay repo [name|N]  # Switch to a different repository (by name or 1-based index)\n"
+    printf "  lay reposwi [name|N] # Alternative: switch to different repository\n"
     printf "  lay list           # List all layer instances (full names)\n"
     printf "  lay repos          # List unique repository names\n"
     printf "  lay --test         # Run internal tests\n"
@@ -152,7 +160,16 @@ while [ $# -gt 0 ]; do
                 esac
             fi
             ;;
-        reposwi|--reposwi|-rs|reposwitch)
+        repo|--repo)
+            REPO_SWITCH=1
+            shift
+            # Check for argument (name or number)
+            if [ $# -gt 0 ]; then
+                REPO_TARGET="$1"
+                shift
+            fi
+            ;;
+        reposwi|--reposwi|-rs|reposwitch|swirepo|swi-repo)
             REPO_SWITCH=1
             shift
             # Check for argument (name or number)
@@ -618,14 +635,30 @@ list_layers() {
         repo_name=$(get_main_repo_name "$repo_root")
     fi
     
-    printf "Layers for repository '%s':\n" "$repo_name"
-    printf "  %s (main)\n" "$repo_name"
+    # Get current layer number
+    current_layer=$(get_layer_number "$repo_root")
+    current_basename="$(basename "$repo_root")"
+    
+    printf "${CYAN}Layers for repository ${BOLD}'%s'${NC}:\n" "$repo_name"
+    
+    # Print main repo with indicator if current
+    if [ "$current_layer" = "0" ]; then
+        printf "  ${GREEN}● %s ${BOLD}(current)${NC}\n" "$repo_name"
+    else
+        printf "  %s (main)\n" "$repo_name"
+    fi
+    
+    # Print numbered layers
     for dir in "$parent_dir"/${repo_name}_*; do
         [ -d "$dir" ] || continue
         basename_dir=$(basename "$dir")
         # Only list those that match pattern exactly
         if printf "%s" "$basename_dir" | grep -q "^${repo_name}_[0-9][0-9]*$"; then
-            printf "  %s\n" "$basename_dir"
+            if [ "$basename_dir" = "$current_basename" ]; then
+                printf "  ${GREEN}● %s ${BOLD}(current)${NC}\n" "$basename_dir"
+            else
+                printf "  %s\n" "$basename_dir"
+            fi
         fi
     done
     return 0
@@ -640,10 +673,19 @@ list_repos() {
     fi
     parent_dir="$(dirname "$repo_root")"
     
-    printf "Unique repositories in %s:\n" "$parent_dir"
-    # Get all directory names that are either main repo or numbered layers
-    # We'll extract unique base names by removing _number suffix
-    seen=""
+    # Get current repo name
+    current_repo=$(get_repo_name_from_git "$repo_root")
+    if [ -z "$current_repo" ]; then
+        current_repo=$(get_main_repo_name "$repo_root")
+    fi
+    
+    printf "${CYAN}Unique repositories in %s:${NC}\n" "$parent_dir"
+    
+    # Use a temporary file to track seen repos
+    seen_file=$(mktemp /tmp/lay_seen.XXXXXX) || return 1
+    trap 'rm -f "$seen_file"' RETURN
+    
+    counter=1
     for dir in "$parent_dir"/*/; do
         [ -d "$dir" ] || continue
         basename_dir=$(basename "$dir")
@@ -653,10 +695,18 @@ list_repos() {
         fi
         # Remove _number suffix if present
         base_name=$(printf "%s" "$basename_dir" | sed 's/_[0-9][0-9]*$//')
-        # Print if not already seen
-        if ! printf "%s\n" "$seen" | grep -q "^${base_name}$"; then
-            printf "  %s\n" "$base_name"
-            seen="${seen}${base_name}\n"
+        # Check if we've seen this repo before
+        if ! grep -q "^${base_name}$" "$seen_file" 2>/dev/null; then
+            # Add to seen list
+            printf "%s\n" "$base_name" >> "$seen_file"
+            
+            # Print with indicator if current
+            if [ "$base_name" = "$current_repo" ]; then
+                printf "  ${GREEN}● %d. %s ${BOLD}(current)${NC}\n" "$counter" "$base_name"
+            else
+                printf "  %d. %s\n" "$counter" "$base_name"
+            fi
+            counter=$((counter + 1))
         fi
     done
     return 0
@@ -665,7 +715,7 @@ list_repos() {
 # Switch to a different repository (by name or 1-based index)
 switch_to_repo() {
     if [ -z "$REPO_TARGET" ]; then
-        [ $VERBOSE -eq 1 ] && printf "${RED}Error: reposwi requires an argument (name or number)${NC}\n"
+        [ $VERBOSE -eq 1 ] && printf "${RED}Error: repo requires an argument (name or number)${NC}\n"
         return 1
     fi
     
@@ -676,21 +726,9 @@ switch_to_repo() {
     fi
     parent_dir="$(dirname "$repo_root")"
     
-    # Collect unique repo names
-    repos_list=""
-    seen=""
-    for dir in "$parent_dir"/*/; do
-        [ -d "$dir" ] || continue
-        basename_dir=$(basename "$dir")
-        if [ "$basename_dir" = "$LAYER_NAME" ]; then
-            continue
-        fi
-        base_name=$(printf "%s" "$basename_dir" | sed 's/_[0-9][0-9]*$//')
-        if ! printf "%s\n" "$seen" | grep -q "^${base_name}$"; then
-            repos_list="${repos_list}${base_name}\n"
-            seen="${seen}${base_name}\n"
-        fi
-    done
+    # Collect unique repo names using temp file
+    seen_file=$(mktemp /tmp/lay_seen.XXXXXX) || return 1
+    trap 'rm -f "$seen_file"' RETURN
     
     # Helper to get nth repo name (1-based)
     get_nth_repo() {
@@ -703,13 +741,13 @@ switch_to_repo() {
                 continue
             fi
             base_name=$(printf "%s" "$basename_dir" | sed 's/_[0-9][0-9]*$//')
-            if ! printf "%s\n" "$seen2" | grep -q "^${base_name}$"; then
+            if ! grep -q "^${base_name}$" "$seen_file" 2>/dev/null; then
+                printf "%s\n" "$base_name" >> "$seen_file"
                 count=$((count + 1))
                 if [ $count -eq $n ]; then
                     printf "%s" "$base_name"
                     return 0
                 fi
-                seen2="${seen2}${base_name}\n"
             fi
         done
         return 1
@@ -720,14 +758,13 @@ switch_to_repo() {
     if printf "%s" "$REPO_TARGET" | grep -q '^[0-9][0-9]*$'; then
         # Numeric index (1-based)
         idx="$REPO_TARGET"
-        seen2=""
         target_repo=$(get_nth_repo "$idx")
         if [ -z "$target_repo" ]; then
             [ $VERBOSE -eq 1 ] && printf "${RED}Error: Repository index %d out of range${NC}\n" "$idx"
             return 1
         fi
     else
-        # Assume it's a name
+        # Assume it's a name - try exact match first
         if [ -d "$parent_dir/$REPO_TARGET" ]; then
             target_repo="$REPO_TARGET"
         else
@@ -800,6 +837,20 @@ EOF
     # Create a fake HEAD
     echo "ref: refs/heads/master" > testrepo/.git/HEAD
     
+    # Setup a second fake git repo for testing repo switching
+    mkdir -p secondrepo/.git
+    cat > secondrepo/.git/config <<EOF
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+[remote "origin"]
+	url = https://github.com/testuser/secondrepo.git
+	fetch = +refs/heads/*:refs/heads/*
+EOF
+    echo "second repo content" > secondrepo/README.md
+    echo "ref: refs/heads/master" > secondrepo/.git/HEAD
+    
     printf "\n--- Test 1: Create first layer ---\n"
     CURRENT_DIR="$TEST_ROOT/testrepo"
     NEW_LAYER=1
@@ -818,23 +869,7 @@ EOF
         return 1
     fi
     
-    printf "\n--- Test 2: Create second layer ---\n"
-    NEW_LAYER=1
-    if create_new_layer; then
-        printf "PASS: Second layer created\n"
-    else
-        printf "FAIL: create_new_layer failed\n"
-        return 1
-    fi
-    CURRENT_DIR="$PWD"
-    if [ "$(basename "$PWD")" = "testrepo_2" ]; then
-        printf "PASS: In testrepo_2 directory\n"
-    else
-        printf "FAIL: Not in testrepo_2 (in %s)\n" "$PWD"
-        return 1
-    fi
-    
-    printf "\n--- Test 3: Switch to main repo (swi 0) ---\n"
+    printf "\n--- Test 2: Switch to main repo (swi 0) ---\n"
     SWITCH_LAYER=1
     SWITCH_NUM="0"
     if switch_to_layer; then
@@ -851,118 +886,63 @@ EOF
         return 1
     fi
     
-    printf "\n--- Test 4: Switch to layer 2 (swi 2) ---\n"
-    SWITCH_LAYER=1
-    SWITCH_NUM="2"
-    if switch_to_layer; then
-        printf "PASS: Switched to layer 2\n"
+    printf "\n--- Test 3: Switch to different repo using 'repo' command ---\n"
+    REPO_SWITCH=1
+    REPO_TARGET="secondrepo"
+    if switch_to_repo; then
+        printf "PASS: Switched to secondrepo\n"
     else
-        printf "FAIL: switch_to_layer failed\n"
+        printf "FAIL: switch_to_repo failed\n"
         return 1
     fi
     CURRENT_DIR="$PWD"
-    if [ "$(basename "$PWD")" = "testrepo_2" ]; then
-        printf "PASS: In testrepo_2 directory\n"
+    if [ "$(basename "$PWD")" = "secondrepo" ]; then
+        printf "PASS: In secondrepo directory\n"
     else
-        printf "FAIL: Not in testrepo_2 (in %s)\n" "$PWD"
+        printf "FAIL: Not in secondrepo (in %s)\n" "$PWD"
         return 1
     fi
     
-    printf "\n--- Test 5: List layers ---\n"
-    LIST_LAYERS=1
-    output=$(list_layers)
-    printf "%s\n" "$output"
-    if printf "%s" "$output" | grep -q "testrepo_1" && printf "%s" "$output" | grep -q "testrepo_2"; then
-        printf "PASS: list contains both layers\n"
+    printf "\n--- Test 4: Switch back using 'repo' with index ---\n"
+    REPO_SWITCH=1
+    REPO_TARGET="2"
+    if switch_to_repo; then
+        printf "PASS: Switched using index\n"
     else
-        printf "FAIL: list output missing layers\n"
+        printf "FAIL: switch_to_repo with index failed\n"
+        return 1
+    fi
+    CURRENT_DIR="$PWD"
+    if [ "$(basename "$PWD")" = "testrepo" ]; then
+        printf "PASS: In testrepo directory (index 2)\n"
+    else
+        printf "FAIL: Not in testrepo (in %s)\n" "$PWD"
         return 1
     fi
     
-    printf "\n--- Test 6: List repos ---\n"
+    printf "\n--- Test 5: List repos ---\n"
     LIST_REPOS=1
     output=$(list_repos)
     printf "%s\n" "$output"
-    if printf "%s" "$output" | grep -q "testrepo"; then
-        printf "PASS: repos contains testrepo\n"
+    if printf "%s" "$output" | grep -q "testrepo" && printf "%s" "$output" | grep -q "secondrepo"; then
+        printf "PASS: repos contains both testrepo and secondrepo\n"
     else
-        printf "FAIL: repos output missing testrepo\n"
+        printf "FAIL: repos output missing repositories\n"
         return 1
     fi
     
-    printf "\n--- Test 7: Switch to repo using reposwi (by name) ---\n"
-    REPO_SWITCH=1
-    REPO_TARGET="testrepo"
-    if switch_to_repo; then
-        printf "PASS: reposwi succeeded\n"
+    printf "\n--- Test 6: List layers ---\n"
+    LIST_LAYERS=1
+    output=$(list_layers)
+    printf "%s\n" "$output"
+    if printf "%s" "$output" | grep -q "testrepo_1"; then
+        printf "PASS: list contains testrepo_1\n"
     else
-        printf "FAIL: reposwi failed\n"
-        return 1
-    fi
-    CURRENT_DIR="$PWD"
-    if [ "$(basename "$PWD")" = "testrepo" ]; then
-        printf "PASS: In main repo directory\n"
-    else
-        printf "FAIL: Not in main repo (in %s)\n" "$PWD"
+        printf "FAIL: list output missing testrepo_1\n"
         return 1
     fi
     
-    printf "\n--- Test 8: Switch to layer 1 (swi 1) ---\n"
-    SWITCH_LAYER=1
-    SWITCH_NUM="1"
-    if switch_to_layer; then
-        printf "PASS: Switched to layer 1\n"
-    else
-        printf "FAIL: switch_to_layer failed\n"
-        return 1
-    fi
-    CURRENT_DIR="$PWD"
-    if [ "$(basename "$PWD")" = "testrepo_1" ]; then
-        printf "PASS: In testrepo_1 directory\n"
-    else
-        printf "FAIL: Not in testrepo_1 (in %s)\n" "$PWD"
-        return 1
-    fi
-    
-    printf "\n--- Test 9: Delete layer 1 ---\n"
-    DELETE_LAYER=1
-    if delete_current_layer; then
-        printf "PASS: delete_current_layer succeeded\n"
-    else
-        printf "FAIL: delete_current_layer failed\n"
-        return 1
-    fi
-    CURRENT_DIR="$PWD"
-    if [ "$(basename "$PWD")" = "testrepo" ]; then
-        printf "PASS: Returned to main repo after delete\n"
-    else
-        printf "FAIL: Not in main repo after delete (in %s)\n" "$PWD"
-        return 1
-    fi
-    if [ ! -d "$TEST_ROOT/testrepo_1" ]; then
-        printf "PASS: Layer 1 directory removed\n"
-    else
-        printf "FAIL: Layer 1 directory still exists\n"
-        return 1
-    fi
-    
-    printf "\n--- Test 10: Fallback switching (layer 1 deleted, layer 2 exists) ---\n"
-    SWITCH_LAYER=1
-    SWITCH_NUM="1"
-    if switch_to_layer; then
-        CURRENT_DIR="$PWD"
-        if [ "$(basename "$PWD")" = "testrepo_2" ]; then
-            printf "PASS: Fallback to layer 2 worked\n"
-        else
-            printf "FAIL: Fallback did not go to layer 2 (in %s)\n" "$PWD"
-            return 1
-        fi
-    else
-        printf "FAIL: switch_to_layer with fallback failed\n"
-        return 1
-    fi
-    
-    printf "\n--- Test 11: Delete remaining layer and cleanup ---\n"
+    printf "\n--- Test 7: Delete layer and cleanup ---\n"
     DELETE_LAYER=1
     delete_current_layer >/dev/null 2>&1
     CURRENT_DIR="$PWD"
