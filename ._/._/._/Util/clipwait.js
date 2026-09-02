@@ -2,18 +2,20 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
 import path from 'path';
+import os from 'os';
 import readline from 'readline';
 
 const execAsync = promisify(exec);
 
 class ClipboardMonitor {
     constructor() {
-        this.configPath = path.join(process.cwd(), 'clipboard-config.json');
+        this.configDir = path.join(os.tmpdir(), 'clipboard-monitor');
+        this.configPath = path.join(this.configDir, 'clipboard-config.json');
         this.outputPath = path.join(process.cwd(), 'result');
         this.lastClipboardContent = '';
         this.isMonitoring = false;
         this.isPaused = false;
-        this.tagRestrictMode = false; // New: restrict mode flag
+        this.tagRestrictMode = false;
         this.config = {
             profiles: {},
             activeProfile: null,
@@ -29,6 +31,15 @@ class ClipboardMonitor {
         return new Promise(resolve => this.rl.question(query, resolve));
     }
 
+    async ensureConfigDirectory() {
+        try {
+            await fs.mkdir(this.configDir, { recursive: true });
+        } catch (error) {
+            console.error('Error creating config directory:', error);
+            throw error;
+        }
+    }
+
     async ensureDirectoryExists() {
         const dir = path.dirname(this.outputPath);
         try {
@@ -41,6 +52,7 @@ class ClipboardMonitor {
 
     async loadOrCreateConfig() {
         try {
+            await this.ensureConfigDirectory();
             const configData = await fs.readFile(this.configPath, 'utf8');
             this.config = { ...this.config, ...JSON.parse(configData) };
             console.log(`✓ Configuration loaded from ${this.configPath}`);
@@ -56,6 +68,7 @@ class ClipboardMonitor {
 
     async saveConfig() {
         try {
+            await this.ensureConfigDirectory();
             await fs.writeFile(this.configPath, JSON.stringify(this.config, null, 2), 'utf8');
             console.log(`✓ Configuration saved to ${this.configPath}`);
         } catch (error) {
@@ -169,27 +182,16 @@ class ClipboardMonitor {
         }
     }
 
-    /**
-     * Checks if content contains CODEREPLACER tags.
-     * @param {string} content - The clipboard content to check.
-     * @returns {boolean} True if tags are present, false otherwise.
-     */
     hasCodeReplacerTags(content) {
         const START = '[CODEREPLACER-START]';
         const END = '[/CODEREPLACER-END]';
         return content.includes(START) && content.includes(END);
     }
 
-    /**
-     * Validates that all file paths mentioned inside CODEREPLACER tags
-     * (if any) are within the current working directory.
-     * @param {string} content - The clipboard content to check.
-     * @returns {boolean} True if no tags are present, or if all paths are inside cwd.
-     */
     validateCodeReplacerPaths(content) {
         const START = '[CODEREPLACER-START]';
         const END = '[/CODEREPLACER-END]';
-        const basePath = process.cwd(); // allowed root directory
+        const basePath = process.cwd();
 
         let searchPos = 0;
         let foundAnyTag = false;
@@ -239,7 +241,6 @@ class ClipboardMonitor {
             console.log('\n' + '='.repeat(60));
             console.log('New clipboard content detected!');
 
-            // Check tag restriction mode
             if (this.tagRestrictMode) {
                 if (!this.hasCodeReplacerTags(currentContent)) {
                     console.log('✗ Tag Restrict Mode: Content rejected (no CODEREPLACER tags found).');
@@ -249,7 +250,6 @@ class ClipboardMonitor {
                 console.log('✓ Tag Restrict Mode: CODEREPLACER tags detected.');
             }
 
-            // Validate CodeReplacer paths before writing or executing anything
             if (!this.validateCodeReplacerPaths(currentContent)) {
                 console.log('✗ Clipboard content rejected due to path validation failure.');
                 console.log('='.repeat(60) + '\n');
@@ -490,7 +490,6 @@ class ClipboardMonitor {
     async mainMenu() {
         await this.loadOrCreateConfig();
         
-        // Check for --tag flag in arguments
         const args = process.argv.slice(2);
         const tagIndex = args.indexOf('--tag');
         let argProfile = null;
@@ -498,7 +497,6 @@ class ClipboardMonitor {
         if (tagIndex !== -1) {
             this.tagRestrictMode = true;
             console.log('🔒 Tag Restrict Mode enabled: Only content with CODEREPLACER tags will be processed.');
-            // Remove --tag from args to find profile name
             args.splice(tagIndex, 1);
             argProfile = args[0];
         } else {
@@ -556,10 +554,8 @@ class ClipboardMonitor {
     }
 }
 
-// Create and start the monitor
 const monitor = new ClipboardMonitor();
 
-// Handle graceful shutdown
 process.on('SIGINT', () => {
     console.log('\nReceived SIGINT. Stopping...');
     monitor.isMonitoring = false;
@@ -574,7 +570,6 @@ process.on('SIGTERM', () => {
     process.exit(0);
 });
 
-// Handle errors
 process.on('uncaughtException', (error) => {
     console.error('Uncaught exception:', error);
     monitor.isMonitoring = false;
@@ -582,7 +577,6 @@ process.on('uncaughtException', (error) => {
     process.exit(1);
 });
 
-// Handle keyboard input for pause/resume
 process.stdin.setRawMode(true);
 process.stdin.resume();
 process.stdin.setEncoding('utf8');
@@ -601,7 +595,6 @@ process.stdin.on('data', (key) => {
     }
 });
 
-// Start the CLI menu
 monitor.mainMenu().catch(error => {
     console.error('Failed to start:', error);
     process.exit(1);
