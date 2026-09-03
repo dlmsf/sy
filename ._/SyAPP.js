@@ -5661,7 +5661,666 @@ this.DropDownManager = {
       }
     };
 
+
+/**
+ * JSON Browser – Load a JSON file and navigate its structure with pagination.
+ * Features: Hierarchical navigation, pagination, text abbreviation, and fast search.
+ * @param {string} id - User/build ID
+ * @param {Object} config - Configuration options
+ * @param {Object} [config.fileConfig] - Custom options for the file picker (see this.File)
+ * @param {number} [config.itemsPerPage=5] - Number of items per page for arrays/objects
+ * @param {string} [config.name='default'] - Unique name for this browser instance
+ * @param {string} [config.startPath] - Starting directory for the file picker
+ * @param {number} [config.maxTextLength=40] - Maximum characters before abbreviation
+ * @returns {Promise<void>}
+ */
+this.JSON = async (id, config = {}) => {
+  // Capture 'this' context for use in callbacks
+  const self = this;
+  
+  // ------------------------------------------------------------------
+  // Setup storage & instance name
+  // ------------------------------------------------------------------
+  const instanceName = config.name || 'default';
+  const storageKey = `jsonBrowser_${instanceName}`;
+  const filePickerName = `${storageKey}_filepicker`;
+  const searchFieldName = `${storageKey}_search`;
+  const searchChangeProp = `${storageKey}_searchChange`;
+  const searchIndexKey = `${storageKey}_searchIndex`;
+
+  if (!this.Storages.Has(id, storageKey)) {
+    this.Storages.Set(id, storageKey, {
+      data: null,
+      path: [],
+      searchResults: null,
+      searchPath: [],
+      filePath: null,
+      searchQuery: ''
+    });
+  }
+
+  const storage = this.Storages.Get(id, storageKey);
+  const currentProps = this.Builds.get(id).Session.ActualProps || {};
+
+  // ------------------------------------------------------------------
+  // Handle navigation props
+  // ------------------------------------------------------------------
+  const backProp = `${storageKey}_back`;
+  const navProp = `${storageKey}_navigate`;
+  const loadNewProp = `${storageKey}_loadNew`;
+  const clearSearchProp = `${storageKey}_clearSearch`;
+
+  if (currentProps[backProp]) {
+    if (storage.searchResults) {
+      storage.searchPath.pop();
+      if (storage.searchPath.length === 0) {
+        // Go back to search results list
+        storage.searchPath = [];
+      }
+    } else {
+      storage.path.pop();
+    }
+    delete currentProps[backProp];
+  }
+
+  if (currentProps[navProp] !== undefined) {
+    if (storage.searchResults) {
+      storage.searchPath.push(currentProps[navProp]);
+    } else {
+      storage.path.push(currentProps[navProp]);
+    }
+    delete currentProps[navProp];
+  }
+
+  if (currentProps[loadNewProp]) {
+    storage.data = null;
+    storage.path = [];
+    storage.searchResults = null;
+    storage.searchPath = [];
+    storage.filePath = null;
+    storage.searchQuery = '';
+    this.FileManager.ClearSelection(id, filePickerName);
+    this.Storages.Delete(id, searchFieldName);
+    this.Storages.Delete(id, searchIndexKey);
+    delete currentProps[loadNewProp];
+  }
+
+  if (currentProps[clearSearchProp]) {
+    storage.searchResults = null;
+    storage.searchPath = [];
+    storage.searchQuery = '';
+    this.Storages.Delete(id, searchFieldName);
+    delete currentProps[clearSearchProp];
+  }
+
+  // Handle search change from field
+  if (currentProps[searchChangeProp] !== undefined) {
+    const newSearchValue = currentProps[searchChangeProp] || '';
+    this.Storages.Set(id, searchFieldName, newSearchValue);
+    storage.searchQuery = newSearchValue;
+    
+    if (newSearchValue && newSearchValue.trim()) {
+      // Perform fast in-memory search with similarity
+      storage.searchResults = fastSearchJSON(
+        storage.data, 
+        newSearchValue.trim(),
+        this.Storages.Get(id, searchIndexKey)
+      );
+      storage.searchPath = [];
+    } else {
+      storage.searchResults = null;
+      storage.searchPath = [];
+    }
+    
+    delete currentProps[searchChangeProp];
+  }
+
+  this.Storages.Set(id, storageKey, storage);
+
+  // ------------------------------------------------------------------
+  // Load JSON data if not already loaded
+  // ------------------------------------------------------------------
+  if (storage.data === null) {
+    const selected = this.FileManager.GetSelected(id, filePickerName);
+    if (selected.length > 0) {
+      const filePath = selected[0];
+      try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        const data = JSON.parse(content);
+        storage.data = data;
+        storage.filePath = filePath;
+        
+        // Build search index for fast searching
+        const searchIndex = buildSearchIndex(data);
+        this.Storages.Set(id, searchIndexKey, searchIndex);
+        
+        this.Storages.Set(id, storageKey, storage);
+        this.Alert(id, `✅ Loaded: ${path.basename(filePath)} (${searchIndex.length} searchable items)`, { duration: 2000 });
+      } catch (err) {
+        this.Alert(id, `❌ Error loading JSON: ${err.message}`, { duration: 5000 });
+        this.FileManager.ClearSelection(id, filePickerName);
+      }
+    } else {
+      const fileConfig = config.fileConfig || {
+        name: filePickerName,
+        multiple: false,
+        filter: (itemPath, isDir) => {
+          if (isDir) return true;
+          return itemPath.toLowerCase().endsWith('.json');
+        },
+        startPath: config.startPath || process.cwd(),
+        displayName: '📁 Select JSON file'
+      };
+
+      await this.File(id, fileConfig);
+      this.Text(id, '👆 Use the file browser above to choose a JSON file.');
+      return;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Render search field (using safe context capture)
+  // ------------------------------------------------------------------
+  const searchValue = this.Storages.Get(id, searchFieldName);
+  
+  this.Field(id, searchFieldName, {
+    label: '🔍 Search',
+    initialValue: searchValue || '',
+    maxWidth: config.maxTextLength || 40,
+    onChange: (value) => {
+      // Use 'self' to safely access Builds
+      const build = self.Builds.get(id);
+      if (build && build.Session) {
+        if (!build.Session.ActualProps) {
+          build.Session.ActualProps = {};
+        }
+        build.Session.ActualProps[searchChangeProp] = value;
+      }
+    }
+  });
+
+  // Navigate in search results or normal tree
+  let currentNode;
+  let breadcrumb;
+  let displaySearchResults = false;
+
+  if (storage.searchResults && storage.searchQuery) {
+    displaySearchResults = true;
+    
+    // If we're navigating within a search result
+    if (storage.searchPath.length > 0) {
+      currentNode = storage.searchResults;
+      for (const seg of storage.searchPath) {
+        if (typeof seg === 'number') {
+          currentNode = currentNode[seg];
+        } else {
+          currentNode = currentNode?.[seg];
+        }
+      }
+      breadcrumb = `🔍 "${storage.searchQuery}" → Result`;
+    } else {
+      currentNode = storage.searchResults;
+      breadcrumb = `🔍 Search: "${storage.searchQuery}" (${storage.searchResults.length} results)`;
+    }
+  } else {
+    currentNode = storage.data;
+    breadcrumb = '📍 root';
+    for (const seg of storage.path) {
+      if (typeof seg === 'number') {
+        currentNode = currentNode[seg];
+        breadcrumb += `[${seg}]`;
+      } else {
+        currentNode = currentNode?.[seg];
+        breadcrumb += `.${seg}`;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Helper functions
+  // ------------------------------------------------------------------
+  const maxTextLength = config.maxTextLength || 40;
+  
+  const abbreviateText = (text, maxLength = maxTextLength) => {
+    if (text === undefined || text === null) return String(text);
+    const str = String(text);
+    if (str.length <= maxLength) return str;
+    return str.substring(0, maxLength - 3) + '...';
+  };
+
+  const getValuePreview = (value, maxLength = maxTextLength) => {
+    if (Array.isArray(value)) {
+      return `Array(${value.length})`;
+    }
+    if (value !== null && typeof value === 'object') {
+      const keys = Object.keys(value);
+      return `Object(${keys.length} keys)`;
+    }
+    return abbreviateText(value, maxLength);
+  };
+
+  // ------------------------------------------------------------------
+  // Display breadcrumb and file info
+  // ------------------------------------------------------------------
+  this.Text(id, `${this.TextColor.brightCyan('📍')} ${this.TextColor.bold(breadcrumb)}`);
+  if (storage.filePath && !displaySearchResults) {
+    this.Text(id, `${this.TextColor.dim('📄 ' + path.basename(storage.filePath))}`);
+  }
+  this.Text(id, ' ');
+
+  // ------------------------------------------------------------------
+  // Render the current node
+  // ------------------------------------------------------------------
+  const itemsPerPage = config.itemsPerPage || 5;
+
+  // Helper to create pagination config
+  const createPaginationConfig = (paginationKey, dataLength) => {
+    const paginationStorage = this.Storages.Get(id, paginationKey);
+    const totalPages = Math.max(1, Math.ceil(dataLength / itemsPerPage));
+    const currentPage = paginationStorage?.actual_page || 1;
+    
+    return {
+      items_per_page: itemsPerPage,
+      custom: {
+        showSeparators: false,
+        showPageInfo: true,
+        showNavigation: true,
+        pageInfoStyle: 'text',
+        prevButtonText: '◀',
+        nextButtonText: '▶',
+        pageIndicatorText: `${currentPage}/${totalPages}`
+      }
+    };
+  };
+
+  if (displaySearchResults && storage.searchPath.length === 0) {
+    // ---------------- SEARCH RESULTS LIST ----------------
+    this.Text(id, `${this.TextColor.green('🔍')} Found ${storage.searchResults.length} matches for "${storage.searchQuery}"`);
+    
+    if (storage.searchResults.length === 0) {
+      this.Text(id, `${this.TextColor.dim('No results found')}`);
+    } else {
+      await this.Pagination.Button(
+        id, 
+        `${storageKey}_searchResults`, 
+        storage.searchResults, 
+        {
+          ...createPaginationConfig(`${storageKey}_searchResults`, storage.searchResults.length),
+          renderItem: (itemData) => {
+            const item = itemData.item;
+            const similarity = item.similarity !== undefined ? 
+              ` ${this.TextColor.dim(`(${Math.round(item.similarity * 100)}%)`)}` : '';
+            
+            this.Button(id, {
+              name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${similarity}`,
+              props: { [`${storageKey}_navigate`]: itemData.globalIndex }
+            });
+          }
+        }
+      );
+    }
+
+  } else if (displaySearchResults && storage.searchPath.length > 0) {
+    // ---------------- NAVIGATING WITHIN SEARCH RESULT ----------------
+    if (Array.isArray(currentNode)) {
+      this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
+      
+      if (currentNode.length === 0) {
+        this.Text(id, `${this.TextColor.dim('(empty array)')}`);
+      } else {
+        await this.Pagination.Button(
+          id, 
+          `${storageKey}_searchNav`, 
+          currentNode, 
+          {
+            ...createPaginationConfig(`${storageKey}_searchNav`, currentNode.length),
+            renderItem: (itemData) => {
+              const item = itemData.item;
+              const display = getValuePreview(item, maxTextLength);
+              this.Button(id, {
+                name: `${this.TextColor.green(`#${itemData.globalIndex}`)} ${display}`,
+                props: { [`${storageKey}_navigate`]: itemData.globalIndex }
+              });
+            }
+          }
+        );
+      }
+    } else if (currentNode !== null && typeof currentNode === 'object') {
+      const keys = Object.keys(currentNode);
+      this.Text(id, `${this.TextColor.magenta('🔑')} Object (${keys.length} keys)`);
+      
+      if (keys.length === 0) {
+        this.Text(id, `${this.TextColor.dim('(empty object)')}`);
+      } else {
+        const keyItems = keys.map(key => ({ key, value: currentNode[key] }));
+        
+        await this.Pagination.Button(
+          id, 
+          `${storageKey}_searchNav`, 
+          keyItems, 
+          {
+            ...createPaginationConfig(`${storageKey}_searchNav`, keyItems.length),
+            renderItem: (itemData) => {
+              const { key, value } = itemData.item;
+              const keyDisplay = abbreviateText(key, Math.floor(maxTextLength / 2));
+              const valuePreview = getValuePreview(value, Math.floor(maxTextLength / 2));
+              
+              this.Button(id, {
+                name: `${this.TextColor.cyan(keyDisplay)}: ${this.TextColor.dim(valuePreview)}`,
+                props: { [`${storageKey}_navigate`]: key }
+              });
+            }
+          }
+        );
+      }
+    } else {
+      const valueStr = String(currentNode);
+      this.Text(id, `${this.TextColor.brightGreen('💎')} Value: ${this.TextColor.bold(valueStr)}`);
+    }
+
+  } else if (Array.isArray(currentNode)) {
+    // ---------------- ARRAY ----------------
+    this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
+    
+    if (currentNode.length === 0) {
+      this.Text(id, `${this.TextColor.dim('(empty array)')}`);
+    } else {
+      await this.Pagination.Button(
+        id, 
+        `${storageKey}_array`, 
+        currentNode, 
+        {
+          ...createPaginationConfig(`${storageKey}_array`, currentNode.length),
+          renderItem: (itemData) => {
+            const item = itemData.item;
+            const display = getValuePreview(item, maxTextLength);
+            this.Button(id, {
+              name: `${this.TextColor.green(`#${itemData.globalIndex}`)} ${display}`,
+              props: { [`${storageKey}_navigate`]: itemData.globalIndex }
+            });
+          }
+        }
+      );
+    }
+
+  } else if (currentNode !== null && typeof currentNode === 'object') {
+    // ---------------- OBJECT ----------------
+    const keys = Object.keys(currentNode);
+    this.Text(id, `${this.TextColor.magenta('🔑')} Object (${keys.length} keys)`);
+
+    if (keys.length === 0) {
+      this.Text(id, `${this.TextColor.dim('(empty object)')}`);
+    } else {
+      const keyItems = keys.map(key => ({ key, value: currentNode[key] }));
+      
+      await this.Pagination.Button(
+        id, 
+        `${storageKey}_object`, 
+        keyItems, 
+        {
+          ...createPaginationConfig(`${storageKey}_object`, keyItems.length),
+          renderItem: (itemData) => {
+            const { key, value } = itemData.item;
+            const keyDisplay = abbreviateText(key, Math.floor(maxTextLength / 2));
+            const valuePreview = getValuePreview(value, Math.floor(maxTextLength / 2));
+            
+            let buttonName = `${this.TextColor.cyan(keyDisplay)}: ${this.TextColor.dim(valuePreview)}`;
+            
+            if (typeof value === 'string' && value.length > maxTextLength) {
+              buttonName += ` ${this.TextColor.brightYellow('📖')}`;
+            }
+            
+            this.Button(id, {
+              name: buttonName,
+              props: { [`${storageKey}_navigate`]: key }
+            });
+          }
+        }
+      );
+    }
+
+  } else {
+    // ---------------- PRIMITIVE ----------------
+    const valueStr = typeof currentNode === 'string' ? currentNode : String(currentNode);
+    const isLong = valueStr.length > maxTextLength;
+    
+    this.Text(id, `${this.TextColor.brightGreen('💎')} Value:`);
+    
+    if (isLong) {
+      this.Text(id, abbreviateText(valueStr, maxTextLength));
+      this.Text(id, ' ');
+      this.Text(id, `${this.TextColor.brightYellow('📖 Full Content:')}`);
+      
+      const wrapWidth = 70;
+      for (let i = 0; i < valueStr.length; i += wrapWidth) {
+        this.Text(id, valueStr.substring(i, i + wrapWidth));
+      }
+    } else {
+      this.Text(id, this.TextColor.bold(valueStr));
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Navigation buttons
+  // ------------------------------------------------------------------
+  this.Text(id, ' ');
+  
+  const navButtons = [];
+
+  if ((displaySearchResults && storage.searchPath.length > 0) || 
+      (!displaySearchResults && storage.path.length > 0)) {
+    navButtons.push({
+      name: `${this.TextColor.orange('⬆️ Back')}`,
+      props: { [`${storageKey}_back`]: true }
+    });
+  }
+
+  if (displaySearchResults) {
+    navButtons.push({
+      name: `${this.TextColor.brightRed('✖ Clear Search')}`,
+      props: { [`${storageKey}_clearSearch`]: true }
+    });
+  }
+
+  navButtons.push({
+    name: `${this.TextColor.brightBlue('📂 Load New JSON')}`,
+    props: { [`${storageKey}_loadNew`]: true }
+  });
+
+  this.Buttons(id, navButtons);
+};
+
+// ----------------------------------------------------------------------
+// Build search index for fast in-memory searching
+// ----------------------------------------------------------------------
+function buildSearchIndex(data) {
+  const index = [];
+  
+  const traverse = (obj, path = '') => {
+    if (obj === null || obj === undefined) return;
+    
+    if (Array.isArray(obj)) {
+      obj.forEach((item, i) => {
+        traverse(item, `${path}[${i}]`);
+      });
+    } else if (typeof obj === 'object') {
+      for (const [key, value] of Object.entries(obj)) {
+        const fullPath = path ? `${path}.${key}` : key;
+        
+        // Index the key itself
+        index.push({
+          type: 'key',
+          path: fullPath,
+          key: key.toLowerCase(),
+          value: typeof value === 'string' ? value.toLowerCase() : '',
+          fullValue: value
+        });
+        
+        traverse(value, fullPath);
+      }
+    } else {
+      // Index primitive values
+      const strValue = String(obj).toLowerCase();
+      index.push({
+        type: 'value',
+        path: path || 'root',
+        key: path.split('.').pop()?.toLowerCase() || 'root',
+        value: strValue,
+        fullValue: obj
+      });
+    }
+  };
+  
+  traverse(data);
+  return index;
+}
+
+// ----------------------------------------------------------------------
+// Fast in-memory search with similarity
+// ----------------------------------------------------------------------
+function fastSearchJSON(data, query, searchIndex) {
+  if (!searchIndex) {
+    searchIndex = buildSearchIndex(data);
+  }
+  
+  const queryLower = query.toLowerCase();
+  const queryTokens = queryLower.split(/\s+/).filter(t => t.length > 0);
+  
+  const results = [];
+  const seen = new Set();
+  
+  for (const item of searchIndex) {
+    let similarity = 0;
+    let matched = false;
+    
+    // Check key matches
+    if (item.key) {
+      const keySimilarity = calculateSimilarity(item.key, queryLower);
+      if (keySimilarity > 0.3) {
+        similarity = Math.max(similarity, keySimilarity);
+        matched = true;
+      }
+    }
+    
+    // Check value matches
+    if (item.value) {
+      const valueSimilarity = calculateSimilarity(item.value, queryLower);
+      if (valueSimilarity > 0.3) {
+        similarity = Math.max(similarity, valueSimilarity);
+        matched = true;
+      }
+      
+      // Check token-based matching for multi-word queries
+      if (queryTokens.length > 1) {
+        const allTokensPresent = queryTokens.every(token => item.value.includes(token));
+        if (allTokensPresent) {
+          similarity = Math.max(similarity, 0.8);
+          matched = true;
+        }
+      }
+    }
+    
+    if (matched && !seen.has(item.path)) {
+      seen.add(item.path);
+      results.push({
+        path: item.path,
+        key: item.path.split('.').pop() || 'root',
+        value: item.fullValue !== undefined ? item.fullValue : item.value,
+        type: item.type,
+        similarity: similarity
+      });
+    }
+  }
+  
+  // Sort by similarity (highest first)
+  results.sort((a, b) => b.similarity - a.similarity);
+  
+  // Limit to top 100 results for performance
+  return results.slice(0, 100);
+}
+
+// ----------------------------------------------------------------------
+// Calculate similarity between two strings (0-1)
+// Combines exact match, prefix, substring, and Levenshtein distance
+// ----------------------------------------------------------------------
+function calculateSimilarity(str1, str2) {
+  if (!str1 || !str2) return 0;
+  
+  // Exact match
+  if (str1 === str2) return 1;
+  
+  // Prefix match (starts with)
+  if (str1.startsWith(str2)) return 0.9;
+  if (str2.startsWith(str1)) return 0.85;
+  
+  // Substring match
+  if (str1.includes(str2)) return 0.7;
+  if (str2.includes(str1)) return 0.65;
+  
+  // Token-based match
+  const tokens1 = str1.split(/[\s_\-\.]+/);
+  const tokens2 = str2.split(/[\s_\-\.]+/);
+  
+  for (const token1 of tokens1) {
+    for (const token2 of tokens2) {
+      if (token1 && token2) {
+        if (token1 === token2) return 0.6;
+        if (token1.startsWith(token2) || token2.startsWith(token1)) return 0.55;
+        if (token1.includes(token2) || token2.includes(token1)) return 0.5;
+      }
+    }
+  }
+  
+  // Levenshtein distance for fuzzy matching
+  const maxLen = Math.max(str1.length, str2.length);
+  if (maxLen === 0) return 0;
+  
+  const distance = levenshteinDistance(str1.substring(0, 100), str2.substring(0, 100));
+  const similarity = 1 - (distance / Math.max(str1.substring(0, 100).length, str2.substring(0, 100).length));
+  
+  // Scale Levenshtein similarity to be lower priority than other matches
+  return similarity * 0.4;
+}
+
+// ----------------------------------------------------------------------
+// Levenshtein distance algorithm for fuzzy string matching
+// ----------------------------------------------------------------------
+function levenshteinDistance(str1, str2) {
+  const len1 = str1.length;
+  const len2 = str2.length;
+  
+  if (len1 === 0) return len2;
+  if (len2 === 0) return len1;
+  
+  const matrix = [];
+  
+  // Initialize matrix
+  for (let i = 0; i <= len1; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= len2; j++) {
+    matrix[0][j] = j;
+  }
+  
+  // Fill matrix
+  for (let i = 1; i <= len1; i++) {
+    for (let j = 1; j <= len2; j++) {
+      const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,      // deletion
+        matrix[i][j - 1] + 1,      // insertion
+        matrix[i - 1][j - 1] + cost // substitution
+      );
+    }
+  }
+  
+  return matrix[len1][len2];
+}
+
+    
     // --------------------------- GotoNow Method ---------------------------
+
+    
 
     /**
      * Navigate to another function immediately
@@ -6765,7 +7424,7 @@ class TemplateFunc extends SyAPP_Func {
         if (props.inputValue) {
           this.Text(uid, `Numero digitado : ${props.inputValue}`)
         }
-
+        this.JSON(uid)
         this.Field(uid, 'teste')
         this.Text(uid, 'Hello World')
         this.Button(uid, { name: 'Button 1' })
