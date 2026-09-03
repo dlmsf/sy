@@ -118,6 +118,7 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
         userDemand = '',
         outputFormat = 'full',
         parsedFiles = null,
+        referenceOnlyFiles = new Set(),  // NEW: set of paths marked as reference-only
     } = options;
 
     let structContent = '';
@@ -162,6 +163,20 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
             structContent += `${'!'.repeat(50)}\n\n`;
         }
 
+        // NEW: mention reference-only files in instructions
+        if (referenceOnlyFiles.size > 0) {
+            structContent += `${'*'.repeat(50)}\n`;
+            structContent += `ℹ️  REFERENCE-ONLY FILES\n`;
+            structContent += `${'*'.repeat(50)}\n\n`;
+            structContent += `The following files are provided for CONTEXT ONLY.\n`;
+            structContent += `DO NOT modify them, do not propose changes to them.\n`;
+            structContent += `Use them only to understand the surrounding code.\n\n`;
+            for (const refFile of referenceOnlyFiles) {
+                structContent += `  REFERENCE ONLY: ${refFile}\n`;
+            }
+            structContent += `\n${'*'.repeat(50)}\n\n`;
+        }
+
         if (outputFormat === 'full') {
             structContent += `OUTPUT FORMAT: FULL FILES\n`;
             structContent += `Provide the complete new content for EVERY file that requires changes.\n`;
@@ -204,6 +219,11 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
             structContent += `FILE: ${filePath}\n`;
             structContent += `${'='.repeat(50)}\n`;
 
+            // NEW: add reference-only note if applicable
+            if (referenceOnlyFiles.has(filePath)) {
+                structContent += `[NOTE: This file is for REFERENCE/CONTEXT ONLY - DO NOT MODIFY]\n`;
+            }
+
             const parsedInfo = parsedFiles?.get(filePath);
             if (parsedInfo) {
                 structContent += `[NOTE: This file has been PARSED - showing FILTERED content only]\n`;
@@ -229,6 +249,10 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
     
     if (parsedFiles && parsedFiles.size > 0) {
         console.log(`\n${MAGENTA}🔍 Parsed ${parsedFiles.size} JavaScript file(s) with CodeParser${RESET}`);
+    }
+    
+    if (referenceOnlyFiles.size > 0) {
+        console.log(`\n${MAGENTA}ℹ️  Marked ${referenceOnlyFiles.size} file(s) as reference-only${RESET}`);
     }
 }
 
@@ -441,6 +465,7 @@ async function interactiveMode() {
     const selectedFiles = new Set();
     const selectedTokenCounts = new Map();
     const parsedFiles = new Map();
+    const referenceOnlyFiles = new Set();  // NEW: set for reference-only files
     let totalTokens = 0;
 
     function getMaxEntries() {
@@ -490,6 +515,7 @@ async function interactiveMode() {
         totalTokens -= tokenCount;
         
         parsedFiles.delete(filePath);
+        referenceOnlyFiles.delete(filePath);  // remove from reference set if deselected
     }
 
     async function toggleFile(filePath) {
@@ -555,6 +581,10 @@ async function interactiveMode() {
             console.log(`${RED}${BOLD}⚠️  ${parsedFiles.size} file(s) will be PARSED (filtered)${RESET}`);
         }
         
+        if (referenceOnlyFiles.size > 0) {
+            console.log(`${MAGENTA}${BOLD}ℹ️  ${referenceOnlyFiles.size} file(s) marked reference-only${RESET}`);
+        }
+        
         console.log('─'.repeat(process.stdout.columns || 80));
         console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, g gen, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
@@ -569,6 +599,8 @@ async function interactiveMode() {
             } else if (selectedFiles.has(fullPath)) {
                 if (parsedFiles.has(fullPath)) {
                     prefix = `${MAGENTA}[🔍]${RESET} `;
+                } else if (referenceOnlyFiles.has(fullPath)) {
+                    prefix = `${YELLOW}[ℹ️]${RESET} `;
                 } else {
                     prefix = `${GREEN}[✔]${RESET} `;
                 }
@@ -752,6 +784,35 @@ async function interactiveMode() {
                 console.log(`\n${YELLOW}No JavaScript files selected - skipping parser option.${RESET}`);
             }
 
+            // STEP 1.5: Ask about reference-only files (NEW)
+            console.log(`\n${YELLOW}${BOLD}=== REFERENCE-ONLY SELECTION ===${RESET}`);
+            const refAnswer = await askQuestion(`Do you want to mark any of the selected files as reference/context only (not to be modified)? (y/n):`);
+            if (refAnswer.toLowerCase() === 'y' || refAnswer.toLowerCase() === 'yes') {
+                console.log(`\n${BOLD}Selected files:${RESET}`);
+                const allSelected = [...selectedFiles];
+                allSelected.forEach((file, idx) => {
+                    const alreadyRef = referenceOnlyFiles.has(file) ? ' (already marked)' : '';
+                    console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyRef}`);
+                });
+                
+                const refChoice = await askQuestion(`\nWhich files should be reference-only? (all | 1,3,5 | 2-4 | none):`);
+                if (refChoice.toLowerCase() !== 'none' && refChoice.trim() !== '') {
+                    let filesToMark = [];
+                    
+                    if (refChoice.toLowerCase() === 'all') {
+                        filesToMark = allSelected;
+                    } else {
+                        const indexes = parseIndexes(refChoice, allSelected.length);
+                        filesToMark = indexes.map(idx => allSelected[idx]);
+                    }
+                    
+                    for (const filePath of filesToMark) {
+                        referenceOnlyFiles.add(filePath);
+                    }
+                    console.log(`\n${GREEN}Marked ${filesToMark.length} file(s) as reference-only.${RESET}`);
+                }
+            }
+
             // STEP 2: Ask about AI instructions
             const includeInstrAnswer = await askQuestion(`\nDo you want to add AI instructions? (y/n):`);
             const includeInstructions = includeInstrAnswer.toLowerCase() === 'y' || includeInstrAnswer.toLowerCase() === 'yes';
@@ -776,12 +837,13 @@ async function interactiveMode() {
                 }
             }
 
-            // STEP 3: Generate the struct file with options
+            // STEP 3: Generate the struct file with options (including referenceOnlyFiles)
             await generateStruct([...selectedFiles], 'struct', {
                 includeInstructions,
                 userDemand,
                 outputFormat,
                 parsedFiles,
+                referenceOnlyFiles,
             });
 
             // STEP 4: Ask if save paths
