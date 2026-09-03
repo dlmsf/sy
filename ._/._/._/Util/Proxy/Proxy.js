@@ -28,26 +28,45 @@ class Proxy {
    * @param {boolean} [options.allowHttp] Allow HTTP requests without redirecting to HTTPS
    * @param {boolean} [options.checkPorts] Check and open ports if needed
    * @param {boolean} [options.configureFirewall] Configure firewall rules
+   * @param {number} [options.httpPort] HTTP port (default: 80)
+   * @param {number} [options.httpsPort] HTTPS port (default: 443)
    */
   constructor(rules, options = {}) {
     this.rules = rules;
     this.options = {
       allowHttp: false,
-      checkPorts: true,
-      configureFirewall: true,
+      checkPorts: false, // Changed to false by default to avoid conflicts
+      configureFirewall: false, // Changed to false by default
+      httpPort: 80,
+      httpsPort: 443,
       ...options
     };
     this.certificates = this.loadCertificates();
     
-    if (this.options.checkPorts) {
-      this.checkAndOpenPorts();
+    // Initialize async setup
+    this.initialize();
+  }
+
+  /**
+   * Initialize the proxy asynchronously
+   */
+  async initialize() {
+    try {
+      if (this.options.checkPorts) {
+        await this.checkAndOpenPorts();
+      }
+      
+      if (this.options.configureFirewall) {
+        await this.configureFirewallRules();
+      }
+      
+      // Start servers after port checks
+      this.startServers();
+    } catch (error) {
+      console.error('Failed to initialize proxy:', error.message);
+      // Still try to start servers in case ports are actually available
+      this.startServers();
     }
-    
-    if (this.options.configureFirewall) {
-      this.configureFirewallRules();
-    }
-    
-    this.startServers();
   }
 
   loadCertificates() {
@@ -69,23 +88,7 @@ class Proxy {
   }
 
   /**
-   * Check if a port is available and open it if needed
-   */
-  async checkAndOpenPorts() {
-    const ports = [80, 443];
-    
-    for (const port of ports) {
-      try {
-        await this.checkPort(port);
-      } catch (error) {
-        console.log(`Opening port ${port}...`);
-        await this.openPort(port);
-      }
-    }
-  }
-
-  /**
-   * Check if a port is in use
+   * Check if a port is available
    */
   checkPort(port) {
     return new Promise((resolve, reject) => {
@@ -104,25 +107,49 @@ class Proxy {
         resolve();
       });
       
-      server.listen(port);
+      server.listen(port, '0.0.0.0');
     });
   }
 
   /**
-   * Open a port using ufw or iptables
+   * Check and open ports if needed
    */
-  async openPort(port) {
-    const commands = [
-      `ufw allow ${port}/tcp`,
-      `iptables -A INPUT -p tcp --dport ${port} -j ACCEPT`
-    ];
+  async checkAndOpenPorts() {
+    const ports = [this.options.httpPort, this.options.httpsPort];
     
-    for (const command of commands) {
+    for (const port of ports) {
       try {
-        await this.execCommand(command);
+        await this.checkPort(port);
+        console.log(`Port ${port} is available`);
       } catch (error) {
-        console.warn(`Could not execute ${command}: ${error.message}`);
+        console.log(`Port ${port} is in use, attempting to free it...`);
+        await this.freePort(port);
       }
+    }
+  }
+
+  /**
+   * Free a port by killing the process using it
+   */
+  async freePort(port) {
+    try {
+      // Try to find and kill the process using the port
+      const command = `lsof -ti:${port} | xargs kill -9 2>/dev/null || fuser -k ${port}/tcp 2>/dev/null || true`;
+      await this.execCommand(command);
+      console.log(`Attempted to free port ${port}`);
+      
+      // Wait a moment for the port to be released
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Check if port is now available
+      try {
+        await this.checkPort(port);
+        console.log(`Port ${port} is now available`);
+      } catch (error) {
+        console.warn(`Could not free port ${port}: ${error.message}`);
+      }
+    } catch (error) {
+      console.warn(`Error freeing port ${port}: ${error.message}`);
     }
   }
 
@@ -131,10 +158,10 @@ class Proxy {
    */
   async configureFirewallRules() {
     const commands = [
-      'ufw allow 80/tcp',
-      'ufw allow 443/tcp',
-      'iptables -A INPUT -p tcp --dport 80 -j ACCEPT',
-      'iptables -A INPUT -p tcp --dport 443 -j ACCEPT'
+      `ufw allow ${this.options.httpPort}/tcp 2>/dev/null || true`,
+      `ufw allow ${this.options.httpsPort}/tcp 2>/dev/null || true`,
+      `iptables -A INPUT -p tcp --dport ${this.options.httpPort} -j ACCEPT 2>/dev/null || true`,
+      `iptables -A INPUT -p tcp --dport ${this.options.httpsPort} -j ACCEPT 2>/dev/null || true`
     ];
     
     for (const command of commands) {
@@ -198,22 +225,30 @@ class Proxy {
       }
     });
 
-    // Start servers
-    httpServer.listen(80, () => {
-      console.log('HTTP proxy server started on port 80');
-    });
-
-    httpsServer.listen(443, () => {
-      console.log('HTTPS proxy server started on port 443');
-    });
-
-    // Error handlers
+    // Start HTTP server with error handling
     httpServer.on('error', (error) => {
-      console.error('HTTP Server error:', error);
+      if (error.code === 'EADDRINUSE') {
+        console.error(`HTTP Server error: Port ${this.options.httpPort} is already in use. The server might already be running.`);
+      } else {
+        console.error('HTTP Server error:', error);
+      }
     });
 
+    httpServer.listen(this.options.httpPort, '0.0.0.0', () => {
+      console.log(`HTTP proxy server started on port ${this.options.httpPort}`);
+    });
+
+    // Start HTTPS server with error handling
     httpsServer.on('error', (error) => {
-      console.error('HTTPS Server error:', error);
+      if (error.code === 'EADDRINUSE') {
+        console.error(`HTTPS Server error: Port ${this.options.httpsPort} is already in use. The server might already be running.`);
+      } else {
+        console.error('HTTPS Server error:', error);
+      }
+    });
+
+    httpsServer.listen(this.options.httpsPort, '0.0.0.0', () => {
+      console.log(`HTTPS proxy server started on port ${this.options.httpsPort}`);
     });
   }
 
@@ -269,6 +304,8 @@ class Proxy {
       if (existing) {
         console.log(`Stopping existing proxy (ID: ${existing.id})...`);
         SyPM.kill(existing.id);
+        // Wait for the process to be fully killed
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     } catch (error) {
       console.warn('Could not check/kill existing proxy:', error.message);

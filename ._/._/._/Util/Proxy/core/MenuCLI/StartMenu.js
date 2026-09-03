@@ -7,7 +7,9 @@ let rules = []
 let proxyOptions = {
   allowHttp: false,
   checkPorts: true,
-  configureFirewall: true
+  configureFirewall: true,
+  httpPort: 80,
+  httpsPort: 443
 }
 
 let config_options = () => {
@@ -45,6 +47,27 @@ let config_options = () => {
             MenuCLI.displayMenu(ConfigMenu, {
                 props: { options: config_options() },
                 alert: proxyOptions.configureFirewall ? 'Firewall configuration enabled' : 'Firewall configuration disabled'
+            })
+        }
+    })
+    
+    // Custom ports
+    final_array.push({
+        name: `🔧 Custom Ports: HTTP:${proxyOptions.httpPort} HTTPS:${proxyOptions.httpsPort}`,
+        action: async () => {
+            let httpPort = await MenuCLI.ask(`HTTP Port (current: ${proxyOptions.httpPort}): `)
+            if (httpPort && !isNaN(httpPort)) {
+                proxyOptions.httpPort = parseInt(httpPort)
+            }
+            
+            let httpsPort = await MenuCLI.ask(`HTTPS Port (current: ${proxyOptions.httpsPort}): `)
+            if (httpsPort && !isNaN(httpsPort)) {
+                proxyOptions.httpsPort = parseInt(httpsPort)
+            }
+            
+            MenuCLI.displayMenu(ConfigMenu, {
+                props: { options: config_options() },
+                alert: 'Ports updated'
             })
         }
     })
@@ -177,7 +200,9 @@ const StartMenu = () => ({
                 proxyOptions = {
                     allowHttp: false,
                     checkPorts: true,
-                    configureFirewall: true
+                    configureFirewall: true,
+                    httpPort: 80,
+                    httpsPort: 443
                 }
                 MenuCLI.displayMenu(ConfigMenu, {
                     props: { options: config_options() }
@@ -190,7 +215,9 @@ const StartMenu = () => ({
                 let config = `Current Configuration:\n\n`
                 config += `Proxy Mode: ${proxyOptions.allowHttp ? 'HTTP + HTTPS' : 'HTTPS Only'}\n`
                 config += `Port Management: ${proxyOptions.checkPorts ? 'Enabled' : 'Disabled'}\n`
-                config += `Firewall Config: ${proxyOptions.configureFirewall ? 'Enabled' : 'Disabled'}\n\n`
+                config += `Firewall Config: ${proxyOptions.configureFirewall ? 'Enabled' : 'Disabled'}\n`
+                config += `HTTP Port: ${proxyOptions.httpPort}\n`
+                config += `HTTPS Port: ${proxyOptions.httpsPort}\n\n`
                 
                 if (rules.length > 0) {
                     config += `Rules:\n`
