@@ -4,78 +4,209 @@ import Certificates from './Certificates.js'
 import addHttp from '../useful/addHttp.js'
 
 let rules = []
+let proxyOptions = {
+  allowHttp: false,
+  checkPorts: true,
+  configureFirewall: true
+}
 
 let config_options = () => {
     let final_array = []
+    
+    // Proxy mode options
     final_array.push({
-        name : '⚡ Start',
-        action : async () => {
-            if(rules.length){
-                let start_result = await Proxy.SyPM(rules)
-                if(start_result){
-                    MenuCLI.displayMenu(ConfigMenu,{alert_emoji : '✔️',alert : 'Proxy running',props : {options : config_options()}})
+        name: `🔒 Proxy Mode: ${proxyOptions.allowHttp ? 'HTTP + HTTPS' : 'HTTPS Only'}`,
+        action: async () => {
+            proxyOptions.allowHttp = !proxyOptions.allowHttp
+            MenuCLI.displayMenu(ConfigMenu, {
+                props: { options: config_options() },
+                alert: proxyOptions.allowHttp ? 'HTTP mode enabled' : 'HTTP mode disabled'
+            })
+        }
+    })
+    
+    // Port management options
+    final_array.push({
+        name: `🔌 Port Management: ${proxyOptions.checkPorts ? 'Enabled' : 'Disabled'}`,
+        action: async () => {
+            proxyOptions.checkPorts = !proxyOptions.checkPorts
+            MenuCLI.displayMenu(ConfigMenu, {
+                props: { options: config_options() },
+                alert: proxyOptions.checkPorts ? 'Port management enabled' : 'Port management disabled'
+            })
+        }
+    })
+    
+    // Firewall configuration
+    final_array.push({
+        name: `🛡️ Firewall Config: ${proxyOptions.configureFirewall ? 'Enabled' : 'Disabled'}`,
+        action: async () => {
+            proxyOptions.configureFirewall = !proxyOptions.configureFirewall
+            MenuCLI.displayMenu(ConfigMenu, {
+                props: { options: config_options() },
+                alert: proxyOptions.configureFirewall ? 'Firewall configuration enabled' : 'Firewall configuration disabled'
+            })
+        }
+    })
+    
+    // Separator
+    final_array.push({
+        name: '─'.repeat(30),
+        action: () => {}
+    })
+    
+    // Start proxy
+    final_array.push({
+        name: '⚡ Start Proxy',
+        action: async () => {
+            if (rules.length) {
+                let start_result = await Proxy.SyPM(rules, proxyOptions)
+                if (start_result) {
+                    MenuCLI.displayMenu(ConfigMenu, {
+                        alert_emoji: '✔️',
+                        alert: 'Proxy running',
+                        props: { options: config_options() }
+                    })
                 } else {
-                    MenuCLI.displayMenu(ConfigMenu,{alert : 'Proxy init error !',props : {options : config_options()}})
+                    MenuCLI.displayMenu(ConfigMenu, {
+                        alert: 'Proxy init error!',
+                        props: { options: config_options() }
+                    })
                 }
-                
             } else {
-                MenuCLI.displayMenu(ConfigMenu,{alert : 'Please add at least one rule',props : {options : config_options()}})
+                MenuCLI.displayMenu(ConfigMenu, {
+                    alert: 'Please add at least one rule',
+                    props: { options: config_options() }
+                })
             }
         }
-        })
-    let cert_array =  Certificates.List()
-    cert_array.forEach(e => {
-        final_array.push({
-            name : `${(rules.findIndex(rule => rule.domain == e) != -1) ? '✔️' : '➕'} ${e}${(rules.findIndex(rule => rule.domain == e) != -1) ? ` -> ${rules[rules.findIndex(rule => rule.domain == e)].target}`: '' }`,
-            action : async () => {
-                let ask_result
-                if(rules.findIndex(rule => rule.domain == e) == -1){
-                  ask_result = await MenuCLI.ask('Type the target : ')
-                  ask_result = addHttp(ask_result)
-                  rules.push({domain : e,target : ask_result})
-                } else {
-                ask_result = await MenuCLI.ask('Type the target or REMOVE to disable : ')
-                if(ask_result == 'REMOVE'){
-                    rules.splice(rules.findIndex(rule => rule.domain == e),1)
-                } else {
-                    ask_result = addHttp(ask_result)
-                    rules[rules.findIndex(rule => rule.domain == e)].target = ask_result
-                }
-                }
-                MenuCLI.displayMenu(ConfigMenu,{props : {options : config_options()}})
-                }
-            })
     })
-final_array.push({
-    name : '← Voltar',
-    action : () => {
-        MenuCLI.displayMenu(StartMenu)
+    
+    // Separator
+    final_array.push({
+        name: '─'.repeat(30),
+        action: () => {}
+    })
+    
+    // Certificate-based domains
+    let cert_array = Certificates.List()
+    cert_array.forEach(e => {
+        const ruleIndex = rules.findIndex(rule => rule.domain === e)
+        const useHttps = ruleIndex !== -1 ? rules[ruleIndex].useHttps !== false : true
+        
+        final_array.push({
+            name: `${ruleIndex !== -1 ? '✔️' : '➕'} ${e}${ruleIndex !== -1 ? ` -> ${rules[ruleIndex].target}` : ''} ${useHttps ? '🔒' : '🔓'}`,
+            action: async () => {
+                let ask_result
+                if (ruleIndex === -1) {
+                    ask_result = await MenuCLI.ask('Type the target: ')
+                    ask_result = addHttp(ask_result)
+                    
+                    // Ask for HTTPS preference
+                    let httpsChoice = await MenuCLI.ask('Use HTTPS? (y/n): ')
+                    let useHttps = httpsChoice.toLowerCase() !== 'n'
+                    
+                    rules.push({
+                        domain: e,
+                        target: ask_result,
+                        useHttps: useHttps
+                    })
+                } else {
+                    ask_result = await MenuCLI.ask('Type the target, REMOVE to disable, or TOGGLE for HTTP/HTTPS: ')
+                    
+                    if (ask_result === 'REMOVE') {
+                        rules.splice(ruleIndex, 1)
+                    } else if (ask_result === 'TOGGLE') {
+                        rules[ruleIndex].useHttps = rules[ruleIndex].useHttps === false
+                    } else {
+                        ask_result = addHttp(ask_result)
+                        rules[ruleIndex].target = ask_result
+                    }
+                }
+                MenuCLI.displayMenu(ConfigMenu, {
+                    props: { options: config_options() }
+                })
+            }
+        })
+    })
+    
+    // Allow custom domains without certificates (HTTP only)
+    final_array.push({
+        name: '➕ Add HTTP Domain (No Certificate)',
+        action: async () => {
+            let domain = await MenuCLI.ask('Type the domain: ')
+            let target = await MenuCLI.ask('Type the target: ')
+            target = addHttp(target)
+            
+            rules.push({
+                domain: domain,
+                target: target,
+                useHttps: false
+            })
+            
+            MenuCLI.displayMenu(ConfigMenu, {
+                props: { options: config_options() }
+            })
         }
     })
-return final_array
+    
+    final_array.push({
+        name: '← Voltar',
+        action: () => {
+            MenuCLI.displayMenu(StartMenu)
+        }
+    })
+    
+    return final_array
 }
 
-
 const ConfigMenu = (props) => ({
-    title : `⚙️ Proxy Config
+    title: `⚙️ Proxy Config
 `,
-options : props.options
-
+    options: props.options
 })
 
 const StartMenu = () => ({
-    title : `✔️ Proxy Menu
+    title: `✔️ Proxy Menu
 `,
-options : [
-    {
-    name : '🌐 Start Proxy',
-    action : async () => {
-        rules = []
-        MenuCLI.displayMenu(ConfigMenu,{props : {options : config_options()}})
-    }
-    }
-     ]
-
+    options: [
+        {
+            name: '🌐 Configure Proxy',
+            action: async () => {
+                rules = []
+                proxyOptions = {
+                    allowHttp: false,
+                    checkPorts: true,
+                    configureFirewall: true
+                }
+                MenuCLI.displayMenu(ConfigMenu, {
+                    props: { options: config_options() }
+                })
+            }
+        },
+        {
+            name: '📋 View Current Configuration',
+            action: () => {
+                let config = `Current Configuration:\n\n`
+                config += `Proxy Mode: ${proxyOptions.allowHttp ? 'HTTP + HTTPS' : 'HTTPS Only'}\n`
+                config += `Port Management: ${proxyOptions.checkPorts ? 'Enabled' : 'Disabled'}\n`
+                config += `Firewall Config: ${proxyOptions.configureFirewall ? 'Enabled' : 'Disabled'}\n\n`
+                
+                if (rules.length > 0) {
+                    config += `Rules:\n`
+                    rules.forEach(rule => {
+                        config += `  ${rule.domain} -> ${rule.target} (${rule.useHttps !== false ? 'HTTPS' : 'HTTP'})\n`
+                    })
+                } else {
+                    config += `No rules configured\n`
+                }
+                
+                MenuCLI.displayMenu(StartMenu, {
+                    alert: config
+                })
+            }
+        }
+    ]
 })
 
 export default StartMenu
