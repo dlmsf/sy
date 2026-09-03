@@ -1,5 +1,4 @@
 import MenuCLI from "./MenuCLI.js"
-import PM2 from '../PM2.js'
 import Proxy from '../../Proxy.js'
 import Certificates from './Certificates.js'
 import addHttp from '../useful/addHttp.js'
@@ -12,7 +11,7 @@ let config_options = () => {
         name : '⚡ Start',
         action : async () => {
             if(rules.length){
-                let start_result = await Proxy.PM2(rules)
+                let start_result = await Proxy.SyPM(rules)
                 if(start_result){
                     MenuCLI.displayMenu(ConfigMenu,{alert_emoji : '✔️',alert : 'Proxy running',props : {options : config_options()}})
                 } else {
@@ -71,9 +70,6 @@ options : [
     {
     name : '🌐 Start Proxy',
     action : async () => {
-        if(!(await PM2.Check())){
-            await PM2.Install()
-        }
         rules = []
         MenuCLI.displayMenu(ConfigMenu,{props : {options : config_options()}})
     }

@@ -2,7 +2,8 @@ import http from 'http';
 import https from 'https';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { createSecureContext } from 'tls';
-import {exec} from 'child_process'
+import { exec } from 'child_process';
+import SyPM from '../../../../SyPM.js'; // Adjust path as needed
 
 /**
  * Represents a rule for handling requests for a specific domain.
@@ -16,7 +17,6 @@ import {exec} from 'child_process'
  * 
  * @class
  */
-
 class Proxy {
 
    /**
@@ -88,15 +88,32 @@ class Proxy {
     }).listen(443);
   }
   
-  static async PM2(rules) {
+  /**
+   * Start the proxy using SyPM as a background process.
+   * @param {Rule[]} rules - Array of proxy rules.
+   * @returns {Promise<boolean>} True if the proxy was started successfully.
+   */
+  static async SyPM(rules) {
+    const PROCESS_NAME = 'sypm_proxy_server'; // Name used in SyPM registry
+
+    // Kill any existing proxy managed by SyPM
+    try {
+      const processes = SyPM.list();
+      const existing = processes.find(p => p.name === PROCESS_NAME);
+      if (existing) {
+        console.log(`Stopping existing proxy (ID: ${existing.id})...`);
+        SyPM.kill(existing.id);
+      }
+    } catch (error) {
+      console.warn('Could not check/kill existing proxy:', error.message);
+      // Continue anyway
+    }
 
     async function findGlobalProxyPath() {
       try {
         const command = `find / -name Proxy.js 2>/dev/null`;
         const { stdout } = await execAsync(command);
-        // Split the output by newline and filter out empty lines
         const paths = stdout.split('\n').filter(path => path.trim() !== '');
-        // Return the first path found
         return paths[0] || null;
       } catch (error) {
         console.error(`Error finding global Proxy.js: ${error}`);
@@ -104,12 +121,11 @@ class Proxy {
       }
     }
 
-    const proxyScriptPath = './pm2_proxy.js';
+    const proxyScriptPath = './sypm_proxy.js';
     const localProxyPath = './Proxy.js';
-    const globalProxyPath = await findGlobalProxyPath()
+    const globalProxyPath = await findGlobalProxyPath();
 
     // Dynamically determine the import statement based on the existence of the local Proxy.js file
-    // We need to encapsulate the logic in an IIFE to use await
     const fileContent = `
       (async () => {
         let Proxy;
@@ -123,22 +139,18 @@ class Proxy {
       })();
     `;
 
-    // Write the dynamically generated script to pm2_proxy.js
+    // Write the dynamically generated script
     writeFileSync(proxyScriptPath, fileContent);
 
-    // Use exec to manage the PM2 process, first stopping any existing instance
     try {
-      const { stdout: pm2ListStdout } = await execAsync(`pm2 list`);
-      if (pm2ListStdout.includes('pm2_proxy')) {
-        await execAsync(`pm2 delete pm2_proxy`);
-      }
-
-      // Start a new PM2 process with the updated pm2_proxy.js
-      await execAsync(`pm2 start ${proxyScriptPath}`);
-      console.log("PM2 process successfully managed.");
+      // Start the proxy using SyPM
+      const result = SyPM.run(proxyScriptPath, {
+        name: PROCESS_NAME
+      });
+      console.log(`Proxy started with SyPM (PID: ${result.pid}, ID: ${result.id})`);
       return true;
     } catch (error) {
-      console.error(`PM2 process management error: ${error.message}`);
+      console.error(`SyPM process management error: ${error.message}`);
       return false;
     }
   }
@@ -156,7 +168,6 @@ function execAsync(command) {
       resolve({ stdout, stderr });
     });
   });
-
 }
 
 export default Proxy;
