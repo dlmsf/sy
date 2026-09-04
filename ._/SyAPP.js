@@ -5677,7 +5677,7 @@ this.DropDownManager = {
 this.JSON = async (id, config = {}) => {
   // Capture 'this' context for use in callbacks
   const self = this;
-  
+
   // ------------------------------------------------------------------
   // Setup storage & instance name
   // ------------------------------------------------------------------
@@ -5714,7 +5714,6 @@ this.JSON = async (id, config = {}) => {
     if (storage.searchResults) {
       storage.searchPath.pop();
       if (storage.searchPath.length === 0) {
-        // Go back to search results list
         storage.searchPath = [];
       }
     } else {
@@ -5753,26 +5752,45 @@ this.JSON = async (id, config = {}) => {
     delete currentProps[clearSearchProp];
   }
 
-  // Handle search change from field
+  // ------------------------------------------------------------------
+  // CRITICAL: Check for search change from field storage
+  // ------------------------------------------------------------------
+  // Get the current field value from storage
+  const currentFieldValue = this.Storages.Get(id, searchFieldName) || '';
+  
+  // Check if there's a pending search change in props
   if (currentProps[searchChangeProp] !== undefined) {
     const newSearchValue = currentProps[searchChangeProp] || '';
     this.Storages.Set(id, searchFieldName, newSearchValue);
     storage.searchQuery = newSearchValue;
     
-    if (newSearchValue && newSearchValue.trim()) {
-      // Perform fast in-memory search with similarity
-      storage.searchResults = fastSearchJSON(
-        storage.data, 
-        newSearchValue.trim(),
-        this.Storages.Get(id, searchIndexKey)
-      );
-      storage.searchPath = [];
-    } else {
-      storage.searchResults = null;
-      storage.searchPath = [];
-    }
-    
     delete currentProps[searchChangeProp];
+  } else if (currentFieldValue !== storage.searchQuery) {
+    // Field value changed but prop wasn't set (direct field edit)
+    storage.searchQuery = currentFieldValue;
+  }
+
+  // NOW process the search with the current query
+  if (storage.searchQuery && storage.searchQuery.trim()) {
+    // Perform search
+    const searchIndex = this.Storages.Get(id, searchIndexKey);
+    storage.searchResults = fastSearchJSON(
+      storage.data, 
+      storage.searchQuery.trim(),
+      searchIndex
+    );
+    storage.searchPath = [];
+    
+    // Reset pagination for search results
+    this.Pagination.Reset(id, `${storageKey}_searchResults`);
+    this.Pagination.Reset(id, `${storageKey}_searchNav`);
+  } else {
+    storage.searchResults = null;
+    storage.searchPath = [];
+    
+    // Reset pagination when clearing search
+    this.Pagination.Reset(id, `${storageKey}_searchResults`);
+    this.Pagination.Reset(id, `${storageKey}_searchNav`);
   }
 
   this.Storages.Set(id, storageKey, storage);
@@ -5789,11 +5807,11 @@ this.JSON = async (id, config = {}) => {
         const data = JSON.parse(content);
         storage.data = data;
         storage.filePath = filePath;
-        
+
         // Build search index for fast searching
         const searchIndex = buildSearchIndex(data);
         this.Storages.Set(id, searchIndexKey, searchIndex);
-        
+
         this.Storages.Set(id, storageKey, storage);
         this.Alert(id, `✅ Loaded: ${path.basename(filePath)} (${searchIndex.length} searchable items)`, { duration: 2000 });
       } catch (err) {
@@ -5819,16 +5837,19 @@ this.JSON = async (id, config = {}) => {
   }
 
   // ------------------------------------------------------------------
-  // Render search field (using safe context capture)
+  // Render search field
   // ------------------------------------------------------------------
-  const searchValue = this.Storages.Get(id, searchFieldName);
-  
+  const searchValue = this.Storages.Get(id, searchFieldName) || '';
+
   this.Field(id, searchFieldName, {
     label: '🔍 Search',
-    initialValue: searchValue || '',
+    initialValue: searchValue,
     maxWidth: config.maxTextLength || 40,
     onChange: (value) => {
-      // Use 'self' to safely access Builds
+      // Immediately update storage and trigger re-render
+      self.Storages.Set(id, searchFieldName, value);
+      
+      // Force immediate refresh by setting props
       const build = self.Builds.get(id);
       if (build && build.Session) {
         if (!build.Session.ActualProps) {
@@ -5846,8 +5867,7 @@ this.JSON = async (id, config = {}) => {
 
   if (storage.searchResults && storage.searchQuery) {
     displaySearchResults = true;
-    
-    // If we're navigating within a search result
+
     if (storage.searchPath.length > 0) {
       currentNode = storage.searchResults;
       for (const seg of storage.searchPath) {
@@ -5880,7 +5900,7 @@ this.JSON = async (id, config = {}) => {
   // Helper functions
   // ------------------------------------------------------------------
   const maxTextLength = config.maxTextLength || 40;
-  
+
   const abbreviateText = (text, maxLength = maxTextLength) => {
     if (text === undefined || text === null) return String(text);
     const str = String(text);
@@ -5918,9 +5938,11 @@ this.JSON = async (id, config = {}) => {
     const paginationStorage = this.Storages.Get(id, paginationKey);
     const totalPages = Math.max(1, Math.ceil(dataLength / itemsPerPage));
     const currentPage = paginationStorage?.actual_page || 1;
+    const safeCurrentPage = Math.min(currentPage, totalPages);
     
     return {
       items_per_page: itemsPerPage,
+      actual_page: safeCurrentPage,
       custom: {
         showSeparators: false,
         showPageInfo: true,
@@ -5928,7 +5950,7 @@ this.JSON = async (id, config = {}) => {
         pageInfoStyle: 'text',
         prevButtonText: '◀',
         nextButtonText: '▶',
-        pageIndicatorText: `${currentPage}/${totalPages}`
+        pageIndicatorText: `${safeCurrentPage}/${totalPages}`
       }
     };
   };
@@ -5936,7 +5958,7 @@ this.JSON = async (id, config = {}) => {
   if (displaySearchResults && storage.searchPath.length === 0) {
     // ---------------- SEARCH RESULTS LIST ----------------
     this.Text(id, `${this.TextColor.green('🔍')} Found ${storage.searchResults.length} matches for "${storage.searchQuery}"`);
-    
+
     if (storage.searchResults.length === 0) {
       this.Text(id, `${this.TextColor.dim('No results found')}`);
     } else {
@@ -5950,7 +5972,7 @@ this.JSON = async (id, config = {}) => {
             const item = itemData.item;
             const similarity = item.similarity !== undefined ? 
               ` ${this.TextColor.dim(`(${Math.round(item.similarity * 100)}%)`)}` : '';
-            
+
             this.Button(id, {
               name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${similarity}`,
               props: { [`${storageKey}_navigate`]: itemData.globalIndex }
@@ -5964,7 +5986,7 @@ this.JSON = async (id, config = {}) => {
     // ---------------- NAVIGATING WITHIN SEARCH RESULT ----------------
     if (Array.isArray(currentNode)) {
       this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
-      
+
       if (currentNode.length === 0) {
         this.Text(id, `${this.TextColor.dim('(empty array)')}`);
       } else {
@@ -5988,12 +6010,12 @@ this.JSON = async (id, config = {}) => {
     } else if (currentNode !== null && typeof currentNode === 'object') {
       const keys = Object.keys(currentNode);
       this.Text(id, `${this.TextColor.magenta('🔑')} Object (${keys.length} keys)`);
-      
+
       if (keys.length === 0) {
         this.Text(id, `${this.TextColor.dim('(empty object)')}`);
       } else {
         const keyItems = keys.map(key => ({ key, value: currentNode[key] }));
-        
+
         await this.Pagination.Button(
           id, 
           `${storageKey}_searchNav`, 
@@ -6004,7 +6026,7 @@ this.JSON = async (id, config = {}) => {
               const { key, value } = itemData.item;
               const keyDisplay = abbreviateText(key, Math.floor(maxTextLength / 2));
               const valuePreview = getValuePreview(value, Math.floor(maxTextLength / 2));
-              
+
               this.Button(id, {
                 name: `${this.TextColor.cyan(keyDisplay)}: ${this.TextColor.dim(valuePreview)}`,
                 props: { [`${storageKey}_navigate`]: key }
@@ -6021,7 +6043,7 @@ this.JSON = async (id, config = {}) => {
   } else if (Array.isArray(currentNode)) {
     // ---------------- ARRAY ----------------
     this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
-    
+
     if (currentNode.length === 0) {
       this.Text(id, `${this.TextColor.dim('(empty array)')}`);
     } else {
@@ -6052,7 +6074,7 @@ this.JSON = async (id, config = {}) => {
       this.Text(id, `${this.TextColor.dim('(empty object)')}`);
     } else {
       const keyItems = keys.map(key => ({ key, value: currentNode[key] }));
-      
+
       await this.Pagination.Button(
         id, 
         `${storageKey}_object`, 
@@ -6063,13 +6085,13 @@ this.JSON = async (id, config = {}) => {
             const { key, value } = itemData.item;
             const keyDisplay = abbreviateText(key, Math.floor(maxTextLength / 2));
             const valuePreview = getValuePreview(value, Math.floor(maxTextLength / 2));
-            
+
             let buttonName = `${this.TextColor.cyan(keyDisplay)}: ${this.TextColor.dim(valuePreview)}`;
-            
+
             if (typeof value === 'string' && value.length > maxTextLength) {
               buttonName += ` ${this.TextColor.brightYellow('📖')}`;
             }
-            
+
             this.Button(id, {
               name: buttonName,
               props: { [`${storageKey}_navigate`]: key }
@@ -6083,14 +6105,14 @@ this.JSON = async (id, config = {}) => {
     // ---------------- PRIMITIVE ----------------
     const valueStr = typeof currentNode === 'string' ? currentNode : String(currentNode);
     const isLong = valueStr.length > maxTextLength;
-    
+
     this.Text(id, `${this.TextColor.brightGreen('💎')} Value:`);
-    
+
     if (isLong) {
       this.Text(id, abbreviateText(valueStr, maxTextLength));
       this.Text(id, ' ');
       this.Text(id, `${this.TextColor.brightYellow('📖 Full Content:')}`);
-      
+
       const wrapWidth = 70;
       for (let i = 0; i < valueStr.length; i += wrapWidth) {
         this.Text(id, valueStr.substring(i, i + wrapWidth));
@@ -6104,7 +6126,7 @@ this.JSON = async (id, config = {}) => {
   // Navigation buttons
   // ------------------------------------------------------------------
   this.Text(id, ' ');
-  
+
   const navButtons = [];
 
   if ((displaySearchResults && storage.searchPath.length > 0) || 
@@ -7348,121 +7370,7 @@ class TemplateFunc extends SyAPP_Func {
       async (props) => {
         let uid = props.session.UniqueID
 
-        // Example HTTP routes with models
-        this.Get(uid, '/test', async (req, res) => {
-          res.json({ 
-            message: 'Test route working!', 
-            query: req.query,
-            path: '/test'
-          })
-        }, {
-          output_model: {
-            message: 'string',
-            query: 'object',
-            path: 'string'
-          }
-        })
-
-        this.Get(uid, '/api/users', async (req, res) => {
-          res.json({ users: ['user1', 'user2', 'user3'] })
-        }, {
-          output_model: {
-            users: { type: 'array', required: true }
-          }
-        })
-
-        this.Post(uid, '/api/users', async (req, res) => {
-          // Input is already validated and sanitized by the HTTP handler
-          res.json({ 
-            created: req.body, 
-            message: 'User created successfully' 
-          })
-        }, {
-          input_model: {
-            name: { type: 'string', required: true },
-            age: { type: 'number', required: true },
-            email: { type: 'string', required: true },
-            phone: 'string'
-          },
-          output_model: {
-            created: 'object',
-            message: 'string'
-          },
-          input_validate: { 
-            error: 'Validation failed',
-            status: 400
-          }
-        })
-
-        this.Put(uid, '/api/users/:id', async (req, res) => {
-          res.json({ 
-            updated: req.params.id, 
-            data: req.body,
-            message: 'User updated' 
-          })
-        }, {
-          input_model: {
-            name: 'string',
-            age: 'number',
-            email: 'string'
-          },
-          output_model: {
-            updated: 'string',
-            data: 'object',
-            message: 'string'
-          }
-        })
-
-        if (props.errorforce) {
-          this.Text(uid, 'Error forced')
-        }
-
-        if (props.inputnumero) {
-          this.WaitInput(uid)
-        }
-
-        if (props.inputValue) {
-          this.Text(uid, `Numero digitado : ${props.inputValue}`)
-        }
         this.JSON(uid)
-        this.Field(uid, 'teste')
-        this.Text(uid, 'Hello World')
-        this.Button(uid, { name: 'Button 1' })
-        this.Buttons(uid, [
-          { name: 'Error', props: { errorforce: true } },
-          { name: 'Inexistent Func', path: 'dasded' }
-        ])
-        await this.DropDown(uid, 'drop1', async () => {
-          this.Button(uid, { name: 'opa' })
-          await this.DropDown(uid, 'drop2', async () => {
-            this.Button(uid, { name: 'testing1' })
-            await this.DropDown(uid, 'drop3', () => {
-              this.Button(uid, { name: 'maisum1' })
-              this.Button(uid, { name: 'outro' })
-            })
-            this.Button(uid, { name: 'testing2' })
-          })
-          this.Button(uid, { name: 'opa 2' })
-        })
-        await this.DropDown(uid, 'drop55', async () => {
-
-          this.Button(uid, { name: 'dsdsdasd' })
-          this.Button(uid, { name: 'dsddfsdd' })
-          this.Button(uid, { name: 'dsdfsddasd' })
-        })
-
-        this.Button(uid, { name: 'Button 4', resetSelection: true })
-        await this.DropDown(uid, 'lateral', async () => {
-
-          this.Button(uid, { name: 'dsdsdasd' })
-          this.Button(uid, { name: 'dsdfsddasd' })
-        }, { horizontal: true })
-        this.Button(uid, { name: 'Button 5', props: { testando: true } })
-        if (props.testando) {
-          this.Button(uid, { name: 'Button 6' })
-        }
-
-        this.Button(uid, { name: 'Inserir numero', props: { inputnumero: true } })
       }
     )
   }
