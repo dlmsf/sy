@@ -5672,6 +5672,11 @@ this.DropDownManager = {
  * @param {string} [config.name='default'] - Unique name for this browser instance
  * @param {string} [config.startPath] - Starting directory for the file picker
  * @param {number} [config.maxTextLength=40] - Maximum characters before abbreviation
+ * @param {Object} [config.searchConfig] - Search configuration
+ * @param {string} [config.searchConfig.mode='both'] - Search mode: 'key', 'value', or 'both'
+ * @param {number} [config.searchConfig.keyWeight=0.7] - Weight for key matches (0-1)
+ * @param {number} [config.searchConfig.valueWeight=0.3] - Weight for value matches (0-1)
+ * @param {number} [config.searchConfig.minSimilarity=0.3] - Minimum similarity threshold
  * @returns {Promise<void>}
  */
 this.JSON = async (id, config = {}) => {
@@ -5687,6 +5692,31 @@ this.JSON = async (id, config = {}) => {
   const searchFieldName = `${storageKey}_search`;
   const searchChangeProp = `${storageKey}_searchChange`;
   const searchIndexKey = `${storageKey}_searchIndex`;
+  const searchModeKey = `${storageKey}_searchMode`;
+  const searchKeyWeightKey = `${storageKey}_keyWeight`;
+  const searchValueWeightKey = `${storageKey}_valueWeight`;
+  const searchMinSimilarityKey = `${storageKey}_minSimilarity`;
+  const configPanelOpenKey = `${storageKey}_configPanelOpen`;
+  const lastSearchQueryKey = `${storageKey}_lastSearchQuery`;
+
+  // Search configuration with defaults
+  let searchConfig = {
+    mode: config.searchConfig?.mode || 'both',
+    keyWeight: config.searchConfig?.keyWeight || 0.7,
+    valueWeight: config.searchConfig?.valueWeight || 0.3,
+    minSimilarity: config.searchConfig?.minSimilarity || 0.3
+  };
+
+  // Load saved search config from storage if exists
+  const savedMode = this.Storages.Get(id, searchModeKey);
+  const savedKeyWeight = this.Storages.Get(id, searchKeyWeightKey);
+  const savedValueWeight = this.Storages.Get(id, searchValueWeightKey);
+  const savedMinSimilarity = this.Storages.Get(id, searchMinSimilarityKey);
+
+  if (savedMode) searchConfig.mode = savedMode;
+  if (savedKeyWeight !== undefined && savedKeyWeight !== null) searchConfig.keyWeight = savedKeyWeight;
+  if (savedValueWeight !== undefined && savedValueWeight !== null) searchConfig.valueWeight = savedValueWeight;
+  if (savedMinSimilarity !== undefined && savedMinSimilarity !== null) searchConfig.minSimilarity = savedMinSimilarity;
 
   if (!this.Storages.Has(id, storageKey)) {
     this.Storages.Set(id, storageKey, {
@@ -5709,6 +5739,12 @@ this.JSON = async (id, config = {}) => {
   const navProp = `${storageKey}_navigate`;
   const loadNewProp = `${storageKey}_loadNew`;
   const clearSearchProp = `${storageKey}_clearSearch`;
+  const toggleSearchModeProp = `${storageKey}_toggleSearchMode`;
+  const setSearchModeProp = `${storageKey}_setSearchMode`;
+  const toggleConfigPanelProp = `${storageKey}_toggleConfigPanel`;
+  const updateKeyWeightProp = `${storageKey}_updateKeyWeight`;
+  const updateValueWeightProp = `${storageKey}_updateValueWeight`;
+  const updateMinSimilarityProp = `${storageKey}_updateMinSimilarity`;
 
   if (currentProps[backProp]) {
     if (storage.searchResults) {
@@ -5741,6 +5777,7 @@ this.JSON = async (id, config = {}) => {
     this.FileManager.ClearSelection(id, filePickerName);
     this.Storages.Delete(id, searchFieldName);
     this.Storages.Delete(id, searchIndexKey);
+    this.Storages.Set(id, lastSearchQueryKey, '');
     delete currentProps[loadNewProp];
   }
 
@@ -5749,49 +5786,124 @@ this.JSON = async (id, config = {}) => {
     storage.searchPath = [];
     storage.searchQuery = '';
     this.Storages.Delete(id, searchFieldName);
+    this.Storages.Set(id, lastSearchQueryKey, '');
     delete currentProps[clearSearchProp];
   }
 
+  // Handle direct search mode selection
+  if (currentProps[setSearchModeProp]) {
+    const newMode = currentProps[setSearchModeProp];
+    if (newMode === 'key' || newMode === 'value' || newMode === 'both') {
+      searchConfig.mode = newMode;
+      this.Storages.Set(id, searchModeKey, searchConfig.mode);
+      // Force pagination reset since results will change
+      this.Storages.Set(id, lastSearchQueryKey, '');
+    }
+    delete currentProps[setSearchModeProp];
+  }
+
+  // Handle search mode toggle (cycle)
+  // Handle search mode toggle (cycle)
+  if (currentProps[toggleSearchModeProp]) {
+    const modes = ['key', 'value', 'both'];
+    const currentModeIndex = modes.indexOf(searchConfig.mode);
+    searchConfig.mode = modes[(currentModeIndex + 1) % modes.length];
+    this.Storages.Set(id, searchModeKey, searchConfig.mode);
+    // Force pagination reset since results will change
+    this.Storages.Set(id, lastSearchQueryKey, '');
+    delete currentProps[toggleSearchModeProp];
+  }
+
+  // Handle config panel toggle
+  if (currentProps[toggleConfigPanelProp]) {
+    const currentState = this.Storages.Get(id, configPanelOpenKey) || false;
+    this.Storages.Set(id, configPanelOpenKey, !currentState);
+    delete currentProps[toggleConfigPanelProp];
+  }
+
+  // Handle weight updates
+  if (currentProps[updateKeyWeightProp] !== undefined && currentProps[updateKeyWeightProp] !== null) {
+    const newWeight = parseFloat(currentProps[updateKeyWeightProp]);
+    if (!isNaN(newWeight) && newWeight >= 0 && newWeight <= 1) {
+      searchConfig.keyWeight = newWeight;
+      searchConfig.valueWeight = Math.round((1 - newWeight) * 100) / 100;
+      this.Storages.Set(id, searchKeyWeightKey, searchConfig.keyWeight);
+      this.Storages.Set(id, searchValueWeightKey, searchConfig.valueWeight);
+      // Force pagination reset since results will change
+      this.Storages.Set(id, lastSearchQueryKey, '');
+    }
+    delete currentProps[updateKeyWeightProp];
+  }
+
+  if (currentProps[updateValueWeightProp] !== undefined && currentProps[updateValueWeightProp] !== null) {
+    const newWeight = parseFloat(currentProps[updateValueWeightProp]);
+    if (!isNaN(newWeight) && newWeight >= 0 && newWeight <= 1) {
+      searchConfig.valueWeight = newWeight;
+      searchConfig.keyWeight = Math.round((1 - newWeight) * 100) / 100;
+      this.Storages.Set(id, searchValueWeightKey, searchConfig.valueWeight);
+      this.Storages.Set(id, searchKeyWeightKey, searchConfig.keyWeight);
+      // Force pagination reset since results will change
+      this.Storages.Set(id, lastSearchQueryKey, '');
+    }
+    delete currentProps[updateValueWeightProp];
+  }
+
+  if (currentProps[updateMinSimilarityProp] !== undefined && currentProps[updateMinSimilarityProp] !== null) {
+    const newMin = parseFloat(currentProps[updateMinSimilarityProp]);
+    if (!isNaN(newMin) && newMin >= 0 && newMin <= 1) {
+      searchConfig.minSimilarity = newMin;
+      this.Storages.Set(id, searchMinSimilarityKey, searchConfig.minSimilarity);
+      // Force pagination reset since results will change
+      this.Storages.Set(id, lastSearchQueryKey, '');
+    }
+    delete currentProps[updateMinSimilarityProp];
+  }
   // ------------------------------------------------------------------
   // CRITICAL: Check for search change from field storage
   // ------------------------------------------------------------------
-  // Get the current field value from storage
   const currentFieldValue = this.Storages.Get(id, searchFieldName) || '';
   
-  // Check if there's a pending search change in props
-  if (currentProps[searchChangeProp] !== undefined) {
+  if (currentProps[searchChangeProp] !== undefined && currentProps[searchChangeProp] !== null) {
     const newSearchValue = currentProps[searchChangeProp] || '';
     this.Storages.Set(id, searchFieldName, newSearchValue);
     storage.searchQuery = newSearchValue;
-    
     delete currentProps[searchChangeProp];
   } else if (currentFieldValue !== storage.searchQuery) {
-    // Field value changed but prop wasn't set (direct field edit)
     storage.searchQuery = currentFieldValue;
   }
 
-  // NOW process the search with the current query
-  if (storage.searchQuery && storage.searchQuery.trim()) {
-    // Perform search
-    const searchIndex = this.Storages.Get(id, searchIndexKey);
-    storage.searchResults = fastSearchJSON(
-      storage.data, 
-      storage.searchQuery.trim(),
-      searchIndex
-    );
-    storage.searchPath = [];
-    
-    // Reset pagination for search results
-    this.Pagination.Reset(id, `${storageKey}_searchResults`);
-    this.Pagination.Reset(id, `${storageKey}_searchNav`);
-  } else {
-    storage.searchResults = null;
-    storage.searchPath = [];
-    
-    // Reset pagination when clearing search
-    this.Pagination.Reset(id, `${storageKey}_searchResults`);
-    this.Pagination.Reset(id, `${storageKey}_searchNav`);
-  }
+    // NOW process the search with the current query and configured weights
+    const lastSearchQuery = this.Storages.Get(id, lastSearchQueryKey) || '';
+    const searchQueryChanged = lastSearchQuery !== storage.searchQuery;
+  
+    if (storage.searchQuery && storage.searchQuery.trim()) {
+      // Perform search with weighted similarity
+      const searchIndex = this.Storages.Get(id, searchIndexKey);
+      storage.searchResults = weightedSearchJSON(
+        storage.data, 
+        storage.searchQuery.trim(),
+        searchIndex,
+        searchConfig
+      );
+      storage.searchPath = [];
+      
+      // Only reset pagination if the search query actually changed
+      if (searchQueryChanged) {
+        this.Pagination.Reset(id, `${storageKey}_searchResults`);
+        this.Pagination.Reset(id, `${storageKey}_searchNav`);
+        this.Storages.Set(id, lastSearchQueryKey, storage.searchQuery);
+      }
+    } else {
+      storage.searchResults = null;
+      storage.searchPath = [];
+      
+      // Only reset pagination if we had a search before
+      if (searchQueryChanged) {
+        this.Pagination.Reset(id, `${storageKey}_searchResults`);
+        this.Pagination.Reset(id, `${storageKey}_searchNav`);
+        this.Storages.Set(id, lastSearchQueryKey, storage.searchQuery);
+      }
+    } 
 
   this.Storages.Set(id, storageKey, storage);
 
@@ -5808,7 +5920,6 @@ this.JSON = async (id, config = {}) => {
         storage.data = data;
         storage.filePath = filePath;
 
-        // Build search index for fast searching
         const searchIndex = buildSearchIndex(data);
         this.Storages.Set(id, searchIndexKey, searchIndex);
 
@@ -5837,7 +5948,7 @@ this.JSON = async (id, config = {}) => {
   }
 
   // ------------------------------------------------------------------
-  // Render search field
+  // Render search field and controls
   // ------------------------------------------------------------------
   const searchValue = this.Storages.Get(id, searchFieldName) || '';
 
@@ -5846,10 +5957,10 @@ this.JSON = async (id, config = {}) => {
     initialValue: searchValue,
     maxWidth: config.maxTextLength || 40,
     onChange: (value) => {
-      // Immediately update storage and trigger re-render
       self.Storages.Set(id, searchFieldName, value);
+      // Clear last search query to force pagination reset on next build
+      self.Storages.Set(id, lastSearchQueryKey, '');
       
-      // Force immediate refresh by setting props
       const build = self.Builds.get(id);
       if (build && build.Session) {
         if (!build.Session.ActualProps) {
@@ -5859,6 +5970,175 @@ this.JSON = async (id, config = {}) => {
       }
     }
   });
+  // Mode toggle button
+  const modeEmoji = {
+    'key': '🔑',
+    'value': '📝',
+    'both': '🔀'
+  };
+  const modeLabel = {
+    'key': 'Keys Only',
+    'value': 'Values Only',
+    'both': 'Keys + Values'
+  };
+
+  this.Button(id, {
+    name: `${modeEmoji[searchConfig.mode]} Mode: ${modeLabel[searchConfig.mode]}`,
+    props: { [toggleSearchModeProp]: true }
+  });
+
+  // Config panel toggle button
+  const configPanelOpen = this.Storages.Get(id, configPanelOpenKey) || false;
+  this.Button(id, {
+    name: configPanelOpen ? '⚙️ Hide Search Config' : '⚙️ Search Config',
+    props: { [toggleConfigPanelProp]: true }
+  });
+
+  // ------------------------------------------------------------------
+  // Render search configuration panel (if open)
+  // ------------------------------------------------------------------
+  if (configPanelOpen) {
+    this.Text(id, ' ');
+    this.Text(id, `${this.TextColor.brightYellow('⚙️ Search Configuration')}`);
+    
+    // Mode selection - using individual buttons with setSearchModeProp
+    this.Buttons(id, [
+      {
+        name: searchConfig.mode === 'key' ? '✅ Keys Only' : '🔑 Keys Only',
+        props: { [setSearchModeProp]: 'key' }
+      },
+      {
+        name: searchConfig.mode === 'value' ? '✅ Values Only' : '📝 Values Only',
+        props: { [setSearchModeProp]: 'value' }
+      },
+      {
+        name: searchConfig.mode === 'both' ? '✅ Keys + Values' : '🔀 Keys + Values',
+        props: { [setSearchModeProp]: 'both' }
+      }
+    ]);
+    
+    this.Text(id, ' ');
+    
+    // Weight adjustment (only in 'both' mode)
+    if (searchConfig.mode === 'both') {
+      this.Text(id, `${this.TextColor.brightCyan('Weights (auto-adjust to 100%):')}`);
+      
+      // Key weight field
+      this.Field(id, `${storageKey}_keyWeightField`, {
+        label: '🔑 Key Weight %',
+        initialValue: Math.round(searchConfig.keyWeight * 100).toString(),
+        maxWidth: 4,
+        onChange: (value) => {
+          const weightValue = parseFloat(value) / 100;
+          if (!isNaN(weightValue) && weightValue >= 0 && weightValue <= 1) {
+            self.Storages.Set(id, searchKeyWeightKey, weightValue);
+            self.Storages.Set(id, searchValueWeightKey, Math.round((1 - weightValue) * 100) / 100);
+            
+            const build = self.Builds.get(id);
+            if (build && build.Session) {
+              if (!build.Session.ActualProps) {
+                build.Session.ActualProps = {};
+              }
+              build.Session.ActualProps[updateKeyWeightProp] = weightValue;
+            }
+          }
+        }
+      });
+      
+      // Value weight field
+      this.Field(id, `${storageKey}_valueWeightField`, {
+        label: '📝 Value Weight %',
+        initialValue: Math.round(searchConfig.valueWeight * 100).toString(),
+        maxWidth: 4,
+        onChange: (value) => {
+          const weightValue = parseFloat(value) / 100;
+          if (!isNaN(weightValue) && weightValue >= 0 && weightValue <= 1) {
+            self.Storages.Set(id, searchValueWeightKey, weightValue);
+            self.Storages.Set(id, searchKeyWeightKey, Math.round((1 - weightValue) * 100) / 100);
+            
+            const build = self.Builds.get(id);
+            if (build && build.Session) {
+              if (!build.Session.ActualProps) {
+                build.Session.ActualProps = {};
+              }
+              build.Session.ActualProps[updateValueWeightProp] = weightValue;
+            }
+          }
+        }
+      });
+      
+      // Quick weight presets
+            this.Text(id, `${this.TextColor.dim('Quick presets:')}`);
+            this.Buttons(id, [
+              {
+                name: '🔑 90/10',
+                props: { [updateKeyWeightProp]: 0.9 }
+              },
+              {
+                name: '🔑 80/20',
+                props: { [updateKeyWeightProp]: 0.8 }
+              },
+              {
+                name: '🔀 50/50',
+                props: { [updateKeyWeightProp]: 0.5 }
+              },
+              {
+                name: '📝 20/80',
+                props: { [updateKeyWeightProp]: 0.2 }
+              },
+              {
+                name: '📝 10/90',
+                props: { [updateKeyWeightProp]: 0.1 }
+              }
+            ]);
+      
+      this.Text(id, ' ');
+    }
+    
+    // Minimum similarity threshold
+    this.Text(id, `${this.TextColor.brightCyan('Minimum Similarity:')}`);
+    this.Field(id, `${storageKey}_minSimilarityField`, {
+      label: '🎯 Min %',
+      initialValue: Math.round(searchConfig.minSimilarity * 100).toString(),
+      maxWidth: 4,
+      onChange: (value) => {
+        const minValue = parseFloat(value) / 100;
+        if (!isNaN(minValue) && minValue >= 0 && minValue <= 1) {
+          self.Storages.Set(id, searchMinSimilarityKey, minValue);
+          
+          const build = self.Builds.get(id);
+          if (build && build.Session) {
+            if (!build.Session.ActualProps) {
+              build.Session.ActualProps = {};
+            }
+            build.Session.ActualProps[updateMinSimilarityProp] = minValue;
+          }
+        }
+      }
+    });
+    
+    // Quick min similarity presets
+    this.Buttons(id, [
+      {
+        name: '10%',
+        props: { [updateMinSimilarityProp]: 0.1 }
+      },
+      {
+        name: '30%',
+        props: { [updateMinSimilarityProp]: 0.3 }
+      },
+      {
+        name: '50%',
+        props: { [updateMinSimilarityProp]: 0.5 }
+      },
+      {
+        name: '70%',
+        props: { [updateMinSimilarityProp]: 0.7 }
+      }
+    ]);
+  }
+
+  this.Text(id, ' ');
 
   // Navigate in search results or normal tree
   let currentNode;
@@ -5933,7 +6213,6 @@ this.JSON = async (id, config = {}) => {
   // ------------------------------------------------------------------
   const itemsPerPage = config.itemsPerPage || 5;
 
-  // Helper to create pagination config
   const createPaginationConfig = (paginationKey, dataLength) => {
     const paginationStorage = this.Storages.Get(id, paginationKey);
     const totalPages = Math.max(1, Math.ceil(dataLength / itemsPerPage));
@@ -5956,7 +6235,7 @@ this.JSON = async (id, config = {}) => {
   };
 
   if (displaySearchResults && storage.searchPath.length === 0) {
-    // ---------------- SEARCH RESULTS LIST ----------------
+    // Search results list
     this.Text(id, `${this.TextColor.green('🔍')} Found ${storage.searchResults.length} matches for "${storage.searchQuery}"`);
 
     if (storage.searchResults.length === 0) {
@@ -5972,9 +6251,18 @@ this.JSON = async (id, config = {}) => {
             const item = itemData.item;
             const similarity = item.similarity !== undefined ? 
               ` ${this.TextColor.dim(`(${Math.round(item.similarity * 100)}%)`)}` : '';
+            
+            let matchInfo = '';
+            if (item.matchType === 'key') {
+              matchInfo = ` 🔑${item.keySimilarity ? Math.round(item.keySimilarity * 100) + '%' : ''}`;
+            } else if (item.matchType === 'value') {
+              matchInfo = ` 📝${item.valueSimilarity ? Math.round(item.valueSimilarity * 100) + '%' : ''}`;
+            } else if (item.matchType === 'both') {
+              matchInfo = ` 🔀K:${item.keySimilarity ? Math.round(item.keySimilarity * 100) + '%' : '0%'} V:${item.valueSimilarity ? Math.round(item.valueSimilarity * 100) + '%' : '0%'}`;
+            }
 
             this.Button(id, {
-              name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${similarity}`,
+              name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${matchInfo}${similarity}`,
               props: { [`${storageKey}_navigate`]: itemData.globalIndex }
             });
           }
@@ -5983,7 +6271,7 @@ this.JSON = async (id, config = {}) => {
     }
 
   } else if (displaySearchResults && storage.searchPath.length > 0) {
-    // ---------------- NAVIGATING WITHIN SEARCH RESULT ----------------
+    // Navigating within search result
     if (Array.isArray(currentNode)) {
       this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
 
@@ -6041,7 +6329,7 @@ this.JSON = async (id, config = {}) => {
     }
 
   } else if (Array.isArray(currentNode)) {
-    // ---------------- ARRAY ----------------
+    // Array display
     this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
 
     if (currentNode.length === 0) {
@@ -6066,7 +6354,7 @@ this.JSON = async (id, config = {}) => {
     }
 
   } else if (currentNode !== null && typeof currentNode === 'object') {
-    // ---------------- OBJECT ----------------
+    // Object display
     const keys = Object.keys(currentNode);
     this.Text(id, `${this.TextColor.magenta('🔑')} Object (${keys.length} keys)`);
 
@@ -6102,7 +6390,7 @@ this.JSON = async (id, config = {}) => {
     }
 
   } else {
-    // ---------------- PRIMITIVE ----------------
+    // Primitive display
     const valueStr = typeof currentNode === 'string' ? currentNode : String(currentNode);
     const isLong = valueStr.length > maxTextLength;
 
@@ -6195,6 +6483,130 @@ function buildSearchIndex(data) {
   
   traverse(data);
   return index;
+}
+
+// ----------------------------------------------------------------------
+// Weighted search with configurable key/value weights
+// ----------------------------------------------------------------------
+function weightedSearchJSON(data, query, searchIndex, searchConfig = {}) {
+  if (!searchIndex) {
+    searchIndex = buildSearchIndex(data);
+  }
+
+  const queryLower = query.toLowerCase();
+  const queryTokens = queryLower.split(/\s+/).filter(t => t.length > 0);
+  
+  const mode = searchConfig.mode || 'both';
+  const keyWeight = searchConfig.keyWeight || 0.7;
+  const valueWeight = searchConfig.valueWeight || 0.3;
+  const minSimilarity = searchConfig.minSimilarity || 0.3;
+
+  const results = [];
+  const seen = new Set();
+
+  for (const item of searchIndex) {
+    let keySimilarity = 0;
+    let valueSimilarity = 0;
+    let matched = false;
+    let matchType = null;
+
+    // Check key matches (if mode is 'key' or 'both')
+    if ((mode === 'key' || mode === 'both') && item.key) {
+      keySimilarity = calculateSimilarity(item.key, queryLower);
+      
+      // Check token-based matching for keys
+      if (queryTokens.length > 0) {
+        const keyTokens = item.key.split(/[\s_\-\.]+/);
+        for (const token of queryTokens) {
+          for (const keyToken of keyTokens) {
+            if (keyToken && (keyToken === token || keyToken.includes(token) || token.includes(keyToken))) {
+              keySimilarity = Math.max(keySimilarity, 0.8);
+              break;
+            }
+          }
+        }
+      }
+      
+      if (keySimilarity > minSimilarity) {
+        matched = true;
+        matchType = 'key';
+      }
+    }
+
+    // Check value matches (if mode is 'value' or 'both')
+    if ((mode === 'value' || mode === 'both') && item.value) {
+      valueSimilarity = calculateSimilarity(item.value, queryLower);
+      
+      // Check token-based matching for values
+      if (queryTokens.length > 0) {
+        const valueTokens = item.value.split(/[\s_\-\.]+/);
+        for (const token of queryTokens) {
+          for (const valueToken of valueTokens) {
+            if (valueToken && (valueToken === token || valueToken.includes(token) || token.includes(valueToken))) {
+              valueSimilarity = Math.max(valueSimilarity, 0.8);
+              break;
+            }
+          }
+        }
+        
+        // Check if all tokens are present in value (for multi-word queries)
+        if (queryTokens.length > 1) {
+          const allTokensPresent = queryTokens.every(token => item.value.includes(token));
+          if (allTokensPresent) {
+            valueSimilarity = Math.max(valueSimilarity, 0.9);
+          }
+        }
+      }
+      
+      if (valueSimilarity > minSimilarity) {
+        matched = true;
+        if (matchType === 'key') {
+          matchType = 'both';
+        } else {
+          matchType = 'value';
+        }
+      }
+    }
+
+    // Calculate weighted similarity
+    if (matched && !seen.has(item.path)) {
+      let finalSimilarity = 0;
+      
+      if (mode === 'key') {
+        finalSimilarity = keySimilarity;
+      } else if (mode === 'value') {
+        finalSimilarity = valueSimilarity;
+      } else {
+        // Weighted average for 'both' mode
+        finalSimilarity = (keySimilarity * keyWeight) + (valueSimilarity * valueWeight);
+        
+        // If only one type matched, give it full weight
+        if (keySimilarity === 0) {
+          finalSimilarity = valueSimilarity;
+        } else if (valueSimilarity === 0) {
+          finalSimilarity = keySimilarity;
+        }
+      }
+      
+      seen.add(item.path);
+      results.push({
+        path: item.path,
+        key: item.path.split('.').pop() || 'root',
+        value: item.fullValue !== undefined ? item.fullValue : item.value,
+        type: item.type,
+        similarity: finalSimilarity,
+        matchType: matchType,
+        keySimilarity: keySimilarity,
+        valueSimilarity: valueSimilarity
+      });
+    }
+  }
+
+  // Sort by similarity (highest first)
+  results.sort((a, b) => b.similarity - a.similarity);
+
+  // Limit to top 100 results for performance
+  return results.slice(0, 100);
 }
 
 // ----------------------------------------------------------------------
