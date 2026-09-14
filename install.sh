@@ -95,6 +95,7 @@ get_command_working_dir() {
         # NODE.JS COMMANDS
         # =====================================================================
         "sy") echo "global" ;;
+        "syapp") echo "caller";;
         "sypm") echo "caller" ;;
         "sydb") echo "global" ;;
         "pkg") echo "caller" ;;

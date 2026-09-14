@@ -10121,7 +10121,230 @@ this.HUD = new TerminalHUD({
 
 export default SyAPP
 
-// If this file is run directly, execute the CLI with HTTP disabled by default
+// If this file is run directly, execute the CLI with HTTP disabled by default.
+//
+// Usage:
+//   node SyAPP.js                 → starts with the built-in TemplateFunc as main func (legacy behavior)
+//   node SyAPP.js path/to/My.js   → dynamically imports My.js, uses its default export
+//                                    (a class extending SyAPP_Func OR SyAPP.Func()) as the main func.
+//
+// The dynamic import preserves the full module graph of the target file
+// (its own imports, its Linked functions, its routes, etc.), and SyAPP
+// then recursively registers every function reachable through .Linked,
+// exactly the same way it does for its own built-in main function.
 if (import.meta.url === `file://${process.argv[1]}`) {
-  new SyAPP()
+  (async () => {
+    const targetFile = process.argv[2];
+
+    // No file argument: keep the original default behavior (TemplateFunc).
+    if (!targetFile) {
+      new SyAPP();
+      return;
+    }
+
+    // ------------------------------------------------------------------
+    // SyAPP_Func acceptance check — reference-independent.
+    //
+    // The user's file may extend either:
+    //   1) class MyFunc extends SyAPP_Func { ... }        ← direct subclass
+    //   2) class MyFunc extends SyAPP.Func() { ... }      ← factory subclass
+    //
+    // Both ultimately resolve to the SAME internal SyAPP_Func class — but
+    // only if the user's file imports the exact same SyAPP.js module that
+    // we are running from. When the user's file imports SyAPP from a
+    // DIFFERENT path (e.g. "./SyAPP.js" vs "./._/SyAPP.js", or a symlink,
+    // or a re-export), Node loads a SECOND copy of the module, producing
+    // a second SyAPP_Func class. Plain `instanceof` then fails even though
+    // the class is genuinely a SyAPP_Func.
+    //
+    // To be robust against this, we accept a class when ANY of the
+    // following is true:
+    //   a) it is our local SyAPP_Func,
+    //   b) it is SyAPP.Func() (same thing, but kept explicit),
+    //   c) its prototype chain contains a constructor named "SyAPP_Func",
+    //   d) a fresh instance duck-types as a SyAPP_Func (has the methods
+    //      and properties the runtime expects).
+    // ------------------------------------------------------------------
+    const acceptedBases = [SyAPP_Func, SyAPP.Func()];
+
+    const extendsKnownBase = (cls) => {
+      if (typeof cls !== 'function') return false;
+      for (const base of acceptedBases) {
+        try {
+          if (cls === base) return true;
+          if (base && cls.prototype instanceof base) return true;
+        } catch (_) { /* try next */ }
+      }
+      return false;
+    };
+
+    const prototypeChainHasSyAPPFunc = (cls) => {
+      if (typeof cls !== 'function') return false;
+      let proto = cls.prototype;
+      const seen = new Set();
+      while (proto && !seen.has(proto)) {
+        seen.add(proto);
+        const ctor = proto.constructor;
+        if (ctor && ctor.name === 'SyAPP_Func') return true;
+        proto = Object.getPrototypeOf(proto);
+      }
+      return false;
+    };
+
+    const duckTypesAsSyAPPFunc = (cls) => {
+      if (typeof cls !== 'function') return false;
+      let instance;
+      try {
+        instance = new cls();
+      } catch (_) {
+        return false;
+      }
+      if (!instance || typeof instance !== 'object') return false;
+
+      // Core surface every SyAPP_Func instance is expected to expose.
+      const requiredProps = [
+        'Name',
+        'Linked',
+        'Builds',
+        'UserStorage',
+        'Storages',
+        'TextColor',
+        'Build',
+        'Text',
+        'Button',
+        'Buttons',
+        'Page',
+        'DropDown',
+        'Pagination',
+        'GotoNow',
+        'SetPage',
+        'WaitInput',
+        'Field',
+        'Alert',
+        'AlertButton',
+        'Admin'
+      ];
+
+      for (const prop of requiredProps) {
+        if (!(prop in instance)) return false;
+      }
+
+      // Function-typed sanity checks
+      if (typeof instance.Build !== 'function') return false;
+      if (typeof instance.Text !== 'function') return false;
+      if (typeof instance.Button !== 'function') return false;
+      if (!(instance.Storages && typeof instance.Storages.Get === 'function' && typeof instance.Storages.Set === 'function')) {
+        return false;
+      }
+
+      return true;
+    };
+
+    const isSyAPPFuncClass = (cls) => {
+      return (
+        extendsKnownBase(cls) ||
+        prototypeChainHasSyAPPFunc(cls) ||
+        duckTypesAsSyAPPFunc(cls)
+      );
+    };
+
+    try {
+      // Resolve the target to an absolute path (relative and absolute inputs both work).
+      const absolutePath = path.isAbsolute(targetFile)
+        ? targetFile
+        : path.resolve(process.cwd(), targetFile);
+
+      if (!fs.existsSync(absolutePath)) {
+        console.error(ColorText.brightRed(`❌ SyAPP runner: file not found → ${targetFile}`));
+        process.exit(1);
+      }
+
+      // Convert to a file:// URL so Node's ESM loader imports it identically
+      // on Linux, macOS and Windows.
+      const fileUrl = url.pathToFileURL(absolutePath).href;
+
+      // Dynamically import the user's file. This preserves ALL of its own
+      // imports (relative and bare), its full module graph, and any
+      // SyAPP_Func subclasses it declares.
+      let importedModule;
+      try {
+        importedModule = await import(fileUrl);
+      } catch (importErr) {
+        console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
+        console.error(importErr);
+        process.exit(1);
+      }
+
+      // ------------------------------------------------------------------
+      // Collect all exported functions and pick the first one that looks
+      // like a SyAPP_Func.
+      //
+      // Priority:
+      //   1. default export
+      //   2. any named export
+      //   3. nested keys inside a plain-object default export
+      // ------------------------------------------------------------------
+      const candidates = [];
+
+      if (importedModule) {
+        if (importedModule.default !== undefined && importedModule.default !== null) {
+          candidates.push({ name: 'default', value: importedModule.default });
+        }
+        for (const key of Object.keys(importedModule)) {
+          if (key === 'default') continue;
+          candidates.push({ name: key, value: importedModule[key] });
+        }
+      }
+
+      let ExportedFunc = null;
+      let ExportedFuncName = null;
+
+      for (const cand of candidates) {
+        let value = cand.value;
+
+        // Descend into plain-object exports looking for common nested keys.
+        if (value && typeof value !== 'function' && typeof value === 'object') {
+          const nestedKeys = ['default', 'MainFunc', 'Func', 'SyAPP_Func'];
+          for (const nk of nestedKeys) {
+            const nested = value[nk];
+            if (isSyAPPFuncClass(nested)) {
+              value = nested;
+              break;
+            }
+          }
+        }
+
+        if (isSyAPPFuncClass(value)) {
+          ExportedFunc = value;
+          ExportedFuncName = cand.name;
+          break;
+        }
+      }
+
+      if (typeof ExportedFunc !== 'function') {
+        console.error(ColorText.brightRed(
+          `❌ SyAPP runner: "${targetFile}" does not export a class extending SyAPP_Func.\n` +
+          `   Expected one of:\n` +
+          `     export default class MyFunc extends SyAPP_Func { ... }\n` +
+          `     export default class MyFunc extends SyAPP.Func() { ... }\n` +
+          `     export class MainFunc extends SyAPP_Func { ... }\n` +
+          `     export class Func extends SyAPP_Func { ... }`
+        ));
+        process.exit(1);
+      }
+
+      // Boot SyAPP with the user-provided class as the main function.
+      // SyAPP's constructor will:
+      //   1. instantiate it as the main func,
+      //   2. recursively register every Linked function it declares,
+      //   3. start the terminal HUD / refresh loop / HTTP routes
+      //      exactly as if it were the built-in main func.
+      new SyAPP(ExportedFunc);
+
+    } catch (err) {
+      console.error(ColorText.brightRed(`❌ SyAPP runner: unexpected error while loading "${targetFile}":`));
+      console.error(err);
+      process.exit(1);
+    }
+  })();
 }
