@@ -10336,6 +10336,11 @@ class SelfBuilder extends SyAPP_Func {
 
     if (p.__toggleEdit) { this.Editing = !this.Editing; this.EditItemId = null }
 
+    if (p.__toggleNew) {
+      const cur = this.Storages.Get(id, 'sb_new_open') || false
+      this.Storages.Set(id, 'sb_new_open', !cur)
+    }
+
     if (p.__add) {
       const t = p.__add
       const it = { id: this._nid(), type: t }
@@ -10346,9 +10351,13 @@ class SelfBuilder extends SyAPP_Func {
       if (t === 'code') it.value = '// this.Text(id, "hello")'
       S.items.push(it)
       this.EditItemId = it.id
+      this.Storages.Set(id, 'sb_new_open', false)
     }
 
-    if (p.__del) S.items = S.items.filter(i => i.id !== p.__del)
+    if (p.__del) {
+      S.items = S.items.filter(i => i.id !== p.__del)
+      if (this.EditItemId === p.__del) this.EditItemId = null
+    }
     if (p.__up) {
       const i = S.items.findIndex(x => x.id === p.__up)
       if (i > 0) { const [x] = S.items.splice(i, 1); S.items.splice(i - 1, 0, x) }
@@ -10394,8 +10403,7 @@ class SelfBuilder extends SyAPP_Func {
     this.Text(id, _hr('─'), { pinnedTop: true })
 
     if (!curPage) {
-      // Main toolbar (only on root)
-      this._renderToolbar(id, S)
+      this._renderTopToolbar(id, S)
     } else {
       // Breadcrumb when inside a page
       const pageItem = S.items.find(i => i.type === 'page' && i.name === curPage)
@@ -10410,7 +10418,7 @@ class SelfBuilder extends SyAPP_Func {
     // -------- body (scrollable) --------
     if (!curPage && S.items.length === 0) {
       this.Text(id, '')
-      this.Text(id, ColorText.dim('  Empty app. Use the toolbar above to add items.'))
+      this.Text(id, ColorText.dim('  Empty app. Use the "+ New" menu above to add items.'))
       this.Text(id, ColorText.dim('  Ctrl+C saves & exits.'))
     } else if (!curPage) {
       await this._renderItems(id, S.items, props)
@@ -10419,15 +10427,21 @@ class SelfBuilder extends SyAPP_Func {
       if (!pageItem) {
         this.Text(id, ColorText.red(`Page "${curPage}" not found.`))
       } else if (!pageItem.items || pageItem.items.length === 0) {
-        this.Text(id, ColorText.dim('  (empty page — switch to Edit Mode to add items)'))
+        this.Text(id, ColorText.dim('  (empty page — use the "+ New" menu to add items)'))
       } else {
         await this._renderItems(id, pageItem.items, props)
       }
     }
 
-    // -------- pinned bottom: status bar --------
+    // -------- pinned bottom: editor (when an item is selected) or status bar --------
     this.Text(id, _hr('─'), { pinned: true })
-    this.Text(id, this._statusLine(S), { pinned: true })
+
+    const editingItem = this.EditItemId ? this._findItem(this.EditItemId) : null
+    if (editingItem) {
+      this._renderPinnedEditor(id, editingItem)
+    } else {
+      this.Text(id, this._statusLine(S), { pinned: true })
+    }
   }
 
   _headerLine(S, curPage) {
@@ -10447,27 +10461,52 @@ class SelfBuilder extends SyAPP_Func {
     return ' ' + _fit(body, W - 2)
   }
 
-  _renderToolbar(id, S) {
-    // Group 1: Add  (compact labels so it fits narrow terminals)
+  _renderTopToolbar(id, S) {
+    const newOpen = this.Storages.Get(id, 'sb_new_open') || false
+
+    // Row 1: "+ New" toggle + global actions
     this.Buttons(id, [
-      { name: '＋ Text',   props: { __add: 'text' },   pinnedTop: true },
-      { name: '＋ Button', props: { __add: 'button' }, pinnedTop: true },
-      { name: '＋ Field',  props: { __add: 'field' },  pinnedTop: true },
-      { name: '＋ Page',   props: { __add: 'page' },   pinnedTop: true },
-      { name: '＋ Code',   props: { __add: 'code' },   pinnedTop: true },
-      { name: '＋ Space',  props: { __add: 'spacer' }, pinnedTop: true }
-    ])
-    // Group 2: Actions
-    const actions = [
-      { name: this.Editing ? '👁 View' : '✎ Edit', props: { __toggleEdit: 1 }, pinnedTop: true },
+      { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
+        props: { __toggleNew: 1 }, pinnedTop: true },
+      { name: this.Editing ? '👁 View' : '✎ Edit',
+        props: { __toggleEdit: 1 }, pinnedTop: true },
       { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
       { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
       { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
-      { name: '⚙ Name', props: { __setAppName: 1 }, pinnedTop: true },
-      { name: '⚙ Class', props: { __setFuncName: 1 }, pinnedTop: true },
       { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true }
-    ]
-    this.Buttons(id, actions)
+    ])
+
+    // Row 2: app name / class name
+    this.Buttons(id, [
+      { name: `⚙ ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
+      { name: `⌘ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
+    ])
+
+    // Vertical dropdown: when "+ New" is open, stack each add-option on its
+    // own line. This block renders AFTER the two toolbar rows above, so it
+    // naturally appears under them. Each entry is a full row so it reads as
+    // a real vertical menu dropped down from the "+ New" button.
+    if (newOpen) {
+      this.Text(id, ColorText.dim('  ┌─ New item'), { pinnedTop: true })
+
+      const opts = [
+        ['📝  Text',    'text'],
+        ['🔘  Button',  'button'],
+        ['✏️  Field',   'field'],
+        ['📄  Page',    'page'],
+        ['💻  Code',    'code'],
+        ['⬜  Spacer',  'spacer']
+      ]
+      for (let i = 0; i < opts.length; i++) {
+        const [label, kind] = opts[i]
+        const prefix = (i === opts.length - 1) ? '  └─ ' : '  ├─ '
+        this.Button(id, {
+          name: ColorText.dim(prefix) + label,
+          props: { __add: kind },
+          pinnedTop: true
+        })
+      }
+    }
   }
 
   async _renderItems(id, items, props) {
@@ -10475,20 +10514,15 @@ class SelfBuilder extends SyAPP_Func {
   }
 
   async _renderItem(id, it, props) {
-    if (this.Editing && this.EditItemId === it.id) {
-      this._renderItemEditor(id, it)
-      return
-    }
-
-    // In edit mode, prefix each item with a compact control strip.
+    // In edit mode, prefix each item with a compact selector dot.
+    // Clicking the dot reveals the pinned-bottom editor for this item,
+    // while keeping the item itself visible in the preview.
     if (this.Editing) {
-      this.Buttons(id, [
-        { name: ColorText.dim(`▪ ${_fit(it.type, 6).padEnd(6)}`), props: {} },
-        { name: '✎', props: { __editItem: it.id } },
-        { name: '↑', props: { __up: it.id } },
-        { name: '↓', props: { __down: it.id } },
-        { name: ColorText.red('×'), props: { __del: it.id } }
-      ])
+      const isActive = this.EditItemId === it.id
+      this.Button(id, {
+        name: isActive ? ColorText.brightYellow('◉') : ColorText.dim('○'),
+        props: { __editItem: isActive ? '' : it.id }
+      })
     }
 
     try {
@@ -10528,22 +10562,38 @@ class SelfBuilder extends SyAPP_Func {
     }
   }
 
-  _renderItemEditor(id, it) {
-    this.Text(id, ColorText.brightYellow(`▸ Editing [${it.type}]`))
-    this.Text(id, ColorText.dim(`  id: ${it.id}`))
+  _renderPinnedEditor(id, it) {
+    // Title line (compact, pinned to bottom)
+    this.Text(id, ' ' + ColorText.brightYellow(`▸ Editing [${it.type}]`) +
+                     ColorText.dim(` (${it.id.slice(-6)})`), { pinned: true })
 
+    // Editable property fields — rendered as a horizontal row
     const fields = []
-    if (it.type === 'text' || it.type === 'code') fields.push(['value', 'Value'])
+    if (it.type === 'text')   fields.push(['value', 'Text'])
     if (it.type === 'button') fields.push(['name', 'Name'])
-    if (it.type === 'field') fields.push(['name', 'Name'], ['label', 'Label'], ['initialValue', 'Initial Value'])
-    if (it.type === 'page') fields.push(['name', 'Page Name'])
+    if (it.type === 'field')  fields.push(['name', 'Name'], ['label', 'Label'], ['initialValue', 'Value'])
+    if (it.type === 'page')   fields.push(['name', 'Page Name'])
+    if (it.type === 'code')   fields.push(['value', 'Code'])
 
-    for (const [prop, label] of fields) {
-      const preview = _fit(String(it[prop] || '') || '(empty)', 40)
-      this.Button(id, { name: `✎ ${label}: ${preview}`, props: { __editProp: `${it.id}::${prop}` } })
+    if (fields.length > 0) {
+      const fieldButtons = fields.map(([prop, label]) => {
+        const preview = _fit(String(it[prop] || '') || '(empty)', 32)
+        return {
+          name: `✎ ${label}: ${preview}`,
+          props: { __editProp: `${it.id}::${prop}` },
+          pinned: true
+        }
+      })
+      this.Buttons(id, fieldButtons)
     }
-    this.Button(id, { name: '✓ Done', props: { __editItem: '' } })
-    this.Text(id, _hr('─'))
+
+    // Action buttons — reorder / delete / close editor
+    this.Buttons(id, [
+      { name: '↑ Up',   props: { __up: it.id },               pinned: true },
+      { name: '↓ Down', props: { __down: it.id },             pinned: true },
+      { name: ColorText.red('× Delete'), props: { __del: it.id },   pinned: true },
+      { name: ColorText.green('✓ Done'), props: { __editItem: '' }, pinned: true }
+    ])
   }
 }
 
