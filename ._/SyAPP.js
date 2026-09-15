@@ -2339,6 +2339,10 @@ if (configuration.remember) {
 
           case 'c':
             if (key.ctrl) {
+              if (this.listenerCount('ctrl+c') > 0) {
+                this.emit('ctrl+c');
+                return;
+              }
               this.cleanupMenuState();
               process.exit();
             }
@@ -10121,6 +10125,445 @@ this.HUD = new TerminalHUD({
 
 export default SyAPP
 
+// ============================================================
+// SELF BUILDER — persistent state + interactive editor
+// ============================================================
+const SYAPP_HOME = path.join(os.homedir(), '.syapp')
+const SYAPP_SAVES_DIR = path.join(SYAPP_HOME, 'saves')
+
+function _ensureSavesDir() {
+  if (!fs.existsSync(SYAPP_SAVES_DIR)) fs.mkdirSync(SYAPP_SAVES_DIR, { recursive: true })
+}
+function _getSaveFile(name) {
+  return path.join(SYAPP_SAVES_DIR, `${name}.json`)
+}
+function _listSaves() {
+  _ensureSavesDir()
+  return fs.readdirSync(SYAPP_SAVES_DIR)
+    .filter(f => f.endsWith('.json'))
+    .map(f => f.slice(0, -5))
+    .sort()
+}
+function _loadSaveState(name) {
+  const p = _getSaveFile(name)
+  if (!fs.existsSync(p)) return null
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return null }
+}
+function _writeSaveState(name, state) {
+  _ensureSavesDir()
+  fs.writeFileSync(_getSaveFile(name), JSON.stringify(state, null, 2))
+}
+
+// ---------- responsive helpers ----------
+function _termCols() { return stdout.columns || 80 }
+function _termRows() { return stdout.rows || 24 }
+function _hr(char = '─', inset = 0) {
+  const w = Math.max(10, _termCols() - inset * 2)
+  return ColorText.dim(char.repeat(w))
+}
+function _fit(str, width) {
+  const s = String(str == null ? '' : str)
+  if (s.length <= width) return s
+  if (width <= 3) return s.slice(0, width)
+  return s.slice(0, width - 1) + '…'
+}
+function _fitCenter(str, width) {
+  const s = _fit(str, width)
+  const pad = Math.max(0, Math.floor((width - s.length) / 2))
+  return ' '.repeat(pad) + s
+}
+
+/**
+ * Generate a stand-alone .js module from a builder state.
+ */
+function _genFuncJS(state, syappRelPath) {
+  const L = []
+  L.push(`import SyAPP from ${JSON.stringify(syappRelPath)}`)
+  L.push('')
+  const clsName = (state.funcName || 'MyApp').replace(/[^A-Za-z0-9_$]/g, '') || 'MyApp'
+  L.push(`export default class ${clsName} extends SyAPP.Func() {`)
+  L.push(`  constructor() {`)
+  L.push(`    super(${JSON.stringify(state.name || 'myapp')}, async (props) => {`)
+  L.push(`      const id = props.session.UniqueID`)
+
+  const emit = (items, indent) => {
+    for (const it of items || []) {
+      switch (it.type) {
+        case 'text':
+          L.push(`${indent}this.Text(id, ${JSON.stringify(it.value || '')})`)
+          break
+        case 'spacer':
+          L.push(`${indent}this.Text(id, '')`)
+          break
+        case 'button': {
+          const cfg = { name: it.name || '' }
+          if (it.path) cfg.path = it.path
+          if (it.props && Object.keys(it.props).length) cfg.props = it.props
+          L.push(`${indent}this.Button(id, ${JSON.stringify(cfg)})`)
+          break
+        }
+        case 'field': {
+          const cfg = {}
+          if (it.label) cfg.label = it.label
+          if (it.initialValue) cfg.initialValue = it.initialValue
+          L.push(`${indent}this.Field(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
+          break
+        }
+        case 'page':
+          L.push(`${indent}await this.Page(id, ${JSON.stringify(it.name)}, async () => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}})`)
+          break
+        case 'code':
+          L.push(`${indent}${(it.value || '').replace(/\n/g, '\n' + indent)}`)
+          break
+      }
+    }
+  }
+
+  emit(state.items || [], '      ')
+  if (state.code) L.push(state.code)
+  L.push(`    })`)
+  L.push(`  }`)
+  L.push(`}`)
+  return L.join('\n')
+}
+
+// ============================================================
+// SELF BUILDER
+// ============================================================
+let __BUILDER_INITIAL_STATE = null
+let __BUILDER_EXPORT_TARGET = null
+
+const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor
+
+class SelfBuilder extends SyAPP_Func {
+  constructor() {
+    super('__selfbuilder__', async (props) => { await this._renderSelf(props) }, { refreshMode: false })
+    this.State = __BUILDER_INITIAL_STATE
+      ? JSON.parse(JSON.stringify(__BUILDER_INITIAL_STATE))
+      : { name: 'untitled', funcName: 'MyApp', code: '', items: [] }
+    this.Editing = true
+    this.EditItemId = null
+    this.ExportTarget = __BUILDER_EXPORT_TARGET
+    this._pendingEdit = null
+    this._pendingAction = null
+    this._idSeq = 0
+  }
+
+  _nid() { return `it_${Date.now().toString(36)}_${++this._idSeq}` }
+
+  _findItem(id, items) {
+    items = items || this.State.items
+    for (const it of items) {
+      if (it.id === id) return it
+      if (it.type === 'page' && it.items) {
+        const f = this._findItem(id, it.items)
+        if (f) return f
+      }
+    }
+    return null
+  }
+
+  _processActions(id, props) {
+    const S = this.State
+    const p = props || {}
+    const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
+    const curPage = curProps.page || ''
+    const passProps = curPage ? { page: curPage } : {}
+
+    // ---- WaitInput resolution ----
+    if (p.inputValue !== undefined) {
+      if (this._pendingEdit) {
+        const it = this._findItem(this._pendingEdit.itemId)
+        if (it) it[this._pendingEdit.prop] = String(p.inputValue)
+        this._pendingEdit = null
+      } else if (this._pendingAction === 'save') {
+        const name = String(p.inputValue).trim()
+        if (name) {
+          S.name = name
+          try {
+            _writeSaveState(name, S)
+            this.Alert(id, `💾 Saved "${name}"`, { duration: 2500 })
+          } catch (e) {
+            this.Alert(id, `❌ ${e.message}`, { duration: 4000 })
+          }
+        }
+        this._pendingAction = null
+      } else if (this._pendingAction === 'export') {
+        const name = String(p.inputValue).trim()
+        if (name) {
+          try {
+            const target = this.ExportTarget
+              ? this.ExportTarget
+              : path.resolve(process.cwd(), name.endsWith('.js') ? name : name + '.js')
+            const dir = path.dirname(target)
+            let rel = path.relative(dir, url.fileURLToPath(import.meta.url))
+            if (!rel.startsWith('.')) rel = './' + rel
+            const js = _genFuncJS(S, rel)
+            fs.writeFileSync(target, js)
+            this.Alert(id, `📤 Exported: ${target}`, { duration: 3500 })
+          } catch (e) {
+            this.Alert(id, `❌ ${e.message}`, { duration: 4000 })
+          }
+        }
+        this._pendingAction = null
+      } else if (this._pendingAction === 'load') {
+        const name = String(p.inputValue).trim()
+        if (name) {
+          const loaded = _loadSaveState(name)
+          if (loaded) {
+            this.State = loaded
+            this.EditItemId = null
+            this.Alert(id, `📂 Loaded "${name}"`, { duration: 2500 })
+          } else {
+            this.Alert(id, `❌ No save "${name}"`, { duration: 3000 })
+          }
+        }
+        this._pendingAction = null
+      } else if (this._pendingAction === 'funcName') {
+        const v = String(p.inputValue).trim().replace(/[^A-Za-z0-9_$]/g, '')
+        if (v) S.funcName = v
+        this._pendingAction = null
+      } else if (this._pendingAction === 'appName') {
+        const v = String(p.inputValue).trim()
+        if (v) S.name = v
+        this._pendingAction = null
+      }
+      delete p.inputValue
+      return
+    }
+
+    if (p.__toggleEdit) { this.Editing = !this.Editing; this.EditItemId = null }
+
+    if (p.__add) {
+      const t = p.__add
+      const it = { id: this._nid(), type: t }
+      if (t === 'text') it.value = 'New text'
+      if (t === 'button') { it.name = 'Button'; it.props = {} }
+      if (t === 'field') { it.name = 'field_' + this._nid(); it.label = 'Label'; it.initialValue = '' }
+      if (t === 'page') { it.name = 'page_' + this._nid(); it.items = [] }
+      if (t === 'code') it.value = '// this.Text(id, "hello")'
+      S.items.push(it)
+      this.EditItemId = it.id
+    }
+
+    if (p.__del) S.items = S.items.filter(i => i.id !== p.__del)
+    if (p.__up) {
+      const i = S.items.findIndex(x => x.id === p.__up)
+      if (i > 0) { const [x] = S.items.splice(i, 1); S.items.splice(i - 1, 0, x) }
+    }
+    if (p.__down) {
+      const i = S.items.findIndex(x => x.id === p.__down)
+      if (i >= 0 && i < S.items.length - 1) { const [x] = S.items.splice(i, 1); S.items.splice(i + 1, 0, x) }
+    }
+
+    if (p.__editItem !== undefined) this.EditItemId = p.__editItem || null
+
+    if (p.__editProp) {
+      const [iid, prop] = String(p.__editProp).split('::')
+      this._pendingEdit = { itemId: iid, prop }
+      this.WaitInput(id, { question: `Edit ${prop}: `, path: this.Name, props: passProps })
+      return
+    }
+
+    if (p.__setFuncName) { this._pendingAction = 'funcName'; this.WaitInput(id, { question: 'Class name: ', path: this.Name, props: passProps }); return }
+    if (p.__setAppName) { this._pendingAction = 'appName'; this.WaitInput(id, { question: 'App name: ', path: this.Name, props: passProps }); return }
+    if (p.__save) { this._pendingAction = 'save'; this.WaitInput(id, { question: 'Save as: ', path: this.Name, props: passProps }); return }
+    if (p.__load) { this._pendingAction = 'load'; this.WaitInput(id, { question: 'Load name: ', path: this.Name, props: passProps }); return }
+    if (p.__export) { this._pendingAction = 'export'; this.WaitInput(id, { question: 'Export file: ', path: this.Name, props: passProps }); return }
+    if (p.__exit) { process.exit(0) }
+  }
+
+  // ----------------------------------------------------------
+  // RENDER
+  // ----------------------------------------------------------
+  async _renderSelf(props) {
+    const id = props.session.UniqueID
+    const S = this.State
+    const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
+    const curPage = curProps.page || ''
+
+    this._processActions(id, props)
+    if (this.Builds.get(id)?.WaitInput) return
+
+    const W = _termCols()
+
+    // -------- pinned top: header + toolbar --------
+    this.Text(id, this._headerLine(S, curPage), { pinnedTop: true })
+    this.Text(id, _hr('─'), { pinnedTop: true })
+
+    if (!curPage) {
+      // Main toolbar (only on root)
+      this._renderToolbar(id, S)
+    } else {
+      // Breadcrumb when inside a page
+      const pageItem = S.items.find(i => i.type === 'page' && i.name === curPage)
+      this.Buttons(id, [
+        { name: '← Root', props: { page: '' }, pinnedTop: true },
+        { name: `📄 ${_fit(curPage, 30)}`, pinnedTop: true }
+      ])
+    }
+
+    this.Text(id, _hr('─'), { pinnedTop: true })
+
+    // -------- body (scrollable) --------
+    if (!curPage && S.items.length === 0) {
+      this.Text(id, '')
+      this.Text(id, ColorText.dim('  Empty app. Use the toolbar above to add items.'))
+      this.Text(id, ColorText.dim('  Ctrl+C saves & exits.'))
+    } else if (!curPage) {
+      await this._renderItems(id, S.items, props)
+    } else {
+      const pageItem = S.items.find(i => i.type === 'page' && i.name === curPage)
+      if (!pageItem) {
+        this.Text(id, ColorText.red(`Page "${curPage}" not found.`))
+      } else if (!pageItem.items || pageItem.items.length === 0) {
+        this.Text(id, ColorText.dim('  (empty page — switch to Edit Mode to add items)'))
+      } else {
+        await this._renderItems(id, pageItem.items, props)
+      }
+    }
+
+    // -------- pinned bottom: status bar --------
+    this.Text(id, _hr('─'), { pinned: true })
+    this.Text(id, this._statusLine(S), { pinned: true })
+  }
+
+  _headerLine(S, curPage) {
+    const W = _termCols()
+    const mode = this.Editing ? ColorText.bgGreen(ColorText.black(' EDIT ')) : ColorText.bgBlue(ColorText.white(' VIEW '))
+    const title = ColorText.bold(ColorText.brightCyan(_fit(S.name, Math.max(8, W - 30))))
+    const cls = ColorText.dim(`[${_fit(S.funcName, 20)}]`)
+    return `  ${mode}  ${title}  ${cls}`
+  }
+
+  _statusLine(S) {
+    const W = _termCols()
+    const left = ColorText.dim(` items: ${S.items.length}`)
+    const mid = ColorText.dim(' │ ')
+    const right = ColorText.dim('Ctrl+C save+exit')
+    const body = left + mid + right
+    return ' ' + _fit(body, W - 2)
+  }
+
+  _renderToolbar(id, S) {
+    // Group 1: Add  (compact labels so it fits narrow terminals)
+    this.Buttons(id, [
+      { name: '＋ Text',   props: { __add: 'text' },   pinnedTop: true },
+      { name: '＋ Button', props: { __add: 'button' }, pinnedTop: true },
+      { name: '＋ Field',  props: { __add: 'field' },  pinnedTop: true },
+      { name: '＋ Page',   props: { __add: 'page' },   pinnedTop: true },
+      { name: '＋ Code',   props: { __add: 'code' },   pinnedTop: true },
+      { name: '＋ Space',  props: { __add: 'spacer' }, pinnedTop: true }
+    ])
+    // Group 2: Actions
+    const actions = [
+      { name: this.Editing ? '👁 View' : '✎ Edit', props: { __toggleEdit: 1 }, pinnedTop: true },
+      { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
+      { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
+      { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
+      { name: '⚙ Name', props: { __setAppName: 1 }, pinnedTop: true },
+      { name: '⚙ Class', props: { __setFuncName: 1 }, pinnedTop: true },
+      { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true }
+    ]
+    this.Buttons(id, actions)
+  }
+
+  async _renderItems(id, items, props) {
+    for (const it of items) await this._renderItem(id, it, props)
+  }
+
+  async _renderItem(id, it, props) {
+    if (this.Editing && this.EditItemId === it.id) {
+      this._renderItemEditor(id, it)
+      return
+    }
+
+    // In edit mode, prefix each item with a compact control strip.
+    if (this.Editing) {
+      this.Buttons(id, [
+        { name: ColorText.dim(`▪ ${_fit(it.type, 6).padEnd(6)}`), props: {} },
+        { name: '✎', props: { __editItem: it.id } },
+        { name: '↑', props: { __up: it.id } },
+        { name: '↓', props: { __down: it.id } },
+        { name: ColorText.red('×'), props: { __del: it.id } }
+      ])
+    }
+
+    try {
+      switch (it.type) {
+        case 'text':
+          this.Text(id, it.value || '')
+          break
+        case 'spacer':
+          this.Text(id, '')
+          break
+        case 'button':
+          this.Button(id, { name: it.name || '', props: it.props || {} })
+          break
+        case 'field':
+          this.Field(id, it.name, { label: it.label || '', initialValue: it.initialValue || '' })
+          break
+        case 'page':
+          if (this.Editing) {
+            this.Button(id, { name: `📄 ${it.name}`, props: { page: it.name } })
+          } else {
+            await this.Page(id, it.name, async () => {
+              await this._renderItems(id, it.items || [], props)
+            })
+          }
+          break
+        case 'code':
+          try {
+            const fn = new AsyncFunction('id', 'props', it.value || '')
+            await fn.call(this, id, props)
+          } catch (e) {
+            this.Text(id, ColorText.red(`[code error] ${e.message}`))
+          }
+          break
+      }
+    } catch (e) {
+      this.Text(id, ColorText.red(`[render error] ${e.message}`))
+    }
+  }
+
+  _renderItemEditor(id, it) {
+    this.Text(id, ColorText.brightYellow(`▸ Editing [${it.type}]`))
+    this.Text(id, ColorText.dim(`  id: ${it.id}`))
+
+    const fields = []
+    if (it.type === 'text' || it.type === 'code') fields.push(['value', 'Value'])
+    if (it.type === 'button') fields.push(['name', 'Name'])
+    if (it.type === 'field') fields.push(['name', 'Name'], ['label', 'Label'], ['initialValue', 'Initial Value'])
+    if (it.type === 'page') fields.push(['name', 'Page Name'])
+
+    for (const [prop, label] of fields) {
+      const preview = _fit(String(it[prop] || '') || '(empty)', 40)
+      this.Button(id, { name: `✎ ${label}: ${preview}`, props: { __editProp: `${it.id}::${prop}` } })
+    }
+    this.Button(id, { name: '✓ Done', props: { __editItem: '' } })
+    this.Text(id, _hr('─'))
+  }
+}
+
+function _installCtrlC(syapp) {
+  syapp.HUD.on('ctrl+c', async () => {
+    const builder = syapp.Funcs.get('__selfbuilder__')
+    if (!builder) { process.exit(0) }
+    try {
+      const name = await syapp.HUD.ask('\nSave as: ')
+      const trimmed = String(name || '').trim()
+      if (trimmed) {
+        builder.State.name = trimmed
+        _writeSaveState(trimmed, builder.State)
+        console.log(ColorText.brightGreen(`💾 Saved "${trimmed}" → ${_getSaveFile(trimmed)}`))
+      }
+    } catch (_) { }
+    process.exit(0)
+  })
+}
+
 // If this file is run directly, execute the CLI with HTTP disabled by default.
 //
 // Usage:
@@ -10134,13 +10577,66 @@ export default SyAPP
 // exactly the same way it does for its own built-in main function.
 if (import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
-    const targetFile = process.argv[2];
+    const arg1 = process.argv[2];
+    const arg2 = process.argv[3];
 
-    // No file argument: keep the original default behavior (TemplateFunc).
-    if (!targetFile) {
-      new SyAPP();
+    // --- `node SyAPP.js list` ---
+    if (arg1 === 'list') {
+      const saves = _listSaves();
+      if (saves.length === 0) {
+        console.log(`No saves yet.\nDirectory: ${SYAPP_SAVES_DIR}`);
+      } else {
+        console.log(`Saves (${SYAPP_SAVES_DIR}):`);
+        for (const s of saves) console.log('  • ' + s);
+      }
       return;
     }
+
+    // --- `node SyAPP.js --edit <file>` or `node SyAPP.js <file> --edit` ---
+    let editMode = false;
+    let editTarget = null;
+    if (arg1 === '--edit' && arg2) { editMode = true; editTarget = arg2; }
+    else if (arg2 === '--edit') { editMode = true; editTarget = arg1; }
+    if (editMode && editTarget) {
+      __BUILDER_INITIAL_STATE = null;
+      __BUILDER_EXPORT_TARGET = path.isAbsolute(editTarget)
+        ? editTarget
+        : path.resolve(process.cwd(), editTarget);
+      const syapp = new SyAPP(SelfBuilder);
+      _installCtrlC(syapp);
+      return;
+    }
+
+    // --- No arguments: start the interactive SelfBuilder with a blank state ---
+    if (!arg1) {
+      __BUILDER_INITIAL_STATE = null;
+      __BUILDER_EXPORT_TARGET = null;
+      const syapp = new SyAPP(SelfBuilder);
+      _installCtrlC(syapp);
+      return;
+    }
+
+    // --- If arg1 is a save name (not a file path), load its state ---
+    const _looksLikeFile =
+      arg1.endsWith('.js') || arg1.endsWith('.mjs') || arg1.endsWith('.cjs') ||
+      arg1.startsWith('./') || arg1.startsWith('../') || arg1.startsWith('/') ||
+      fs.existsSync(path.resolve(process.cwd(), arg1));
+
+    if (!_looksLikeFile) {
+      const st = _loadSaveState(arg1);
+      if (!st) {
+        console.error(ColorText.brightRed(`❌ Save "${arg1}" not found. Try: node SyAPP.js list`));
+        process.exit(1);
+      }
+      __BUILDER_INITIAL_STATE = st;
+      __BUILDER_EXPORT_TARGET = null;
+      const syapp = new SyAPP(SelfBuilder);
+      _installCtrlC(syapp);
+      return;
+    }
+
+    // --- Otherwise: existing file-loading behavior is preserved below ---
+    const targetFile = arg1;
 
     // ------------------------------------------------------------------
     // SyAPP_Func acceptance check — reference-independent.
