@@ -10149,9 +10149,35 @@ function _loadSaveState(name) {
   if (!fs.existsSync(p)) return null
   try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch (_) { return null }
 }
+// Deep-clone a value while stripping runtime-only objects that must never
+// be persisted (Session instances) and breaking any accidental cycles.
+// This guarantees JSON.stringify() cannot throw even if a user object
+// picked up a reference to the live Session somewhere.
+function _sbSafeState(value, seen = new WeakSet()) {
+  if (value === null || typeof value !== 'object') return value
+  if (value.constructor && value.constructor.name === 'Session') return undefined
+  if (seen.has(value)) return undefined
+  seen.add(value)
+  if (Array.isArray(value)) {
+    const out = []
+    for (const v of value) {
+      const sv = _sbSafeState(v, seen)
+      out.push(sv === undefined ? null : sv)
+    }
+    return out
+  }
+  const out = {}
+  for (const k of Object.keys(value)) {
+    const sv = _sbSafeState(value[k], seen)
+    if (sv !== undefined) out[k] = sv
+  }
+  return out
+}
+
 function _writeSaveState(name, state) {
   _ensureSavesDir()
-  fs.writeFileSync(_getSaveFile(name), JSON.stringify(state, null, 2))
+  const safe = _sbSafeState(state)
+  fs.writeFileSync(_getSaveFile(name), JSON.stringify(safe, null, 2))
 }
 
 // ---------- responsive helpers ----------
@@ -10900,9 +10926,13 @@ class SelfBuilder extends SyAPP_Func {
           this.Text(id, '')
           break
         case 'button':
+          // IMPORTANT: pass a *copy* of the props. If we pass the live
+          // `it.props` object, SyAPP's LoadScreen will attach `.session`
+          // (and `.mainfunc`) onto it, which in turn nests the Session
+          // into State.items → circular reference → save fails.
           this.Button(id, {
             name: it.name || '',
-            props: it.props || {},
+            props: { ...(it.props || {}) },
             path: it.path,
             resetSelection: it.resetSelection,
             jumpTo: it.jumpTo,
