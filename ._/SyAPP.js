@@ -10199,13 +10199,20 @@ function _genFuncJS(state, syappRelPath) {
           const cfg = { name: it.name || '' }
           if (it.path) cfg.path = it.path
           if (it.props && Object.keys(it.props).length) cfg.props = it.props
-          L.push(`${indent}this.Button(id, ${JSON.stringify(cfg)})`)
+          if (it.resetSelection) cfg.resetSelection = true
+          if (it.jumpTo) cfg.jumpTo = it.jumpTo
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
+          const method = it.sourceMethod === 'SideButton' ? 'SideButton' : 'Button'
+          L.push(`${indent}this.${method}(id, ${JSON.stringify(cfg)})`)
           break
         }
         case 'field': {
           const cfg = {}
           if (it.label) cfg.label = it.label
           if (it.initialValue) cfg.initialValue = it.initialValue
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
           L.push(`${indent}this.Field(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
           break
         }
@@ -10214,9 +10221,50 @@ function _genFuncJS(state, syappRelPath) {
           emit(it.items || [], indent + '  ')
           L.push(`${indent}})`)
           break
+        case 'dropdown': {
+          const cfg = {
+            up_buttontext: it.up_buttontext || 'Show more',
+            down_buttontext: it.down_buttontext || 'Hide'
+          }
+          L.push(`${indent}await this.DropDown(id, ${JSON.stringify(it.name)}, async () => {`)
+          L.push(`${indent}  // dropdown content`)
+          L.push(`${indent}}, ${JSON.stringify(cfg)})`)
+          break
+        }
+        case 'waitinput':
+          L.push(`${indent}this.WaitInput(id, ${JSON.stringify({
+            path: it.path || '',
+            props: it.props || {},
+            question: it.question || ''
+          })})`)
+          break
+        case 'alert':
+          L.push(`${indent}this.Alert(id, ${JSON.stringify(it.text || '')}, { duration: ${Number(it.duration) || 3000} })`)
+          break
+        case 'gotonow':
+          L.push(`${indent}this.GotoNow(id, ${JSON.stringify(it.path || '')}, { props: ${JSON.stringify(it.props || {})} })`)
+          break
+        case 'setpage':
+          L.push(`${indent}this.SetPage(id, ${JSON.stringify(it.page || '')})`)
+          break
+        case 'file':
+          L.push(`${indent}await this.File(id, ${JSON.stringify(it.config || {})})`)
+          break
+        case 'json':
+          L.push(`${indent}await this.JSON(id, ${JSON.stringify(it.config || {})})`)
+          break
+        case 'route': {
+          const m = it.method || 'Get'
+          L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
+          L.push(`${indent}  ${(it.handler || '').replace(/\n/g, '\n' + indent + '  ')}`)
+          L.push(`${indent}})`)
+          break
+        }
         case 'code':
           L.push(`${indent}${(it.value || '').replace(/\n/g, '\n' + indent)}`)
           break
+        default:
+          L.push(`${indent}// [unknown item type: ${it.type}]`)
       }
     }
   }
@@ -10237,12 +10285,127 @@ let __BUILDER_EXPORT_TARGET = null
 
 const AsyncFunction = Object.getPrototypeOf(async function () { }).constructor
 
+// ============================================================
+// SELF BUILDER — method discovery, defaults and item factories
+// ============================================================
+
+/**
+ * Methods that are ALWAYS excluded from the "+New" list because they don't
+ * make sense as standalone building blocks. The user-hidden list is layered
+ * on top of this via `state.hiddenMethods`, so any SyAPP_Func method not in
+ * this list is visible by default and can be toggled off via ⚙ Methods.
+ */
+const _SB_DEFAULT_NEW_BLACKLIST = [
+  'Build', 'DiscoverRoutes', 'ProcessAlerts',
+  'WaitLog', 'SetAlertConfig', 'RemoveAlert', 'ClearAlerts',
+  'OnFunctionFirstEnter', 'OnFunctionEnter', 'OnFunctionLeave', 'OnFunctionFirstLeave',
+  'OnSessionEnter', 'OnSessionEveryEnter', 'OnSessionLeave', 'OnSessionFirstLeave',
+  'OnPageEnter', 'OnPageEveryEnter', 'OnPageLeave', 'OnPageFirstLeave',
+  'LockPage', 'UnlockPage', 'IsPageLocked',
+  'Storages', 'Admin', 'TextColor',
+  'DropDownManager', 'FileManager', 'Pagination'
+]
+
+/**
+ * Map a SyAPP_Func method name to a builder item type. Methods not present
+ * here become generic `code` items whose body is a template call.
+ */
+const _SB_METHOD_TO_ITEMTYPE = {
+  Text: 'text',
+  Button: 'button',
+  SideButton: 'button',
+  Field: 'field',
+  Page: 'page',
+  DropDown: 'dropdown',
+  WaitInput: 'waitinput',
+  Alert: 'alert',
+  AlertButton: 'button',
+  GotoNow: 'gotonow',
+  SetPage: 'setpage',
+  File: 'file',
+  JSON: 'json',
+  Get: 'route',
+  Post: 'route',
+  Put: 'route',
+  Delete: 'route'
+}
+
+/**
+ * Build a fresh item payload for the given SyAPP_Func method name.
+ * @param {string} methodName
+ * @param {string} id - unique item id
+ * @returns {object} item payload
+ */
+function _sbMakeItemForMethod(methodName, id) {
+  const t = _SB_METHOD_TO_ITEMTYPE[methodName] || 'code'
+  const base = { id, type: t, sourceMethod: methodName }
+  switch (t) {
+    case 'text':
+      return { ...base, value: 'New text' }
+    case 'button':
+      return {
+        ...base,
+        name: methodName === 'SideButton' ? 'Side Button'
+            : methodName === 'AlertButton' ? 'Alert Button'
+            : 'Button',
+        props: {},
+        buttons: methodName === 'SideButton'
+      }
+    case 'field':
+      return { ...base, name: 'field_' + id, label: 'Label', initialValue: '' }
+    case 'page':
+      return { ...base, name: 'page_' + id, items: [] }
+    case 'dropdown':
+      return { ...base, name: 'dropdown_' + id, up_buttontext: 'Show more', down_buttontext: 'Hide' }
+    case 'waitinput':
+      return { ...base, path: '', props: {}, question: 'Type: ' }
+    case 'alert':
+      return { ...base, text: 'Alert text', duration: 3000 }
+    case 'gotonow':
+      return { ...base, path: '', props: {} }
+    case 'setpage':
+      return { ...base, page: '' }
+    case 'file':
+      return { ...base, config: {} }
+    case 'json':
+      return { ...base, config: {} }
+    case 'route':
+      return { ...base, method: methodName, path: '/', handler: '// handler code' }
+    case 'code':
+    default:
+      return { ...base, value: `// this.${methodName}(id, ...)` }
+  }
+}
+
+/**
+ * Enumerate all "constructive" methods exposed by SyAPP_Func instances
+ * (functions assigned to `this.X = ...` inside the constructor). Cached
+ * after the first call because the set is static.
+ * @returns {Array<string>}
+ */
+let __SB_METHOD_CACHE = null
+function _sbDiscoverMethods() {
+  if (__SB_METHOD_CACHE) return __SB_METHOD_CACHE
+  const probe = new SyAPP_Func('__sb_probe__')
+  const found = []
+  for (const key of Object.getOwnPropertyNames(probe)) {
+    if (key.startsWith('_')) continue
+    let v
+    try { v = probe[key] } catch (_) { continue }
+    if (typeof v === 'function') found.push(key)
+  }
+  __SB_METHOD_CACHE = found.sort()
+  return __SB_METHOD_CACHE
+}
+
 class SelfBuilder extends SyAPP_Func {
   constructor() {
     super('__selfbuilder__', async (props) => { await this._renderSelf(props) }, { refreshMode: false })
-    this.State = __BUILDER_INITIAL_STATE
+    const initial = __BUILDER_INITIAL_STATE
       ? JSON.parse(JSON.stringify(__BUILDER_INITIAL_STATE))
       : { name: 'untitled', funcName: 'MyApp', code: '', items: [] }
+    if (!Array.isArray(initial.hiddenMethods)) initial.hiddenMethods = []
+    this.State = initial
     this.Editing = true
     this.EditItemId = null
     this.ExportTarget = __BUILDER_EXPORT_TARGET
@@ -10265,6 +10428,30 @@ class SelfBuilder extends SyAPP_Func {
     return null
   }
 
+  _findItemByName(name, items) {
+    items = items || this.State.items
+    for (const it of items) {
+      if (it.type === 'page' && it.name === name) return it
+      if (it.type === 'page' && it.items) {
+        const f = this._findItemByName(name, it.items)
+        if (f) return f
+      }
+    }
+    return null
+  }
+
+  _getHiddenSet() {
+    const hidden = new Set(_SB_DEFAULT_NEW_BLACKLIST)
+    for (const m of (this.State.hiddenMethods || [])) hidden.add(m)
+    return hidden
+  }
+
+  _getVisibleNewMethods() {
+    const all = _sbDiscoverMethods()
+    const hidden = this._getHiddenSet()
+    return all.filter(m => !hidden.has(m))
+  }
+
   _processActions(id, props) {
     const S = this.State
     const p = props || {}
@@ -10276,7 +10463,21 @@ class SelfBuilder extends SyAPP_Func {
     if (p.inputValue !== undefined) {
       if (this._pendingEdit) {
         const it = this._findItem(this._pendingEdit.itemId)
-        if (it) it[this._pendingEdit.prop] = String(p.inputValue)
+        if (it) {
+          const kind = this._pendingEdit.kind || 'string'
+          const prop = this._pendingEdit.prop
+          let v = p.inputValue
+          if (kind === 'json') {
+            try { v = typeof v === 'string' ? JSON.parse(v) : v }
+            catch (_) { this.Alert(id, '❌ Invalid JSON', { duration: 2500 }); v = it[prop] }
+          } else if (kind === 'number') {
+            const n = Number(v)
+            v = isNaN(n) ? 0 : n
+          } else {
+            v = String(v)
+          }
+          it[prop] = v
+        }
         this._pendingEdit = null
       } else if (this._pendingAction === 'save') {
         const name = String(p.inputValue).trim()
@@ -10313,6 +10514,7 @@ class SelfBuilder extends SyAPP_Func {
         if (name) {
           const loaded = _loadSaveState(name)
           if (loaded) {
+            if (!Array.isArray(loaded.hiddenMethods)) loaded.hiddenMethods = []
             this.State = loaded
             this.EditItemId = null
             this.Alert(id, `📂 Loaded "${name}"`, { duration: 2500 })
@@ -10341,38 +10543,118 @@ class SelfBuilder extends SyAPP_Func {
       this.Storages.Set(id, 'sb_new_open', !cur)
     }
 
+    if (p.__toggleMethods) {
+      const cur = this.Storages.Get(id, 'sb_methods_open') || false
+      this.Storages.Set(id, 'sb_methods_open', !cur)
+    }
+
+    if (p.__newPagePrev) {
+      const st = this.Storages.Get(id, 'sb_new_page') || { page: 1 }
+      st.page = Math.max(1, (st.page || 1) - 1)
+      this.Storages.Set(id, 'sb_new_page', st)
+    }
+    if (p.__newPageNext) {
+      const st = this.Storages.Get(id, 'sb_new_page') || { page: 1 }
+      st.page = (st.page || 1) + 1
+      this.Storages.Set(id, 'sb_new_page', st)
+    }
+    if (p.__methodsPagePrev) {
+      const st = this.Storages.Get(id, 'sb_methods_page') || { page: 1 }
+      st.page = Math.max(1, (st.page || 1) - 1)
+      this.Storages.Set(id, 'sb_methods_page', st)
+    }
+    if (p.__methodsPageNext) {
+      const st = this.Storages.Get(id, 'sb_methods_page') || { page: 1 }
+      st.page = (st.page || 1) + 1
+      this.Storages.Set(id, 'sb_methods_page', st)
+    }
+
+    if (p.__toggleMethodHidden) {
+      const m = p.__toggleMethodHidden
+      const hidden = Array.isArray(S.hiddenMethods) ? S.hiddenMethods.slice() : []
+      const idx = hidden.indexOf(m)
+      if (idx >= 0) hidden.splice(idx, 1)
+      else hidden.push(m)
+      S.hiddenMethods = hidden
+    }
+
+    if (p.__resetHidden) {
+      S.hiddenMethods = []
+      this.Alert(id, '↺ Method blacklist reset (using defaults)', { duration: 2500 })
+    }
+
     if (p.__add) {
-      const t = p.__add
-      const it = { id: this._nid(), type: t }
-      if (t === 'text') it.value = 'New text'
-      if (t === 'button') { it.name = 'Button'; it.props = {} }
-      if (t === 'field') { it.name = 'field_' + this._nid(); it.label = 'Label'; it.initialValue = '' }
-      if (t === 'page') { it.name = 'page_' + this._nid(); it.items = [] }
-      if (t === 'code') it.value = '// this.Text(id, "hello")'
-      S.items.push(it)
+      const methodName = p.__add
+      const newId = this._nid()
+      const it = _sbMakeItemForMethod(methodName, newId)
+
+      // Nested add: if we are currently inside a page, add the item to that
+      // page's items array. Otherwise add it at the root.
+      if (curPage) {
+        const pageItem = this._findItemByName(curPage)
+        if (pageItem && pageItem.type === 'page') {
+          if (!Array.isArray(pageItem.items)) pageItem.items = []
+          pageItem.items.push(it)
+        } else {
+          S.items.push(it)
+        }
+      } else {
+        S.items.push(it)
+      }
+
       this.EditItemId = it.id
       this.Storages.Set(id, 'sb_new_open', false)
     }
 
+    // Recursive delete across page hierarchy
     if (p.__del) {
-      S.items = S.items.filter(i => i.id !== p.__del)
+      const removeFrom = (arr) => {
+        const idx = arr.findIndex(x => x.id === p.__del)
+        if (idx >= 0) { arr.splice(idx, 1); return true }
+        for (const it of arr) {
+          if (it.type === 'page' && Array.isArray(it.items)) {
+            if (removeFrom(it.items)) return true
+          }
+        }
+        return false
+      }
+      removeFrom(S.items)
       if (this.EditItemId === p.__del) this.EditItemId = null
     }
-    if (p.__up) {
-      const i = S.items.findIndex(x => x.id === p.__up)
-      if (i > 0) { const [x] = S.items.splice(i, 1); S.items.splice(i - 1, 0, x) }
+
+    // Recursive reorder (up/down) across page hierarchy
+    const moveInTree = (arr, targetId, dir) => {
+      const i = arr.findIndex(x => x.id === targetId)
+      if (i >= 0) {
+        if (dir === 'up' && i > 0) { const [x] = arr.splice(i, 1); arr.splice(i - 1, 0, x); return true }
+        if (dir === 'down' && i < arr.length - 1) { const [x] = arr.splice(i, 1); arr.splice(i + 1, 0, x); return true }
+        return false
+      }
+      for (const it of arr) {
+        if (it.type === 'page' && Array.isArray(it.items)) {
+          if (moveInTree(it.items, targetId, dir)) return true
+        }
+      }
+      return false
     }
-    if (p.__down) {
-      const i = S.items.findIndex(x => x.id === p.__down)
-      if (i >= 0 && i < S.items.length - 1) { const [x] = S.items.splice(i, 1); S.items.splice(i + 1, 0, x) }
-    }
+    if (p.__up)   moveInTree(S.items, p.__up, 'up')
+    if (p.__down) moveInTree(S.items, p.__down, 'down')
 
     if (p.__editItem !== undefined) this.EditItemId = p.__editItem || null
 
+    if (p.__toggleProp) {
+      const [iid, prop] = String(p.__toggleProp).split('::')
+      const it = this._findItem(iid)
+      if (it) it[prop] = !it[prop]
+    }
+
     if (p.__editProp) {
-      const [iid, prop] = String(p.__editProp).split('::')
-      this._pendingEdit = { itemId: iid, prop }
-      this.WaitInput(id, { question: `Edit ${prop}: `, path: this.Name, props: passProps })
+      const [iid, prop, kind] = String(p.__editProp).split('::')
+      this._pendingEdit = { itemId: iid, prop, kind: kind || 'string' }
+      const label = kind === 'json' ? `${prop} (JSON)`
+                  : kind === 'number' ? `${prop} (number)`
+                  : prop
+      this.WaitInput(id, { question: `Edit ${label}: `, path: this.Name, props: passProps })
       return
     }
 
@@ -10405,12 +10687,16 @@ class SelfBuilder extends SyAPP_Func {
     if (!curPage) {
       this._renderTopToolbar(id, S)
     } else {
-      // Breadcrumb when inside a page
-      const pageItem = S.items.find(i => i.type === 'page' && i.name === curPage)
+      // Breadcrumb when inside a page + a page-scoped "+New" so that new
+      // items land INSIDE the page (nested add).
+      const newOpen = this.Storages.Get(id, 'sb_new_open') || false
       this.Buttons(id, [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
-        { name: `📄 ${_fit(curPage, 30)}`, pinnedTop: true }
+        { name: `📄 ${_fit(curPage, 30)}`, pinnedTop: true },
+        { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
+          props: { __toggleNew: 1 }, pinnedTop: true }
       ])
+      if (newOpen) this._renderNewMethodsMenu(id)
     }
 
     this.Text(id, _hr('─'), { pinnedTop: true })
@@ -10463,8 +10749,9 @@ class SelfBuilder extends SyAPP_Func {
 
   _renderTopToolbar(id, S) {
     const newOpen = this.Storages.Get(id, 'sb_new_open') || false
+    const methodsOpen = this.Storages.Get(id, 'sb_methods_open') || false
 
-    // Row 1: "+ New" toggle + global actions
+    // Row 1: "+ New" toggle + global actions (pinned top)
     this.Buttons(id, [
       { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
         props: { __toggleNew: 1 }, pinnedTop: true },
@@ -10473,40 +10760,119 @@ class SelfBuilder extends SyAPP_Func {
       { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
       { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
       { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
+      { name: methodsOpen ? ColorText.bold('⚙ Methods ✓') : '⚙ Methods',
+        props: { __toggleMethods: 1 }, pinnedTop: true },
       { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true }
     ])
 
-    // Row 2: app name / class name
+    // Row 2: app name / class name (pinned top)
     this.Buttons(id, [
       { name: `⚙ ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
       { name: `⌘ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
     ])
 
-    // Vertical dropdown: when "+ New" is open, stack each add-option on its
-    // own line. This block renders AFTER the two toolbar rows above, so it
-    // naturally appears under them. Each entry is a full row so it reads as
-    // a real vertical menu dropped down from the "+ New" button.
-    if (newOpen) {
-      this.Text(id, ColorText.dim('  ┌─ New item'), { pinnedTop: true })
+    // Scrollable "+New" and "⚙ Methods" content. Rendered as paginated
+    // pinned-top blocks so the toolbar footprint stays fixed regardless of
+    // how many methods are enabled.
+    if (newOpen)     this._renderNewMethodsMenu(id)
+    if (methodsOpen) this._renderMethodsConfigMenu(id)
+  }
 
-      const opts = [
-        ['📝  Text',    'text'],
-        ['🔘  Button',  'button'],
-        ['✏️  Field',   'field'],
-        ['📄  Page',    'page'],
-        ['💻  Code',    'code'],
-        ['⬜  Spacer',  'spacer']
-      ]
-      for (let i = 0; i < opts.length; i++) {
-        const [label, kind] = opts[i]
-        const prefix = (i === opts.length - 1) ? '  └─ ' : '  ├─ '
-        this.Button(id, {
-          name: ColorText.dim(prefix) + label,
-          props: { __add: kind },
-          pinnedTop: true
-        })
-      }
+  /**
+   * Render the "+New" menu, driven by the visible SyAPP_Func methods.
+   * Uses pagination so the block occupies a fixed vertical footprint no
+   * matter how many methods are enabled — this is what makes it
+   * "scrollable in the same size" as the user requested.
+   */
+  _renderNewMethodsMenu(id) {
+    const methods = this._getVisibleNewMethods()
+    const perPage = 6
+    const totalPages = Math.max(1, Math.ceil(methods.length / perPage))
+    const st = this.Storages.Get(id, 'sb_new_page') || { page: 1 }
+    const cur = Math.min(Math.max(1, st.page || 1), totalPages)
+    const start = (cur - 1) * perPage
+    const end = Math.min(start + perPage, methods.length)
+    const shown = methods.slice(start, end)
+
+    this.Text(id, ColorText.brightCyan(
+      `  ┌─ New item (${cur}/${totalPages})  •  ${methods.length} available`
+    ), { pinnedTop: true })
+
+    for (let i = 0; i < shown.length; i++) {
+      const m = shown[i]
+      const prefix = (i === shown.length - 1) ? '  └─ ' : '  ├─ '
+      this.Button(id, {
+        name: ColorText.dim(prefix) + `➕ ${m}`,
+        props: { __add: m },
+        pinnedTop: true
+      })
     }
+
+    if (methods.length === 0) {
+      this.Text(id, ColorText.dim('     (no methods enabled — open ⚙ Methods)'), { pinnedTop: true })
+    }
+
+    if (totalPages > 1) {
+      this.Buttons(id, [
+        { name: cur > 1 ? ColorText.cyan('◀ Prev') : ColorText.dim('◀ Prev'),
+          props: cur > 1 ? { __newPagePrev: 1 } : {}, pinnedTop: true },
+        { name: ColorText.dim(`  ${cur} / ${totalPages}  `),
+          props: {}, pinnedTop: true },
+        { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
+          props: cur < totalPages ? { __newPageNext: 1 } : {}, pinnedTop: true }
+      ])
+    }
+  }
+
+  /**
+   * Render the ⚙ Methods config menu. Lists every discovered SyAPP_Func
+   * method as a toggle so the user can hide/show each one. The default
+   * blacklist is always applied on top (and cannot be re-enabled here).
+   */
+  _renderMethodsConfigMenu(id) {
+    const all = _sbDiscoverMethods()
+    const hiddenSet = this._getHiddenSet()
+    const perPage = 6
+    const totalPages = Math.max(1, Math.ceil(all.length / perPage))
+    const st = this.Storages.Get(id, 'sb_methods_page') || { page: 1 }
+    const cur = Math.min(Math.max(1, st.page || 1), totalPages)
+    const start = (cur - 1) * perPage
+    const end = Math.min(start + perPage, all.length)
+    const shown = all.slice(start, end)
+    const visibleCount = all.filter(m => !hiddenSet.has(m)).length
+
+    this.Text(id, ColorText.brightMagenta(
+      `  ┌─ ⚙ Methods config (${cur}/${totalPages})  •  ${visibleCount}/${all.length} visible`
+    ), { pinnedTop: true })
+
+    for (let i = 0; i < shown.length; i++) {
+      const m = shown[i]
+      const hidden = hiddenSet.has(m)
+      const isDefaultHidden = _SB_DEFAULT_NEW_BLACKLIST.includes(m)
+      const prefix = (i === shown.length - 1) ? '  └─ ' : '  ├─ '
+      const mark = hidden ? ColorText.red('✗') : ColorText.green('✓')
+      const tag = isDefaultHidden ? ColorText.dim(' [default-off]') : ''
+      this.Button(id, {
+        name: ColorText.dim(prefix) + mark + ' ' + m + tag,
+        props: { __toggleMethodHidden: m },
+        pinnedTop: true
+      })
+    }
+
+    if (totalPages > 1) {
+      this.Buttons(id, [
+        { name: cur > 1 ? ColorText.cyan('◀ Prev') : ColorText.dim('◀ Prev'),
+          props: cur > 1 ? { __methodsPagePrev: 1 } : {}, pinnedTop: true },
+        { name: ColorText.dim(`  ${cur} / ${totalPages}  `),
+          props: {}, pinnedTop: true },
+        { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
+          props: cur < totalPages ? { __methodsPageNext: 1 } : {}, pinnedTop: true }
+      ])
+    }
+    this.Buttons(id, [
+      { name: ColorText.yellow('↺ Reset hidden'),
+        props: { __resetHidden: 1 }, pinnedTop: true }
+    ])
   }
 
   async _renderItems(id, items, props) {
@@ -10534,19 +10900,59 @@ class SelfBuilder extends SyAPP_Func {
           this.Text(id, '')
           break
         case 'button':
-          this.Button(id, { name: it.name || '', props: it.props || {} })
+          this.Button(id, {
+            name: it.name || '',
+            props: it.props || {},
+            path: it.path,
+            resetSelection: it.resetSelection,
+            jumpTo: it.jumpTo,
+            pinned: it.pinned,
+            pinnedTop: it.pinnedTop
+          })
           break
         case 'field':
-          this.Field(id, it.name, { label: it.label || '', initialValue: it.initialValue || '' })
+          this.Field(id, it.name, {
+            label: it.label || '',
+            initialValue: it.initialValue || '',
+            pinned: it.pinned,
+            pinnedTop: it.pinnedTop
+          })
           break
         case 'page':
           if (this.Editing) {
+            // In edit mode, a page renders as a navigable button so the
+            // user can step into it and add nested items.
             this.Button(id, { name: `📄 ${it.name}`, props: { page: it.name } })
           } else {
             await this.Page(id, it.name, async () => {
               await this._renderItems(id, it.items || [], props)
             })
           }
+          break
+        case 'dropdown':
+          // Preview only in editor; export emits the real DropDown call.
+          this.Button(id, { name: `▼ ${it.name}`, props: {} })
+          break
+        case 'waitinput':
+          this.Button(id, { name: `⏳ WaitInput: ${it.question || ''}`, props: {} })
+          break
+        case 'alert':
+          this.Text(id, ColorText.brightYellow(`⚠ ${it.text || ''}`))
+          break
+        case 'gotonow':
+          this.Button(id, { name: `→ GotoNow: ${it.path || '?'}`, props: {} })
+          break
+        case 'setpage':
+          this.Button(id, { name: `📄 SetPage: ${it.page || '?'}`, props: {} })
+          break
+        case 'file':
+          this.Button(id, { name: `📁 File`, props: {} })
+          break
+        case 'json':
+          this.Button(id, { name: `🔍 JSON`, props: {} })
+          break
+        case 'route':
+          this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
           break
         case 'code':
           try {
@@ -10556,6 +10962,8 @@ class SelfBuilder extends SyAPP_Func {
             this.Text(id, ColorText.red(`[code error] ${e.message}`))
           }
           break
+        default:
+          this.Text(id, ColorText.dim(`[unknown item type: ${it.type}]`))
       }
     } catch (e) {
       this.Text(id, ColorText.red(`[render error] ${e.message}`))
@@ -10567,33 +10975,132 @@ class SelfBuilder extends SyAPP_Func {
     this.Text(id, ' ' + ColorText.brightYellow(`▸ Editing [${it.type}]`) +
                      ColorText.dim(` (${it.id.slice(-6)})`), { pinned: true })
 
-    // Editable property fields — rendered as a horizontal row
-    const fields = []
-    if (it.type === 'text')   fields.push(['value', 'Text'])
-    if (it.type === 'button') fields.push(['name', 'Name'])
-    if (it.type === 'field')  fields.push(['name', 'Name'], ['label', 'Label'], ['initialValue', 'Value'])
-    if (it.type === 'page')   fields.push(['name', 'Page Name'])
-    if (it.type === 'code')   fields.push(['value', 'Code'])
+    // ---- Editable properties --------------------------------------------
+    // Every property is now editable: strings via WaitInput, numbers via
+    // WaitInput with numeric coercion, objects/arrays via JSON WaitInput,
+    // booleans via one-click toggles.
+    const propButtons = []
 
-    if (fields.length > 0) {
-      const fieldButtons = fields.map(([prop, label]) => {
-        const preview = _fit(String(it[prop] || '') || '(empty)', 32)
-        return {
-          name: `✎ ${label}: ${preview}`,
-          props: { __editProp: `${it.id}::${prop}` },
-          pinned: true
-        }
+    const mkProp = (prop, label, kind = 'string') => {
+      const raw = it[prop]
+      let preview
+      if (kind === 'json') {
+        try { preview = JSON.stringify(raw == null ? {} : raw) } catch (_) { preview = '{}' }
+      } else if (kind === 'bool') {
+        preview = raw ? 'true' : 'false'
+      } else {
+        preview = String(raw == null ? '' : raw)
+      }
+      preview = _fit(preview, 28) || '(empty)'
+      propButtons.push({
+        name: `✎ ${label}: ${preview}`,
+        props: { __editProp: `${it.id}::${prop}::${kind}` },
+        pinned: true
       })
-      this.Buttons(id, fieldButtons)
     }
 
-    // Action buttons — reorder / delete / close editor
-    this.Buttons(id, [
-      { name: '↑ Up',   props: { __up: it.id },               pinned: true },
-      { name: '↓ Down', props: { __down: it.id },             pinned: true },
-      { name: ColorText.red('× Delete'), props: { __del: it.id },   pinned: true },
-      { name: ColorText.green('✓ Done'), props: { __editItem: '' }, pinned: true }
-    ])
+    const mkToggle = (prop, label) => {
+      const on = !!it[prop]
+      propButtons.push({
+        name: `${on ? ColorText.green('✓') : ColorText.dim('○')} ${label}`,
+        props: { __toggleProp: `${it.id}::${prop}` },
+        pinned: true
+      })
+    }
+
+    switch (it.type) {
+      case 'text':
+        mkProp('value', 'Text', 'string')
+        break
+
+      case 'button':
+        mkProp('name', 'Name', 'string')
+        mkProp('path', 'Path', 'string')
+        mkProp('props', 'Props', 'json')
+        mkProp('jumpTo', 'JumpTo', 'number')
+        mkToggle('resetSelection', 'Reset Sel')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
+        break
+
+      case 'field':
+        mkProp('name', 'Name', 'string')
+        mkProp('label', 'Label', 'string')
+        mkProp('initialValue', 'Initial', 'string')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
+        break
+
+      case 'page':
+        mkProp('name', 'Page Name', 'string')
+        break
+
+      case 'dropdown':
+        mkProp('name', 'Name', 'string')
+        mkProp('up_buttontext', 'Up Button', 'string')
+        mkProp('down_buttontext', 'Down Button', 'string')
+        break
+
+      case 'waitinput':
+        mkProp('path', 'Path', 'string')
+        mkProp('question', 'Question', 'string')
+        mkProp('props', 'Props', 'json')
+        break
+
+      case 'alert':
+        mkProp('text', 'Text', 'string')
+        mkProp('duration', 'Duration', 'number')
+        break
+
+      case 'gotonow':
+        mkProp('path', 'Path', 'string')
+        mkProp('props', 'Props', 'json')
+        break
+
+      case 'setpage':
+        mkProp('page', 'Page', 'string')
+        break
+
+      case 'file':
+        mkProp('config', 'Config', 'json')
+        break
+
+      case 'json':
+        mkProp('config', 'Config', 'json')
+        break
+
+      case 'route':
+        mkProp('path', 'Path', 'string')
+        mkProp('handler', 'Handler', 'string')
+        break
+
+      case 'code':
+        mkProp('value', 'Code', 'string')
+        break
+    }
+
+    if (propButtons.length > 0) this.Buttons(id, propButtons)
+
+    // ---- Actions --------------------------------------------------------
+    const actions = [
+      { name: '↑ Up',   props: { __up: it.id },   pinned: true },
+      { name: '↓ Down', props: { __down: it.id }, pinned: true }
+    ]
+
+    // "Add child" shortcut: pages get a direct jump into themselves so
+    // the user can add nested items right from the editor.
+    if (it.type === 'page') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: it.name },
+        pinned: true
+      })
+    }
+
+    actions.push({ name: ColorText.red('× Delete'),    props: { __del: it.id },      pinned: true })
+    actions.push({ name: ColorText.green('✓ Done'),    props: { __editItem: '' },    pinned: true })
+
+    this.Buttons(id, actions)
   }
 }
 
