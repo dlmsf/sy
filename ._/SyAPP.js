@@ -8389,6 +8389,257 @@ function levenshteinDistance(str1, str2) {
         this.Builds.get(id).Buttons.push(fieldObj);
     };
 
+    // --------------------------- Args Method ---------------------------
+
+    /**
+     * Process command-line arguments for this function.
+     *
+     * Arguments are captured from the original process launch:
+     *   `node SyAPP.js MyFunc.js [arg1] [arg2] ...`
+     * — everything after the target file becomes the positional args array.
+     *
+     * The handler is called with a SINGLE argument: the `args` array. When
+     * a schema (`config.required`) is provided, positional CLI args are
+     * mapped onto the schema by order, and any missing required values
+     * trigger an interactive form (using `this.Field`) so the user can
+     * fill them in. In the form, each `Field` label defaults to the
+     * schema entry's `label` (or `name`).
+     *
+     * The handler runs ONLY when args have actually been resolved on this
+     * render — never on a plain refresh tick. With `everyTime: false`
+     * (default) the handler fires exactly once per args key; with
+     * `everyTime: true` it fires on every entrance.
+     *
+     * @param {string} id - User/build ID
+     * @param {Function} handler - async (args) => {} — receives the args array
+     * @param {Object} [config] - Configuration
+     * @param {Array<{
+     *   name: string,
+     *   label?: string,
+     *   required?: boolean,
+     *   defaultValue?: *,
+     *   validate?: (value: *) => (boolean|string|undefined|Promise<boolean|string|undefined>)
+     * }>} [config.required=[]] - Named arg schema (order = positional order)
+     * @param {boolean} [config.everyTime=false] - If true, re-process on every entrance;
+     *                                              else only on the first entrance
+     * @param {boolean} [config.form=true] - Show the interactive form when required args
+     *                                       are missing
+     * @param {string} [config.description] - Text shown above the form
+     * @param {string} [config.key='default'] - Unique key when the same func uses
+     *                                          multiple Args() blocks
+     * @returns {Promise<void>}
+     */
+    this.Args = async (id, handler, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Args() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`this.Args() Error - handler must be a function | BuildID: ${id}`);
+        return;
+      }
+
+      const opts = {
+        required: [],
+        everyTime: false,
+        form: true,
+        description: 'Please provide the required arguments:',
+        key: 'default',
+        ...config
+      };
+
+      const stateKey   = `__args_state_${this.Name}_${opts.key}`;
+      const submitKey  = `__args_submit_${this.Name}_${opts.key}`;
+      const fieldPrefix = `__args_field_${this.Name}_${opts.key}_`;
+
+      const build = this.Builds.get(id);
+      const curProps = (build && build.Session && build.Session.ActualProps) || {};
+
+      let state = this.Storages.Get(id, stateKey);
+      if (!state || typeof state !== 'object') state = { processed: false, values: {} };
+      if (!state.values || typeof state.values !== 'object') state.values = {};
+
+      // ------------------------------------------------------------------
+      // RAW CLI ARGS — captured once by SyAPP at launch
+      // ------------------------------------------------------------------
+      const syapp = this._syappInstance;
+      const cliArgs = (syapp && Array.isArray(syapp._processArgs))
+        ? syapp._processArgs
+        : [];
+
+      // ------------------------------------------------------------------
+      // ROUTE DISCOVERY MODE — never show a form, just hand the handler
+      // whatever we have from the CLI (or schema defaults).
+      // ------------------------------------------------------------------
+      if (curProps._routeDiscovery) {
+        const args = [];
+        for (let i = 0; i < opts.required.length; i++) {
+          const spec = opts.required[i];
+          if (!spec || !spec.name) continue;
+          const v = cliArgs[i] !== undefined ? cliArgs[i] : spec.defaultValue;
+          args.push(v);
+          if (!(spec.name in args)) args[spec.name] = v;
+        }
+        for (let i = opts.required.length; i < cliArgs.length; i++) args.push(cliArgs[i]);
+        try { await handler(args); } catch (e) { if (this.Log) console.error(`Args discovery error in ${this.Name}:`, e); }
+        return;
+      }
+
+      // ------------------------------------------------------------------
+      // FORM SUBMISSION — the user just clicked "Submit Args".
+      // Collect every Field value, validate, and commit to state.
+      // ------------------------------------------------------------------
+      let formJustSubmitted = false;
+      if (curProps[submitKey]) {
+        delete curProps[submitKey];
+
+        const newValues = { ...state.values };
+        let allValid = true;
+
+        for (const spec of opts.required) {
+          if (!spec || !spec.name) continue;
+          const fieldStorageKey = `field_${fieldPrefix}${spec.name}`;
+          let v = this.Storages.Get(id, fieldStorageKey);
+
+          if (v === undefined || v === '') {
+            if (spec.defaultValue !== undefined) v = spec.defaultValue;
+            else if (spec.required !== false) {
+              this.Alert(id, `Field "${spec.label || spec.name}" is required`, { duration: 3000 });
+              allValid = false;
+              break;
+            }
+          }
+
+          if (allValid && typeof spec.validate === 'function') {
+            try {
+              const check = await spec.validate(v);
+              if (check !== true && check !== undefined) {
+                this.Alert(id,
+                  typeof check === 'string' ? check : `Invalid value for "${spec.name}"`,
+                  { duration: 3000 });
+                allValid = false;
+                break;
+              }
+            } catch (err) {
+              this.Alert(id, `Validation error for "${spec.name}": ${err.message}`, { duration: 3000 });
+              allValid = false;
+              break;
+            }
+          }
+
+          newValues[spec.name] = v;
+        }
+
+        if (allValid) {
+          state.values = newValues;
+          state.processed = true;
+          this.Storages.Set(id, stateKey, state);
+
+          // Clean up transient form fields so they don't linger
+          for (const spec of opts.required) {
+            if (!spec || !spec.name) continue;
+            this.Storages.Delete(id, `field_${fieldPrefix}${spec.name}`);
+          }
+          formJustSubmitted = true;
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // MAPPING + FORM DECISION
+      // Process on the first entrance (default) OR on every entrance
+      // (when opts.everyTime is true).
+      //
+      // IMPORTANT: the handler is ONLY invoked when we actually processed
+      // args on this render. With everyTime:false and state.processed:true
+      // (i.e. the args were already settled), we return WITHOUT calling
+      // the handler — otherwise the handler runs on every refresh tick.
+      // ------------------------------------------------------------------
+      const shouldProcess = opts.everyTime || !state.processed;
+
+      // Case A — already processed and not everyTime: just skip silently.
+      if (!shouldProcess && !formJustSubmitted) {
+        return;
+      }
+
+      // Case B — form was just submitted on this render: fall through
+      // and call the handler with the freshly validated values.
+
+      // Case C — first entrance (or everyTime): attempt to resolve args.
+      if (shouldProcess && !formJustSubmitted) {
+        const values = { ...state.values };
+
+        // Positional CLI args → schema (only fill when not already set)
+        for (let i = 0; i < opts.required.length; i++) {
+          const spec = opts.required[i];
+          if (!spec || !spec.name) continue;
+          if (values[spec.name] === undefined || values[spec.name] === '') {
+            if (cliArgs[i] !== undefined) values[spec.name] = cliArgs[i];
+            else if (spec.defaultValue !== undefined) values[spec.name] = spec.defaultValue;
+          }
+        }
+        state.values = values;
+
+        const missing = opts.required.filter(spec => {
+          if (!spec || !spec.name) return false;
+          if (spec.required === false) return false;
+          const v = values[spec.name];
+          return v === undefined || v === null || v === '';
+        });
+
+        if (missing.length > 0 && opts.form) {
+          // ---------- Render the interactive args form ----------
+          this.Text(id, opts.description || 'Please provide the required arguments:');
+
+          for (const spec of opts.required) {
+            if (!spec || !spec.name) continue;
+            const fieldName = `${fieldPrefix}${spec.name}`;
+            const currentVal = values[spec.name] !== undefined ? String(values[spec.name]) : '';
+            this.Field(id, fieldName, {
+              label: spec.label || spec.name,
+              initialValue: currentVal
+            });
+          }
+
+          this.Button(id, {
+            name: ColorText.green('✓ Submit Args'),
+            props: { [submitKey]: true }
+          });
+
+          this.Storages.Set(id, stateKey, state);
+          return; // wait for user to submit
+        }
+
+        state.processed = true;
+        this.Storages.Set(id, stateKey, state);
+      }
+
+      // ------------------------------------------------------------------
+      // BUILD THE FINAL ARGS ARRAY AND CALL THE HANDLER
+      //   • Schema order first
+      //   • Then any extra positional CLI args beyond the schema
+      //   • Named access: `args.filename` works alongside `args[0]`
+      // ------------------------------------------------------------------
+      const values = state.values || {};
+      const args = [];
+
+      for (const spec of opts.required) {
+        if (!spec || !spec.name) continue;
+        const v = values[spec.name];
+        args.push(v);
+        if (!(spec.name in args)) args[spec.name] = v;
+      }
+      for (let i = opts.required.length; i < cliArgs.length; i++) {
+        args.push(cliArgs[i]);
+      }
+
+      try {
+        await handler(args);
+      } catch (e) {
+        if (this.Log) console.error(`Args handler error in ${this.Name}:`, e);
+        throw e;
+      }
+    };
+
     // --------------------------- Build Method ---------------------------
 
     this.Build = async (props = { session: new Session }) => {
@@ -9207,6 +9458,24 @@ this.HUD = new TerminalHUD({
 
     // Store global refresh mode setting
     this.GlobalRefreshMode = userConfig.RefreshMode !== false; // true by default if not set to false
+
+    /**
+     * Command-line arguments passed after the target file.
+     *
+     * Example: `node SyAPP.js MyFunc.js arg1 arg2`
+     *   → process.argv = ['node', 'SyAPP.js', 'MyFunc.js', 'arg1', 'arg2']
+     *   → this._processArgs = ['arg1', 'arg2']
+     *
+     * Can be overridden by passing `processArgs: [...]` in the SyAPP config,
+     * which is useful when the app is launched programmatically.
+     *
+     * These arguments are consumed by `this.Args()` inside any SyAPP_Func.
+     *
+     * @type {Array<string>}
+     */
+    this._processArgs = Array.isArray(userConfig.processArgs)
+      ? userConfig.processArgs.slice()
+      : process.argv.slice(3);
 
     // Per-function refreshers storage
     this._perFunctionRefreshers = new Map();
@@ -10303,6 +10572,19 @@ function _genFuncJS(state, syappRelPath) {
         case 'json':
           L.push(`${indent}await this.JSON(id, ${JSON.stringify(it.config || {})})`)
           break
+        case 'args': {
+          const cfg = {
+            required: it.schema || [],
+            everyTime: !!it.everyTime,
+            form: it.form !== false,
+            key: it.key || it.id
+          }
+          if (it.description) cfg.description = it.description
+          L.push(`${indent}await this.Args(id, async (args) => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'route': {
           const m = it.method || 'Get'
           L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
@@ -10374,6 +10656,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   SetPage: 'setpage',
   File: 'file',
   JSON: 'json',
+  Args: 'args',
   Get: 'route',
   Post: 'route',
   Put: 'route',
@@ -10419,6 +10702,19 @@ function _sbMakeItemForMethod(methodName, id) {
       return { ...base, config: {} }
     case 'json':
       return { ...base, config: {} }
+    case 'args':
+      // Args container: own schema + everyTime/form flags + nested children
+      // (the handler body). `key` is stable across re-renders so the
+      // captured state survives refreshes.
+      return {
+        ...base,
+        everyTime: false,
+        form: true,
+        description: '',
+        key: id,
+        schema: [],
+        items: []
+      }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
     case 'code':
@@ -10574,7 +10870,7 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.id === id) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock') &&
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' || it.type === 'args') &&
           Array.isArray(it.items)) {
         const f = this._findItem(id, it.items)
         if (f) return f
@@ -10587,7 +10883,7 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.type === 'page' && it.name === name) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock') &&
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' || it.type === 'args') &&
           Array.isArray(it.items)) {
         const f = this._findItemByName(name, it.items)
         if (f) return f
@@ -10620,6 +10916,14 @@ class SelfBuilder extends SyAPP_Func {
       if (item && item.type === 'codeblock') {
         if (!Array.isArray(item.items)) item.items = []
         return { kind: 'codeblock', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sba__:')) {
+      const id = pageName.slice(8)
+      const item = this._findItem(id)
+      if (item && item.type === 'args') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'args', item, items: item.items }
       }
     }
     const pageItem = S.items.find(i => i.type === 'page' && i.name === pageName)
@@ -10983,7 +11287,9 @@ class SelfBuilder extends SyAPP_Func {
           ? `▼ ${_fit(container.item.name, 30)}`
           : container.kind === 'codeblock'
             ? `{} ${_fit(this._codeblockLabel(container.item), 30)}`
-            : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
+            : container.kind === 'args'
+              ? `⚡ Args (args: [ ... ])`
+              : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
       this.Buttons(id, [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
         { name: label, pinnedTop: true },
@@ -11045,6 +11351,7 @@ class SelfBuilder extends SyAPP_Func {
       if (container.kind === 'page')            lbl = `📄 ${container.item.name}`
       else if (container.kind === 'dropdown')   lbl = `▼ ${container.item.name}`
       else if (container.kind === 'codeblock')  lbl = `{} ${this._codeblockLabel(container.item)}`
+      else if (container.kind === 'args')       lbl = `⚡ Args (args: [ ... ])`
       else                                       lbl = `? ${curPage}`
       ctx = ColorText.dim(` | ${_fit(lbl, 40)}`)
     }
@@ -11263,7 +11570,7 @@ class SelfBuilder extends SyAPP_Func {
     if (this.Editing) {
       const isActive = this.EditItemId === it.id
       const navigable = (it.type === 'button' || it.type === 'dropdown' ||
-                         it.type === 'page' || it.type === 'codeblock')
+                         it.type === 'page' || it.type === 'codeblock' || it.type === 'args')
       const dot = isActive
         ? ColorText.brightYellow('◉')
         : navigable ? ColorText.green('○') : ColorText.dim('○')
@@ -11366,6 +11673,30 @@ class SelfBuilder extends SyAPP_Func {
           break
         case 'json':
           this.Button(id, { name: `🔍 JSON`, props: {} })
+          break
+        case 'args':
+          // Args container: behaves like a page in edit mode (click to
+          // step inside and add/modify its children) and executes the
+          // real this.Args(...) call in view mode, rendering every nested
+          // child as the body of the args handler.
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            const schemaLen = Array.isArray(it.schema) ? it.schema.length : 0
+            this.Button(id, {
+              name: `${ColorText.brightGreen('⚡')} Args (args)${schemaLen ? ColorText.dim(` [${schemaLen} schema]`) : ''}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sba__:${it.id}` }
+            })
+          } else {
+            await this.Args(id, async (args) => {
+              await this._renderItems(id, it.items || [], props)
+            }, {
+              required: it.schema || [],
+              everyTime: !!it.everyTime,
+              form: it.form !== false,
+              description: it.description || undefined,
+              key: it.key || it.id
+            })
+          }
           break
         case 'route':
           this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
@@ -11632,6 +11963,13 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('config', 'Config', 'json')
         break
 
+      case 'args':
+        mkProp('description', 'Description', 'string')
+        mkProp('schema', 'Schema (JSON)', 'json')
+        mkToggle('everyTime', 'Every Time')
+        mkToggle('form', 'Form Fallback')
+        break
+
       case 'route':
         mkProp('path', 'Path', 'string')
         mkProp('handler', 'Handler', 'string')
@@ -11678,6 +12016,12 @@ class SelfBuilder extends SyAPP_Func {
       actions.push({
         name: ColorText.brightCyan('＋ Add child'),
         props: { page: `__sbcb__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'args') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sba__:${it.id}` },
         pinned: true
       })
     }
