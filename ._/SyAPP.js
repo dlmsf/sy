@@ -10645,6 +10645,19 @@ class SelfBuilder extends SyAPP_Func {
     return all.filter(m => !hidden.has(m))
   }
 
+  /**
+   * Number of items to show per page in the "+New" list and in the
+   * Config menu. Persisted inside the builder State (so it survives
+   * saves/loads) and defaults to 4.
+   * @returns {number}
+   */
+  _getItemsPerPage() {
+    const v = this.State && this.State.itemsPerPage
+    return (typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 20)
+      ? Math.floor(v)
+      : 4
+  }
+
   _processActions(id, props) {
     const S = this.State
     const p = props || {}
@@ -10758,6 +10771,12 @@ class SelfBuilder extends SyAPP_Func {
         const v = String(p.inputValue).trim()
         if (v) S.name = v
         this._pendingAction = null
+      } else if (this._pendingAction === 'itemsPerPage') {
+        const v = parseInt(String(p.inputValue).trim(), 10)
+        if (!isNaN(v) && v >= 1 && v <= 20) {
+          S.itemsPerPage = v
+        }
+        this._pendingAction = null
       }
       delete p.inputValue
       return
@@ -10773,6 +10792,22 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__toggleMethods) {
       const cur = this.Storages.Get(id, 'sb_methods_open') || false
       this.Storages.Set(id, 'sb_methods_open', !cur)
+    }
+
+    // Filter toggle for the "+New" list (SyAPP ↔ Javascript).
+    if (p.__setNewFilter) {
+      this.Storages.Set(id, 'sb_new_filter', p.__setNewFilter)
+      this.Storages.Set(id, 'sb_new_page', { page: 1 })
+    }
+
+    // Config menu: edit the number of items per page.
+    if (p.__editConfig) {
+      const prop = p.__editConfig
+      if (prop === 'itemsPerPage') {
+        this._pendingAction = 'itemsPerPage'
+        this.WaitInput(id, { question: 'Items per page (1-20): ', path: this.Name, props: passProps })
+        return
+      }
     }
 
     if (p.__newPagePrev) {
@@ -11012,127 +11047,148 @@ class SelfBuilder extends SyAPP_Func {
       { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
       { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
       { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
-      { name: methodsOpen ? ColorText.bold('⚙ Methods ✓') : '⚙ Methods',
+      { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
         props: { __toggleMethods: 1 }, pinnedTop: true },
       { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true }
     ])
 
-    // Row 2: app name / class name (pinned top)
+    // Row 2: app name / class name (pinned top).
+    // NOTE: 🏷 replaces the previous ⚙ that duplicated the toolbar's
+    // "⚙ Config" emoji.
     this.Buttons(id, [
-      { name: `⚙ ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
-      { name: `⌘ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
+      { name: `🏷 ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
+      { name: `◆ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
     ])
 
-    // Scrollable "+New" and "⚙ Methods" content. Rendered as paginated
-    // pinned-top blocks so the toolbar footprint stays fixed regardless of
-    // how many methods are enabled.
+    // "+New" and "⚙ Config" content. Both are pinned-top blocks between
+    // the two existing separator lines, so opening them does NOT add any
+    // additional separators.
     if (newOpen)     this._renderNewMethodsMenu(id)
-    if (methodsOpen) this._renderMethodsConfigMenu(id)
+    if (methodsOpen) this._renderConfigMenu(id)
   }
 
   /**
-   * Render the "+New" menu.
+   * Render the "+New" menu as ONE paginated options list. The two filter
+   * buttons (SyAPP ↔ Javascript) sit on their OWN row BELOW the options
+   * list, so they never mix with the primary option buttons.
    *
-   * Two sections:
-   *   1. "Methods" — discovered SyAPP_Func methods (paginated)
-   *   2. "JS chains / Custom code" — logic-block templates, rendered
-   *      below the methods so they stand out and remain easily
-   *      discoverable without crowding the primary options.
+   *   • "SyAPP"       → discovered SyAPP_Func methods
+   *   • "Javascript"  → JS chains / custom-code logic-block templates
    *
-   * Uses pagination in each section so the block occupies a fixed
-   * vertical footprint no matter how many methods are enabled.
+   * The number of items per page is driven by the shared config value
+   * (default 4, configurable via ⚙ Config → Items per page).
+   * No section headers are printed — only the toolbar separators that
+   * already surround the pinned-top area.
    */
   _renderNewMethodsMenu(id) {
-    const methods = this._getVisibleNewMethods()
-    const logicBlocks = _SB_LOGIC_BLOCKS
+    const perPage = this._getItemsPerPage()
+    const filter = this.Storages.Get(id, 'sb_new_filter') || 'syapp'
 
-    const perPage = 6
-    const totalPages = Math.max(1, Math.ceil(methods.length / perPage))
+    let entries
+    if (filter === 'js') {
+      entries = _SB_LOGIC_BLOCKS.map(m => ({ kind: 'js', value: m }))
+    } else {
+      entries = this._getVisibleNewMethods().map(m => ({ kind: 'syapp', value: m }))
+    }
+
+    const totalPages = Math.max(1, Math.ceil(entries.length / perPage))
     const st = this.Storages.Get(id, 'sb_new_page') || { page: 1 }
     const cur = Math.min(Math.max(1, st.page || 1), totalPages)
     const start = (cur - 1) * perPage
-    const end = Math.min(start + perPage, methods.length)
-    const shown = methods.slice(start, end)
+    const end = Math.min(start + perPage, entries.length)
+    const shown = entries.slice(start, end)
 
-    // ---------------- Section 1: Methods ----------------
-    this.Text(id, ColorText.brightCyan(
-      `  ┌─ Methods (${cur}/${totalPages})  •  ${methods.length} available`
-    ), { pinnedTop: true })
-
-    for (let i = 0; i < shown.length; i++) {
-      const m = shown[i]
-      const prefix = (i === shown.length - 1) ? '  └─ ' : '  ├─ '
-      this.Button(id, {
-        name: ColorText.dim(prefix) + `➕ ${m}`,
-        props: { __add: m },
-        pinnedTop: true
-      })
+    // ---------------- Options list ----------------
+    if (shown.length === 0) {
+      this.Text(id, ColorText.dim('  (empty — enable methods in ⚙ Config)'), { pinnedTop: true })
+    } else {
+      for (const entry of shown) {
+        const name = entry.kind === 'js'
+          ? `⌘ ${entry.value}`
+          : `➕ ${entry.value}`
+        this.Button(id, {
+          name,
+          props: { __add: entry.value },
+          pinnedTop: true
+        })
+      }
     }
 
-    if (methods.length === 0) {
-      this.Text(id, ColorText.dim('     (no methods enabled — open ⚙ Methods)'), { pinnedTop: true })
-    }
-
+    // ---------------- Pagination row (below options) ----------------
     if (totalPages > 1) {
       this.Buttons(id, [
-        { name: cur > 1 ? ColorText.cyan('◀ Prev') : ColorText.dim('◀ Prev'),
-          props: cur > 1 ? { __newPagePrev: 1 } : {}, pinnedTop: true },
-        { name: ColorText.dim(`  ${cur} / ${totalPages}  `),
-          props: {}, pinnedTop: true },
-        { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
-          props: cur < totalPages ? { __newPageNext: 1 } : {}, pinnedTop: true }
+        { name: cur > 1 ? '◀' : ColorText.dim('◀'),
+          props: cur > 1 ? { __newPagePrev: 1 } : {},
+          pinnedTop: true },
+        { name: ColorText.dim(`${cur}/${totalPages}`),
+          props: {},
+          pinnedTop: true },
+        { name: cur < totalPages ? '▶' : ColorText.dim('▶'),
+          props: cur < totalPages ? { __newPageNext: 1 } : {},
+          pinnedTop: true }
       ])
     }
 
-    // ---------------- Section 2: JS chains / Custom code ----------------
-    // Rendered below the methods so the default options stay the primary
-    // focus while the logic-block templates remain highly visible.
-    this.Text(id, '', { pinnedTop: true })
-    this.Text(id, ColorText.brightMagenta(
-      `  ┌─ JS chains / Custom code  •  ${logicBlocks.length} templates`
-    ), { pinnedTop: true })
-
-    for (let i = 0; i < logicBlocks.length; i++) {
-      const m = logicBlocks[i]
-      const prefix = (i === logicBlocks.length - 1) ? '  └─ ' : '  ├─ '
-      this.Button(id, {
-        name: ColorText.dim(prefix) + ColorText.brightMagenta(`⌘ ${m}`),
-        props: { __add: m },
+    // ---------------- Filter row (below pagination) ----------------
+    this.Buttons(id, [
+      {
+        name: filter === 'syapp' ? ColorText.bold('SyAPP') : ColorText.dim('SyAPP'),
+        props: { __setNewFilter: 'syapp' },
         pinnedTop: true
-      })
-    }
+      },
+      { name: ColorText.dim('|'), props: {}, pinnedTop: true },
+      {
+        name: filter === 'js' ? ColorText.bold('Javascript') : ColorText.dim('Javascript'),
+        props: { __setNewFilter: 'js' },
+        pinnedTop: true
+      }
+    ])
   }
 
   /**
-   * Render the ⚙ Methods config menu. Lists every discovered SyAPP_Func
-   * method as a toggle so the user can hide/show each one. The default
-   * blacklist is always applied on top (and cannot be re-enabled here).
+   * Render the unified ⚙ Config menu.
+   *
+   * This single view absorbs every builder setting that used to be
+   * scattered across dedicated menus:
+   *
+   *   • Items per page (default 4) — drives BOTH the "+New" list and
+   *     the method toggle list below.
+   *   • The full method visibility blacklist (formerly "⚙ Methods").
+   *   • The "Reset hidden" shortcut.
+   *
+   * No section headers are printed — only the separator lines that
+   * already surround the pinned-top toolbar.
    */
-  _renderMethodsConfigMenu(id) {
+  _renderConfigMenu(id) {
+    const perPage = this._getItemsPerPage()
     const all = _sbDiscoverMethods()
     const hiddenSet = this._getHiddenSet()
-    const perPage = 6
+
+    // Config options row.
+    this.Buttons(id, [
+      { name: `Items per page: ${perPage}`,
+        props: { __editConfig: 'itemsPerPage' },
+        pinnedTop: true },
+      { name: 'Reset hidden',
+        props: { __resetHidden: 1 },
+        pinnedTop: true }
+    ])
+
+    // Method visibility list — paginated with the SAME per-page value.
     const totalPages = Math.max(1, Math.ceil(all.length / perPage))
     const st = this.Storages.Get(id, 'sb_methods_page') || { page: 1 }
     const cur = Math.min(Math.max(1, st.page || 1), totalPages)
     const start = (cur - 1) * perPage
     const end = Math.min(start + perPage, all.length)
     const shown = all.slice(start, end)
-    const visibleCount = all.filter(m => !hiddenSet.has(m)).length
 
-    this.Text(id, ColorText.brightMagenta(
-      `  ┌─ ⚙ Methods config (${cur}/${totalPages})  •  ${visibleCount}/${all.length} visible`
-    ), { pinnedTop: true })
-
-    for (let i = 0; i < shown.length; i++) {
-      const m = shown[i]
+    for (const m of shown) {
       const hidden = hiddenSet.has(m)
       const isDefaultHidden = _SB_DEFAULT_NEW_BLACKLIST.includes(m)
-      const prefix = (i === shown.length - 1) ? '  └─ ' : '  ├─ '
       const mark = hidden ? ColorText.red('✗') : ColorText.green('✓')
-      const tag = isDefaultHidden ? ColorText.dim(' [default-off]') : ''
+      const tag = isDefaultHidden ? ColorText.dim(' [off]') : ''
       this.Button(id, {
-        name: ColorText.dim(prefix) + mark + ' ' + m + tag,
+        name: `${mark} ${m}${tag}`,
         props: { __toggleMethodHidden: m },
         pinnedTop: true
       })
@@ -11140,18 +11196,17 @@ class SelfBuilder extends SyAPP_Func {
 
     if (totalPages > 1) {
       this.Buttons(id, [
-        { name: cur > 1 ? ColorText.cyan('◀ Prev') : ColorText.dim('◀ Prev'),
-          props: cur > 1 ? { __methodsPagePrev: 1 } : {}, pinnedTop: true },
-        { name: ColorText.dim(`  ${cur} / ${totalPages}  `),
-          props: {}, pinnedTop: true },
-        { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
-          props: cur < totalPages ? { __methodsPageNext: 1 } : {}, pinnedTop: true }
+        { name: cur > 1 ? '◀' : ColorText.dim('◀'),
+          props: cur > 1 ? { __methodsPagePrev: 1 } : {},
+          pinnedTop: true },
+        { name: ColorText.dim(`${cur}/${totalPages}`),
+          props: {},
+          pinnedTop: true },
+        { name: cur < totalPages ? '▶' : ColorText.dim('▶'),
+          props: cur < totalPages ? { __methodsPageNext: 1 } : {},
+          pinnedTop: true }
       ])
     }
-    this.Buttons(id, [
-      { name: ColorText.yellow('↺ Reset hidden'),
-        props: { __resetHidden: 1 }, pinnedTop: true }
-    ])
   }
 
   async _renderItems(id, items, props) {
