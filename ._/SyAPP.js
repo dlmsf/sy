@@ -10787,11 +10787,16 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__toggleNew) {
       const cur = this.Storages.Get(id, 'sb_new_open') || false
       this.Storages.Set(id, 'sb_new_open', !cur)
+      // Opening "+New" closes "⚙ Config" (and vice versa) so only one
+      // menu ever occupies the top area at any given time.
+      if (!cur) this.Storages.Set(id, 'sb_methods_open', false)
     }
 
     if (p.__toggleMethods) {
       const cur = this.Storages.Get(id, 'sb_methods_open') || false
       this.Storages.Set(id, 'sb_methods_open', !cur)
+      // Opening "⚙ Config" closes "+New" (and vice versa).
+      if (!cur) this.Storages.Set(id, 'sb_new_open', false)
     }
 
     // Filter toggle for the "+New" list (SyAPP ↔ Javascript).
@@ -10957,7 +10962,13 @@ class SelfBuilder extends SyAPP_Func {
     const container = this._resolveContainer(curPage)
 
     // -------- pinned top: header + toolbar --------
-    this.Text(id, this._headerLine(S, curPage, container), { pinnedTop: true })
+    // Only ONE separator is emitted here (between header and toolbar).
+    // The separator between the toolbar and whatever menu is currently
+    // open is rendered by _renderTopToolbar() / the container branch as
+    // a pinned-top BUTTON, because _hr() text always lands at the very
+    // top of the pinned-top area (before the toolbar buttons) and would
+    // therefore never visually sit between the toolbar and the options.
+    this.Text(id, this._headerLine(S, curPage, container, id), { pinnedTop: true })
     this.Text(id, _hr('─'), { pinnedTop: true })
 
     if (container.kind === 'root') {
@@ -10979,10 +10990,14 @@ class SelfBuilder extends SyAPP_Func {
         { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
           props: { __toggleNew: 1 }, pinnedTop: true }
       ])
-      if (newOpen) this._renderNewMethodsMenu(id)
+      if (newOpen) {
+        // Break the toolbar options group + draw a separator line between
+        // the toolbar and the opened "+New" menu, so the two never merge
+        // onto the same visual row.
+        this.Button(id, { name: _hr('─'), pinnedTop: true })
+        this._renderNewMethodsMenu(id)
+      }
     }
-
-    this.Text(id, _hr('─'), { pinnedTop: true })
 
     // -------- body (scrollable) --------
     if (container.kind === 'root' && S.items.length === 0) {
@@ -11008,19 +11023,30 @@ class SelfBuilder extends SyAPP_Func {
     }
   }
 
-  _headerLine(S, curPage, container) {
+  _headerLine(S, curPage, container, id) {
     const W = _termCols()
     const mode = this.Editing ? ColorText.bgGreen(ColorText.black(' EDIT ')) : ColorText.bgBlue(ColorText.white(' VIEW '))
     const title = ColorText.bold(ColorText.brightCyan(_fit(S.name, Math.max(8, W - 30))))
     const cls = ColorText.dim(`[${_fit(S.funcName, 20)}]`)
+
+    // Determine the label that follows the "|" separator. The header now
+    // reflects which menu is currently open in the toolbar — "+New",
+    // "Config", or (when inside a nested container) a breadcrumb.
     let ctx = ''
-    if (container && container.kind !== 'root') {
+    const newOpen = id ? (this.Storages.Get(id, 'sb_new_open') || false) : false
+    const methodsOpen = id ? (this.Storages.Get(id, 'sb_methods_open') || false) : false
+
+    if (newOpen) {
+      ctx = ` | ${ColorText.dim('New: choose one option to add...')}`
+    } else if (methodsOpen) {
+      ctx = ` | ${ColorText.dim('Config: adjust builder settings')}`
+    } else if (container && container.kind !== 'root') {
       let lbl
       if (container.kind === 'page')            lbl = `📄 ${container.item.name}`
       else if (container.kind === 'dropdown')   lbl = `▼ ${container.item.name}`
       else if (container.kind === 'codeblock')  lbl = `{} ${this._codeblockLabel(container.item)}`
       else                                       lbl = `? ${curPage}`
-      ctx = ColorText.dim(` › ${_fit(lbl, 28)}`)
+      ctx = ColorText.dim(` | ${_fit(lbl, 40)}`)
     }
     return `  ${mode}  ${title}  ${cls}${ctx}`
   }
@@ -11038,7 +11064,11 @@ class SelfBuilder extends SyAPP_Func {
     const newOpen = this.Storages.Get(id, 'sb_new_open') || false
     const methodsOpen = this.Storages.Get(id, 'sb_methods_open') || false
 
-    // Row 1: "+ New" toggle + global actions (pinned top)
+    // Single toolbar row: toggle + global actions + app/class name.
+    // Because this.Buttons() appends every entry into ONE shared
+    // "options" group, the whole toolbar renders as a single physical
+    // line:
+    //   − New   👁 View   💾 Save   📂 Load   📤 Export   ⚙ Config   🚪 Exit   🏷 untitled   ◆ MyApp
     this.Buttons(id, [
       { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
         props: { __toggleNew: 1 }, pinnedTop: true },
@@ -11049,20 +11079,27 @@ class SelfBuilder extends SyAPP_Func {
       { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
       { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
         props: { __toggleMethods: 1 }, pinnedTop: true },
-      { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true }
-    ])
-
-    // Row 2: app name / class name (pinned top).
-    // NOTE: 🏷 replaces the previous ⚙ that duplicated the toolbar's
-    // "⚙ Config" emoji.
-    this.Buttons(id, [
+      { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true },
       { name: `🏷 ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
       { name: `◆ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
     ])
 
-    // "+New" and "⚙ Config" content. Both are pinned-top blocks between
-    // the two existing separator lines, so opening them does NOT add any
-    // additional separators.
+    // When either menu is open, break the toolbar's options group and
+    // draw a separator line BEFORE the menu content. Pushing a plain
+    // this.Button() (without the `buttons: true` flag) does two things:
+    //   1. it terminates the toolbar's options group, so the config /
+    //      "+New" content that follows starts on its own line — never
+    //      merged into the toolbar row itself (which is exactly what
+    //      made "Items per page" appear to live inside the main tab);
+    //   2. it renders a long dim line that visually separates the
+    //      toolbar from whatever was opened below it.
+    if (newOpen || methodsOpen) {
+      this.Button(id, { name: _hr('─'), pinnedTop: true })
+    }
+
+    // "+New" and "⚙ Config" content. Each one now lives BELOW the
+    // separator button pushed above, so opening them no longer makes
+    // their controls appear to live inside the main toolbar tab.
     if (newOpen)     this._renderNewMethodsMenu(id)
     if (methodsOpen) this._renderConfigMenu(id)
   }
@@ -11164,15 +11201,20 @@ class SelfBuilder extends SyAPP_Func {
     const all = _sbDiscoverMethods()
     const hiddenSet = this._getHiddenSet()
 
-    // Config options row.
-    this.Buttons(id, [
-      { name: `Items per page: ${perPage}`,
-        props: { __editConfig: 'itemsPerPage' },
-        pinnedTop: true },
-      { name: 'Reset hidden',
-        props: { __resetHidden: 1 },
-        pinnedTop: true }
-    ])
+    // Each config entry gets its OWN line, matching the layout of the
+    // method-visibility list below. This guarantees "Items per page"
+    // never sits on the toolbar row and always appears "below like the
+    // selection" of the method list.
+    this.Button(id, {
+      name: `Items per page: ${perPage}`,
+      props: { __editConfig: 'itemsPerPage' },
+      pinnedTop: true
+    })
+    this.Button(id, {
+      name: 'Reset hidden',
+      props: { __resetHidden: 1 },
+      pinnedTop: true
+    })
 
     // Method visibility list — paginated with the SAME per-page value.
     const totalPages = Math.max(1, Math.ceil(all.length / perPage))
