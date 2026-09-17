@@ -10253,8 +10253,32 @@ function _genFuncJS(state, syappRelPath) {
             down_buttontext: it.down_buttontext || 'Hide'
           }
           L.push(`${indent}await this.DropDown(id, ${JSON.stringify(it.name)}, async () => {`)
-          L.push(`${indent}  // dropdown content`)
+          emit(it.items || [], indent + '  ')
           L.push(`${indent}}, ${JSON.stringify(cfg)})`)
+          break
+        }
+        case 'codeblock': {
+          const bt = it.blockType
+          const cond = it.condition || ''
+          const openBlock = (header) => {
+            L.push(`${indent}${header} {`)
+            emit(it.items || [], indent + '  ')
+            L.push(`${indent}}`)
+          }
+          if (bt === 'if')            openBlock(`if (${cond || 'true'})`)
+          else if (bt === 'elseif')   openBlock(`else if (${cond || 'true'})`)
+          else if (bt === 'else')     openBlock(`else`)
+          else if (bt === 'for')      openBlock(`for (${cond || 'let i = 0; i < 0; i++'})`)
+          else if (bt === 'forof')    openBlock(`for (${cond || 'const x of []'})`)
+          else if (bt === 'forawait') openBlock(`for await (${cond || 'const x of []'})`)
+          else if (bt === 'while')    openBlock(`while (${cond || 'false'})`)
+          else {
+            // custom / raw JS block: emit customBefore, nested items,
+            // then customAfter, all at the same indentation level.
+            if (it.customBefore) L.push(`${indent}${String(it.customBefore).replace(/\n/g, '\n' + indent)}`)
+            emit(it.items || [], indent)
+            if (it.customAfter) L.push(`${indent}${String(it.customAfter).replace(/\n/g, '\n' + indent)}`)
+          }
           break
         }
         case 'waitinput':
@@ -10404,6 +10428,110 @@ function _sbMakeItemForMethod(methodName, id) {
 }
 
 /**
+ * Logic-block template names exposed in the "+New" menu.
+ * These do NOT come from SyAPP_Func methods — they generate container
+ * items (`type: 'codeblock'`) that hold nested items in their body and
+ * export as real JS control-flow structures.
+ *
+ * They are rendered in a SEPARATE section of the "+New" menu (below the
+ * method list) so the default options stay the primary focus.
+ */
+const _SB_LOGIC_BLOCKS = [
+  '+ if', '+ else if', '+ else',
+  '+ for', '+ for of', '+ for await', '+ while',
+  '+ Custom JS'
+]
+
+/**
+ * Build a fresh logic-block (code chain) item.
+ *
+ * The resulting item is a CONTAINER: it exposes an `items` array that can
+ * receive any other builder item (buttons, text, other code-blocks…) and,
+ * on export, wraps those items inside the corresponding JS block:
+ *
+ *   if (condition) { <nested items go here> }
+ *   for (let i = 0; i < n; i++) { <nested items go here> }
+ *   for await (const x of iterable) { <nested items go here> }
+ *
+ * In VIEW mode the condition is evaluated for real (via AsyncFunction) so
+ * the preview reflects the actual control flow — e.g. a button placed
+ * inside a `for` will only render when the loop is entered.
+ *
+ * `customBefore` / `customAfter` carry raw JS for the "+ Custom JS"
+ * template (and can be used to inject statements before/after the body
+ * of any block).
+ *
+ * @param {string} blockType
+ * @param {string} id
+ * @returns {object}
+ */
+function _sbMakeCodeblock(blockType, id) {
+  const templates = {
+    if:       { label: 'if',        condition: 'condition' },
+    elseif:   { label: 'else if',   condition: 'condition' },
+    else:     { label: 'else',      condition: '' },
+    for:      { label: 'for',       condition: 'let i = 0; i < n; i++' },
+    forof:    { label: 'for of',    condition: 'const item of items' },
+    forawait: { label: 'for await', condition: 'const item of iterable' },
+    while:    { label: 'while',     condition: 'condition' },
+    custom:   { label: 'custom JS', condition: '' }
+  }
+  const t = templates[blockType] || templates.custom
+  return {
+    id,
+    type: 'codeblock',
+    blockType,
+    label: t.label,
+    condition: t.condition,
+    customBefore: blockType === 'custom' ? '// custom JS\n' : '',
+    customAfter: '',
+    items: []
+  }
+}
+
+/**
+ * Validate a raw JS snippet by attempting to compile it as the body of an
+ * AsyncFunction. Returns `{ ok: true }` or `{ ok: false, error: <Error> }`.
+ *
+ * This is a pure syntax check — it does NOT execute the code and therefore
+ * does not catch runtime ReferenceErrors. Combined with the render-time
+ * execution warning (which DOES surface ReferenceErrors for undefined
+ * variables), this covers both the "does not exist" and "won't parse"
+ * cases.
+ *
+ * @param {string} code
+ * @param {string} [label='<js>']
+ * @returns {{ok: true} | {ok: false, error: Error, label: string}}
+ */
+function _sbValidateJS(code, label = '<js>') {
+  try {
+    // eslint-disable-next-line no-new
+    new AsyncFunction('id', 'props', code || '')
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e, label }
+  }
+}
+
+/**
+ * Validate a condition expression (used by if/else if/for/while blocks).
+ * Conditions are wrapped in `return (...)` so we check them as expressions.
+ * @param {string} cond
+ * @returns {{ok: true} | {ok: false, error: Error, label: string}}
+ */
+function _sbValidateCondition(cond) {
+  // `else` has an empty condition — always OK.
+  if (!cond || !cond.trim()) return { ok: true }
+  try {
+    // eslint-disable-next-line no-new
+    new AsyncFunction('id', 'props', `return (${cond})`)
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: e, label: '<condition>' }
+  }
+}
+
+/**
  * Enumerate all "constructive" methods exposed by SyAPP_Func instances
  * (functions assigned to `this.X = ...` inside the constructor). Cached
  * after the first call because the set is static.
@@ -10446,7 +10574,8 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.id === id) return it
-      if (it.type === 'page' && it.items) {
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock') &&
+          Array.isArray(it.items)) {
         const f = this._findItem(id, it.items)
         if (f) return f
       }
@@ -10458,12 +10587,47 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.type === 'page' && it.name === name) return it
-      if (it.type === 'page' && it.items) {
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock') &&
+          Array.isArray(it.items)) {
         const f = this._findItemByName(name, it.items)
         if (f) return f
       }
     }
     return null
+  }
+
+  /**
+   * Resolve the current editing context from a synthetic "page name".
+   *   - real pages            → pageName is the page's name
+   *   - dropdown containers   → `__sbdd__:<itemId>`
+   *   - code-block containers → `__sbcb__:<itemId>`
+   * @returns {{kind: 'root'|'page'|'dropdown'|'codeblock'|'missing', item?: object, items: Array}}
+   */
+  _resolveContainer(pageName) {
+    const S = this.State
+    if (!pageName) return { kind: 'root', items: S.items }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbdd__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'dropdown') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'dropdown', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbcb__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'codeblock') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'codeblock', item, items: item.items }
+      }
+    }
+    const pageItem = S.items.find(i => i.type === 'page' && i.name === pageName)
+    if (pageItem) {
+      if (!Array.isArray(pageItem.items)) pageItem.items = []
+      return { kind: 'page', item: pageItem, items: pageItem.items }
+    }
+    return { kind: 'missing', items: [] }
   }
 
   _getHiddenSet() {
@@ -10475,6 +10639,9 @@ class SelfBuilder extends SyAPP_Func {
   _getVisibleNewMethods() {
     const all = _sbDiscoverMethods()
     const hidden = this._getHiddenSet()
+    // Only SyAPP_Func methods here. Logic-block templates are handled
+    // separately by _renderNewMethodsMenu so they can be shown in their
+    // own section below the method list.
     return all.filter(m => !hidden.has(m))
   }
 
@@ -10493,16 +10660,50 @@ class SelfBuilder extends SyAPP_Func {
           const kind = this._pendingEdit.kind || 'string'
           const prop = this._pendingEdit.prop
           let v = p.inputValue
+          let valid = true
+          let reason = ''
+
           if (kind === 'json') {
             try { v = typeof v === 'string' ? JSON.parse(v) : v }
-            catch (_) { this.Alert(id, '❌ Invalid JSON', { duration: 2500 }); v = it[prop] }
+            catch (e) { valid = false; reason = 'Invalid JSON: ' + e.message; v = it[prop] }
           } else if (kind === 'number') {
             const n = Number(v)
-            v = isNaN(n) ? 0 : n
+            if (isNaN(n)) { valid = false; reason = 'Not a number'; v = it[prop] }
+            else v = n
           } else {
             v = String(v)
           }
-          it[prop] = v
+
+          // ---------------- JS VALIDATION ----------------
+          // For code-bearing properties, compile the result before we
+          // commit it. If it doesn't parse, revert to the previous value
+          // and alert the user. This is what catches "does not exist"
+          // typos at edit time (unbalanced parens, unknown syntax, etc.),
+          // while runtime ReferenceErrors are surfaced by the render pass.
+          if (valid) {
+            if (prop === 'value' && it.type === 'code') {
+              const res = _sbValidateJS(v, 'code')
+              if (!res.ok) { valid = false; reason = 'JS syntax: ' + res.error.message }
+            } else if (prop === 'handler' && it.type === 'route') {
+              const res = _sbValidateJS(v, 'handler')
+              if (!res.ok) { valid = false; reason = 'JS syntax: ' + res.error.message }
+            } else if (prop === 'customBefore' && it.type === 'codeblock') {
+              const res = _sbValidateJS(v, 'customBefore')
+              if (!res.ok) { valid = false; reason = 'JS syntax: ' + res.error.message }
+            } else if (prop === 'customAfter' && it.type === 'codeblock') {
+              const res = _sbValidateJS(v, 'customAfter')
+              if (!res.ok) { valid = false; reason = 'JS syntax: ' + res.error.message }
+            } else if (prop === 'condition' && it.type === 'codeblock') {
+              const res = _sbValidateCondition(v)
+              if (!res.ok) { valid = false; reason = 'Condition syntax: ' + res.error.message }
+            }
+          }
+
+          if (valid) {
+            it[prop] = v
+          } else {
+            this.Alert(id, '❌ ' + reason, { duration: 4000 })
+          }
         }
         this._pendingEdit = null
       } else if (this._pendingAction === 'save') {
@@ -10612,20 +10813,33 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__add) {
       const methodName = p.__add
       const newId = this._nid()
-      const it = _sbMakeItemForMethod(methodName, newId)
+      let it
 
-      // Nested add: if we are currently inside a page, add the item to that
-      // page's items array. Otherwise add it at the root.
-      if (curPage) {
-        const pageItem = this._findItemByName(curPage)
-        if (pageItem && pageItem.type === 'page') {
-          if (!Array.isArray(pageItem.items)) pageItem.items = []
-          pageItem.items.push(it)
-        } else {
-          S.items.push(it)
-        }
+      // Logic-block pseudo-methods start with "+ ". Everything else maps
+      // to a real SyAPP_Func method.
+      if (methodName.startsWith('+ ')) {
+        const blockType = {
+          '+ if':        'if',
+          '+ else if':   'elseif',
+          '+ else':      'else',
+          '+ for':       'for',
+          '+ for of':    'forof',
+          '+ for await': 'forawait',
+          '+ while':     'while',
+          '+ Custom JS': 'custom'
+        }[methodName] || 'custom'
+        it = _sbMakeCodeblock(blockType, newId)
       } else {
+        it = _sbMakeItemForMethod(methodName, newId)
+      }
+
+      // Resolve where the new item should go. This supports arbitrarily
+      // nested containers (root → page → dropdown → dropdown → codeblock...).
+      const container = this._resolveContainer(curPage)
+      if (container.kind === 'root' || !container.items) {
         S.items.push(it)
+      } else {
+        container.items.push(it)
       }
 
       this.EditItemId = it.id
@@ -10705,20 +10919,28 @@ class SelfBuilder extends SyAPP_Func {
     if (this.Builds.get(id)?.WaitInput) return
 
     const W = _termCols()
+    const container = this._resolveContainer(curPage)
 
     // -------- pinned top: header + toolbar --------
-    this.Text(id, this._headerLine(S, curPage), { pinnedTop: true })
+    this.Text(id, this._headerLine(S, curPage, container), { pinnedTop: true })
     this.Text(id, _hr('─'), { pinnedTop: true })
 
-    if (!curPage) {
+    if (container.kind === 'root') {
       this._renderTopToolbar(id, S)
     } else {
-      // Breadcrumb when inside a page + a page-scoped "+New" so that new
-      // items land INSIDE the page (nested add).
+      // Breadcrumb when inside a nested container + a container-scoped
+      // "+New" so that new items land INSIDE the current container.
       const newOpen = this.Storages.Get(id, 'sb_new_open') || false
+      const label = container.kind === 'page'
+        ? `📄 ${_fit(container.item.name, 30)}`
+        : container.kind === 'dropdown'
+          ? `▼ ${_fit(container.item.name, 30)}`
+          : container.kind === 'codeblock'
+            ? `{} ${_fit(this._codeblockLabel(container.item), 30)}`
+            : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
       this.Buttons(id, [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
-        { name: `📄 ${_fit(curPage, 30)}`, pinnedTop: true },
+        { name: label, pinnedTop: true },
         { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
           props: { __toggleNew: 1 }, pinnedTop: true }
       ])
@@ -10728,21 +10950,16 @@ class SelfBuilder extends SyAPP_Func {
     this.Text(id, _hr('─'), { pinnedTop: true })
 
     // -------- body (scrollable) --------
-    if (!curPage && S.items.length === 0) {
+    if (container.kind === 'root' && S.items.length === 0) {
       this.Text(id, '')
       this.Text(id, ColorText.dim('  Empty app. Use the "+ New" menu above to add items.'))
       this.Text(id, ColorText.dim('  Ctrl+C saves & exits.'))
-    } else if (!curPage) {
-      await this._renderItems(id, S.items, props)
+    } else if (container.kind === 'missing') {
+      this.Text(id, ColorText.red(`Container "${curPage}" not found.`))
+    } else if (!container.items || container.items.length === 0) {
+      this.Text(id, ColorText.dim('  (empty — use the "+ New" menu to add items)'))
     } else {
-      const pageItem = S.items.find(i => i.type === 'page' && i.name === curPage)
-      if (!pageItem) {
-        this.Text(id, ColorText.red(`Page "${curPage}" not found.`))
-      } else if (!pageItem.items || pageItem.items.length === 0) {
-        this.Text(id, ColorText.dim('  (empty page — use the "+ New" menu to add items)'))
-      } else {
-        await this._renderItems(id, pageItem.items, props)
-      }
+      await this._renderItems(id, container.items, props)
     }
 
     // -------- pinned bottom: editor (when an item is selected) or status bar --------
@@ -10756,12 +10973,21 @@ class SelfBuilder extends SyAPP_Func {
     }
   }
 
-  _headerLine(S, curPage) {
+  _headerLine(S, curPage, container) {
     const W = _termCols()
     const mode = this.Editing ? ColorText.bgGreen(ColorText.black(' EDIT ')) : ColorText.bgBlue(ColorText.white(' VIEW '))
     const title = ColorText.bold(ColorText.brightCyan(_fit(S.name, Math.max(8, W - 30))))
     const cls = ColorText.dim(`[${_fit(S.funcName, 20)}]`)
-    return `  ${mode}  ${title}  ${cls}`
+    let ctx = ''
+    if (container && container.kind !== 'root') {
+      let lbl
+      if (container.kind === 'page')            lbl = `📄 ${container.item.name}`
+      else if (container.kind === 'dropdown')   lbl = `▼ ${container.item.name}`
+      else if (container.kind === 'codeblock')  lbl = `{} ${this._codeblockLabel(container.item)}`
+      else                                       lbl = `? ${curPage}`
+      ctx = ColorText.dim(` › ${_fit(lbl, 28)}`)
+    }
+    return `  ${mode}  ${title}  ${cls}${ctx}`
   }
 
   _statusLine(S) {
@@ -10805,13 +11031,21 @@ class SelfBuilder extends SyAPP_Func {
   }
 
   /**
-   * Render the "+New" menu, driven by the visible SyAPP_Func methods.
-   * Uses pagination so the block occupies a fixed vertical footprint no
-   * matter how many methods are enabled — this is what makes it
-   * "scrollable in the same size" as the user requested.
+   * Render the "+New" menu.
+   *
+   * Two sections:
+   *   1. "Methods" — discovered SyAPP_Func methods (paginated)
+   *   2. "JS chains / Custom code" — logic-block templates, rendered
+   *      below the methods so they stand out and remain easily
+   *      discoverable without crowding the primary options.
+   *
+   * Uses pagination in each section so the block occupies a fixed
+   * vertical footprint no matter how many methods are enabled.
    */
   _renderNewMethodsMenu(id) {
     const methods = this._getVisibleNewMethods()
+    const logicBlocks = _SB_LOGIC_BLOCKS
+
     const perPage = 6
     const totalPages = Math.max(1, Math.ceil(methods.length / perPage))
     const st = this.Storages.Get(id, 'sb_new_page') || { page: 1 }
@@ -10820,8 +11054,9 @@ class SelfBuilder extends SyAPP_Func {
     const end = Math.min(start + perPage, methods.length)
     const shown = methods.slice(start, end)
 
+    // ---------------- Section 1: Methods ----------------
     this.Text(id, ColorText.brightCyan(
-      `  ┌─ New item (${cur}/${totalPages})  •  ${methods.length} available`
+      `  ┌─ Methods (${cur}/${totalPages})  •  ${methods.length} available`
     ), { pinnedTop: true })
 
     for (let i = 0; i < shown.length; i++) {
@@ -10847,6 +11082,24 @@ class SelfBuilder extends SyAPP_Func {
         { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
           props: cur < totalPages ? { __newPageNext: 1 } : {}, pinnedTop: true }
       ])
+    }
+
+    // ---------------- Section 2: JS chains / Custom code ----------------
+    // Rendered below the methods so the default options stay the primary
+    // focus while the logic-block templates remain highly visible.
+    this.Text(id, '', { pinnedTop: true })
+    this.Text(id, ColorText.brightMagenta(
+      `  ┌─ JS chains / Custom code  •  ${logicBlocks.length} templates`
+    ), { pinnedTop: true })
+
+    for (let i = 0; i < logicBlocks.length; i++) {
+      const m = logicBlocks[i]
+      const prefix = (i === logicBlocks.length - 1) ? '  └─ ' : '  ├─ '
+      this.Button(id, {
+        name: ColorText.dim(prefix) + ColorText.brightMagenta(`⌘ ${m}`),
+        props: { __add: m },
+        pinnedTop: true
+      })
     }
   }
 
@@ -10907,12 +11160,18 @@ class SelfBuilder extends SyAPP_Func {
 
   async _renderItem(id, it, props) {
     // In edit mode, prefix each item with a compact selector dot.
-    // Clicking the dot reveals the pinned-bottom editor for this item,
-    // while keeping the item itself visible in the preview.
+    // The dot's colour encodes whether the item is a navigable preview
+    // (green) or a non-navigable body item (dim yellow), so routes, text,
+    // alerts, etc. stand visually apart from the clickable body.
     if (this.Editing) {
       const isActive = this.EditItemId === it.id
+      const navigable = (it.type === 'button' || it.type === 'dropdown' ||
+                         it.type === 'page' || it.type === 'codeblock')
+      const dot = isActive
+        ? ColorText.brightYellow('◉')
+        : navigable ? ColorText.green('○') : ColorText.dim('○')
       this.Button(id, {
-        name: isActive ? ColorText.brightYellow('◉') : ColorText.dim('○'),
+        name: dot,
         props: { __editItem: isActive ? '' : it.id }
       })
     }
@@ -10950,9 +11209,11 @@ class SelfBuilder extends SyAPP_Func {
           break
         case 'page':
           if (this.Editing) {
-            // In edit mode, a page renders as a navigable button so the
-            // user can step into it and add nested items.
-            this.Button(id, { name: `📄 ${it.name}`, props: { page: it.name } })
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `📄 ${it.name}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: it.name }
+            })
           } else {
             await this.Page(id, it.name, async () => {
               await this._renderItems(id, it.items || [], props)
@@ -10960,8 +11221,36 @@ class SelfBuilder extends SyAPP_Func {
           }
           break
         case 'dropdown':
-          // Preview only in editor; export emits the real DropDown call.
-          this.Button(id, { name: `▼ ${it.name}`, props: {} })
+          // In edit mode the dropdown behaves like a page: clicking
+          // navigates INTO it, so its nested items can be edited
+          // recursively — the same way this.Page() works.
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `${ColorText.brightCyan('▼')} ${it.name || '(dropdown)'}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sbdd__:${it.id}` }
+            })
+          } else {
+            await this.DropDown(id, it.name, async () => {
+              await this._renderItems(id, it.items || [], props)
+            }, {
+              up_buttontext: it.up_buttontext || 'Show more',
+              down_buttontext: it.down_buttontext || 'Hide'
+            })
+          }
+          break
+        case 'codeblock':
+          // Logic-block containers (if/for/for-of/for-await/while/custom)
+          // behave like pages in edit mode: click to step inside.
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `${ColorText.brightMagenta('{}')} ${this._codeblockLabel(it)}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sbcb__:${it.id}` }
+            })
+          } else {
+            await this._renderCodeblock(id, it, props)
+          }
           break
         case 'waitinput':
           this.Button(id, { name: `⏳ WaitInput: ${it.question || ''}`, props: {} })
@@ -10997,6 +11286,146 @@ class SelfBuilder extends SyAPP_Func {
       }
     } catch (e) {
       this.Text(id, ColorText.red(`[render error] ${e.message}`))
+    }
+  }
+
+  _codeblockLabel(it) {
+    switch (it.blockType) {
+      case 'if':       return `if (${it.condition || '...'})`
+      case 'elseif':   return `else if (${it.condition || '...'})`
+      case 'else':     return 'else'
+      case 'for':      return `for (${it.condition || '...'})`
+      case 'forof':    return `for (${it.condition || '...'})`
+      case 'forawait': return `for await (${it.condition || '...'})`
+      case 'while':    return `while (${it.condition || '...'})`
+      case 'custom':   return 'custom JS'
+      default:         return it.label || 'code'
+    }
+  }
+
+  /**
+   * Evaluate a code-block's condition for REAL in VIEW mode. Returns true
+   * when the block's body should be rendered.
+   *
+   *   - if / else if / while      → condition must be truthy
+   *   - else                      → always true (rendered after the
+   *                                 preceding if/else-if in the same
+   *                                 sibling group; the builder does not
+   *                                 try to detect chain grouping, so an
+   *                                 `else` will always render — the user
+   *                                 is responsible for chaining blocks
+   *                                 correctly, matching real JS)
+   *   - for / for of / for await  → the body is rendered once for the
+   *                                 preview, provided the iterable yields
+   *                                 at least one item (or, for classic
+   *                                 `for`, the initial condition passes).
+   *                                 We can't actually iterate in preview
+   *                                 because the body contains builder
+   *                                 calls (not pure JS), so we use a
+   *                                 light-weight "would it enter?" probe.
+   *   - custom                    → always true (raw JS does not gate
+   *                                 the body; use an `if` inside it)
+   *
+   * Any ReferenceError raised by the condition (e.g. an undefined
+   * variable) is surfaced as a warning and the body is hidden, which is
+   * exactly the behaviour the user asked for: "if I put variables that
+   * do not exist, it shows the warning".
+   */
+  async _evaluateCodeblockCondition(id, it, props) {
+    const bt = it.blockType
+    const cond = it.condition || ''
+
+    // Non-gating blocks
+    if (bt === 'else' || bt === 'custom') return { enter: true }
+
+    // Classic for-loop: we don't know how many iterations the user wants
+    // for the preview, so we just evaluate the guard once with i = 0 to
+    // decide whether the body renders at least once.
+    if (bt === 'for') {
+      // The stored condition is the FULL header `let i=0; i<n; i++`.
+      // Reuse AsyncFunction's function-body semantics: we can't simply
+      // `return (header)`, so we wrap it in a minimal for-loop that
+      // executes zero body iterations but does evaluate the guard.
+      try {
+        const fn = new AsyncFunction('id', 'props', `
+          let __entered = false;
+          for (${cond}) { __entered = true; break; }
+          return __entered;
+        `)
+        const enter = await fn.call(this, id, props)
+        return { enter: !!enter }
+      } catch (e) {
+        return { enter: false, error: e }
+      }
+    }
+
+    // for of / for await: probe the iterable to know if there is at
+    // least one element. The stored condition is `const x of EXPR` or
+    // `const x of await EXPR`.
+    if (bt === 'forof' || bt === 'forawait') {
+      const m = cond.match(/^\s*(?:const|let|var)\s+[\w$]+\s+of\s+([\s\S]+)$/)
+      if (!m) return { enter: true } // can't parse → don't block preview
+      const iterableExpr = m[1].trim()
+      try {
+        const fn = new AsyncFunction('id', 'props', `
+          const __it = (${iterableExpr});
+          if (__it == null) return false;
+          if (typeof __it[Symbol.asyncIterator] === 'function' || typeof __it[Symbol.iterator] === 'function') {
+            const __first = await (__it[Symbol.asyncIterator]
+              ? __it[Symbol.asyncIterator]().next()
+              : __it[Symbol.iterator]().next());
+            return !__first.done;
+          }
+          return false;
+        `)
+        const enter = await fn.call(this, id, props)
+        return { enter: !!enter }
+      } catch (e) {
+        return { enter: false, error: e }
+      }
+    }
+
+    // if / else if / while: plain boolean expression.
+    try {
+      const fn = new AsyncFunction('id', 'props', `return (${cond || 'false'})`)
+      const enter = await fn.call(this, id, props)
+      return { enter: !!enter }
+    } catch (e) {
+      return { enter: false, error: e }
+    }
+  }
+
+  async _renderCodeblock(id, it, props) {
+    // In non-edit mode the code-block gates its nested items by
+    // evaluating the condition for real. This is what makes an `if`
+    // with a false condition HIDE the button placed inside it, instead
+    // of rendering it unconditionally.
+    const verdict = await this._evaluateCodeblockCondition(id, it, props)
+
+    if (verdict.error) {
+      this.Text(id, ColorText.red(`[code warning] ${this._codeblockLabel(it)} → ${verdict.error.message}`))
+    }
+
+    if (!verdict.enter) return
+
+    if (it.customBefore) {
+      try {
+        const fn = new AsyncFunction('id', 'props', it.customBefore)
+        await fn.call(this, id, props)
+      } catch (e) {
+        this.Text(id, ColorText.red(`[code error] ${e.message}`))
+      }
+    }
+
+    await this._renderItems(id, it.items || [], props)
+
+    if (it.customAfter) {
+      try {
+        const fn = new AsyncFunction('id', 'props', it.customAfter)
+        await fn.call(this, id, props)
+      } catch (e) {
+        this.Text(id, ColorText.red(`[code error] ${e.message}`))
+      }
     }
   }
 
@@ -11071,6 +11500,13 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('down_buttontext', 'Down Button', 'string')
         break
 
+      case 'codeblock':
+        mkProp('label', 'Label', 'string')
+        mkProp('condition', 'Condition / Header', 'string')
+        mkProp('customBefore', 'JS before body', 'string')
+        mkProp('customAfter', 'JS after body', 'string')
+        break
+
       case 'waitinput':
         mkProp('path', 'Path', 'string')
         mkProp('question', 'Question', 'string')
@@ -11111,24 +11547,46 @@ class SelfBuilder extends SyAPP_Func {
 
     if (propButtons.length > 0) this.Buttons(id, propButtons)
 
-    // ---- Actions --------------------------------------------------------
+    // ------------------------------------------------------------------
+    // Force a NEW physical row for the action buttons (× Delete / ✓ Done
+    // / ↑ Up / ↓ Down) so the user never has to walk past every
+    // property-edit button just to reach Delete or Done. The plain
+    // spacer button breaks the previous `options` group that
+    // this.Buttons() would otherwise append to, and the follow-up
+    // this.Buttons() therefore starts a fresh group on its own line.
+    // ------------------------------------------------------------------
+    this.Button(id, { name: ' ', pinned: true })
+
     const actions = [
       { name: '↑ Up',   props: { __up: it.id },   pinned: true },
       { name: '↓ Down', props: { __down: it.id }, pinned: true }
     ]
 
-    // "Add child" shortcut: pages get a direct jump into themselves so
-    // the user can add nested items right from the editor.
+    // "Add child" shortcut: container items (pages, dropdowns and
+    // code-blocks) get a direct jump into themselves so the user can
+    // add nested items right from the editor.
     if (it.type === 'page') {
       actions.push({
         name: ColorText.brightCyan('＋ Add child'),
         props: { page: it.name },
         pinned: true
       })
+    } else if (it.type === 'dropdown') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbdd__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'codeblock') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbcb__:${it.id}` },
+        pinned: true
+      })
     }
 
-    actions.push({ name: ColorText.red('× Delete'),    props: { __del: it.id },      pinned: true })
-    actions.push({ name: ColorText.green('✓ Done'),    props: { __editItem: '' },    pinned: true })
+    actions.push({ name: ColorText.red('× Delete'), props: { __del: it.id },   pinned: true })
+    actions.push({ name: ColorText.green('✓ Done'), props: { __editItem: '' }, pinned: true })
 
     this.Buttons(id, actions)
   }
