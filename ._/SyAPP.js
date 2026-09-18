@@ -8389,6 +8389,257 @@ function levenshteinDistance(str1, str2) {
         this.Builds.get(id).Buttons.push(fieldObj);
     };
 
+    // --------------------------- Args Method ---------------------------
+
+    /**
+     * Process command-line arguments for this function.
+     *
+     * Arguments are captured from the original process launch:
+     *   `node SyAPP.js MyFunc.js [arg1] [arg2] ...`
+     * — everything after the target file becomes the positional args array.
+     *
+     * The handler is called with a SINGLE argument: the `args` array. When
+     * a schema (`config.required`) is provided, positional CLI args are
+     * mapped onto the schema by order, and any missing required values
+     * trigger an interactive form (using `this.Field`) so the user can
+     * fill them in. In the form, each `Field` label defaults to the
+     * schema entry's `label` (or `name`).
+     *
+     * The handler runs ONLY when args have actually been resolved on this
+     * render — never on a plain refresh tick. With `everyTime: false`
+     * (default) the handler fires exactly once per args key; with
+     * `everyTime: true` it fires on every entrance.
+     *
+     * @param {string} id - User/build ID
+     * @param {Function} handler - async (args) => {} — receives the args array
+     * @param {Object} [config] - Configuration
+     * @param {Array<{
+     *   name: string,
+     *   label?: string,
+     *   required?: boolean,
+     *   defaultValue?: *,
+     *   validate?: (value: *) => (boolean|string|undefined|Promise<boolean|string|undefined>)
+     * }>} [config.required=[]] - Named arg schema (order = positional order)
+     * @param {boolean} [config.everyTime=false] - If true, re-process on every entrance;
+     *                                              else only on the first entrance
+     * @param {boolean} [config.form=true] - Show the interactive form when required args
+     *                                       are missing
+     * @param {string} [config.description] - Text shown above the form
+     * @param {string} [config.key='default'] - Unique key when the same func uses
+     *                                          multiple Args() blocks
+     * @returns {Promise<void>}
+     */
+    this.Args = async (id, handler, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Args() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      if (typeof handler !== 'function') {
+        if (this.Log) console.log(`this.Args() Error - handler must be a function | BuildID: ${id}`);
+        return;
+      }
+
+      const opts = {
+        required: [],
+        everyTime: false,
+        form: true,
+        description: 'Please provide the required arguments:',
+        key: 'default',
+        ...config
+      };
+
+      const stateKey   = `__args_state_${this.Name}_${opts.key}`;
+      const submitKey  = `__args_submit_${this.Name}_${opts.key}`;
+      const fieldPrefix = `__args_field_${this.Name}_${opts.key}_`;
+
+      const build = this.Builds.get(id);
+      const curProps = (build && build.Session && build.Session.ActualProps) || {};
+
+      let state = this.Storages.Get(id, stateKey);
+      if (!state || typeof state !== 'object') state = { processed: false, values: {} };
+      if (!state.values || typeof state.values !== 'object') state.values = {};
+
+      // ------------------------------------------------------------------
+      // RAW CLI ARGS — captured once by SyAPP at launch
+      // ------------------------------------------------------------------
+      const syapp = this._syappInstance;
+      const cliArgs = (syapp && Array.isArray(syapp._processArgs))
+        ? syapp._processArgs
+        : [];
+
+      // ------------------------------------------------------------------
+      // ROUTE DISCOVERY MODE — never show a form, just hand the handler
+      // whatever we have from the CLI (or schema defaults).
+      // ------------------------------------------------------------------
+      if (curProps._routeDiscovery) {
+        const args = [];
+        for (let i = 0; i < opts.required.length; i++) {
+          const spec = opts.required[i];
+          if (!spec || !spec.name) continue;
+          const v = cliArgs[i] !== undefined ? cliArgs[i] : spec.defaultValue;
+          args.push(v);
+          if (!(spec.name in args)) args[spec.name] = v;
+        }
+        for (let i = opts.required.length; i < cliArgs.length; i++) args.push(cliArgs[i]);
+        try { await handler(args); } catch (e) { if (this.Log) console.error(`Args discovery error in ${this.Name}:`, e); }
+        return;
+      }
+
+      // ------------------------------------------------------------------
+      // FORM SUBMISSION — the user just clicked "Submit Args".
+      // Collect every Field value, validate, and commit to state.
+      // ------------------------------------------------------------------
+      let formJustSubmitted = false;
+      if (curProps[submitKey]) {
+        delete curProps[submitKey];
+
+        const newValues = { ...state.values };
+        let allValid = true;
+
+        for (const spec of opts.required) {
+          if (!spec || !spec.name) continue;
+          const fieldStorageKey = `field_${fieldPrefix}${spec.name}`;
+          let v = this.Storages.Get(id, fieldStorageKey);
+
+          if (v === undefined || v === '') {
+            if (spec.defaultValue !== undefined) v = spec.defaultValue;
+            else if (spec.required !== false) {
+              this.Alert(id, `Field "${spec.label || spec.name}" is required`, { duration: 3000 });
+              allValid = false;
+              break;
+            }
+          }
+
+          if (allValid && typeof spec.validate === 'function') {
+            try {
+              const check = await spec.validate(v);
+              if (check !== true && check !== undefined) {
+                this.Alert(id,
+                  typeof check === 'string' ? check : `Invalid value for "${spec.name}"`,
+                  { duration: 3000 });
+                allValid = false;
+                break;
+              }
+            } catch (err) {
+              this.Alert(id, `Validation error for "${spec.name}": ${err.message}`, { duration: 3000 });
+              allValid = false;
+              break;
+            }
+          }
+
+          newValues[spec.name] = v;
+        }
+
+        if (allValid) {
+          state.values = newValues;
+          state.processed = true;
+          this.Storages.Set(id, stateKey, state);
+
+          // Clean up transient form fields so they don't linger
+          for (const spec of opts.required) {
+            if (!spec || !spec.name) continue;
+            this.Storages.Delete(id, `field_${fieldPrefix}${spec.name}`);
+          }
+          formJustSubmitted = true;
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // MAPPING + FORM DECISION
+      // Process on the first entrance (default) OR on every entrance
+      // (when opts.everyTime is true).
+      //
+      // IMPORTANT: the handler is ONLY invoked when we actually processed
+      // args on this render. With everyTime:false and state.processed:true
+      // (i.e. the args were already settled), we return WITHOUT calling
+      // the handler — otherwise the handler runs on every refresh tick.
+      // ------------------------------------------------------------------
+      const shouldProcess = opts.everyTime || !state.processed;
+
+      // Case A — already processed and not everyTime: just skip silently.
+      if (!shouldProcess && !formJustSubmitted) {
+        return;
+      }
+
+      // Case B — form was just submitted on this render: fall through
+      // and call the handler with the freshly validated values.
+
+      // Case C — first entrance (or everyTime): attempt to resolve args.
+      if (shouldProcess && !formJustSubmitted) {
+        const values = { ...state.values };
+
+        // Positional CLI args → schema (only fill when not already set)
+        for (let i = 0; i < opts.required.length; i++) {
+          const spec = opts.required[i];
+          if (!spec || !spec.name) continue;
+          if (values[spec.name] === undefined || values[spec.name] === '') {
+            if (cliArgs[i] !== undefined) values[spec.name] = cliArgs[i];
+            else if (spec.defaultValue !== undefined) values[spec.name] = spec.defaultValue;
+          }
+        }
+        state.values = values;
+
+        const missing = opts.required.filter(spec => {
+          if (!spec || !spec.name) return false;
+          if (spec.required === false) return false;
+          const v = values[spec.name];
+          return v === undefined || v === null || v === '';
+        });
+
+        if (missing.length > 0 && opts.form) {
+          // ---------- Render the interactive args form ----------
+          this.Text(id, opts.description || 'Please provide the required arguments:');
+
+          for (const spec of opts.required) {
+            if (!spec || !spec.name) continue;
+            const fieldName = `${fieldPrefix}${spec.name}`;
+            const currentVal = values[spec.name] !== undefined ? String(values[spec.name]) : '';
+            this.Field(id, fieldName, {
+              label: spec.label || spec.name,
+              initialValue: currentVal
+            });
+          }
+
+          this.Button(id, {
+            name: ColorText.green('✓ Submit Args'),
+            props: { [submitKey]: true }
+          });
+
+          this.Storages.Set(id, stateKey, state);
+          return; // wait for user to submit
+        }
+
+        state.processed = true;
+        this.Storages.Set(id, stateKey, state);
+      }
+
+      // ------------------------------------------------------------------
+      // BUILD THE FINAL ARGS ARRAY AND CALL THE HANDLER
+      //   • Schema order first
+      //   • Then any extra positional CLI args beyond the schema
+      //   • Named access: `args.filename` works alongside `args[0]`
+      // ------------------------------------------------------------------
+      const values = state.values || {};
+      const args = [];
+
+      for (const spec of opts.required) {
+        if (!spec || !spec.name) continue;
+        const v = values[spec.name];
+        args.push(v);
+        if (!(spec.name in args)) args[spec.name] = v;
+      }
+      for (let i = opts.required.length; i < cliArgs.length; i++) {
+        args.push(cliArgs[i]);
+      }
+
+      try {
+        await handler(args);
+      } catch (e) {
+        if (this.Log) console.error(`Args handler error in ${this.Name}:`, e);
+        throw e;
+      }
+    };
+
     // --------------------------- Build Method ---------------------------
 
     this.Build = async (props = { session: new Session }) => {
@@ -9207,6 +9458,24 @@ this.HUD = new TerminalHUD({
 
     // Store global refresh mode setting
     this.GlobalRefreshMode = userConfig.RefreshMode !== false; // true by default if not set to false
+
+    /**
+     * Command-line arguments passed after the target file.
+     *
+     * Example: `node SyAPP.js MyFunc.js arg1 arg2`
+     *   → process.argv = ['node', 'SyAPP.js', 'MyFunc.js', 'arg1', 'arg2']
+     *   → this._processArgs = ['arg1', 'arg2']
+     *
+     * Can be overridden by passing `processArgs: [...]` in the SyAPP config,
+     * which is useful when the app is launched programmatically.
+     *
+     * These arguments are consumed by `this.Args()` inside any SyAPP_Func.
+     *
+     * @type {Array<string>}
+     */
+    this._processArgs = Array.isArray(userConfig.processArgs)
+      ? userConfig.processArgs.slice()
+      : process.argv.slice(3);
 
     // Per-function refreshers storage
     this._perFunctionRefreshers = new Map();
@@ -10303,6 +10572,19 @@ function _genFuncJS(state, syappRelPath) {
         case 'json':
           L.push(`${indent}await this.JSON(id, ${JSON.stringify(it.config || {})})`)
           break
+        case 'args': {
+          const cfg = {
+            required: it.schema || [],
+            everyTime: !!it.everyTime,
+            form: it.form !== false,
+            key: it.key || it.id
+          }
+          if (it.description) cfg.description = it.description
+          L.push(`${indent}await this.Args(id, async (args) => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'route': {
           const m = it.method || 'Get'
           L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
@@ -10374,6 +10656,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   SetPage: 'setpage',
   File: 'file',
   JSON: 'json',
+  Args: 'args',
   Get: 'route',
   Post: 'route',
   Put: 'route',
@@ -10419,6 +10702,19 @@ function _sbMakeItemForMethod(methodName, id) {
       return { ...base, config: {} }
     case 'json':
       return { ...base, config: {} }
+    case 'args':
+      // Args container: own schema + everyTime/form flags + nested children
+      // (the handler body). `key` is stable across re-renders so the
+      // captured state survives refreshes.
+      return {
+        ...base,
+        everyTime: false,
+        form: true,
+        description: '',
+        key: id,
+        schema: [],
+        items: []
+      }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
     case 'code':
@@ -10574,7 +10870,7 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.id === id) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock') &&
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' || it.type === 'args') &&
           Array.isArray(it.items)) {
         const f = this._findItem(id, it.items)
         if (f) return f
@@ -10587,7 +10883,7 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.type === 'page' && it.name === name) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock') &&
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' || it.type === 'args') &&
           Array.isArray(it.items)) {
         const f = this._findItemByName(name, it.items)
         if (f) return f
@@ -10622,6 +10918,14 @@ class SelfBuilder extends SyAPP_Func {
         return { kind: 'codeblock', item, items: item.items }
       }
     }
+    if (typeof pageName === 'string' && pageName.startsWith('__sba__:')) {
+      const id = pageName.slice(8)
+      const item = this._findItem(id)
+      if (item && item.type === 'args') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'args', item, items: item.items }
+      }
+    }
     const pageItem = S.items.find(i => i.type === 'page' && i.name === pageName)
     if (pageItem) {
       if (!Array.isArray(pageItem.items)) pageItem.items = []
@@ -10643,6 +10947,19 @@ class SelfBuilder extends SyAPP_Func {
     // separately by _renderNewMethodsMenu so they can be shown in their
     // own section below the method list.
     return all.filter(m => !hidden.has(m))
+  }
+
+  /**
+   * Number of items to show per page in the "+New" list and in the
+   * Config menu. Persisted inside the builder State (so it survives
+   * saves/loads) and defaults to 4.
+   * @returns {number}
+   */
+  _getItemsPerPage() {
+    const v = this.State && this.State.itemsPerPage
+    return (typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 20)
+      ? Math.floor(v)
+      : 4
   }
 
   _processActions(id, props) {
@@ -10758,6 +11075,12 @@ class SelfBuilder extends SyAPP_Func {
         const v = String(p.inputValue).trim()
         if (v) S.name = v
         this._pendingAction = null
+      } else if (this._pendingAction === 'itemsPerPage') {
+        const v = parseInt(String(p.inputValue).trim(), 10)
+        if (!isNaN(v) && v >= 1 && v <= 20) {
+          S.itemsPerPage = v
+        }
+        this._pendingAction = null
       }
       delete p.inputValue
       return
@@ -10768,11 +11091,32 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__toggleNew) {
       const cur = this.Storages.Get(id, 'sb_new_open') || false
       this.Storages.Set(id, 'sb_new_open', !cur)
+      // Opening "+New" closes "⚙ Config" (and vice versa) so only one
+      // menu ever occupies the top area at any given time.
+      if (!cur) this.Storages.Set(id, 'sb_methods_open', false)
     }
 
     if (p.__toggleMethods) {
       const cur = this.Storages.Get(id, 'sb_methods_open') || false
       this.Storages.Set(id, 'sb_methods_open', !cur)
+      // Opening "⚙ Config" closes "+New" (and vice versa).
+      if (!cur) this.Storages.Set(id, 'sb_new_open', false)
+    }
+
+    // Filter toggle for the "+New" list (SyAPP ↔ Javascript).
+    if (p.__setNewFilter) {
+      this.Storages.Set(id, 'sb_new_filter', p.__setNewFilter)
+      this.Storages.Set(id, 'sb_new_page', { page: 1 })
+    }
+
+    // Config menu: edit the number of items per page.
+    if (p.__editConfig) {
+      const prop = p.__editConfig
+      if (prop === 'itemsPerPage') {
+        this._pendingAction = 'itemsPerPage'
+        this.WaitInput(id, { question: 'Items per page (1-20): ', path: this.Name, props: passProps })
+        return
+      }
     }
 
     if (p.__newPagePrev) {
@@ -10922,7 +11266,13 @@ class SelfBuilder extends SyAPP_Func {
     const container = this._resolveContainer(curPage)
 
     // -------- pinned top: header + toolbar --------
-    this.Text(id, this._headerLine(S, curPage, container), { pinnedTop: true })
+    // Only ONE separator is emitted here (between header and toolbar).
+    // The separator between the toolbar and whatever menu is currently
+    // open is rendered by _renderTopToolbar() / the container branch as
+    // a pinned-top BUTTON, because _hr() text always lands at the very
+    // top of the pinned-top area (before the toolbar buttons) and would
+    // therefore never visually sit between the toolbar and the options.
+    this.Text(id, this._headerLine(S, curPage, container, id), { pinnedTop: true })
     this.Text(id, _hr('─'), { pinnedTop: true })
 
     if (container.kind === 'root') {
@@ -10937,17 +11287,23 @@ class SelfBuilder extends SyAPP_Func {
           ? `▼ ${_fit(container.item.name, 30)}`
           : container.kind === 'codeblock'
             ? `{} ${_fit(this._codeblockLabel(container.item), 30)}`
-            : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
+            : container.kind === 'args'
+              ? `⚡ Args (args: [ ... ])`
+              : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
       this.Buttons(id, [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
         { name: label, pinnedTop: true },
         { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
           props: { __toggleNew: 1 }, pinnedTop: true }
       ])
-      if (newOpen) this._renderNewMethodsMenu(id)
+      if (newOpen) {
+        // Break the toolbar options group + draw a separator line between
+        // the toolbar and the opened "+New" menu, so the two never merge
+        // onto the same visual row.
+        this.Button(id, { name: _hr('─'), pinnedTop: true })
+        this._renderNewMethodsMenu(id)
+      }
     }
-
-    this.Text(id, _hr('─'), { pinnedTop: true })
 
     // -------- body (scrollable) --------
     if (container.kind === 'root' && S.items.length === 0) {
@@ -10973,19 +11329,31 @@ class SelfBuilder extends SyAPP_Func {
     }
   }
 
-  _headerLine(S, curPage, container) {
+  _headerLine(S, curPage, container, id) {
     const W = _termCols()
     const mode = this.Editing ? ColorText.bgGreen(ColorText.black(' EDIT ')) : ColorText.bgBlue(ColorText.white(' VIEW '))
     const title = ColorText.bold(ColorText.brightCyan(_fit(S.name, Math.max(8, W - 30))))
     const cls = ColorText.dim(`[${_fit(S.funcName, 20)}]`)
+
+    // Determine the label that follows the "|" separator. The header now
+    // reflects which menu is currently open in the toolbar — "+New",
+    // "Config", or (when inside a nested container) a breadcrumb.
     let ctx = ''
-    if (container && container.kind !== 'root') {
+    const newOpen = id ? (this.Storages.Get(id, 'sb_new_open') || false) : false
+    const methodsOpen = id ? (this.Storages.Get(id, 'sb_methods_open') || false) : false
+
+    if (newOpen) {
+      ctx = ` | ${ColorText.dim('New: choose one option to add...')}`
+    } else if (methodsOpen) {
+      ctx = ` | ${ColorText.dim('Config: adjust builder settings')}`
+    } else if (container && container.kind !== 'root') {
       let lbl
       if (container.kind === 'page')            lbl = `📄 ${container.item.name}`
       else if (container.kind === 'dropdown')   lbl = `▼ ${container.item.name}`
       else if (container.kind === 'codeblock')  lbl = `{} ${this._codeblockLabel(container.item)}`
+      else if (container.kind === 'args')       lbl = `⚡ Args (args: [ ... ])`
       else                                       lbl = `? ${curPage}`
-      ctx = ColorText.dim(` › ${_fit(lbl, 28)}`)
+      ctx = ColorText.dim(` | ${_fit(lbl, 40)}`)
     }
     return `  ${mode}  ${title}  ${cls}${ctx}`
   }
@@ -11003,7 +11371,11 @@ class SelfBuilder extends SyAPP_Func {
     const newOpen = this.Storages.Get(id, 'sb_new_open') || false
     const methodsOpen = this.Storages.Get(id, 'sb_methods_open') || false
 
-    // Row 1: "+ New" toggle + global actions (pinned top)
+    // Single toolbar row: toggle + global actions + app/class name.
+    // Because this.Buttons() appends every entry into ONE shared
+    // "options" group, the whole toolbar renders as a single physical
+    // line:
+    //   − New   👁 View   💾 Save   📂 Load   📤 Export   ⚙ Config   🚪 Exit   🏷 untitled   ◆ MyApp
     this.Buttons(id, [
       { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
         props: { __toggleNew: 1 }, pinnedTop: true },
@@ -11012,127 +11384,160 @@ class SelfBuilder extends SyAPP_Func {
       { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
       { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
       { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
-      { name: methodsOpen ? ColorText.bold('⚙ Methods ✓') : '⚙ Methods',
+      { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
         props: { __toggleMethods: 1 }, pinnedTop: true },
-      { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true }
+      { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true },
+      { name: `🏷 ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
+      { name: `◆ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
     ])
 
-    // Row 2: app name / class name (pinned top)
-    this.Buttons(id, [
-      { name: `⚙ ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
-      { name: `⌘ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
-    ])
+    // When either menu is open, break the toolbar's options group and
+    // draw a separator line BEFORE the menu content. Pushing a plain
+    // this.Button() (without the `buttons: true` flag) does two things:
+    //   1. it terminates the toolbar's options group, so the config /
+    //      "+New" content that follows starts on its own line — never
+    //      merged into the toolbar row itself (which is exactly what
+    //      made "Items per page" appear to live inside the main tab);
+    //   2. it renders a long dim line that visually separates the
+    //      toolbar from whatever was opened below it.
+    if (newOpen || methodsOpen) {
+      this.Button(id, { name: _hr('─'), pinnedTop: true })
+    }
 
-    // Scrollable "+New" and "⚙ Methods" content. Rendered as paginated
-    // pinned-top blocks so the toolbar footprint stays fixed regardless of
-    // how many methods are enabled.
+    // "+New" and "⚙ Config" content. Each one now lives BELOW the
+    // separator button pushed above, so opening them no longer makes
+    // their controls appear to live inside the main toolbar tab.
     if (newOpen)     this._renderNewMethodsMenu(id)
-    if (methodsOpen) this._renderMethodsConfigMenu(id)
+    if (methodsOpen) this._renderConfigMenu(id)
   }
 
   /**
-   * Render the "+New" menu.
+   * Render the "+New" menu as ONE paginated options list. The two filter
+   * buttons (SyAPP ↔ Javascript) sit on their OWN row BELOW the options
+   * list, so they never mix with the primary option buttons.
    *
-   * Two sections:
-   *   1. "Methods" — discovered SyAPP_Func methods (paginated)
-   *   2. "JS chains / Custom code" — logic-block templates, rendered
-   *      below the methods so they stand out and remain easily
-   *      discoverable without crowding the primary options.
+   *   • "SyAPP"       → discovered SyAPP_Func methods
+   *   • "Javascript"  → JS chains / custom-code logic-block templates
    *
-   * Uses pagination in each section so the block occupies a fixed
-   * vertical footprint no matter how many methods are enabled.
+   * The number of items per page is driven by the shared config value
+   * (default 4, configurable via ⚙ Config → Items per page).
+   * No section headers are printed — only the toolbar separators that
+   * already surround the pinned-top area.
    */
   _renderNewMethodsMenu(id) {
-    const methods = this._getVisibleNewMethods()
-    const logicBlocks = _SB_LOGIC_BLOCKS
+    const perPage = this._getItemsPerPage()
+    const filter = this.Storages.Get(id, 'sb_new_filter') || 'syapp'
 
-    const perPage = 6
-    const totalPages = Math.max(1, Math.ceil(methods.length / perPage))
+    let entries
+    if (filter === 'js') {
+      entries = _SB_LOGIC_BLOCKS.map(m => ({ kind: 'js', value: m }))
+    } else {
+      entries = this._getVisibleNewMethods().map(m => ({ kind: 'syapp', value: m }))
+    }
+
+    const totalPages = Math.max(1, Math.ceil(entries.length / perPage))
     const st = this.Storages.Get(id, 'sb_new_page') || { page: 1 }
     const cur = Math.min(Math.max(1, st.page || 1), totalPages)
     const start = (cur - 1) * perPage
-    const end = Math.min(start + perPage, methods.length)
-    const shown = methods.slice(start, end)
+    const end = Math.min(start + perPage, entries.length)
+    const shown = entries.slice(start, end)
 
-    // ---------------- Section 1: Methods ----------------
-    this.Text(id, ColorText.brightCyan(
-      `  ┌─ Methods (${cur}/${totalPages})  •  ${methods.length} available`
-    ), { pinnedTop: true })
-
-    for (let i = 0; i < shown.length; i++) {
-      const m = shown[i]
-      const prefix = (i === shown.length - 1) ? '  └─ ' : '  ├─ '
-      this.Button(id, {
-        name: ColorText.dim(prefix) + `➕ ${m}`,
-        props: { __add: m },
-        pinnedTop: true
-      })
+    // ---------------- Options list ----------------
+    if (shown.length === 0) {
+      this.Text(id, ColorText.dim('  (empty — enable methods in ⚙ Config)'), { pinnedTop: true })
+    } else {
+      for (const entry of shown) {
+        const name = entry.kind === 'js'
+          ? `⌘ ${entry.value}`
+          : `➕ ${entry.value}`
+        this.Button(id, {
+          name,
+          props: { __add: entry.value },
+          pinnedTop: true
+        })
+      }
     }
 
-    if (methods.length === 0) {
-      this.Text(id, ColorText.dim('     (no methods enabled — open ⚙ Methods)'), { pinnedTop: true })
-    }
-
+    // ---------------- Pagination row (below options) ----------------
     if (totalPages > 1) {
       this.Buttons(id, [
-        { name: cur > 1 ? ColorText.cyan('◀ Prev') : ColorText.dim('◀ Prev'),
-          props: cur > 1 ? { __newPagePrev: 1 } : {}, pinnedTop: true },
-        { name: ColorText.dim(`  ${cur} / ${totalPages}  `),
-          props: {}, pinnedTop: true },
-        { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
-          props: cur < totalPages ? { __newPageNext: 1 } : {}, pinnedTop: true }
+        { name: cur > 1 ? '◀' : ColorText.dim('◀'),
+          props: cur > 1 ? { __newPagePrev: 1 } : {},
+          pinnedTop: true },
+        { name: ColorText.dim(`${cur}/${totalPages}`),
+          props: {},
+          pinnedTop: true },
+        { name: cur < totalPages ? '▶' : ColorText.dim('▶'),
+          props: cur < totalPages ? { __newPageNext: 1 } : {},
+          pinnedTop: true }
       ])
     }
 
-    // ---------------- Section 2: JS chains / Custom code ----------------
-    // Rendered below the methods so the default options stay the primary
-    // focus while the logic-block templates remain highly visible.
-    this.Text(id, '', { pinnedTop: true })
-    this.Text(id, ColorText.brightMagenta(
-      `  ┌─ JS chains / Custom code  •  ${logicBlocks.length} templates`
-    ), { pinnedTop: true })
-
-    for (let i = 0; i < logicBlocks.length; i++) {
-      const m = logicBlocks[i]
-      const prefix = (i === logicBlocks.length - 1) ? '  └─ ' : '  ├─ '
-      this.Button(id, {
-        name: ColorText.dim(prefix) + ColorText.brightMagenta(`⌘ ${m}`),
-        props: { __add: m },
+    // ---------------- Filter row (below pagination) ----------------
+    this.Buttons(id, [
+      {
+        name: filter === 'syapp' ? ColorText.bold('SyAPP') : ColorText.dim('SyAPP'),
+        props: { __setNewFilter: 'syapp' },
         pinnedTop: true
-      })
-    }
+      },
+      { name: ColorText.dim('|'), props: {}, pinnedTop: true },
+      {
+        name: filter === 'js' ? ColorText.bold('Javascript') : ColorText.dim('Javascript'),
+        props: { __setNewFilter: 'js' },
+        pinnedTop: true
+      }
+    ])
   }
 
   /**
-   * Render the ⚙ Methods config menu. Lists every discovered SyAPP_Func
-   * method as a toggle so the user can hide/show each one. The default
-   * blacklist is always applied on top (and cannot be re-enabled here).
+   * Render the unified ⚙ Config menu.
+   *
+   * This single view absorbs every builder setting that used to be
+   * scattered across dedicated menus:
+   *
+   *   • Items per page (default 4) — drives BOTH the "+New" list and
+   *     the method toggle list below.
+   *   • The full method visibility blacklist (formerly "⚙ Methods").
+   *   • The "Reset hidden" shortcut.
+   *
+   * No section headers are printed — only the separator lines that
+   * already surround the pinned-top toolbar.
    */
-  _renderMethodsConfigMenu(id) {
+  _renderConfigMenu(id) {
+    const perPage = this._getItemsPerPage()
     const all = _sbDiscoverMethods()
     const hiddenSet = this._getHiddenSet()
-    const perPage = 6
+
+    // Each config entry gets its OWN line, matching the layout of the
+    // method-visibility list below. This guarantees "Items per page"
+    // never sits on the toolbar row and always appears "below like the
+    // selection" of the method list.
+    this.Button(id, {
+      name: `Items per page: ${perPage}`,
+      props: { __editConfig: 'itemsPerPage' },
+      pinnedTop: true
+    })
+    this.Button(id, {
+      name: 'Reset hidden',
+      props: { __resetHidden: 1 },
+      pinnedTop: true
+    })
+
+    // Method visibility list — paginated with the SAME per-page value.
     const totalPages = Math.max(1, Math.ceil(all.length / perPage))
     const st = this.Storages.Get(id, 'sb_methods_page') || { page: 1 }
     const cur = Math.min(Math.max(1, st.page || 1), totalPages)
     const start = (cur - 1) * perPage
     const end = Math.min(start + perPage, all.length)
     const shown = all.slice(start, end)
-    const visibleCount = all.filter(m => !hiddenSet.has(m)).length
 
-    this.Text(id, ColorText.brightMagenta(
-      `  ┌─ ⚙ Methods config (${cur}/${totalPages})  •  ${visibleCount}/${all.length} visible`
-    ), { pinnedTop: true })
-
-    for (let i = 0; i < shown.length; i++) {
-      const m = shown[i]
+    for (const m of shown) {
       const hidden = hiddenSet.has(m)
       const isDefaultHidden = _SB_DEFAULT_NEW_BLACKLIST.includes(m)
-      const prefix = (i === shown.length - 1) ? '  └─ ' : '  ├─ '
       const mark = hidden ? ColorText.red('✗') : ColorText.green('✓')
-      const tag = isDefaultHidden ? ColorText.dim(' [default-off]') : ''
+      const tag = isDefaultHidden ? ColorText.dim(' [off]') : ''
       this.Button(id, {
-        name: ColorText.dim(prefix) + mark + ' ' + m + tag,
+        name: `${mark} ${m}${tag}`,
         props: { __toggleMethodHidden: m },
         pinnedTop: true
       })
@@ -11140,18 +11545,17 @@ class SelfBuilder extends SyAPP_Func {
 
     if (totalPages > 1) {
       this.Buttons(id, [
-        { name: cur > 1 ? ColorText.cyan('◀ Prev') : ColorText.dim('◀ Prev'),
-          props: cur > 1 ? { __methodsPagePrev: 1 } : {}, pinnedTop: true },
-        { name: ColorText.dim(`  ${cur} / ${totalPages}  `),
-          props: {}, pinnedTop: true },
-        { name: cur < totalPages ? ColorText.cyan('Next ▶') : ColorText.dim('Next ▶'),
-          props: cur < totalPages ? { __methodsPageNext: 1 } : {}, pinnedTop: true }
+        { name: cur > 1 ? '◀' : ColorText.dim('◀'),
+          props: cur > 1 ? { __methodsPagePrev: 1 } : {},
+          pinnedTop: true },
+        { name: ColorText.dim(`${cur}/${totalPages}`),
+          props: {},
+          pinnedTop: true },
+        { name: cur < totalPages ? '▶' : ColorText.dim('▶'),
+          props: cur < totalPages ? { __methodsPageNext: 1 } : {},
+          pinnedTop: true }
       ])
     }
-    this.Buttons(id, [
-      { name: ColorText.yellow('↺ Reset hidden'),
-        props: { __resetHidden: 1 }, pinnedTop: true }
-    ])
   }
 
   async _renderItems(id, items, props) {
@@ -11166,7 +11570,7 @@ class SelfBuilder extends SyAPP_Func {
     if (this.Editing) {
       const isActive = this.EditItemId === it.id
       const navigable = (it.type === 'button' || it.type === 'dropdown' ||
-                         it.type === 'page' || it.type === 'codeblock')
+                         it.type === 'page' || it.type === 'codeblock' || it.type === 'args')
       const dot = isActive
         ? ColorText.brightYellow('◉')
         : navigable ? ColorText.green('○') : ColorText.dim('○')
@@ -11269,6 +11673,30 @@ class SelfBuilder extends SyAPP_Func {
           break
         case 'json':
           this.Button(id, { name: `🔍 JSON`, props: {} })
+          break
+        case 'args':
+          // Args container: behaves like a page in edit mode (click to
+          // step inside and add/modify its children) and executes the
+          // real this.Args(...) call in view mode, rendering every nested
+          // child as the body of the args handler.
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            const schemaLen = Array.isArray(it.schema) ? it.schema.length : 0
+            this.Button(id, {
+              name: `${ColorText.brightGreen('⚡')} Args (args)${schemaLen ? ColorText.dim(` [${schemaLen} schema]`) : ''}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sba__:${it.id}` }
+            })
+          } else {
+            await this.Args(id, async (args) => {
+              await this._renderItems(id, it.items || [], props)
+            }, {
+              required: it.schema || [],
+              everyTime: !!it.everyTime,
+              form: it.form !== false,
+              description: it.description || undefined,
+              key: it.key || it.id
+            })
+          }
           break
         case 'route':
           this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
@@ -11535,6 +11963,13 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('config', 'Config', 'json')
         break
 
+      case 'args':
+        mkProp('description', 'Description', 'string')
+        mkProp('schema', 'Schema (JSON)', 'json')
+        mkToggle('everyTime', 'Every Time')
+        mkToggle('form', 'Form Fallback')
+        break
+
       case 'route':
         mkProp('path', 'Path', 'string')
         mkProp('handler', 'Handler', 'string')
@@ -11581,6 +12016,12 @@ class SelfBuilder extends SyAPP_Func {
       actions.push({
         name: ColorText.brightCyan('＋ Add child'),
         props: { page: `__sbcb__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'args') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sba__:${it.id}` },
         pinned: true
       })
     }
