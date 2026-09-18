@@ -5395,6 +5395,95 @@ this.DropDownManager = {
       return false;
     };
 
+    // --------------------------- Pinned Container Methods ---------------------------
+
+    /**
+     * Execute a block of UI-building code inside a "pinned top" context.
+     *
+     * Every child created inside the code block (Text, Button, Buttons,
+     * SideButton, Field) is automatically marked as pinnedTop and is
+     * therefore rendered in the fixed top area, above a single separator
+     * line, regardless of how many scrollable items exist in the middle.
+     *
+     * This is the building-block equivalent of `this.Page`: instead of
+     * following the selected page, it follows the pinned-top region, and
+     * the code you supply becomes the body of that region.
+     *
+     * Nesting PinnedTop / PinnedBottom restores the previous context when
+     * the inner block finishes, so combined layouts are safe. Children
+     * may explicitly override the pin by setting `pinned: true` (bottom)
+     * or `pinnedTop: false` on their own config object.
+     *
+     * @param {string} id - User/build ID
+     * @param {Function} code - async () => { ... } builder body
+     * @returns {Promise<void>}
+     *
+     * @example
+     *   await this.PinnedTop(id, async () => {
+     *     this.Text(id, '📌 Header');
+     *     this.Button(id, { name: '☰ Menu', props: { open: 'menu' } });
+     *   });
+     */
+    this.PinnedTop = async (id, code = async () => { }) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.PinnedTop() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      const build = this.Builds.get(id);
+      const previousContext = build._pinContext;
+      build._pinContext = 'top';
+      try {
+        if (typeof code === 'function') {
+          await code();
+        }
+      } finally {
+        build._pinContext = previousContext;
+      }
+    };
+
+    /**
+     * Execute a block of UI-building code inside a "pinned bottom" context.
+     *
+     * Every child created inside the code block (Text, Button, Buttons,
+     * SideButton, Field) is automatically marked as pinned and is
+     * therefore rendered in the fixed bottom area, below a single
+     * separator line, regardless of how many scrollable items exist in
+     * the middle.
+     *
+     * Mirrors `this.PinnedTop` and `this.Page`: the supplied async code
+     * becomes the body of the pinned-bottom region, and nested PinnedTop
+     * / PinnedBottom calls restore the previous context when they finish.
+     *
+     * Children may explicitly override the pin by setting `pinnedTop:
+     * true` (top) or `pinned: false` on their own config object.
+     *
+     * @param {string} id - User/build ID
+     * @param {Function} code - async () => { ... } builder body
+     * @returns {Promise<void>}
+     *
+     * @example
+     *   await this.PinnedBottom(id, async () => {
+     *     this.Button(id, { name: '⌂ Home' });
+     *     this.Button(id, { name: '↻ Refresh' });
+     *   });
+     */
+    this.PinnedBottom = async (id, code = async () => { }) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.PinnedBottom() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      const build = this.Builds.get(id);
+      const previousContext = build._pinContext;
+      build._pinContext = 'bottom';
+      try {
+        if (typeof code === 'function') {
+          await code();
+        }
+      } finally {
+        build._pinContext = previousContext;
+      }
+    };
+
     // --------------------------- Alert Methods (unchanged) ---------------------------
 
     /**
@@ -8349,9 +8438,20 @@ function levenshteinDistance(str1, str2) {
         finalConfig = { name: nameOrConfig, ...config };
         if (rest.length > 0) Object.assign(finalConfig, ...rest);
       } else {
-        finalConfig = nameOrConfig || {};
+        // Clone so the pin-context inheritance below never mutates a
+        // shared config object owned by the caller.
+        finalConfig = nameOrConfig ? { ...nameOrConfig } : {};
       }
       if (!finalConfig.path) finalConfig.path = this.Name;
+
+      // Inherit the current pinned container context (set by
+      // this.PinnedTop / this.PinnedBottom) when the caller did not
+      // explicitly choose a pin target.
+      const __build = this.Builds.get(id);
+      if (__build && finalConfig.pinned === undefined && finalConfig.pinnedTop === undefined) {
+        if (__build._pinContext === 'top') finalConfig.pinnedTop = true;
+        else if (__build._pinContext === 'bottom') finalConfig.pinned = true;
+      }
 
       const button_obj = this._makeButtonObj(id, finalConfig);
       if (!button_obj) return;
@@ -8410,12 +8510,21 @@ function levenshteinDistance(str1, str2) {
       if (!Array.isArray(configs)) configs = [configs];
       if (configs.length === 0) return;
 
+      const __build = this.Builds.get(id);
+
       const objs = [];
       for (let i = 0; i < configs.length; i++) {
         const cfg = configs[i];
         if (!cfg) continue;
         const finalConfig = { ...cfg };
         if (!finalConfig.path) finalConfig.path = this.Name;
+        // Inherit the current pinned container context (set by
+        // this.PinnedTop / this.PinnedBottom) when the caller did not
+        // explicitly choose a pin target.
+        if (__build && finalConfig.pinned === undefined && finalConfig.pinnedTop === undefined) {
+          if (__build._pinContext === 'top') finalConfig.pinnedTop = true;
+          else if (__build._pinContext === 'bottom') finalConfig.pinned = true;
+        }
         // Mark the FIRST item with _startNewGroup, so Button() opens a
         // fresh options row for this call (see Button() step 2).
         if (i === 0) finalConfig._startNewGroup = true;
@@ -8452,6 +8561,15 @@ function levenshteinDistance(str1, str2) {
       const finalConfig = { ...config };
       if (!finalConfig.path) finalConfig.path = this.Name;
 
+      // Inherit the current pinned container context (set by
+      // this.PinnedTop / this.PinnedBottom) when the caller did not
+      // explicitly choose a pin target.
+      const __build = this.Builds.get(id);
+      if (__build && finalConfig.pinned === undefined && finalConfig.pinnedTop === undefined) {
+        if (__build._pinContext === 'top') finalConfig.pinnedTop = true;
+        else if (__build._pinContext === 'bottom') finalConfig.pinned = true;
+      }
+
       const obj = this._makeButtonObj(id, finalConfig);
       if (!obj) return;
 
@@ -8487,14 +8605,23 @@ function levenshteinDistance(str1, str2) {
       if (this.Builds.has(id)) {
         const userBuild = this.Builds.get(id);
 
-        if (config.pinnedTop) {
+        // Inherit the current pinned container context (set by
+        // this.PinnedTop / this.PinnedBottom) when the caller did not
+        // explicitly choose a pin target.
+        const effective = { ...config };
+        if (effective.pinned === undefined && effective.pinnedTop === undefined) {
+          if (userBuild._pinContext === 'top') effective.pinnedTop = true;
+          else if (userBuild._pinContext === 'bottom') effective.pinned = true;
+        }
+
+        if (effective.pinnedTop) {
           // Pinned-top text is rendered above the top separator line.
           if (userBuild.PinnedTopText != '') {
             userBuild.PinnedTopText = `${userBuild.PinnedTopText}\n${text}`
           } else {
             userBuild.PinnedTopText = text
           }
-        } else if (config.pinned) {
+        } else if (effective.pinned) {
           // Pinned text is rendered below the separator, at the bottom of the screen.
           if (userBuild.PinnedText != '') {
             userBuild.PinnedText = `${userBuild.PinnedText}\n${text}`
@@ -8549,6 +8676,18 @@ function levenshteinDistance(str1, str2) {
     this.Field = (id, name, config = {}) => {
         if (!this.Builds.has(id)) return;
 
+        const __build = this.Builds.get(id);
+
+        // Inherit the current pinned container context (set by
+        // this.PinnedTop / this.PinnedBottom) when the caller did not
+        // explicitly choose a pin target.
+        let pinned = config.pinned;
+        let pinnedTop = config.pinnedTop;
+        if (pinned === undefined && pinnedTop === undefined) {
+            if (__build._pinContext === 'top') pinnedTop = true;
+            else if (__build._pinContext === 'bottom') pinned = true;
+        }
+
         const storageKey = `field_${name}`;
         let value = this.Storages.Get(id, storageKey);
         if (value === undefined) {
@@ -8567,10 +8706,10 @@ function levenshteinDistance(str1, str2) {
             value: value,
             // If true, this field is rendered in the pinned-bottom
             // area at the bottom of the screen, below a single separator line.
-            pinned: config.pinned || false,
+            pinned: pinned || false,
             // If true, this field is rendered in the pinned-top
             // area at the top of the screen, above a single separator line.
-            pinnedTop: config.pinnedTop || false,
+            pinnedTop: pinnedTop || false,
             onChange: (newValue) => {
                 this.Storages.Set(id, storageKey, newValue);
                 if (typeof config.onChange === 'function') {
@@ -10784,6 +10923,16 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'pinnedTop':
+          L.push(`${indent}await this.PinnedTop(id, async () => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}})`)
+          break
+        case 'pinnedBottom':
+          L.push(`${indent}await this.PinnedBottom(id, async () => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}})`)
+          break
         case 'codeblock': {
           const bt = it.blockType
           const cond = it.condition || ''
@@ -10907,6 +11056,8 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Buttons: 'buttonsGroup',
   Field: 'field',
   Page: 'page',
+  PinnedTop: 'pinnedTop',
+  PinnedBottom: 'pinnedBottom',
   DropDown: 'dropdown',
   WaitInput: 'waitinput',
   Alert: 'alert',
@@ -10951,6 +11102,14 @@ function _sbMakeItemForMethod(methodName, id) {
       return { ...base, name: 'field_' + id, label: 'Label', initialValue: '' }
     case 'page':
       return { ...base, name: 'page_' + id, items: [] }
+    case 'pinnedTop':
+      // Pinned-top container: children render inside a this.PinnedTop()
+      // block, so everything created inside is auto-marked pinnedTop.
+      return { ...base, items: [] }
+    case 'pinnedBottom':
+      // Pinned-bottom container: children render inside a
+      // this.PinnedBottom() block, so everything is auto-marked pinned.
+      return { ...base, items: [] }
     case 'dropdown':
       return { ...base, name: 'dropdown_' + id, up_buttontext: 'Show more', down_buttontext: 'Hide' }
     case 'waitinput':
@@ -11134,7 +11293,8 @@ class SelfBuilder extends SyAPP_Func {
     for (const it of items) {
       if (it.id === id) return it
       if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' ||
-           it.type === 'args' || it.type === 'buttonsGroup') &&
+           it.type === 'args' || it.type === 'buttonsGroup' ||
+           it.type === 'pinnedTop' || it.type === 'pinnedBottom') &&
           Array.isArray(it.items)) {
         const f = this._findItem(id, it.items)
         if (f) return f
@@ -11148,7 +11308,8 @@ class SelfBuilder extends SyAPP_Func {
     for (const it of items) {
       if (it.type === 'page' && it.name === name) return it
       if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' ||
-           it.type === 'args' || it.type === 'buttonsGroup') &&
+           it.type === 'args' || it.type === 'buttonsGroup' ||
+           it.type === 'pinnedTop' || it.type === 'pinnedBottom') &&
           Array.isArray(it.items)) {
         const f = this._findItemByName(name, it.items)
         if (f) return f
@@ -11197,6 +11358,22 @@ class SelfBuilder extends SyAPP_Func {
       if (item && item.type === 'buttonsGroup') {
         if (!Array.isArray(item.items)) item.items = []
         return { kind: 'buttonsGroup', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbpt__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'pinnedTop') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'pinnedTop', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbpb__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'pinnedBottom') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'pinnedBottom', item, items: item.items }
       }
     }
     const pageItem = S.items.find(i => i.type === 'page' && i.name === pageName)
@@ -11564,7 +11741,11 @@ class SelfBuilder extends SyAPP_Func {
               ? `⚡ Args (args: [ ... ])`
               : container.kind === 'buttonsGroup'
                 ? `⧾ Buttons Group`
-                : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
+                : container.kind === 'pinnedTop'
+                  ? `📌 Pinned Top`
+                  : container.kind === 'pinnedBottom'
+                    ? `📌 Pinned Bottom`
+                    : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
       this.Buttons(id, [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
         { name: label, pinnedTop: true },
@@ -11628,6 +11809,8 @@ class SelfBuilder extends SyAPP_Func {
       else if (container.kind === 'codeblock')  lbl = `{} ${this._codeblockLabel(container.item)}`
       else if (container.kind === 'args')       lbl = `⚡ Args (args: [ ... ])`
       else if (container.kind === 'buttonsGroup') lbl = `⧾ Buttons Group`
+      else if (container.kind === 'pinnedTop')  lbl = `📌 Pinned Top`
+      else if (container.kind === 'pinnedBottom') lbl = `📌 Pinned Bottom`
       else                                       lbl = `? ${curPage}`
       ctx = ColorText.dim(` | ${_fit(lbl, 40)}`)
     }
@@ -11864,7 +12047,8 @@ class SelfBuilder extends SyAPP_Func {
       const isActive = this.EditItemId === it.id
       const navigable = (it.type === 'button' || it.type === 'dropdown' ||
                          it.type === 'page' || it.type === 'codeblock' ||
-                         it.type === 'args' || it.type === 'buttonsGroup')
+                         it.type === 'args' || it.type === 'buttonsGroup' ||
+                         it.type === 'pinnedTop' || it.type === 'pinnedBottom')
       const dot = isActive
         ? ColorText.brightYellow('◉')
         : navigable ? ColorText.green('○') : ColorText.dim('○')
@@ -11988,6 +12172,38 @@ class SelfBuilder extends SyAPP_Func {
             })
           } else {
             await this._renderCodeblock(id, it, props)
+          }
+          break
+        case 'pinnedTop':
+          // Pinned-top container: in view mode, its children render
+          // inside a this.PinnedTop() block so everything created inside
+          // is auto-marked pinnedTop. In edit mode it behaves like a
+          // page (click to step inside and edit children).
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `${ColorText.brightBlue('📌')} Pinned Top${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sbpt__:${it.id}` }
+            })
+          } else {
+            await this.PinnedTop(id, async () => {
+              await this._renderItems(id, it.items || [], props)
+            })
+          }
+          break
+        case 'pinnedBottom':
+          // Pinned-bottom container: view mode wraps children inside a
+          // this.PinnedBottom() call. Edit mode behaves like a page.
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `${ColorText.brightBlue('📌')} Pinned Bottom${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sbpb__:${it.id}` }
+            })
+          } else {
+            await this.PinnedBottom(id, async () => {
+              await this._renderItems(id, it.items || [], props)
+            })
           }
           break
         case 'waitinput':
@@ -12362,6 +12578,18 @@ class SelfBuilder extends SyAPP_Func {
       actions.push({
         name: ColorText.brightCyan('＋ Add child'),
         props: { page: `__sbbg__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'pinnedTop') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbpt__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'pinnedBottom') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbpb__:${it.id}` },
         pinned: true
       })
     }
