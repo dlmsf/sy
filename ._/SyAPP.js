@@ -12601,6 +12601,598 @@ class SelfBuilder extends SyAPP_Func {
   }
 }
 
+// ============================================================
+// USER-FILE PARSER
+// ============================================================
+// Reverse-engineers an existing SyAPP function file (regardless of
+// whether it was originally produced by the SelfBuilder) into a
+// State object that the editor can consume.
+//
+// The parser is intentionally lenient:
+//   • extracts the class name,
+//   • extracts the app name passed to `super(...)`,
+//   • detects the identifier assigned from `props.session.UniqueID`
+//     (which can be named anything — id, uid, ID, session, ...),
+//   • walks the build-function body statement by statement and maps
+//     recognised `this.X(...)` calls into builder items,
+//   • and preserves every unrecognised statement as a raw `code`
+//     item, so nothing is ever silently dropped.
+// ============================================================
+
+let __SB_PARSE_SEQ = 0
+function _sbNid() { return `it_${Date.now().toString(36)}_p${++__SB_PARSE_SEQ}` }
+
+/** Sentinel returned by value parsers when an expression is not a
+ *  plain JSON-safe literal (identifiers, calls, template interpolation). */
+const _SB_CODE = Symbol('sb_code')
+
+/**
+ * Extract the content between a balanced open/close character pair.
+ * Strings, template literals, line comments and block comments are
+ * skipped, so braces/parens inside them never affect the depth count.
+ * @returns {string|null} inner content, or null when unbalanced
+ */
+function _sbExtractBalanced(source, openIdx, openChar, closeChar) {
+  if (!source || source[openIdx] !== openChar) return null
+  let depth = 0
+  let inString = null, inLineComment = false, inBlockComment = false
+  for (let i = openIdx; i < source.length; i++) {
+    const c = source[i], next = source[i + 1]
+    if (inLineComment) { if (c === '\n') inLineComment = false; continue }
+    if (inBlockComment) { if (c === '*' && next === '/') { inBlockComment = false; i++ } continue }
+    if (inString) {
+      if (c === '\\') { i++; continue }
+      if (c === inString) inString = null
+      continue
+    }
+    if (c === '/' && next === '/') { inLineComment = true; i++; continue }
+    if (c === '/' && next === '*') { inBlockComment = true; i++; continue }
+    if (c === '"' || c === "'" || c === '`') { inString = c; continue }
+    if (c === openChar) depth++
+    else if (c === closeChar) {
+      depth--
+      if (depth === 0) return source.slice(openIdx + 1, i)
+    }
+  }
+  return null
+}
+
+/** Split a top-level comma-separated argument string. */
+function _sbSplitArgs(argsStr) {
+  const args = []
+  let depth = 0, start = 0, inString = null
+  for (let i = 0; i < argsStr.length; i++) {
+    const c = argsStr[i]
+    if (inString) {
+      if (c === '\\') { i++; continue }
+      if (c === inString) inString = null
+      continue
+    }
+    if (c === '"' || c === "'" || c === '`') { inString = c; continue }
+    if (c === '(' || c === '{' || c === '[') depth++
+    else if (c === ')' || c === '}' || c === ']') depth--
+    else if (c === ',' && depth === 0) {
+      args.push(argsStr.slice(start, i).trim())
+      start = i + 1
+    }
+  }
+  const last = argsStr.slice(start).trim()
+  if (last) args.push(last)
+  return args
+}
+
+/**
+ * Split a script body into top-level statements. A statement ends when
+ * a newline is seen at bracket depth 0. Multi-line statements (e.g. a
+ * call whose object literal spans several lines) are kept together.
+ */
+function _sbSplitStatements(body) {
+  const stmts = []
+  let depth = 0, start = 0
+  let inString = null, inLineComment = false, inBlockComment = false
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i], next = body[i + 1]
+    if (inLineComment) {
+      if (c === '\n') {
+        inLineComment = false
+        if (depth === 0) { stmts.push(body.slice(start, i)); start = i + 1 }
+      }
+      continue
+    }
+    if (inBlockComment) { if (c === '*' && next === '/') { inBlockComment = false; i++ } continue }
+    if (inString) {
+      if (c === '\\') { i++; continue }
+      if (c === inString) inString = null
+      continue
+    }
+    if (c === '/' && next === '/') { inLineComment = true; i++; continue }
+    if (c === '/' && next === '*') { inBlockComment = true; i++; continue }
+    if (c === '"' || c === "'" || c === '`') { inString = c; continue }
+    if (c === '{' || c === '(' || c === '[') depth++
+    else if (c === '}' || c === ')' || c === ']') depth--
+    else if (c === '\n' && depth === 0) {
+      stmts.push(body.slice(start, i))
+      start = i + 1
+    }
+  }
+  if (start < body.length) {
+    const tail = body.slice(start)
+    if (tail.trim()) stmts.push(tail)
+  }
+  return stmts.map(s => s.trim()).filter(s => s.length > 0)
+}
+
+/**
+ * Parse a value expression (literal, object, array) into a JSON-safe
+ * JavaScript value. Returns _SB_CODE when the expression contains any
+ * runtime evaluation (identifier, call, template interpolation, ...).
+ */
+function _sbParseValue(src) {
+  if (src === undefined || src === null) return undefined
+  src = String(src).trim()
+  if (src === '') return ''
+  if (src === 'true') return true
+  if (src === 'false') return false
+  if (src === 'null') return null
+  if (src === 'undefined') return undefined
+  if (/^-?\d+(?:\.\d+)?$/.test(src)) return Number(src)
+  if ((src[0] === "'" && src[src.length - 1] === "'") ||
+      (src[0] === '"' && src[src.length - 1] === '"')) {
+    return src.slice(1, -1)
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+      .replace(/\\r/g, '\r').replace(/\\'/g, "'")
+      .replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+  }
+  if (src[0] === '`' && src[src.length - 1] === '`') {
+    const inner = src.slice(1, -1)
+    if (inner.includes('${')) return _SB_CODE
+    return inner
+  }
+  if (src.startsWith('{') && src.endsWith('}')) {
+    const inner = src.slice(1, -1).trim()
+    if (inner === '') return {}
+    const parts = _sbSplitArgs(inner)
+    const obj = {}
+    for (const part of parts) {
+      const m = part.match(/^([\w$]+|['"][^'"]+['"])\s*:\s*([\s\S]+)$/)
+      if (!m) return _SB_CODE
+      let key = m[1]
+      if ((key[0] === "'" || key[0] === '"') && key[key.length - 1] === key[0]) {
+        key = key.slice(1, -1)
+      }
+      const v = _sbParseValue(m[2])
+      if (v === _SB_CODE) return _SB_CODE
+      obj[key] = v
+    }
+    return obj
+  }
+  if (src.startsWith('[') && src.endsWith(']')) {
+    const inner = src.slice(1, -1).trim()
+    if (inner === '') return []
+    const parts = _sbSplitArgs(inner)
+    const arr = []
+    for (const p of parts) {
+      const v = _sbParseValue(p)
+      if (v === _SB_CODE) return _SB_CODE
+      arr.push(v)
+    }
+    return arr
+  }
+  return _SB_CODE
+}
+
+/** Detect a `this.Method(...)` call and return { method, args }. */
+function _sbParseCall(stmt) {
+  const m = stmt.match(/^(?:await\s+)?this\.([A-Za-z_$][\w$]*)\s*\(/)
+  if (!m) return null
+  const openIdx = m.index + m[0].length - 1
+  const argsStr = _sbExtractBalanced(stmt, openIdx, '(', ')')
+  if (argsStr === null) return null
+  return {
+    method: m[1],
+    args: _sbSplitArgs(argsStr),
+    isAwait: /^\s*await\s+/.test(stmt)
+  }
+}
+
+/**
+ * Drop the leading session-variable argument from a call when it looks
+ * like a plain identifier reference (the common `this.Text(uid, ...)`
+ * pattern). The sessionVar hint is used when available, but identifier
+ * syntax alone is enough to safely drop the first positional argument
+ * for every builder method — they all take the id first.
+ */
+function _sbDropSessionArg(args, sessionVar) {
+  if (args.length === 0) return args
+  const a0 = args[0]
+  if (a0 === sessionVar || /^[A-Za-z_$][\w$]*$/.test(a0) || /^\w+\.session\b/.test(a0)) {
+    return args.slice(1)
+  }
+  return args
+}
+
+/**
+ * Build a button config from a `this.Button(...)` / `this.SideButton(...)`
+ * argument list. Handles all signatures the runtime accepts:
+ *   Button(id, 'name')
+ *   Button(id, 'name', { ...config })
+ *   Button(id, { name, props, path, ... })
+ *   Button(id, 'name', { ...config1 }, { ...config2 })
+ */
+function _sbButtonConfig(rest) {
+  const cfg = { name: '', props: {} }
+  if (rest.length === 0) return cfg
+  let nameFromString = null
+  let startIdx = 0
+  const first = rest[0]
+  if (first && (first[0] === "'" || first[0] === '"' || first[0] === '`')) {
+    const v = _sbParseValue(first)
+    if (typeof v === 'string') nameFromString = v
+    startIdx = 1
+  }
+  for (let i = startIdx; i < rest.length; i++) {
+    const v = _sbParseValue(rest[i])
+    if (v === _SB_CODE) return null
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      Object.assign(cfg, v)
+    }
+  }
+  if (nameFromString !== null && !cfg.name) cfg.name = nameFromString
+  return cfg
+}
+
+/** Turn a parsed button config into a builder button item, or null. */
+function _sbMakeButtonItem(cfg, sourceMethod) {
+  if (!cfg) return null
+  const out = {
+    type: 'button',
+    sourceMethod: sourceMethod || 'Button',
+    name: typeof cfg.name === 'string' ? cfg.name : '',
+    props: (cfg.props && typeof cfg.props === 'object' && !Array.isArray(cfg.props)) ? cfg.props : {}
+  }
+  if (sourceMethod === 'SideButton') out.buttons = true
+  if (typeof cfg.path === 'string') out.path = cfg.path
+  if (cfg.resetSelection) out.resetSelection = true
+  if (cfg.jumpTo !== undefined) out.jumpTo = cfg.jumpTo
+  if (cfg.pinned) out.pinned = true
+  if (cfg.pinnedTop) out.pinnedTop = true
+  return out
+}
+
+/** Parse a `{...}` config expression into a plain object, or {} on failure. */
+function _sbObjArg(src) {
+  if (src === undefined || src === null) return {}
+  const v = _sbParseValue(src)
+  if (v === _SB_CODE) return null
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v
+  return {}
+}
+
+/** Extract the body of an arrow-function expression `... => { ... }`. */
+function _sbExtractArrowBody(src) {
+  src = String(src).trim()
+  const arrowIdx = src.indexOf('=>')
+  if (arrowIdx < 0) return null
+  const after = src.slice(arrowIdx + 2).trim()
+  if (after.startsWith('{')) return _sbExtractBalanced(after, 0, '{', '}')
+  return null
+}
+
+/**
+ * Parse a container-style method (Page, DropDown, PinnedTop, PinnedBottom,
+ * Args). Containers embed an `async () => { ... }` body that is parsed
+ * recursively. Optional trailing config object is merged into the item.
+ */
+function _sbContainerItem(method, rest) {
+  let name = ''
+  let arrowSrc = null
+  let configSrc = null
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i].trim()
+    if (/^(async\s*\(|async\s+function|\(?\s*[\w$]*\s*\)?\s*=>)/.test(a)) {
+      arrowSrc = a
+      if (i + 1 < rest.length) configSrc = rest[i + 1]
+      break
+    }
+    if (i === 0 && (a[0] === "'" || a[0] === '"' || a[0] === '`')) {
+      const v = _sbParseValue(a)
+      if (typeof v === 'string') name = v
+    }
+  }
+  let nested = []
+  if (arrowSrc) {
+    const body = _sbExtractArrowBody(arrowSrc)
+    if (body !== null) nested = _sbParseBody(body)
+  }
+  let cfg = {}
+  if (configSrc !== null) {
+    const cv = _sbObjArg(configSrc)
+    if (cv) cfg = cv
+  }
+  switch (method) {
+    case 'Page':
+      return { type: 'page', name: name || `page_${_sbNid()}`, items: nested }
+    case 'DropDown':
+      return {
+        type: 'dropdown',
+        name: name || `dropdown_${_sbNid()}`,
+        up_buttontext: typeof cfg.up_buttontext === 'string' ? cfg.up_buttontext : 'Show more',
+        down_buttontext: typeof cfg.down_buttontext === 'string' ? cfg.down_buttontext : 'Hide',
+        items: nested
+      }
+    case 'PinnedTop':
+      return { type: 'pinnedTop', items: nested }
+    case 'PinnedBottom':
+      return { type: 'pinnedBottom', items: nested }
+    case 'Args':
+      return {
+        type: 'args',
+        everyTime: !!cfg.everyTime,
+        form: cfg.form !== false,
+        description: typeof cfg.description === 'string' ? cfg.description : '',
+        key: typeof cfg.key === 'string' ? cfg.key : _sbNid(),
+        schema: Array.isArray(cfg.required) ? cfg.required : [],
+        items: nested
+      }
+  }
+  return null
+}
+
+/**
+ * Convert a parsed `this.X(...)` call into a builder item. Returns null
+ * when the call cannot be safely mapped — the caller then stores the
+ * original statement as a raw code item.
+ */
+function _sbCallToItem(call, sessionVar) {
+  const rest = _sbDropSessionArg(call.args, sessionVar)
+  switch (call.method) {
+    case 'Text': {
+      const v = _sbParseValue(rest[0])
+      if (v === _SB_CODE) return null
+      if (typeof v === 'string' && v === '') return { type: 'spacer' }
+      if (typeof v === 'string') return { type: 'text', value: v }
+      return null
+    }
+    case 'Button':
+    case 'AlertButton':
+      return _sbMakeButtonItem(_sbButtonConfig(rest), call.method)
+    case 'SideButton':
+      return _sbMakeButtonItem(_sbButtonConfig(rest), 'SideButton')
+    case 'Buttons': {
+      const arr = _sbParseValue(rest[0])
+      if (arr === _SB_CODE || !Array.isArray(arr)) return null
+      const items = []
+      for (const c of arr) {
+        if (!c || typeof c !== 'object' || Array.isArray(c)) continue
+        const it = _sbMakeButtonItem(c, 'Button')
+        if (it) { it.id = _sbNid(); items.push(it) }
+      }
+      return { type: 'buttonsGroup', items }
+    }
+    case 'Field': {
+      const name = _sbParseValue(rest[0])
+      if (typeof name !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'field',
+        name,
+        label: typeof cfg.label === 'string' ? cfg.label : '',
+        initialValue: typeof cfg.initialValue === 'string' ? cfg.initialValue : '',
+        pinned: !!cfg.pinned,
+        pinnedTop: !!cfg.pinnedTop
+      }
+    }
+    case 'Alert': {
+      const text = _sbParseValue(rest[0])
+      if (typeof text !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'alert',
+        text,
+        duration: typeof cfg.duration === 'number' ? cfg.duration : 3000
+      }
+    }
+    case 'GotoNow': {
+      const pathVal = _sbParseValue(rest[0])
+      if (typeof pathVal !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return { type: 'gotonow', path: pathVal, props: cfg.props || {} }
+    }
+    case 'SetPage': {
+      const page = _sbParseValue(rest[0])
+      if (typeof page !== 'string') return null
+      return { type: 'setpage', page }
+    }
+    case 'WaitInput': {
+      const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'waitinput',
+        path: typeof cfg.path === 'string' ? cfg.path : '',
+        props: cfg.props || {},
+        question: typeof cfg.question === 'string' ? cfg.question : 'Type: ',
+        password: !!cfg.password
+      }
+    }
+    case 'Page':
+    case 'DropDown':
+    case 'PinnedTop':
+    case 'PinnedBottom':
+    case 'Args':
+      return _sbContainerItem(call.method, rest)
+    case 'File':
+      return { type: 'file', config: {} }
+    case 'JSON':
+      return { type: 'json', config: {} }
+    case 'Get':
+    case 'Post':
+    case 'Put':
+    case 'Delete': {
+      const pathVal = _sbParseValue(rest[0])
+      const handlerArg = rest[1]
+      let handlerCode = '// handler code'
+      if (handlerArg) {
+        const body = _sbExtractArrowBody(handlerArg)
+        if (body !== null) handlerCode = body.trim()
+      }
+      return {
+        type: 'route',
+        method: call.method,
+        path: typeof pathVal === 'string' ? pathVal : '/',
+        handler: handlerCode
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Detect the identifier assigned from `props.session.UniqueID`. The
+ * props variable itself may be named anything (props, p, configuration,
+ * cfg, ...) and the target variable may be anything (id, uid, ID, ...).
+ */
+function _sbFindSessionVar(body, propsVar) {
+  const candidates = []
+  if (propsVar) candidates.push(propsVar)
+  candidates.push('props', 'p', 'configuration', 'config')
+  const seen = new Set()
+  for (const v of candidates) {
+    if (!v || seen.has(v)) continue
+    seen.add(v)
+    const esc = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(
+      `(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${esc}\\.session\\.UniqueID`,
+      'i'
+    )
+    const m = body.match(re)
+    if (m) return { sessionVar: m[1], propsVar: v }
+  }
+  // Fallback: match any `<X>.session.UniqueID` access pattern
+  const f = body.match(/([A-Za-z_$][\w$]*)\.session\.UniqueID/i)
+  if (f) {
+    const esc = f[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const a = body.match(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${esc}\\.session\\.UniqueID`))
+    if (a) return { sessionVar: a[1], propsVar: f[1] }
+    return { sessionVar: 'id', propsVar: f[1] }
+  }
+  return { sessionVar: 'id', propsVar: 'props' }
+}
+
+/**
+ * Extract the async build function from the `super(...)` call. Looks at
+ * the second argument of super() and returns { body, propsVar }.
+ */
+function _sbExtractBuildFunction(source) {
+  const m = source.match(/\bsuper\s*\(/)
+  if (!m) return null
+  const openIdx = source.indexOf('(', m.index)
+  if (openIdx < 0) return null
+  const argsStr = _sbExtractBalanced(source, openIdx, '(', ')')
+  if (argsStr === null) return null
+  const args = _sbSplitArgs(argsStr)
+  if (args.length < 2) return null
+  const buildSrc = args[1].trim()
+  let pm = buildSrc.match(/^async\s*\(\s*([\w$]*)\s*\)\s*=>/)
+  if (!pm) pm = buildSrc.match(/^async\s+([\w$]+)\s*=>/)
+  if (!pm) pm = buildSrc.match(/^async\s+function\s*\(\s*([\w$]*)\s*\)/)
+  if (!pm) pm = buildSrc.match(/^\(\s*([\w$]*)\s*\)\s*=>/)
+  if (!pm) return null
+  const propsVar = pm[1] || 'props'
+  const braceIdx = buildSrc.indexOf('{', pm.index + pm[0].length - 1)
+  if (braceIdx < 0) return null
+  const body = _sbExtractBalanced(buildSrc, braceIdx, '{', '}')
+  if (body === null) return null
+  return { body, propsVar }
+}
+
+/**
+ * Parse a raw build-function body into builder items. Recognised
+ * `this.X(...)` calls become structured items; everything else becomes
+ * a `code` item executed as-is at render time.
+ *
+ * When the session variable is renamed (e.g. `uid`), any code fallback
+ * gets a `const <sessionVar> = id;` prefix so the code can still resolve
+ * the session id inside the AsyncFunction sandbox that the renderer
+ * provides.
+ */
+function _sbParseBody(body) {
+  const found = _sbFindSessionVar(body, 'props')
+  const sessionVar = found.sessionVar
+  const stmts = _sbSplitStatements(body)
+  const items = []
+  for (const stmt of stmts) {
+    // Skip the session-variable declaration itself
+    if (/^(?:const|let|var)\s+[\w$]+\s*=\s*[\w$]+\.session\.UniqueID\b/i.test(stmt)) {
+      continue
+    }
+    const call = _sbParseCall(stmt)
+    if (call) {
+      const item = _sbCallToItem(call, sessionVar)
+      if (item) {
+        item.id = item.id || _sbNid()
+        items.push(item)
+        continue
+      }
+    }
+    // Fallback: preserve the statement as a raw code item
+    let code = stmt
+    if (sessionVar && sessionVar !== 'id') {
+      const esc = sessionVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      if (new RegExp(`\\b${esc}\\b`).test(code)) {
+        code = `const ${sessionVar} = id;\n${code}`
+      }
+    }
+    items.push({ id: _sbNid(), type: 'code', value: code })
+  }
+  return items
+}
+
+/**
+ * Parse an entire SyAPP function file into a builder state object.
+ * Returns `{ name, funcName, items, hiddenMethods, sessionVar }` — a
+ * shape fully compatible with the SelfBuilder's State.
+ *
+ * Anything the parser cannot understand becomes a raw `code` item, so
+ * the loaded file always executes as intended when viewed. Complex
+ * functions that were never produced by the SelfBuilder therefore
+ * round-trip through the editor without losing behaviour.
+ */
+function _sbParseFuncJS(source, filePath) {
+  const baseName = path.basename(filePath).replace(/\.(js|mjs|cjs)$/i, '')
+  const state = {
+    name: baseName || 'untitled',
+    funcName: (baseName || 'MyApp').replace(/[^A-Za-z0-9_$]/g, '') || 'MyApp',
+    code: '',
+    items: [],
+    hiddenMethods: [],
+    sessionVar: 'id'
+  }
+  if (!source || typeof source !== 'string') return state
+
+  // 1. Class name → funcName
+  const clsM = source.match(/class\s+([A-Za-z_$][\w$]*)\s+extends\s+/)
+  if (clsM) state.funcName = clsM[1]
+
+  // 2. App name → first string literal argument of super()
+  const supM = source.match(/super\s*\(\s*(['"`])([^'"`]+)\1/)
+  if (supM) state.name = supM[2]
+
+  // 3. Build-function body (2nd argument to super())
+  const buildInfo = _sbExtractBuildFunction(source)
+  if (!buildInfo) return state
+
+  // 4. Session-var identifier (can be id, uid, ID, session, ...)
+  const found = _sbFindSessionVar(buildInfo.body, buildInfo.propsVar)
+  state.sessionVar = found.sessionVar
+
+  // 5. Parse the body into builder items
+  state.items = _sbParseBody(buildInfo.body)
+  return state
+}
+
 function _installCtrlC(syapp) {
   syapp.HUD.on('ctrl+c', async () => {
     const builder = syapp.Funcs.get('__selfbuilder__')
@@ -12652,10 +13244,38 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     if (arg1 === '--edit' && arg2) { editMode = true; editTarget = arg2; }
     else if (arg2 === '--edit') { editMode = true; editTarget = arg1; }
     if (editMode && editTarget) {
-      __BUILDER_INITIAL_STATE = null;
       __BUILDER_EXPORT_TARGET = path.isAbsolute(editTarget)
         ? editTarget
         : path.resolve(process.cwd(), editTarget);
+
+      // If the target file already exists, parse it into a builder state
+      // so the SelfBuilder opens the file directly in the editor. The
+      // parser is best-effort: whatever cannot be mapped to a structured
+      // item is preserved as a raw `code` item, so nothing is lost and
+      // the loaded code still executes with the same behaviour as before.
+      __BUILDER_INITIAL_STATE = null;
+      try {
+        if (fs.existsSync(__BUILDER_EXPORT_TARGET)) {
+          const src = fs.readFileSync(__BUILDER_EXPORT_TARGET, 'utf8');
+          const parsed = _sbParseFuncJS(src, __BUILDER_EXPORT_TARGET);
+          if (parsed && (parsed.items.length > 0 || parsed.name)) {
+            __BUILDER_INITIAL_STATE = parsed;
+            console.log(ColorText.brightGreen(
+              `📂 Loaded "${editTarget}" — ${parsed.items.length} item(s) parsed`
+            ));
+          }
+        } else {
+          console.log(ColorText.yellow(
+            `ℹ️  New file: ${editTarget} (will be created on export)`
+          ));
+        }
+      } catch (e) {
+        console.error(ColorText.yellow(
+          `⚠️  Could not parse "${editTarget}": ${e.message} — starting with a blank editor`
+        ));
+        __BUILDER_INITIAL_STATE = null;
+      }
+
       const syapp = new SyAPP(SelfBuilder);
       _installCtrlC(syapp);
       return;
