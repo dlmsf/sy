@@ -372,13 +372,15 @@ class Sy extends SyAPP.Func() {
           }
 
           this.Button(uid, ' ');
-          this.Button(uid, {
-            name: this.TextColor.orange('＋ New'),
-            props: { new_instance: true, page }
-          });
+          await this.PinnedBottom(uid, async () => {
+            this.Button(uid, {
+              name: this.TextColor.orange('＋ New'),
+              props: { new_instance: true, page }
+            });
 
-          this.Button(uid, ' ');
-          this.SideButton(uid, { name: '⚙️ Config', path: 'config' });
+            this.Button(uid, ' ');
+            this.SideButton(uid, { name: '⚙️ Config', path: 'config' });
+          });
         });
 
         // ---------- RENDER MANAGE PAGE ----------
