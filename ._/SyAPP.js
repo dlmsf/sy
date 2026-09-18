@@ -1938,6 +1938,19 @@ if (configuration.remember) {
       let maxVisibleLines = 1;
 
       // ------------------------------------------------------------------
+      // PER-LINE HORIZONTAL SCROLL STATE
+      // ------------------------------------------------------------------
+      // Keyed by line index → the leftmost visible column index for that
+      // line. This mirrors the vertical `scrollOffset` above but on the
+      // horizontal axis: whenever a single row of options is wider than
+      // the terminal, the row becomes horizontally scrollable instead of
+      // overflowing / being silently truncated. The focused row is kept
+      // in sync with `column` so left/right navigation always reveals
+      // the focused option (with ◀N / N▶ indicators otherwise).
+      // ------------------------------------------------------------------
+      const hScrollByLine = {};
+
+      // ------------------------------------------------------------------
       // DOUBLE-TAP DETECTION (up and down arrow keys)
       // ------------------------------------------------------------------
       // Auto-repeat from holding a key fires at roughly 30–50ms intervals
@@ -1997,10 +2010,19 @@ if (configuration.remember) {
         );
       };
 
-      // Render a single line of options into a string
+      // Render a single line of options into a string.
+      //
+      // This version applies HORIZONTAL scrolling: if the combined width
+      // of a row's options exceeds the terminal width, only the visible
+      // window [hScroll, lastRendered] is drawn, with dim ◀N / N▶
+      // indicators on either side to signal the hidden columns. The
+      // focused row is always adjusted so the focused column is visible,
+      // exactly mirroring the vertical viewport behaviour above.
       const renderOptionLine = (lineOptions, lineIndex, focusLine, focusColumn) => {
-        return lineOptions.map((option, columnIndex) => {
-          let text;
+        const termWidth = stdout.columns || 80;
+
+        // Build the raw (unstyled) text for every column in this line.
+        const texts = lineOptions.map((option, columnIndex) => {
           if (option.type === 'field') {
             const maxLen = this.fieldMaxWidth || 20;
             let val = '';
@@ -2009,22 +2031,95 @@ if (configuration.remember) {
               val = this.activeField.value;
               const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
               const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
-              text = label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
+              return label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
             } else {
               val = option.value || '';
               const truncated = val.length > maxLen ? val.slice(0, maxLen) : val;
-              text = label ? `${label}: ░${truncated}░` : `░${truncated}░`;
+              return label ? `${label}: ░${truncated}░` : `░${truncated}░`;
+            }
+          }
+          return typeof option === 'string' ? option : option.name || JSON.stringify(option);
+        });
+
+        // ---------- Resolve this line's horizontal scroll offset ----------
+        let hScroll = hScrollByLine[lineIndex] || 0;
+        if (hScroll < 0) hScroll = 0;
+        if (texts.length === 0) {
+          hScrollByLine[lineIndex] = 0;
+          return '';
+        }
+        if (hScroll > texts.length - 1) hScroll = texts.length - 1;
+
+        // Keep the focused column visible on the focused line.
+        if (lineIndex === focusLine) {
+          if (focusColumn < hScroll) {
+            // Focus moved left of the current viewport → snap left.
+            hScroll = focusColumn;
+          } else {
+            // Walk the offset forward until the focused column fits inside
+            // the terminal width (accounting for the ◀ indicator + separators).
+            const RESERVED = 4; // room for a " NNN▶" right indicator
+            while (hScroll < focusColumn) {
+              let w = 0;
+              if (hScroll > 0) w += (`◀${hScroll} `).length;
+              for (let c = hScroll; c <= focusColumn; c++) {
+                if (c > hScroll) w += 3;
+                w += texts[c].length;
+              }
+              if (w <= termWidth - RESERVED) break;
+              hScroll++;
+            }
+          }
+        }
+
+        // Persist the resolved offset so the next render of the same line
+        // resumes from exactly this position.
+        hScrollByLine[lineIndex] = hScroll;
+
+        // ---------- Render the visible slice of this line ----------
+        const parts = [];
+        let currentWidth = 0;
+
+        const leftMore = hScroll;
+        if (leftMore > 0) {
+          const indicator = `◀${leftMore} `;
+          parts.push(ColorText.dim(indicator));
+          currentWidth += indicator.length;
+        }
+
+        let lastRendered = hScroll - 1;
+        for (let c = hScroll; c < texts.length; c++) {
+          const sep = (c > hScroll) ? '   ' : '';
+          const text = texts[c];
+          const pieceWidth = sep.length + text.length;
+          const hasMoreAfter = c < texts.length - 1;
+          // Reserve a little room for the right indicator when there are
+          // more columns waiting beyond this one.
+          const reserve = hasMoreAfter ? 5 : 0;
+          const isFirstVisible = (c === hScroll);
+          if (!isFirstVisible && currentWidth + pieceWidth + reserve > termWidth) {
+            break;
+          }
+
+          if (lineIndex === focusLine && c === focusColumn) {
+            if (this.highlightColor) {
+              parts.push(`${sep}${this.highlightColor}${text}${this.resetColor()}`);
+            } else {
+              parts.push(`${sep}→ ${text}`);
             }
           } else {
-            text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+            parts.push(sep + text);
           }
-          if (lineIndex === focusLine && columnIndex === focusColumn) {
-            return this.highlightColor
-              ? `${this.highlightColor}${text}${this.resetColor()}`
-              : `→ ${text}`;
-          }
-          return text;
-        }).join('   ');
+          currentWidth += pieceWidth;
+          lastRendered = c;
+        }
+
+        const rightMore = texts.length - 1 - lastRendered;
+        if (rightMore > 0) {
+          parts.push(' ' + ColorText.dim(`${rightMore}▶`));
+        }
+
+        return parts.join('');
       };
 
       const renderMenu = () => {
@@ -2364,6 +2459,7 @@ if (configuration.remember) {
         currentColumn: column,
         scrollOffset: 0,
         maxVisibleLines: 1,
+        hScrollByLine,
         firstItemRow: 0,
         hasUpIndicator: false,
         hasDownIndicator: false,
@@ -3310,9 +3406,21 @@ setFocus(newLine, newColumn);
 
     if (row < 0 || row >= normalizedOptions.length) return -1;
 
-    // Find the column inside that row
+    // Find the column inside that row.
+    //
+    // The row may be horizontally scrolled: when `hScrollByLine[row]` is
+    // greater than zero, the first visible column is not column 0, and a
+    // dim "◀N " indicator occupies a few leading characters. Both are
+    // accounted for here so clicks still land on the correct option.
+    const hScrollByLine = (state && state.hScrollByLine) ? state.hScrollByLine : {};
+    const hScroll = hScrollByLine[row] || 0;
+
     let currentColumn = 0;
-    for (let column = 0; column < normalizedOptions[row].length; column++) {
+    if (hScroll > 0) {
+      currentColumn += (`◀${hScroll} `).length;
+    }
+
+    for (let column = hScroll; column < normalizedOptions[row].length; column++) {
       const option = normalizedOptions[row][column];
       const rawText = typeof option === 'string' ? option : option.name || JSON.stringify(option);
       const text = rawText.replace(/\x1b\[[0-9;]*m/g, '');   // strip escape sequences
