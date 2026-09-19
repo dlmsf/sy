@@ -1753,7 +1753,13 @@ if (configuration.remember) {
   
   return this.numberedMenus
     ? this.displayMenuFromOptions(menuTitle, menu.options, { ...configuration, initialSelectedIndex: finalIndex })
-    : this.displayMenuWithArrows(menuTitle, menu.options, { ...configuration, pinnedTitle: menu.pinnedTitle, pinnedTopTitle: menu.pinnedTopTitle }, finalIndex);
+    : this.displayMenuWithArrows(menuTitle, menu.options, {
+        ...configuration,
+        pinnedTitle: menu.pinnedTitle,
+        pinnedTopTitle: menu.pinnedTopTitle,
+        pinnedTopSeparator: menu.pinnedTopSeparator,
+        pinnedBottomSeparator: menu.pinnedBottomSeparator
+      }, finalIndex);
 }
 
   /**
@@ -1921,6 +1927,23 @@ if (configuration.remember) {
       const pinnedTopTitleLines = pinnedTopTitle ? pinnedTopTitle.split('\n') : [];
       const pinnedTitle = configuration.pinnedTitle || '';
       const pinnedTitleLines = pinnedTitle ? pinnedTitle.split('\n') : [];
+
+      // Optional per-area separator styles. Default 'line' = unchanged look.
+      const pinnedTopSeparatorStyle = configuration.pinnedTopSeparator || 'line';
+      const pinnedBottomSeparatorStyle = configuration.pinnedBottomSeparator || 'line';
+
+      const buildSeparator = (style) => {
+        const sepWidth = Math.max(10, stdout.columns || 40);
+        switch (style) {
+          case 'none':
+            return '';
+          case 'discrete':
+            return ColorText.brightBlack('·'.repeat(sepWidth));
+          case 'line':
+          default:
+            return ColorText.dim('─'.repeat(sepWidth));
+        }
+      };
 
       if (configuration.clear) console.clear();
 
@@ -2147,9 +2170,8 @@ if (configuration.remember) {
             currentRow += 1;
           }
 
-          // Single separator line
-          const sepWidth = Math.max(10, stdout.columns || 40);
-          console.log(ColorText.dim('─'.repeat(sepWidth)));
+          // Single separator line (style controlled by pinnedTopSeparator)
+          console.log(buildSeparator(pinnedTopSeparatorStyle));
           currentRow += 1;
         }
 
@@ -2207,8 +2229,8 @@ if (configuration.remember) {
         // ---------- Pinned-bottom area ----------
         let pinnedFirstRow = -1;
         if (hasPinnedArea) {
-          const sepWidth = Math.max(10, stdout.columns || 40);
-          console.log(ColorText.dim('─'.repeat(sepWidth)));
+          // Single separator line (style controlled by pinnedBottomSeparator)
+          console.log(buildSeparator(pinnedBottomSeparatorStyle));
           currentRow += 1;
 
           for (const tLine of pinnedTitleLines) {
@@ -3667,6 +3689,18 @@ class userBuild {
     this.PinnedTopText = ''
     /** @type {string} Text rendered inside the pinned-bottom area (above pinned-bottom options) */
     this.PinnedText = ''
+    /**
+     * Optional separator style for the pinned-top area line.
+     *   'line' (default) | 'none' | 'discrete'
+     * @type {'line'|'none'|'discrete'}
+     */
+    this.PinnedTopSeparator = 'line'
+    /**
+     * Optional separator style for the pinned-bottom area line.
+     *   'line' (default) | 'none' | 'discrete'
+     * @type {'line'|'none'|'discrete'}
+     */
+    this.PinnedBottomSeparator = 'line'
     /** @type {Array<Object>} */
     this.Buttons = []
     /** @type {boolean} */
@@ -5424,7 +5458,7 @@ this.DropDownManager = {
      *     this.Button(id, { name: '☰ Menu', props: { open: 'menu' } });
      *   });
      */
-    this.PinnedTop = async (id, code = async () => { }) => {
+    this.PinnedTop = async (id, code = async () => { }, config = {}) => {
       if (!this.Builds.has(id)) {
         if (this.Log) console.log(`this.PinnedTop() Error - userBuild not found | BuildID: ${id}`);
         return;
@@ -5432,6 +5466,9 @@ this.DropDownManager = {
       const build = this.Builds.get(id);
       const previousContext = build._pinContext;
       build._pinContext = 'top';
+      if (config && config.separator !== undefined) {
+        build.PinnedTopSeparator = config.separator;
+      }
       try {
         if (typeof code === 'function') {
           await code();
@@ -5467,7 +5504,7 @@ this.DropDownManager = {
      *     this.Button(id, { name: '↻ Refresh' });
      *   });
      */
-    this.PinnedBottom = async (id, code = async () => { }) => {
+    this.PinnedBottom = async (id, code = async () => { }, config = {}) => {
       if (!this.Builds.has(id)) {
         if (this.Log) console.log(`this.PinnedBottom() Error - userBuild not found | BuildID: ${id}`);
         return;
@@ -5475,6 +5512,9 @@ this.DropDownManager = {
       const build = this.Builds.get(id);
       const previousContext = build._pinContext;
       build._pinContext = 'bottom';
+      if (config && config.separator !== undefined) {
+        build.PinnedBottomSeparator = config.separator;
+      }
       try {
         if (typeof code === 'function') {
           await code();
@@ -8615,6 +8655,9 @@ function levenshteinDistance(str1, str2) {
         }
 
         if (effective.pinnedTop) {
+          if (effective.separator !== undefined) {
+            userBuild.PinnedTopSeparator = effective.separator
+          }
           // Pinned-top text is rendered above the top separator line.
           if (userBuild.PinnedTopText != '') {
             userBuild.PinnedTopText = `${userBuild.PinnedTopText}\n${text}`
@@ -8622,6 +8665,9 @@ function levenshteinDistance(str1, str2) {
             userBuild.PinnedTopText = text
           }
         } else if (effective.pinned) {
+          if (effective.separator !== undefined) {
+            userBuild.PinnedBottomSeparator = effective.separator
+          }
           // Pinned text is rendered below the separator, at the bottom of the screen.
           if (userBuild.PinnedText != '') {
             userBuild.PinnedText = `${userBuild.PinnedText}\n${text}`
@@ -9053,6 +9099,8 @@ function levenshteinDistance(str1, str2) {
             title: this.Builds.get(sessionId).Text,
             pinnedTopTitle: this.Builds.get(sessionId).PinnedTopText || undefined,
             pinnedTitle: this.Builds.get(sessionId).PinnedText || undefined,
+            pinnedTopSeparator: this.Builds.get(sessionId).PinnedTopSeparator || 'line',
+            pinnedBottomSeparator: this.Builds.get(sessionId).PinnedBottomSeparator || 'line',
             options: this.Builds.get(sessionId).Buttons
           },
           wait_input: this.Builds.get(sessionId).WaitInput,
@@ -10923,16 +10971,24 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}}, ${JSON.stringify(cfg)})`)
           break
         }
-        case 'pinnedTop':
+        case 'pinnedTop': {
+          // Emit the optional separator only when it differs from 'line',
+          // so untouched projects export byte-for-byte identical code.
+          const sep = (it.separator && it.separator !== 'line') ? it.separator : null
+          const cfg = sep ? `, { separator: ${JSON.stringify(sep)} }` : ''
           L.push(`${indent}await this.PinnedTop(id, async () => {`)
           emit(it.items || [], indent + '  ')
-          L.push(`${indent}})`)
+          L.push(`${indent}}${cfg})`)
           break
-        case 'pinnedBottom':
+        }
+        case 'pinnedBottom': {
+          const sep = (it.separator && it.separator !== 'line') ? it.separator : null
+          const cfg = sep ? `, { separator: ${JSON.stringify(sep)} }` : ''
           L.push(`${indent}await this.PinnedBottom(id, async () => {`)
           emit(it.items || [], indent + '  ')
-          L.push(`${indent}})`)
+          L.push(`${indent}}${cfg})`)
           break
+        }
         case 'codeblock': {
           const bt = it.blockType
           const cond = it.condition || ''
@@ -11277,6 +11333,8 @@ class SelfBuilder extends SyAPP_Func {
       ? JSON.parse(JSON.stringify(__BUILDER_INITIAL_STATE))
       : { name: 'untitled', funcName: 'MyApp', code: '', items: [] }
     if (!Array.isArray(initial.hiddenMethods)) initial.hiddenMethods = []
+    if (typeof initial.pinnedTopSeparator !== 'string') initial.pinnedTopSeparator = 'line'
+    if (typeof initial.pinnedBottomSeparator !== 'string') initial.pinnedBottomSeparator = 'line'
     this.State = initial
     this.Editing = true
     this.EditItemId = null
@@ -11602,6 +11660,32 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__resetHidden) {
       S.hiddenMethods = []
       this.Alert(id, '↺ Method blacklist reset (using defaults)', { duration: 2500 })
+    }
+
+    // Cycle a pinned-area separator style: line → none → discrete → line
+    if (p.__cycleSeparator) {
+      const isTop = p.__cycleSeparator === 'top'
+      const key = isTop ? 'pinnedTopSeparator' : 'pinnedBottomSeparator'
+      const cur = S[key] || 'line'
+      const next = cur === 'line' ? 'none' : cur === 'none' ? 'discrete' : 'line'
+      S[key] = next
+      const label = isTop ? 'Top' : 'Bottom'
+      this.Alert(id, `📌 ${label} separator → ${next}`, { duration: 2000 })
+    }
+
+    // Cycle the separator style of a SPECIFIC pinned item (pinnedTop /
+    // pinnedBottom container). Stored on the item itself so each pinned
+    // region can have its own look. The item-level value overrides the
+    // global default when rendering.
+    if (p.__cycleItemSeparator) {
+      const [iid, which] = String(p.__cycleItemSeparator).split('::')
+      const it = this._findItem(iid)
+      if (it) {
+        const cur = it.separator || 'line'
+        const next = cur === 'line' ? 'none' : cur === 'none' ? 'discrete' : 'line'
+        it.separator = next
+        this.Alert(id, `📌 ${which === 'top' ? 'Top' : 'Bottom'} separator → ${next}`, { duration: 2000 })
+      }
     }
 
     if (p.__add) {
@@ -11999,6 +12083,28 @@ class SelfBuilder extends SyAPP_Func {
       pinnedTop: true
     })
 
+    // Global default separator styles for the pinned areas. Clicking
+    // cycles each area independently through:
+    //     line → none → discrete → line
+    // Default is 'line', so untouched projects look identical.
+    const gTop = S.pinnedTopSeparator || 'line'
+    const gBot = S.pinnedBottomSeparator || 'line'
+    const gIcon = (v) => v === 'none' ? '▫' : v === 'discrete' ? '·' : '─'
+    const gTag  = (v) => v === 'none' ? 'none (smooth)'
+                       : v === 'discrete' ? 'discrete (· · ·)'
+                       : 'line (default)'
+
+    this.Button(id, {
+      name: `📌 Top separator: ${gIcon(gTop)} ${gTag(gTop)}   (click to cycle)`,
+      props: { __cycleSeparator: 'top' },
+      pinnedTop: true
+    })
+    this.Button(id, {
+      name: `📌 Bottom separator: ${gIcon(gBot)} ${gTag(gBot)}   (click to cycle)`,
+      props: { __cycleSeparator: 'bottom' },
+      pinnedTop: true
+    })
+
     // Method visibility list — paginated with the SAME per-page value.
     const totalPages = Math.max(1, Math.ceil(all.length / perPage))
     const st = this.Storages.Get(id, 'sb_methods_page') || { page: 1 }
@@ -12175,10 +12281,6 @@ class SelfBuilder extends SyAPP_Func {
           }
           break
         case 'pinnedTop':
-          // Pinned-top container: in view mode, its children render
-          // inside a this.PinnedTop() block so everything created inside
-          // is auto-marked pinnedTop. In edit mode it behaves like a
-          // page (click to step inside and edit children).
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
             this.Button(id, {
@@ -12186,14 +12288,14 @@ class SelfBuilder extends SyAPP_Func {
               props: { page: `__sbpt__:${it.id}` }
             })
           } else {
+            // Per-item separator overrides the global default when set.
+            const sep = it.separator || this.State.pinnedTopSeparator || 'line'
             await this.PinnedTop(id, async () => {
               await this._renderItems(id, it.items || [], props)
-            })
+            }, { separator: sep })
           }
           break
         case 'pinnedBottom':
-          // Pinned-bottom container: view mode wraps children inside a
-          // this.PinnedBottom() call. Edit mode behaves like a page.
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
             this.Button(id, {
@@ -12201,9 +12303,10 @@ class SelfBuilder extends SyAPP_Func {
               props: { page: `__sbpb__:${it.id}` }
             })
           } else {
+            const sep = it.separator || this.State.pinnedBottomSeparator || 'line'
             await this.PinnedBottom(id, async () => {
               await this._renderItems(id, it.items || [], props)
-            })
+            }, { separator: sep })
           }
           break
         case 'waitinput':
@@ -12484,6 +12587,37 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('customBefore', 'JS before body', 'string')
         mkProp('customAfter', 'JS after body', 'string')
         break
+
+      // Pinned container editors get a dedicated "Separator" toggle so
+      // the visible style of THAT pinned area can be cycled right from
+      // its own editor panel (line → none → discrete → line).
+      case 'pinnedTop': {
+        const cur = it.separator || (this.State && this.State.pinnedTopSeparator) || 'line'
+        const icon = cur === 'none' ? '▫' : cur === 'discrete' ? '·' : '─'
+        const tag  = cur === 'none' ? 'none (smooth)'
+                   : cur === 'discrete' ? 'discrete (· · ·)'
+                   : 'line (default)'
+        propButtons.push({
+          name: `📌 Top Separator: ${icon} ${tag}   (click to cycle)`,
+          props: { __cycleItemSeparator: `${it.id}::top` },
+          pinned: true
+        })
+        break
+      }
+
+      case 'pinnedBottom': {
+        const cur = it.separator || (this.State && this.State.pinnedBottomSeparator) || 'line'
+        const icon = cur === 'none' ? '▫' : cur === 'discrete' ? '·' : '─'
+        const tag  = cur === 'none' ? 'none (smooth)'
+                   : cur === 'discrete' ? 'discrete (· · ·)'
+                   : 'line (default)'
+        propButtons.push({
+          name: `📌 Bottom Separator: ${icon} ${tag}   (click to cycle)`,
+          props: { __cycleItemSeparator: `${it.id}::bottom` },
+          pinned: true
+        })
+        break
+      }
 
       case 'waitinput':
         mkProp('path', 'Path', 'string')
@@ -12921,9 +13055,17 @@ function _sbContainerItem(method, rest) {
         items: nested
       }
     case 'PinnedTop':
-      return { type: 'pinnedTop', items: nested }
+      return {
+        type: 'pinnedTop',
+        items: nested,
+        separator: (typeof cfg.separator === 'string') ? cfg.separator : undefined
+      }
     case 'PinnedBottom':
-      return { type: 'pinnedBottom', items: nested }
+      return {
+        type: 'pinnedBottom',
+        items: nested,
+        separator: (typeof cfg.separator === 'string') ? cfg.separator : undefined
+      }
     case 'Args':
       return {
         type: 'args',
