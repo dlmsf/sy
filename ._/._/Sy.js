@@ -371,7 +371,7 @@ class Sy extends SyAPP.Func() {
             await renderInstance(main, 0, true);
           }
 
-          this.Button(uid, ' ');
+        
           await this.PinnedBottom(uid, async () => {
             this.Button(uid, {
               name: this.TextColor.orange('＋ New'),
@@ -380,7 +380,7 @@ class Sy extends SyAPP.Func() {
 
             this.Button(uid, ' ');
             this.SideButton(uid, { name: '⚙️ Config', path: 'config' });
-          });
+          },{separator : 'none'});
         });
 
         // ---------- RENDER MANAGE PAGE ----------
