@@ -1938,6 +1938,19 @@ if (configuration.remember) {
       let maxVisibleLines = 1;
 
       // ------------------------------------------------------------------
+      // PER-LINE HORIZONTAL SCROLL STATE
+      // ------------------------------------------------------------------
+      // Keyed by line index → the leftmost visible column index for that
+      // line. This mirrors the vertical `scrollOffset` above but on the
+      // horizontal axis: whenever a single row of options is wider than
+      // the terminal, the row becomes horizontally scrollable instead of
+      // overflowing / being silently truncated. The focused row is kept
+      // in sync with `column` so left/right navigation always reveals
+      // the focused option (with ◀N / N▶ indicators otherwise).
+      // ------------------------------------------------------------------
+      const hScrollByLine = {};
+
+      // ------------------------------------------------------------------
       // DOUBLE-TAP DETECTION (up and down arrow keys)
       // ------------------------------------------------------------------
       // Auto-repeat from holding a key fires at roughly 30–50ms intervals
@@ -1997,10 +2010,19 @@ if (configuration.remember) {
         );
       };
 
-      // Render a single line of options into a string
+      // Render a single line of options into a string.
+      //
+      // This version applies HORIZONTAL scrolling: if the combined width
+      // of a row's options exceeds the terminal width, only the visible
+      // window [hScroll, lastRendered] is drawn, with dim ◀N / N▶
+      // indicators on either side to signal the hidden columns. The
+      // focused row is always adjusted so the focused column is visible,
+      // exactly mirroring the vertical viewport behaviour above.
       const renderOptionLine = (lineOptions, lineIndex, focusLine, focusColumn) => {
-        return lineOptions.map((option, columnIndex) => {
-          let text;
+        const termWidth = stdout.columns || 80;
+
+        // Build the raw (unstyled) text for every column in this line.
+        const texts = lineOptions.map((option, columnIndex) => {
           if (option.type === 'field') {
             const maxLen = this.fieldMaxWidth || 20;
             let val = '';
@@ -2009,22 +2031,95 @@ if (configuration.remember) {
               val = this.activeField.value;
               const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
               const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
-              text = label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
+              return label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
             } else {
               val = option.value || '';
               const truncated = val.length > maxLen ? val.slice(0, maxLen) : val;
-              text = label ? `${label}: ░${truncated}░` : `░${truncated}░`;
+              return label ? `${label}: ░${truncated}░` : `░${truncated}░`;
+            }
+          }
+          return typeof option === 'string' ? option : option.name || JSON.stringify(option);
+        });
+
+        // ---------- Resolve this line's horizontal scroll offset ----------
+        let hScroll = hScrollByLine[lineIndex] || 0;
+        if (hScroll < 0) hScroll = 0;
+        if (texts.length === 0) {
+          hScrollByLine[lineIndex] = 0;
+          return '';
+        }
+        if (hScroll > texts.length - 1) hScroll = texts.length - 1;
+
+        // Keep the focused column visible on the focused line.
+        if (lineIndex === focusLine) {
+          if (focusColumn < hScroll) {
+            // Focus moved left of the current viewport → snap left.
+            hScroll = focusColumn;
+          } else {
+            // Walk the offset forward until the focused column fits inside
+            // the terminal width (accounting for the ◀ indicator + separators).
+            const RESERVED = 4; // room for a " NNN▶" right indicator
+            while (hScroll < focusColumn) {
+              let w = 0;
+              if (hScroll > 0) w += (`◀${hScroll} `).length;
+              for (let c = hScroll; c <= focusColumn; c++) {
+                if (c > hScroll) w += 3;
+                w += texts[c].length;
+              }
+              if (w <= termWidth - RESERVED) break;
+              hScroll++;
+            }
+          }
+        }
+
+        // Persist the resolved offset so the next render of the same line
+        // resumes from exactly this position.
+        hScrollByLine[lineIndex] = hScroll;
+
+        // ---------- Render the visible slice of this line ----------
+        const parts = [];
+        let currentWidth = 0;
+
+        const leftMore = hScroll;
+        if (leftMore > 0) {
+          const indicator = `◀${leftMore} `;
+          parts.push(ColorText.dim(indicator));
+          currentWidth += indicator.length;
+        }
+
+        let lastRendered = hScroll - 1;
+        for (let c = hScroll; c < texts.length; c++) {
+          const sep = (c > hScroll) ? '   ' : '';
+          const text = texts[c];
+          const pieceWidth = sep.length + text.length;
+          const hasMoreAfter = c < texts.length - 1;
+          // Reserve a little room for the right indicator when there are
+          // more columns waiting beyond this one.
+          const reserve = hasMoreAfter ? 5 : 0;
+          const isFirstVisible = (c === hScroll);
+          if (!isFirstVisible && currentWidth + pieceWidth + reserve > termWidth) {
+            break;
+          }
+
+          if (lineIndex === focusLine && c === focusColumn) {
+            if (this.highlightColor) {
+              parts.push(`${sep}${this.highlightColor}${text}${this.resetColor()}`);
+            } else {
+              parts.push(`${sep}→ ${text}`);
             }
           } else {
-            text = typeof option === 'string' ? option : option.name || JSON.stringify(option);
+            parts.push(sep + text);
           }
-          if (lineIndex === focusLine && columnIndex === focusColumn) {
-            return this.highlightColor
-              ? `${this.highlightColor}${text}${this.resetColor()}`
-              : `→ ${text}`;
-          }
-          return text;
-        }).join('   ');
+          currentWidth += pieceWidth;
+          lastRendered = c;
+        }
+
+        const rightMore = texts.length - 1 - lastRendered;
+        if (rightMore > 0) {
+          parts.push(' ' + ColorText.dim(`${rightMore}▶`));
+        }
+
+        return parts.join('');
       };
 
       const renderMenu = () => {
@@ -2364,6 +2459,7 @@ if (configuration.remember) {
         currentColumn: column,
         scrollOffset: 0,
         maxVisibleLines: 1,
+        hScrollByLine,
         firstItemRow: 0,
         hasUpIndicator: false,
         hasDownIndicator: false,
@@ -3310,9 +3406,21 @@ setFocus(newLine, newColumn);
 
     if (row < 0 || row >= normalizedOptions.length) return -1;
 
-    // Find the column inside that row
+    // Find the column inside that row.
+    //
+    // The row may be horizontally scrolled: when `hScrollByLine[row]` is
+    // greater than zero, the first visible column is not column 0, and a
+    // dim "◀N " indicator occupies a few leading characters. Both are
+    // accounted for here so clicks still land on the correct option.
+    const hScrollByLine = (state && state.hScrollByLine) ? state.hScrollByLine : {};
+    const hScroll = hScrollByLine[row] || 0;
+
     let currentColumn = 0;
-    for (let column = 0; column < normalizedOptions[row].length; column++) {
+    if (hScroll > 0) {
+      currentColumn += (`◀${hScroll} `).length;
+    }
+
+    for (let column = hScroll; column < normalizedOptions[row].length; column++) {
       const option = normalizedOptions[row][column];
       const rawText = typeof option === 'string' ? option : option.name || JSON.stringify(option);
       const text = rawText.replace(/\x1b\[[0-9;]*m/g, '');   // strip escape sequences
@@ -5285,6 +5393,95 @@ this.DropDownManager = {
         return !!this.Storages.Get(id, key);
       }
       return false;
+    };
+
+    // --------------------------- Pinned Container Methods ---------------------------
+
+    /**
+     * Execute a block of UI-building code inside a "pinned top" context.
+     *
+     * Every child created inside the code block (Text, Button, Buttons,
+     * SideButton, Field) is automatically marked as pinnedTop and is
+     * therefore rendered in the fixed top area, above a single separator
+     * line, regardless of how many scrollable items exist in the middle.
+     *
+     * This is the building-block equivalent of `this.Page`: instead of
+     * following the selected page, it follows the pinned-top region, and
+     * the code you supply becomes the body of that region.
+     *
+     * Nesting PinnedTop / PinnedBottom restores the previous context when
+     * the inner block finishes, so combined layouts are safe. Children
+     * may explicitly override the pin by setting `pinned: true` (bottom)
+     * or `pinnedTop: false` on their own config object.
+     *
+     * @param {string} id - User/build ID
+     * @param {Function} code - async () => { ... } builder body
+     * @returns {Promise<void>}
+     *
+     * @example
+     *   await this.PinnedTop(id, async () => {
+     *     this.Text(id, '📌 Header');
+     *     this.Button(id, { name: '☰ Menu', props: { open: 'menu' } });
+     *   });
+     */
+    this.PinnedTop = async (id, code = async () => { }) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.PinnedTop() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      const build = this.Builds.get(id);
+      const previousContext = build._pinContext;
+      build._pinContext = 'top';
+      try {
+        if (typeof code === 'function') {
+          await code();
+        }
+      } finally {
+        build._pinContext = previousContext;
+      }
+    };
+
+    /**
+     * Execute a block of UI-building code inside a "pinned bottom" context.
+     *
+     * Every child created inside the code block (Text, Button, Buttons,
+     * SideButton, Field) is automatically marked as pinned and is
+     * therefore rendered in the fixed bottom area, below a single
+     * separator line, regardless of how many scrollable items exist in
+     * the middle.
+     *
+     * Mirrors `this.PinnedTop` and `this.Page`: the supplied async code
+     * becomes the body of the pinned-bottom region, and nested PinnedTop
+     * / PinnedBottom calls restore the previous context when they finish.
+     *
+     * Children may explicitly override the pin by setting `pinnedTop:
+     * true` (top) or `pinned: false` on their own config object.
+     *
+     * @param {string} id - User/build ID
+     * @param {Function} code - async () => { ... } builder body
+     * @returns {Promise<void>}
+     *
+     * @example
+     *   await this.PinnedBottom(id, async () => {
+     *     this.Button(id, { name: '⌂ Home' });
+     *     this.Button(id, { name: '↻ Refresh' });
+     *   });
+     */
+    this.PinnedBottom = async (id, code = async () => { }) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.PinnedBottom() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      const build = this.Builds.get(id);
+      const previousContext = build._pinContext;
+      build._pinContext = 'bottom';
+      try {
+        if (typeof code === 'function') {
+          await code();
+        }
+      } finally {
+        build._pinContext = previousContext;
+      }
     };
 
     // --------------------------- Alert Methods (unchanged) ---------------------------
@@ -8136,149 +8333,264 @@ function levenshteinDistance(str1, str2) {
     // --------------------------- Button Methods ---------------------------
 
     /**
-     * Create a button
+     * Internal helper: build a normalized button object from a config.
+     * Applies dropdown colouring / spacing but does NOT decide where the
+     * button is placed (individual line vs horizontal group). Placement
+     * is handled by Button / Buttons / SideButton.
+     * @private
+     */
+    this._makeButtonObj = (id, finalConfig) => {
+      if (!this.Builds.has(id)) return null;
+      if (!finalConfig.path) finalConfig.path = this.Name;
+
+      const button_obj = {
+        name: finalConfig.name || '',
+        metadata: {
+          props: finalConfig.props || {},
+          path: finalConfig.path || this.Name,
+          resetSelection: finalConfig.resetSelection || false,
+          jumpTo: finalConfig.jumpTo || false,
+          pinned: finalConfig.pinned || false,
+          pinnedTop: finalConfig.pinnedTop || false
+        },
+        action: (finalConfig.action) ? finalConfig.action : () => { },
+      };
+
+      if (this.Builds.get(id).dropdown_color) {
+        button_obj.name = this.TextColor.rgb(
+          button_obj.name,
+          (127 + Math.floor(Math.sin(this.Builds.get(id).droplevel * 1.7) * 128)),
+          (127 + Math.floor(Math.cos(this.Builds.get(id).droplevel * 2.3) * 128)),
+          (127 + Math.floor(Math.sin(this.Builds.get(id).droplevel * 1.3 + 1.5) * 128))
+        );
+      }
+
+      if (this.Builds.get(id).dropdown_spacement) {
+        let space = '';
+        for (let i = 0; i < this.Builds.get(id).droplevel; i++) {
+          space = ` ${space}`;
+        }
+        button_obj.name = `${space}${button_obj.name}`;
+      }
+
+      return button_obj;
+    };
+
+    /**
+     * Internal helper: try to place one or more button objects into the
+     * currently-open horizontal-dropdown group.
+     * @private
+     * @returns {boolean} true if placement happened
+     */
+    this._placeInHorizontalDropdown = (id, buttonObjs) => {
+      const build = this.Builds.get(id);
+      if (!build || !build.dropdown_horizontal || build.last_dropdown_button === undefined) {
+        return false;
+      }
+
+      const buttonsArray = build.Buttons;
+      const lastDropdownIndex = build.last_dropdown_button;
+      let foundGroup = false;
+
+      for (let i = lastDropdownIndex + 1; i < buttonsArray.length; i++) {
+        if (buttonsArray[i].type === 'options') {
+          buttonsArray[i].value.push(...buttonObjs);
+          foundGroup = true;
+          break;
+        }
+      }
+
+      if (!foundGroup && lastDropdownIndex >= 0 && lastDropdownIndex < buttonsArray.length) {
+        const dropdownButton = buttonsArray[lastDropdownIndex];
+        if (!dropdownButton.type) {
+          buttonsArray[lastDropdownIndex] = {
+            type: 'options',
+            value: [dropdownButton, ...buttonObjs]
+          };
+        } else if (dropdownButton.type === 'options') {
+          dropdownButton.value.push(...buttonObjs);
+        }
+      }
+
+      return true;
+    };
+
+    /**
+     * Create a button that will be rendered on its OWN line.
+     *
+     * For horizontal rows use `this.Buttons([...])` or `this.SideButton(...)`
+     * instead.
+     *
      * @param {string} id - User/build ID
      * @param {string|Object} nameOrConfig - Button name or configuration object
      * @param {Object} [config] - Button configuration (when name is string)
-     * @param {string} [config.name] - Button name
-     * @param {string} [config.path] - Navigation path
-     * @param {Object} [config.props] - Button props
-     * @param {boolean} [config.resetSelection] - Reset selection
-     * @param {number|boolean} [config.jumpTo] - Jump to index
-     * @param {Function} [config.action] - Button action
-     * @param {...*} rest - Additional arguments
      */
     this.Button = (id, nameOrConfig, config = {}, ...rest) => {
-      if (this.Builds.has(id)) {
-        let finalConfig;
-
-        if (typeof nameOrConfig === 'string') {
-          finalConfig = {
-            name: nameOrConfig,
-            ...config
-          };
-
-          if (rest.length > 0) {
-            Object.assign(finalConfig, ...rest);
-          }
-        } else {
-          finalConfig = nameOrConfig || {};
-        }
-
-        if (!finalConfig.path) { finalConfig.path = this.Name; }
-
-        let button_obj = {
-          name: finalConfig.name || '',
-          metadata: {
-            props: finalConfig.props || {},
-            path: finalConfig.path || this.Name,
-            resetSelection: finalConfig.resetSelection || false,
-            jumpTo: finalConfig.jumpTo || false,
-            // If true, this button is rendered in the pinned-bottom
-            // area at the bottom of the screen, below a single separator line.
-            pinned: finalConfig.pinned || false,
-            // If true, this button is rendered in the pinned-top
-            // area at the top of the screen, above a single separator line.
-            pinnedTop: finalConfig.pinnedTop || false
-          },
-          action: (finalConfig.action) ? finalConfig.action : () => { },
-        };
-
-        if (this.Builds.get(id).dropdown_color) {
-          button_obj.name = this.TextColor.rgb(
-            button_obj.name,
-            (127 + Math.floor(Math.sin(this.Builds.get(id).droplevel * 1.7) * 128)),
-            (127 + Math.floor(Math.cos(this.Builds.get(id).droplevel * 2.3) * 128)),
-            (127 + Math.floor(Math.sin(this.Builds.get(id).droplevel * 1.3 + 1.5) * 128))
-          );
-        }
-
-        if (this.Builds.get(id).dropdown_spacement) {
-          let space = '';
-          for (let i = 0; i < this.Builds.get(id).droplevel; i++) {
-            space = ` ${space}`;
-          }
-          button_obj.name = `${space}${button_obj.name}`;
-        }
-
-        if (this.Builds.get(id).dropdown_horizontal &&
-          this.Builds.get(id).last_dropdown_button !== undefined) {
-
-          const buttonsArray = this.Builds.get(id).Buttons;
-          const lastDropdownIndex = this.Builds.get(id).last_dropdown_button;
-
-          let foundGroup = false;
-
-          for (let i = lastDropdownIndex + 1; i < buttonsArray.length; i++) {
-            if (buttonsArray[i].type === 'options') {
-              buttonsArray[i].value.push(button_obj);
-              foundGroup = true;
-              break;
-            }
-          }
-
-          if (!foundGroup) {
-            if (lastDropdownIndex >= 0 && lastDropdownIndex < buttonsArray.length) {
-              const dropdownButton = buttonsArray[lastDropdownIndex];
-
-              if (!dropdownButton.type) {
-                const newGroup = {
-                  type: 'options',
-                  value: [dropdownButton, button_obj]
-                };
-                buttonsArray[lastDropdownIndex] = newGroup;
-              } else if (dropdownButton.type === 'options') {
-                dropdownButton.value.push(button_obj);
-              }
-            }
-          }
-
-        } else if (finalConfig.buttons) {
-          const buttonsArray = this.Builds.get(id).Buttons;
-          if (buttonsArray.length === 0 || !buttonsArray[buttonsArray.length - 1].type) {
-            buttonsArray.push({ type: 'options', value: [button_obj] });
-          } else if (buttonsArray[buttonsArray.length - 1].type === 'options') {
-            buttonsArray[buttonsArray.length - 1].value.push(button_obj);
-          } else {
-            buttonsArray.push({ type: 'options', value: [button_obj] });
-          }
-        } else {
-          this.Builds.get(id).Buttons.push(button_obj);
-        }
-      } else {
+      if (!this.Builds.has(id)) {
         if (this.Log) {
           console.log(`This.Button() Error - userBuild not founded | BuildID: ${id}`);
         }
+        return;
       }
+
+      let finalConfig;
+      if (typeof nameOrConfig === 'string') {
+        finalConfig = { name: nameOrConfig, ...config };
+        if (rest.length > 0) Object.assign(finalConfig, ...rest);
+      } else {
+        // Clone so the pin-context inheritance below never mutates a
+        // shared config object owned by the caller.
+        finalConfig = nameOrConfig ? { ...nameOrConfig } : {};
+      }
+      if (!finalConfig.path) finalConfig.path = this.Name;
+
+      // Inherit the current pinned container context (set by
+      // this.PinnedTop / this.PinnedBottom) when the caller did not
+      // explicitly choose a pin target.
+      const __build = this.Builds.get(id);
+      if (__build && finalConfig.pinned === undefined && finalConfig.pinnedTop === undefined) {
+        if (__build._pinContext === 'top') finalConfig.pinnedTop = true;
+        else if (__build._pinContext === 'bottom') finalConfig.pinned = true;
+      }
+
+      const button_obj = this._makeButtonObj(id, finalConfig);
+      if (!button_obj) return;
+
+      // 1) Inside a horizontal dropdown → merge into that dropdown's group
+      if (this._placeInHorizontalDropdown(id, [button_obj])) return;
+
+      // 2) Legacy "buttons: true" flag.
+      //
+      // LINE-FIX: `_startNewGroup` forces a BRAND NEW options group to
+      // open even if the last array entry is already an options group.
+      // This is what makes each this.Buttons(...) call render on its own
+      // physical line instead of silently merging into the previous one.
+      //
+      // SideButton() deliberately does NOT set _startNewGroup, so
+      // consecutive SideButton calls still accumulate onto the same row.
+      if (finalConfig.buttons) {
+        const buttonsArray = this.Builds.get(id).Buttons;
+        const lastItem = buttonsArray[buttonsArray.length - 1];
+        const forceNewGroup = finalConfig._startNewGroup === true;
+
+        if (forceNewGroup || buttonsArray.length === 0 || !lastItem || lastItem.type !== 'options') {
+          buttonsArray.push({ type: 'options', value: [button_obj] });
+        } else {
+          lastItem.value.push(button_obj);
+        }
+        return;
+      }
+
+      // 3) Normal → individual line
+      this.Builds.get(id).Buttons.push(button_obj);
     };
 
     /**
-     * Create multiple buttons
+     * Create multiple buttons laid out horizontally on a SINGLE new line.
+     *
+     * Behaviour contract (line-fix + button-impl):
+     *   • Every call produces exactly ONE new options group, so N
+     *     separate this.Buttons() calls render as N distinct rows.
+     *   • The group is never merged with a previously created options
+     *     group — that was the source of the "my second Buttons() call
+     *     disappeared into the first one" bug.
+     *   • Inside a horizontal dropdown, the buttons are added to the
+     *     dropdown's own options group (matching this.Button behaviour).
+     *
      * @param {string} id - User/build ID
-     * @param {Array<Object>|Object} configs - Button configurations
+     * @param {Array<Object>|Object} configs - Button configuration(s)
      */
     this.Buttons = (id, configs = []) => {
-      if (!Array.isArray(configs)) {
-        configs = [configs];
+      if (!this.Builds.has(id)) {
+        if (this.Log) {
+          console.log(`this.Buttons() Error - userBuild not found | BuildID: ${id}`);
+        }
+        return;
       }
-      configs.forEach(config => {
-        this.Button(id, {
-          ...config,
-          buttons: true
-        });
-      });
+      if (!Array.isArray(configs)) configs = [configs];
+      if (configs.length === 0) return;
+
+      const __build = this.Builds.get(id);
+
+      const objs = [];
+      for (let i = 0; i < configs.length; i++) {
+        const cfg = configs[i];
+        if (!cfg) continue;
+        const finalConfig = { ...cfg };
+        if (!finalConfig.path) finalConfig.path = this.Name;
+        // Inherit the current pinned container context (set by
+        // this.PinnedTop / this.PinnedBottom) when the caller did not
+        // explicitly choose a pin target.
+        if (__build && finalConfig.pinned === undefined && finalConfig.pinnedTop === undefined) {
+          if (__build._pinContext === 'top') finalConfig.pinnedTop = true;
+          else if (__build._pinContext === 'bottom') finalConfig.pinned = true;
+        }
+        // Mark the FIRST item with _startNewGroup, so Button() opens a
+        // fresh options row for this call (see Button() step 2).
+        if (i === 0) finalConfig._startNewGroup = true;
+        const obj = this._makeButtonObj(id, finalConfig);
+        if (obj) objs.push(obj);
+      }
+      if (objs.length === 0) return;
+
+      // Inside a horizontal dropdown → merge into that dropdown's group
+      if (this._placeInHorizontalDropdown(id, objs)) return;
+
+      // Normal → ALWAYS create a brand-new options group on its own line
+      this.Builds.get(id).Buttons.push({ type: 'options', value: objs });
     };
 
     /**
-     * Create a side button
+     * Create a side button.
+     *
+     * Consecutive SideButton calls merge into the SAME horizontal row;
+     * any other Button / Buttons / Text / Field / DropDown / Page /
+     * WaitInput call between two SideButtons starts a fresh row.
+     *
      * @param {string} id - User/build ID
      * @param {Object} config - Button configuration
      */
     this.SideButton = (id, config = {}) => {
-      this.Button(id, {
-        ...config,
-        buttons: true
-      });
+      if (!this.Builds.has(id)) {
+        if (this.Log) {
+          console.log(`this.SideButton() Error - userBuild not found | BuildID: ${id}`);
+        }
+        return;
+      }
+
+      const finalConfig = { ...config };
+      if (!finalConfig.path) finalConfig.path = this.Name;
+
+      // Inherit the current pinned container context (set by
+      // this.PinnedTop / this.PinnedBottom) when the caller did not
+      // explicitly choose a pin target.
+      const __build = this.Builds.get(id);
+      if (__build && finalConfig.pinned === undefined && finalConfig.pinnedTop === undefined) {
+        if (__build._pinContext === 'top') finalConfig.pinnedTop = true;
+        else if (__build._pinContext === 'bottom') finalConfig.pinned = true;
+      }
+
+      const obj = this._makeButtonObj(id, finalConfig);
+      if (!obj) return;
+
+      // Inside a horizontal dropdown → merge into that dropdown's group
+      if (this._placeInHorizontalDropdown(id, [obj])) return;
+
+      // SideButtons form their own horizontal row. Consecutive calls
+      // append to the same row via the `_sideButtonGroup` tag, so
+      // untouched SideButton usage (Error class, NotFounded class)
+      // still merges horizontally exactly like before.
+      const buttonsArray = this.Builds.get(id).Buttons;
+      const last = buttonsArray[buttonsArray.length - 1];
+      if (last && last.type === 'options' && last._sideButtonGroup) {
+        last.value.push(obj);
+      } else {
+        buttonsArray.push({
+          type: 'options',
+          value: [obj],
+          _sideButtonGroup: true
+        });
+      }
     };
 
     // --------------------------- Text Method ---------------------------
@@ -8293,14 +8605,23 @@ function levenshteinDistance(str1, str2) {
       if (this.Builds.has(id)) {
         const userBuild = this.Builds.get(id);
 
-        if (config.pinnedTop) {
+        // Inherit the current pinned container context (set by
+        // this.PinnedTop / this.PinnedBottom) when the caller did not
+        // explicitly choose a pin target.
+        const effective = { ...config };
+        if (effective.pinned === undefined && effective.pinnedTop === undefined) {
+          if (userBuild._pinContext === 'top') effective.pinnedTop = true;
+          else if (userBuild._pinContext === 'bottom') effective.pinned = true;
+        }
+
+        if (effective.pinnedTop) {
           // Pinned-top text is rendered above the top separator line.
           if (userBuild.PinnedTopText != '') {
             userBuild.PinnedTopText = `${userBuild.PinnedTopText}\n${text}`
           } else {
             userBuild.PinnedTopText = text
           }
-        } else if (config.pinned) {
+        } else if (effective.pinned) {
           // Pinned text is rendered below the separator, at the bottom of the screen.
           if (userBuild.PinnedText != '') {
             userBuild.PinnedText = `${userBuild.PinnedText}\n${text}`
@@ -8355,6 +8676,18 @@ function levenshteinDistance(str1, str2) {
     this.Field = (id, name, config = {}) => {
         if (!this.Builds.has(id)) return;
 
+        const __build = this.Builds.get(id);
+
+        // Inherit the current pinned container context (set by
+        // this.PinnedTop / this.PinnedBottom) when the caller did not
+        // explicitly choose a pin target.
+        let pinned = config.pinned;
+        let pinnedTop = config.pinnedTop;
+        if (pinned === undefined && pinnedTop === undefined) {
+            if (__build._pinContext === 'top') pinnedTop = true;
+            else if (__build._pinContext === 'bottom') pinned = true;
+        }
+
         const storageKey = `field_${name}`;
         let value = this.Storages.Get(id, storageKey);
         if (value === undefined) {
@@ -8373,10 +8706,10 @@ function levenshteinDistance(str1, str2) {
             value: value,
             // If true, this field is rendered in the pinned-bottom
             // area at the bottom of the screen, below a single separator line.
-            pinned: config.pinned || false,
+            pinned: pinned || false,
             // If true, this field is rendered in the pinned-top
             // area at the top of the screen, above a single separator line.
-            pinnedTop: config.pinnedTop || false,
+            pinnedTop: pinnedTop || false,
             onChange: (newValue) => {
                 this.Storages.Set(id, storageKey, newValue);
                 if (typeof config.onChange === 'function') {
@@ -9579,6 +9912,45 @@ this.HUD = new TerminalHUD({
       // for functions that explicitly enable it (handled in ProcessFuncs)
     }
 
+    // ------------------------------------------------------------------
+    // Terminal-resize handling.
+    //
+    // When the terminal shrinks, previously-rendered content sized to the
+    // OLD column count (full-width separators produced by `_hr()`, long
+    // text lines, etc.) becomes wider than the terminal and gets wrapped
+    // onto a second visual line.
+    //
+    // We solve this by re-running the current screen with a lightweight
+    // `_isRefresh` rebuild, so every responsive element is recomputed
+    // using the new column count. The rebuild is:
+    //   • debounced, to avoid thrashing on rapid resize events;
+    //   • skipped while a screen is already loading (InAction lock);
+    //   • skipped while the user is actively editing a field.
+    //
+    // A dedicated `_resizeRedraw` flag tells LoadScreen to bypass the
+    // per-function RefreshMode check, so the layout adapts even when
+    // auto-refresh is disabled.
+    // ------------------------------------------------------------------
+    let __resizeDebounce = null;
+    stdout.on('resize', () => {
+      if (__resizeDebounce) clearTimeout(__resizeDebounce);
+      __resizeDebounce = setTimeout(() => {
+        __resizeDebounce = null;
+        try {
+          const session = this.Sessions.get(this.MainSessionID);
+          if (!session || session.InAction) return;
+          const funcName = session.ActualPath;
+          if (!funcName) return;
+          if (this.HUD && this.HUD.isEditing) return;
+          const page = session.ActualProps && session.ActualProps.page;
+          const props = page
+            ? { page, _isRefresh: true, _resizeRedraw: true }
+            : { _isRefresh: true, _resizeRedraw: true };
+          this.LoadScreen(funcName, { props, resetSelection: false }).catch(() => {});
+        } catch (_) { /* ignore resize-handling errors */ }
+      }, 100);
+    });
+
     /**
      * Process and register a function class
      * @param {Function} FuncClass - Function class to process
@@ -9706,9 +10078,16 @@ this.HUD = new TerminalHUD({
           targetFuncName = 'notfounded';
         }
         
-        // Check if this is a refresh request and if the function allows it
+        // Check if this is a refresh request and if the function allows it.
+        //
+        // A resize-driven redraw (config.props._resizeRedraw === true) is
+        // exempt from the RefreshMode gate: it is not a real refresh, it
+        // is just a re-render needed to adapt to new terminal
+        // dimensions, and it must always run so responsive layouts can
+        // recompute themselves even when auto-refresh is off.
         const isRefreshRequest = config.props._isRefresh === true;
-        if (isRefreshRequest) {
+        const isResizeRedraw = config.props._resizeRedraw === true;
+        if (isRefreshRequest && !isResizeRedraw) {
           const targetFunc = this.Funcs.get(targetFuncName);
           if (targetFunc && !this._shouldRefreshFunction(targetFuncName)) {
             session.InAction = false;
@@ -10502,6 +10881,24 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}this.${method}(id, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'buttonsGroup': {
+          const configs = (it.items || [])
+            .filter(c => c && c.type === 'button')
+            .map(c => {
+              const cfg = { name: c.name || '' }
+              if (c.path) cfg.path = c.path
+              if (c.props && Object.keys(c.props).length) cfg.props = c.props
+              if (c.resetSelection) cfg.resetSelection = true
+              if (c.jumpTo) cfg.jumpTo = c.jumpTo
+              if (c.pinned) cfg.pinned = true
+              if (c.pinnedTop) cfg.pinnedTop = true
+              return cfg
+            })
+          if (configs.length > 0) {
+            L.push(`${indent}this.Buttons(id, ${JSON.stringify(configs)})`)
+          }
+          break
+        }
         case 'field': {
           const cfg = {}
           if (it.label) cfg.label = it.label
@@ -10526,6 +10923,16 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'pinnedTop':
+          L.push(`${indent}await this.PinnedTop(id, async () => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}})`)
+          break
+        case 'pinnedBottom':
+          L.push(`${indent}await this.PinnedBottom(id, async () => {`)
+          emit(it.items || [], indent + '  ')
+          L.push(`${indent}})`)
+          break
         case 'codeblock': {
           const bt = it.blockType
           const cond = it.condition || ''
@@ -10646,8 +11053,11 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Text: 'text',
   Button: 'button',
   SideButton: 'button',
+  Buttons: 'buttonsGroup',
   Field: 'field',
   Page: 'page',
+  PinnedTop: 'pinnedTop',
+  PinnedBottom: 'pinnedBottom',
   DropDown: 'dropdown',
   WaitInput: 'waitinput',
   Alert: 'alert',
@@ -10684,10 +11094,22 @@ function _sbMakeItemForMethod(methodName, id) {
         props: {},
         buttons: methodName === 'SideButton'
       }
+    case 'buttonsGroup':
+      // Container that holds ONLY button-type children. In view mode it
+      // renders all children via this.Buttons([...]) — one horizontal row.
+      return { ...base, items: [] }
     case 'field':
       return { ...base, name: 'field_' + id, label: 'Label', initialValue: '' }
     case 'page':
       return { ...base, name: 'page_' + id, items: [] }
+    case 'pinnedTop':
+      // Pinned-top container: children render inside a this.PinnedTop()
+      // block, so everything created inside is auto-marked pinnedTop.
+      return { ...base, items: [] }
+    case 'pinnedBottom':
+      // Pinned-bottom container: children render inside a
+      // this.PinnedBottom() block, so everything is auto-marked pinned.
+      return { ...base, items: [] }
     case 'dropdown':
       return { ...base, name: 'dropdown_' + id, up_buttontext: 'Show more', down_buttontext: 'Hide' }
     case 'waitinput':
@@ -10870,7 +11292,9 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.id === id) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' || it.type === 'args') &&
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' ||
+           it.type === 'args' || it.type === 'buttonsGroup' ||
+           it.type === 'pinnedTop' || it.type === 'pinnedBottom') &&
           Array.isArray(it.items)) {
         const f = this._findItem(id, it.items)
         if (f) return f
@@ -10883,7 +11307,9 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.type === 'page' && it.name === name) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' || it.type === 'args') &&
+      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' ||
+           it.type === 'args' || it.type === 'buttonsGroup' ||
+           it.type === 'pinnedTop' || it.type === 'pinnedBottom') &&
           Array.isArray(it.items)) {
         const f = this._findItemByName(name, it.items)
         if (f) return f
@@ -10924,6 +11350,30 @@ class SelfBuilder extends SyAPP_Func {
       if (item && item.type === 'args') {
         if (!Array.isArray(item.items)) item.items = []
         return { kind: 'args', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbbg__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'buttonsGroup') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'buttonsGroup', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbpt__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'pinnedTop') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'pinnedTop', item, items: item.items }
+      }
+    }
+    if (typeof pageName === 'string' && pageName.startsWith('__sbpb__:')) {
+      const id = pageName.slice(9)
+      const item = this._findItem(id)
+      if (item && item.type === 'pinnedBottom') {
+        if (!Array.isArray(item.items)) item.items = []
+        return { kind: 'pinnedBottom', item, items: item.items }
       }
     }
     const pageItem = S.items.find(i => i.type === 'page' && i.name === pageName)
@@ -11276,7 +11726,7 @@ class SelfBuilder extends SyAPP_Func {
     this.Text(id, _hr('─'), { pinnedTop: true })
 
     if (container.kind === 'root') {
-      this._renderTopToolbar(id, S)
+      this._renderTopToolbar(id, S, container)
     } else {
       // Breadcrumb when inside a nested container + a container-scoped
       // "+New" so that new items land INSIDE the current container.
@@ -11289,7 +11739,13 @@ class SelfBuilder extends SyAPP_Func {
             ? `{} ${_fit(this._codeblockLabel(container.item), 30)}`
             : container.kind === 'args'
               ? `⚡ Args (args: [ ... ])`
-              : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
+              : container.kind === 'buttonsGroup'
+                ? `⧾ Buttons Group`
+                : container.kind === 'pinnedTop'
+                  ? `📌 Pinned Top`
+                  : container.kind === 'pinnedBottom'
+                    ? `📌 Pinned Bottom`
+                    : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
       this.Buttons(id, [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
         { name: label, pinnedTop: true },
@@ -11301,7 +11757,7 @@ class SelfBuilder extends SyAPP_Func {
         // the toolbar and the opened "+New" menu, so the two never merge
         // onto the same visual row.
         this.Button(id, { name: _hr('─'), pinnedTop: true })
-        this._renderNewMethodsMenu(id)
+        this._renderNewMethodsMenu(id, container)
       }
     }
 
@@ -11352,6 +11808,9 @@ class SelfBuilder extends SyAPP_Func {
       else if (container.kind === 'dropdown')   lbl = `▼ ${container.item.name}`
       else if (container.kind === 'codeblock')  lbl = `{} ${this._codeblockLabel(container.item)}`
       else if (container.kind === 'args')       lbl = `⚡ Args (args: [ ... ])`
+      else if (container.kind === 'buttonsGroup') lbl = `⧾ Buttons Group`
+      else if (container.kind === 'pinnedTop')  lbl = `📌 Pinned Top`
+      else if (container.kind === 'pinnedBottom') lbl = `📌 Pinned Bottom`
       else                                       lbl = `? ${curPage}`
       ctx = ColorText.dim(` | ${_fit(lbl, 40)}`)
     }
@@ -11367,7 +11826,7 @@ class SelfBuilder extends SyAPP_Func {
     return ' ' + _fit(body, W - 2)
   }
 
-  _renderTopToolbar(id, S) {
+  _renderTopToolbar(id, S, container) {
     const newOpen = this.Storages.Get(id, 'sb_new_open') || false
     const methodsOpen = this.Storages.Get(id, 'sb_methods_open') || false
 
@@ -11407,7 +11866,7 @@ class SelfBuilder extends SyAPP_Func {
     // "+New" and "⚙ Config" content. Each one now lives BELOW the
     // separator button pushed above, so opening them no longer makes
     // their controls appear to live inside the main toolbar tab.
-    if (newOpen)     this._renderNewMethodsMenu(id)
+    if (newOpen)     this._renderNewMethodsMenu(id, container)
     if (methodsOpen) this._renderConfigMenu(id)
   }
 
@@ -11424,13 +11883,26 @@ class SelfBuilder extends SyAPP_Func {
    * No section headers are printed — only the toolbar separators that
    * already surround the pinned-top area.
    */
-  _renderNewMethodsMenu(id) {
+  _renderNewMethodsMenu(id, container) {
     const perPage = this._getItemsPerPage()
-    const filter = this.Storages.Get(id, 'sb_new_filter') || 'syapp'
+    const insideButtonsGroup = container && container.kind === 'buttonsGroup'
+    // Inside a buttonsGroup, only the "Javascript" view would produce
+    // items that get filtered out at render time — so we pin the filter
+    // to "SyAPP" and hide the filter selector row.
+    const filter = insideButtonsGroup
+      ? 'syapp'
+      : (this.Storages.Get(id, 'sb_new_filter') || 'syapp')
 
     let entries
     if (filter === 'js') {
       entries = _SB_LOGIC_BLOCKS.map(m => ({ kind: 'js', value: m }))
+    } else if (insideButtonsGroup) {
+      // Only button-producing methods make sense as children of a
+      // Buttons group. Everything else would be filtered at render time.
+      const allowed = ['Button', 'SideButton', 'AlertButton']
+      entries = this._getVisibleNewMethods()
+        .filter(m => allowed.includes(m))
+        .map(m => ({ kind: 'syapp', value: m }))
     } else {
       entries = this._getVisibleNewMethods().map(m => ({ kind: 'syapp', value: m }))
     }
@@ -11474,19 +11946,23 @@ class SelfBuilder extends SyAPP_Func {
     }
 
     // ---------------- Filter row (below pagination) ----------------
-    this.Buttons(id, [
-      {
-        name: filter === 'syapp' ? ColorText.bold('SyAPP') : ColorText.dim('SyAPP'),
-        props: { __setNewFilter: 'syapp' },
-        pinnedTop: true
-      },
-      { name: ColorText.dim('|'), props: {}, pinnedTop: true },
-      {
-        name: filter === 'js' ? ColorText.bold('Javascript') : ColorText.dim('Javascript'),
-        props: { __setNewFilter: 'js' },
-        pinnedTop: true
-      }
-    ])
+    // Hidden when inside a Buttons group, since the group only accepts
+    // button-producing methods and the JS filter has no meaning there.
+    if (!insideButtonsGroup) {
+      this.Buttons(id, [
+        {
+          name: filter === 'syapp' ? ColorText.bold('SyAPP') : ColorText.dim('SyAPP'),
+          props: { __setNewFilter: 'syapp' },
+          pinnedTop: true
+        },
+        { name: ColorText.dim('|'), props: {}, pinnedTop: true },
+        {
+          name: filter === 'js' ? ColorText.bold('Javascript') : ColorText.dim('Javascript'),
+          props: { __setNewFilter: 'js' },
+          pinnedTop: true
+        }
+      ])
+    }
   }
 
   /**
@@ -11570,7 +12046,9 @@ class SelfBuilder extends SyAPP_Func {
     if (this.Editing) {
       const isActive = this.EditItemId === it.id
       const navigable = (it.type === 'button' || it.type === 'dropdown' ||
-                         it.type === 'page' || it.type === 'codeblock' || it.type === 'args')
+                         it.type === 'page' || it.type === 'codeblock' ||
+                         it.type === 'args' || it.type === 'buttonsGroup' ||
+                         it.type === 'pinnedTop' || it.type === 'pinnedBottom')
       const dot = isActive
         ? ColorText.brightYellow('◉')
         : navigable ? ColorText.green('○') : ColorText.dim('○')
@@ -11588,12 +12066,18 @@ class SelfBuilder extends SyAPP_Func {
         case 'spacer':
           this.Text(id, '')
           break
-        case 'button':
+        case 'button': {
           // IMPORTANT: pass a *copy* of the props. If we pass the live
           // `it.props` object, SyAPP's LoadScreen will attach `.session`
           // (and `.mainfunc`) onto it, which in turn nests the Session
           // into State.items → circular reference → save fails.
-          this.Button(id, {
+          //
+          // Dispatch: items created via the "SideButton" entry in the
+          // "+ New" menu (sourceMethod === 'SideButton') are rendered
+          // through this.SideButton(), so consecutive SideButton items
+          // automatically merge into ONE horizontal row in VIEW mode.
+          // Regular Button items keep using this.Button().
+          const cfg = {
             name: it.name || '',
             props: { ...(it.props || {}) },
             path: it.path,
@@ -11601,8 +12085,42 @@ class SelfBuilder extends SyAPP_Func {
             jumpTo: it.jumpTo,
             pinned: it.pinned,
             pinnedTop: it.pinnedTop
-          })
+          }
+          if (it.sourceMethod === 'SideButton' || it.buttons) {
+            this.SideButton(id, cfg)
+          } else {
+            this.Button(id, cfg)
+          }
           break
+        }
+        case 'buttonsGroup': {
+          // Container-of-buttons: renders all its button children as
+          // ONE horizontal row via this.Buttons([...]).
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            const buttonCount = hasItems
+              ? it.items.filter(c => c && c.type === 'button').length
+              : 0
+            this.Button(id, {
+              name: `${ColorText.brightCyan('⧾')} Buttons Group${buttonCount ? ColorText.dim(` (${buttonCount})`) : ''}`,
+              props: { page: `__sbbg__:${it.id}` }
+            })
+          } else {
+            const configs = (it.items || [])
+              .filter(c => c && c.type === 'button')
+              .map(c => ({
+                name: c.name || '',
+                props: { ...(c.props || {}) },
+                path: c.path,
+                resetSelection: c.resetSelection,
+                jumpTo: c.jumpTo,
+                pinned: c.pinned,
+                pinnedTop: c.pinnedTop
+              }))
+            if (configs.length > 0) this.Buttons(id, configs)
+          }
+          break
+        }
         case 'field':
           this.Field(id, it.name, {
             label: it.label || '',
@@ -11654,6 +12172,38 @@ class SelfBuilder extends SyAPP_Func {
             })
           } else {
             await this._renderCodeblock(id, it, props)
+          }
+          break
+        case 'pinnedTop':
+          // Pinned-top container: in view mode, its children render
+          // inside a this.PinnedTop() block so everything created inside
+          // is auto-marked pinnedTop. In edit mode it behaves like a
+          // page (click to step inside and edit children).
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `${ColorText.brightBlue('📌')} Pinned Top${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sbpt__:${it.id}` }
+            })
+          } else {
+            await this.PinnedTop(id, async () => {
+              await this._renderItems(id, it.items || [], props)
+            })
+          }
+          break
+        case 'pinnedBottom':
+          // Pinned-bottom container: view mode wraps children inside a
+          // this.PinnedBottom() call. Edit mode behaves like a page.
+          if (this.Editing) {
+            const hasItems = Array.isArray(it.items) && it.items.length > 0
+            this.Button(id, {
+              name: `${ColorText.brightBlue('📌')} Pinned Bottom${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              props: { page: `__sbpb__:${it.id}` }
+            })
+          } else {
+            await this.PinnedBottom(id, async () => {
+              await this._renderItems(id, it.items || [], props)
+            })
           }
           break
         case 'waitinput':
@@ -12024,6 +12574,24 @@ class SelfBuilder extends SyAPP_Func {
         props: { page: `__sba__:${it.id}` },
         pinned: true
       })
+    } else if (it.type === 'buttonsGroup') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbbg__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'pinnedTop') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbpt__:${it.id}` },
+        pinned: true
+      })
+    } else if (it.type === 'pinnedBottom') {
+      actions.push({
+        name: ColorText.brightCyan('＋ Add child'),
+        props: { page: `__sbpb__:${it.id}` },
+        pinned: true
+      })
     }
 
     actions.push({ name: ColorText.red('× Delete'), props: { __del: it.id },   pinned: true })
@@ -12031,6 +12599,598 @@ class SelfBuilder extends SyAPP_Func {
 
     this.Buttons(id, actions)
   }
+}
+
+// ============================================================
+// USER-FILE PARSER
+// ============================================================
+// Reverse-engineers an existing SyAPP function file (regardless of
+// whether it was originally produced by the SelfBuilder) into a
+// State object that the editor can consume.
+//
+// The parser is intentionally lenient:
+//   • extracts the class name,
+//   • extracts the app name passed to `super(...)`,
+//   • detects the identifier assigned from `props.session.UniqueID`
+//     (which can be named anything — id, uid, ID, session, ...),
+//   • walks the build-function body statement by statement and maps
+//     recognised `this.X(...)` calls into builder items,
+//   • and preserves every unrecognised statement as a raw `code`
+//     item, so nothing is ever silently dropped.
+// ============================================================
+
+let __SB_PARSE_SEQ = 0
+function _sbNid() { return `it_${Date.now().toString(36)}_p${++__SB_PARSE_SEQ}` }
+
+/** Sentinel returned by value parsers when an expression is not a
+ *  plain JSON-safe literal (identifiers, calls, template interpolation). */
+const _SB_CODE = Symbol('sb_code')
+
+/**
+ * Extract the content between a balanced open/close character pair.
+ * Strings, template literals, line comments and block comments are
+ * skipped, so braces/parens inside them never affect the depth count.
+ * @returns {string|null} inner content, or null when unbalanced
+ */
+function _sbExtractBalanced(source, openIdx, openChar, closeChar) {
+  if (!source || source[openIdx] !== openChar) return null
+  let depth = 0
+  let inString = null, inLineComment = false, inBlockComment = false
+  for (let i = openIdx; i < source.length; i++) {
+    const c = source[i], next = source[i + 1]
+    if (inLineComment) { if (c === '\n') inLineComment = false; continue }
+    if (inBlockComment) { if (c === '*' && next === '/') { inBlockComment = false; i++ } continue }
+    if (inString) {
+      if (c === '\\') { i++; continue }
+      if (c === inString) inString = null
+      continue
+    }
+    if (c === '/' && next === '/') { inLineComment = true; i++; continue }
+    if (c === '/' && next === '*') { inBlockComment = true; i++; continue }
+    if (c === '"' || c === "'" || c === '`') { inString = c; continue }
+    if (c === openChar) depth++
+    else if (c === closeChar) {
+      depth--
+      if (depth === 0) return source.slice(openIdx + 1, i)
+    }
+  }
+  return null
+}
+
+/** Split a top-level comma-separated argument string. */
+function _sbSplitArgs(argsStr) {
+  const args = []
+  let depth = 0, start = 0, inString = null
+  for (let i = 0; i < argsStr.length; i++) {
+    const c = argsStr[i]
+    if (inString) {
+      if (c === '\\') { i++; continue }
+      if (c === inString) inString = null
+      continue
+    }
+    if (c === '"' || c === "'" || c === '`') { inString = c; continue }
+    if (c === '(' || c === '{' || c === '[') depth++
+    else if (c === ')' || c === '}' || c === ']') depth--
+    else if (c === ',' && depth === 0) {
+      args.push(argsStr.slice(start, i).trim())
+      start = i + 1
+    }
+  }
+  const last = argsStr.slice(start).trim()
+  if (last) args.push(last)
+  return args
+}
+
+/**
+ * Split a script body into top-level statements. A statement ends when
+ * a newline is seen at bracket depth 0. Multi-line statements (e.g. a
+ * call whose object literal spans several lines) are kept together.
+ */
+function _sbSplitStatements(body) {
+  const stmts = []
+  let depth = 0, start = 0
+  let inString = null, inLineComment = false, inBlockComment = false
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i], next = body[i + 1]
+    if (inLineComment) {
+      if (c === '\n') {
+        inLineComment = false
+        if (depth === 0) { stmts.push(body.slice(start, i)); start = i + 1 }
+      }
+      continue
+    }
+    if (inBlockComment) { if (c === '*' && next === '/') { inBlockComment = false; i++ } continue }
+    if (inString) {
+      if (c === '\\') { i++; continue }
+      if (c === inString) inString = null
+      continue
+    }
+    if (c === '/' && next === '/') { inLineComment = true; i++; continue }
+    if (c === '/' && next === '*') { inBlockComment = true; i++; continue }
+    if (c === '"' || c === "'" || c === '`') { inString = c; continue }
+    if (c === '{' || c === '(' || c === '[') depth++
+    else if (c === '}' || c === ')' || c === ']') depth--
+    else if (c === '\n' && depth === 0) {
+      stmts.push(body.slice(start, i))
+      start = i + 1
+    }
+  }
+  if (start < body.length) {
+    const tail = body.slice(start)
+    if (tail.trim()) stmts.push(tail)
+  }
+  return stmts.map(s => s.trim()).filter(s => s.length > 0)
+}
+
+/**
+ * Parse a value expression (literal, object, array) into a JSON-safe
+ * JavaScript value. Returns _SB_CODE when the expression contains any
+ * runtime evaluation (identifier, call, template interpolation, ...).
+ */
+function _sbParseValue(src) {
+  if (src === undefined || src === null) return undefined
+  src = String(src).trim()
+  if (src === '') return ''
+  if (src === 'true') return true
+  if (src === 'false') return false
+  if (src === 'null') return null
+  if (src === 'undefined') return undefined
+  if (/^-?\d+(?:\.\d+)?$/.test(src)) return Number(src)
+  if ((src[0] === "'" && src[src.length - 1] === "'") ||
+      (src[0] === '"' && src[src.length - 1] === '"')) {
+    return src.slice(1, -1)
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+      .replace(/\\r/g, '\r').replace(/\\'/g, "'")
+      .replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+  }
+  if (src[0] === '`' && src[src.length - 1] === '`') {
+    const inner = src.slice(1, -1)
+    if (inner.includes('${')) return _SB_CODE
+    return inner
+  }
+  if (src.startsWith('{') && src.endsWith('}')) {
+    const inner = src.slice(1, -1).trim()
+    if (inner === '') return {}
+    const parts = _sbSplitArgs(inner)
+    const obj = {}
+    for (const part of parts) {
+      const m = part.match(/^([\w$]+|['"][^'"]+['"])\s*:\s*([\s\S]+)$/)
+      if (!m) return _SB_CODE
+      let key = m[1]
+      if ((key[0] === "'" || key[0] === '"') && key[key.length - 1] === key[0]) {
+        key = key.slice(1, -1)
+      }
+      const v = _sbParseValue(m[2])
+      if (v === _SB_CODE) return _SB_CODE
+      obj[key] = v
+    }
+    return obj
+  }
+  if (src.startsWith('[') && src.endsWith(']')) {
+    const inner = src.slice(1, -1).trim()
+    if (inner === '') return []
+    const parts = _sbSplitArgs(inner)
+    const arr = []
+    for (const p of parts) {
+      const v = _sbParseValue(p)
+      if (v === _SB_CODE) return _SB_CODE
+      arr.push(v)
+    }
+    return arr
+  }
+  return _SB_CODE
+}
+
+/** Detect a `this.Method(...)` call and return { method, args }. */
+function _sbParseCall(stmt) {
+  const m = stmt.match(/^(?:await\s+)?this\.([A-Za-z_$][\w$]*)\s*\(/)
+  if (!m) return null
+  const openIdx = m.index + m[0].length - 1
+  const argsStr = _sbExtractBalanced(stmt, openIdx, '(', ')')
+  if (argsStr === null) return null
+  return {
+    method: m[1],
+    args: _sbSplitArgs(argsStr),
+    isAwait: /^\s*await\s+/.test(stmt)
+  }
+}
+
+/**
+ * Drop the leading session-variable argument from a call when it looks
+ * like a plain identifier reference (the common `this.Text(uid, ...)`
+ * pattern). The sessionVar hint is used when available, but identifier
+ * syntax alone is enough to safely drop the first positional argument
+ * for every builder method — they all take the id first.
+ */
+function _sbDropSessionArg(args, sessionVar) {
+  if (args.length === 0) return args
+  const a0 = args[0]
+  if (a0 === sessionVar || /^[A-Za-z_$][\w$]*$/.test(a0) || /^\w+\.session\b/.test(a0)) {
+    return args.slice(1)
+  }
+  return args
+}
+
+/**
+ * Build a button config from a `this.Button(...)` / `this.SideButton(...)`
+ * argument list. Handles all signatures the runtime accepts:
+ *   Button(id, 'name')
+ *   Button(id, 'name', { ...config })
+ *   Button(id, { name, props, path, ... })
+ *   Button(id, 'name', { ...config1 }, { ...config2 })
+ */
+function _sbButtonConfig(rest) {
+  const cfg = { name: '', props: {} }
+  if (rest.length === 0) return cfg
+  let nameFromString = null
+  let startIdx = 0
+  const first = rest[0]
+  if (first && (first[0] === "'" || first[0] === '"' || first[0] === '`')) {
+    const v = _sbParseValue(first)
+    if (typeof v === 'string') nameFromString = v
+    startIdx = 1
+  }
+  for (let i = startIdx; i < rest.length; i++) {
+    const v = _sbParseValue(rest[i])
+    if (v === _SB_CODE) return null
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      Object.assign(cfg, v)
+    }
+  }
+  if (nameFromString !== null && !cfg.name) cfg.name = nameFromString
+  return cfg
+}
+
+/** Turn a parsed button config into a builder button item, or null. */
+function _sbMakeButtonItem(cfg, sourceMethod) {
+  if (!cfg) return null
+  const out = {
+    type: 'button',
+    sourceMethod: sourceMethod || 'Button',
+    name: typeof cfg.name === 'string' ? cfg.name : '',
+    props: (cfg.props && typeof cfg.props === 'object' && !Array.isArray(cfg.props)) ? cfg.props : {}
+  }
+  if (sourceMethod === 'SideButton') out.buttons = true
+  if (typeof cfg.path === 'string') out.path = cfg.path
+  if (cfg.resetSelection) out.resetSelection = true
+  if (cfg.jumpTo !== undefined) out.jumpTo = cfg.jumpTo
+  if (cfg.pinned) out.pinned = true
+  if (cfg.pinnedTop) out.pinnedTop = true
+  return out
+}
+
+/** Parse a `{...}` config expression into a plain object, or {} on failure. */
+function _sbObjArg(src) {
+  if (src === undefined || src === null) return {}
+  const v = _sbParseValue(src)
+  if (v === _SB_CODE) return null
+  if (v && typeof v === 'object' && !Array.isArray(v)) return v
+  return {}
+}
+
+/** Extract the body of an arrow-function expression `... => { ... }`. */
+function _sbExtractArrowBody(src) {
+  src = String(src).trim()
+  const arrowIdx = src.indexOf('=>')
+  if (arrowIdx < 0) return null
+  const after = src.slice(arrowIdx + 2).trim()
+  if (after.startsWith('{')) return _sbExtractBalanced(after, 0, '{', '}')
+  return null
+}
+
+/**
+ * Parse a container-style method (Page, DropDown, PinnedTop, PinnedBottom,
+ * Args). Containers embed an `async () => { ... }` body that is parsed
+ * recursively. Optional trailing config object is merged into the item.
+ */
+function _sbContainerItem(method, rest) {
+  let name = ''
+  let arrowSrc = null
+  let configSrc = null
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i].trim()
+    if (/^(async\s*\(|async\s+function|\(?\s*[\w$]*\s*\)?\s*=>)/.test(a)) {
+      arrowSrc = a
+      if (i + 1 < rest.length) configSrc = rest[i + 1]
+      break
+    }
+    if (i === 0 && (a[0] === "'" || a[0] === '"' || a[0] === '`')) {
+      const v = _sbParseValue(a)
+      if (typeof v === 'string') name = v
+    }
+  }
+  let nested = []
+  if (arrowSrc) {
+    const body = _sbExtractArrowBody(arrowSrc)
+    if (body !== null) nested = _sbParseBody(body)
+  }
+  let cfg = {}
+  if (configSrc !== null) {
+    const cv = _sbObjArg(configSrc)
+    if (cv) cfg = cv
+  }
+  switch (method) {
+    case 'Page':
+      return { type: 'page', name: name || `page_${_sbNid()}`, items: nested }
+    case 'DropDown':
+      return {
+        type: 'dropdown',
+        name: name || `dropdown_${_sbNid()}`,
+        up_buttontext: typeof cfg.up_buttontext === 'string' ? cfg.up_buttontext : 'Show more',
+        down_buttontext: typeof cfg.down_buttontext === 'string' ? cfg.down_buttontext : 'Hide',
+        items: nested
+      }
+    case 'PinnedTop':
+      return { type: 'pinnedTop', items: nested }
+    case 'PinnedBottom':
+      return { type: 'pinnedBottom', items: nested }
+    case 'Args':
+      return {
+        type: 'args',
+        everyTime: !!cfg.everyTime,
+        form: cfg.form !== false,
+        description: typeof cfg.description === 'string' ? cfg.description : '',
+        key: typeof cfg.key === 'string' ? cfg.key : _sbNid(),
+        schema: Array.isArray(cfg.required) ? cfg.required : [],
+        items: nested
+      }
+  }
+  return null
+}
+
+/**
+ * Convert a parsed `this.X(...)` call into a builder item. Returns null
+ * when the call cannot be safely mapped — the caller then stores the
+ * original statement as a raw code item.
+ */
+function _sbCallToItem(call, sessionVar) {
+  const rest = _sbDropSessionArg(call.args, sessionVar)
+  switch (call.method) {
+    case 'Text': {
+      const v = _sbParseValue(rest[0])
+      if (v === _SB_CODE) return null
+      if (typeof v === 'string' && v === '') return { type: 'spacer' }
+      if (typeof v === 'string') return { type: 'text', value: v }
+      return null
+    }
+    case 'Button':
+    case 'AlertButton':
+      return _sbMakeButtonItem(_sbButtonConfig(rest), call.method)
+    case 'SideButton':
+      return _sbMakeButtonItem(_sbButtonConfig(rest), 'SideButton')
+    case 'Buttons': {
+      const arr = _sbParseValue(rest[0])
+      if (arr === _SB_CODE || !Array.isArray(arr)) return null
+      const items = []
+      for (const c of arr) {
+        if (!c || typeof c !== 'object' || Array.isArray(c)) continue
+        const it = _sbMakeButtonItem(c, 'Button')
+        if (it) { it.id = _sbNid(); items.push(it) }
+      }
+      return { type: 'buttonsGroup', items }
+    }
+    case 'Field': {
+      const name = _sbParseValue(rest[0])
+      if (typeof name !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'field',
+        name,
+        label: typeof cfg.label === 'string' ? cfg.label : '',
+        initialValue: typeof cfg.initialValue === 'string' ? cfg.initialValue : '',
+        pinned: !!cfg.pinned,
+        pinnedTop: !!cfg.pinnedTop
+      }
+    }
+    case 'Alert': {
+      const text = _sbParseValue(rest[0])
+      if (typeof text !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'alert',
+        text,
+        duration: typeof cfg.duration === 'number' ? cfg.duration : 3000
+      }
+    }
+    case 'GotoNow': {
+      const pathVal = _sbParseValue(rest[0])
+      if (typeof pathVal !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return { type: 'gotonow', path: pathVal, props: cfg.props || {} }
+    }
+    case 'SetPage': {
+      const page = _sbParseValue(rest[0])
+      if (typeof page !== 'string') return null
+      return { type: 'setpage', page }
+    }
+    case 'WaitInput': {
+      const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'waitinput',
+        path: typeof cfg.path === 'string' ? cfg.path : '',
+        props: cfg.props || {},
+        question: typeof cfg.question === 'string' ? cfg.question : 'Type: ',
+        password: !!cfg.password
+      }
+    }
+    case 'Page':
+    case 'DropDown':
+    case 'PinnedTop':
+    case 'PinnedBottom':
+    case 'Args':
+      return _sbContainerItem(call.method, rest)
+    case 'File':
+      return { type: 'file', config: {} }
+    case 'JSON':
+      return { type: 'json', config: {} }
+    case 'Get':
+    case 'Post':
+    case 'Put':
+    case 'Delete': {
+      const pathVal = _sbParseValue(rest[0])
+      const handlerArg = rest[1]
+      let handlerCode = '// handler code'
+      if (handlerArg) {
+        const body = _sbExtractArrowBody(handlerArg)
+        if (body !== null) handlerCode = body.trim()
+      }
+      return {
+        type: 'route',
+        method: call.method,
+        path: typeof pathVal === 'string' ? pathVal : '/',
+        handler: handlerCode
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * Detect the identifier assigned from `props.session.UniqueID`. The
+ * props variable itself may be named anything (props, p, configuration,
+ * cfg, ...) and the target variable may be anything (id, uid, ID, ...).
+ */
+function _sbFindSessionVar(body, propsVar) {
+  const candidates = []
+  if (propsVar) candidates.push(propsVar)
+  candidates.push('props', 'p', 'configuration', 'config')
+  const seen = new Set()
+  for (const v of candidates) {
+    if (!v || seen.has(v)) continue
+    seen.add(v)
+    const esc = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(
+      `(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${esc}\\.session\\.UniqueID`,
+      'i'
+    )
+    const m = body.match(re)
+    if (m) return { sessionVar: m[1], propsVar: v }
+  }
+  // Fallback: match any `<X>.session.UniqueID` access pattern
+  const f = body.match(/([A-Za-z_$][\w$]*)\.session\.UniqueID/i)
+  if (f) {
+    const esc = f[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const a = body.match(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${esc}\\.session\\.UniqueID`))
+    if (a) return { sessionVar: a[1], propsVar: f[1] }
+    return { sessionVar: 'id', propsVar: f[1] }
+  }
+  return { sessionVar: 'id', propsVar: 'props' }
+}
+
+/**
+ * Extract the async build function from the `super(...)` call. Looks at
+ * the second argument of super() and returns { body, propsVar }.
+ */
+function _sbExtractBuildFunction(source) {
+  const m = source.match(/\bsuper\s*\(/)
+  if (!m) return null
+  const openIdx = source.indexOf('(', m.index)
+  if (openIdx < 0) return null
+  const argsStr = _sbExtractBalanced(source, openIdx, '(', ')')
+  if (argsStr === null) return null
+  const args = _sbSplitArgs(argsStr)
+  if (args.length < 2) return null
+  const buildSrc = args[1].trim()
+  let pm = buildSrc.match(/^async\s*\(\s*([\w$]*)\s*\)\s*=>/)
+  if (!pm) pm = buildSrc.match(/^async\s+([\w$]+)\s*=>/)
+  if (!pm) pm = buildSrc.match(/^async\s+function\s*\(\s*([\w$]*)\s*\)/)
+  if (!pm) pm = buildSrc.match(/^\(\s*([\w$]*)\s*\)\s*=>/)
+  if (!pm) return null
+  const propsVar = pm[1] || 'props'
+  const braceIdx = buildSrc.indexOf('{', pm.index + pm[0].length - 1)
+  if (braceIdx < 0) return null
+  const body = _sbExtractBalanced(buildSrc, braceIdx, '{', '}')
+  if (body === null) return null
+  return { body, propsVar }
+}
+
+/**
+ * Parse a raw build-function body into builder items. Recognised
+ * `this.X(...)` calls become structured items; everything else becomes
+ * a `code` item executed as-is at render time.
+ *
+ * When the session variable is renamed (e.g. `uid`), any code fallback
+ * gets a `const <sessionVar> = id;` prefix so the code can still resolve
+ * the session id inside the AsyncFunction sandbox that the renderer
+ * provides.
+ */
+function _sbParseBody(body) {
+  const found = _sbFindSessionVar(body, 'props')
+  const sessionVar = found.sessionVar
+  const stmts = _sbSplitStatements(body)
+  const items = []
+  for (const stmt of stmts) {
+    // Skip the session-variable declaration itself
+    if (/^(?:const|let|var)\s+[\w$]+\s*=\s*[\w$]+\.session\.UniqueID\b/i.test(stmt)) {
+      continue
+    }
+    const call = _sbParseCall(stmt)
+    if (call) {
+      const item = _sbCallToItem(call, sessionVar)
+      if (item) {
+        item.id = item.id || _sbNid()
+        items.push(item)
+        continue
+      }
+    }
+    // Fallback: preserve the statement as a raw code item
+    let code = stmt
+    if (sessionVar && sessionVar !== 'id') {
+      const esc = sessionVar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      if (new RegExp(`\\b${esc}\\b`).test(code)) {
+        code = `const ${sessionVar} = id;\n${code}`
+      }
+    }
+    items.push({ id: _sbNid(), type: 'code', value: code })
+  }
+  return items
+}
+
+/**
+ * Parse an entire SyAPP function file into a builder state object.
+ * Returns `{ name, funcName, items, hiddenMethods, sessionVar }` — a
+ * shape fully compatible with the SelfBuilder's State.
+ *
+ * Anything the parser cannot understand becomes a raw `code` item, so
+ * the loaded file always executes as intended when viewed. Complex
+ * functions that were never produced by the SelfBuilder therefore
+ * round-trip through the editor without losing behaviour.
+ */
+function _sbParseFuncJS(source, filePath) {
+  const baseName = path.basename(filePath).replace(/\.(js|mjs|cjs)$/i, '')
+  const state = {
+    name: baseName || 'untitled',
+    funcName: (baseName || 'MyApp').replace(/[^A-Za-z0-9_$]/g, '') || 'MyApp',
+    code: '',
+    items: [],
+    hiddenMethods: [],
+    sessionVar: 'id'
+  }
+  if (!source || typeof source !== 'string') return state
+
+  // 1. Class name → funcName
+  const clsM = source.match(/class\s+([A-Za-z_$][\w$]*)\s+extends\s+/)
+  if (clsM) state.funcName = clsM[1]
+
+  // 2. App name → first string literal argument of super()
+  const supM = source.match(/super\s*\(\s*(['"`])([^'"`]+)\1/)
+  if (supM) state.name = supM[2]
+
+  // 3. Build-function body (2nd argument to super())
+  const buildInfo = _sbExtractBuildFunction(source)
+  if (!buildInfo) return state
+
+  // 4. Session-var identifier (can be id, uid, ID, session, ...)
+  const found = _sbFindSessionVar(buildInfo.body, buildInfo.propsVar)
+  state.sessionVar = found.sessionVar
+
+  // 5. Parse the body into builder items
+  state.items = _sbParseBody(buildInfo.body)
+  return state
 }
 
 function _installCtrlC(syapp) {
@@ -12084,10 +13244,38 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     if (arg1 === '--edit' && arg2) { editMode = true; editTarget = arg2; }
     else if (arg2 === '--edit') { editMode = true; editTarget = arg1; }
     if (editMode && editTarget) {
-      __BUILDER_INITIAL_STATE = null;
       __BUILDER_EXPORT_TARGET = path.isAbsolute(editTarget)
         ? editTarget
         : path.resolve(process.cwd(), editTarget);
+
+      // If the target file already exists, parse it into a builder state
+      // so the SelfBuilder opens the file directly in the editor. The
+      // parser is best-effort: whatever cannot be mapped to a structured
+      // item is preserved as a raw `code` item, so nothing is lost and
+      // the loaded code still executes with the same behaviour as before.
+      __BUILDER_INITIAL_STATE = null;
+      try {
+        if (fs.existsSync(__BUILDER_EXPORT_TARGET)) {
+          const src = fs.readFileSync(__BUILDER_EXPORT_TARGET, 'utf8');
+          const parsed = _sbParseFuncJS(src, __BUILDER_EXPORT_TARGET);
+          if (parsed && (parsed.items.length > 0 || parsed.name)) {
+            __BUILDER_INITIAL_STATE = parsed;
+            console.log(ColorText.brightGreen(
+              `📂 Loaded "${editTarget}" — ${parsed.items.length} item(s) parsed`
+            ));
+          }
+        } else {
+          console.log(ColorText.yellow(
+            `ℹ️  New file: ${editTarget} (will be created on export)`
+          ));
+        }
+      } catch (e) {
+        console.error(ColorText.yellow(
+          `⚠️  Could not parse "${editTarget}": ${e.message} — starting with a blank editor`
+        ));
+        __BUILDER_INITIAL_STATE = null;
+      }
+
       const syapp = new SyAPP(SelfBuilder);
       _installCtrlC(syapp);
       return;
