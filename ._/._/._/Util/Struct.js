@@ -984,6 +984,153 @@ async function searchFilesForTermScored(filePaths, searchTerm, caseSensitive, co
 }
 
 // ============================================================
+//  ADDITIONAL LAYER: .gitignore-aware filename-match penalty.
+//
+//  This is a POST-SCORING pass. It runs AFTER every existing
+//  scoring layer (filename / path / content / fuzzy / prompt
+//  token weighting) and NEVER modifies their logic. Those layers
+//  stay exactly as they were.
+//
+//  Its only job:
+//    When a candidate's FILENAME (basename) matches the search
+//    term AND that same filename also matches a pattern coming
+//    from the applicable .gitignore file, REDUCE the score.
+//
+//  Guarantees that keep the current 100%-working behaviour safe:
+//    * Content-only matches are NEVER penalised.
+//    * Files whose name has nothing to do with the search term
+//      are NEVER penalised (only true FILENAME MATCH cases are).
+//    * If there is no .gitignore, or it cannot be read, the
+//      whole layer is a no-op and results are returned untouched.
+//    * The penalty is moderate so the temperature slider in the
+//      find-results view can still reveal these files by raising
+//      the temperature (nothing is ever truly dropped here).
+// ============================================================
+const GITIGNORE_FILENAME_PENALTY_MULTIPLIER = 0.3;
+const GITIGNORE_FILENAME_PENALTY_FLAT = 300;
+
+// Parse a single .gitignore line into a structured matcher.
+// Returns null for comments, blanks, and patterns that cannot
+// apply to a bare basename (i.e. patterns containing an inner
+// slash - those are anchored to a specific path).
+function parseGitignoreLine(line) {
+    let p = line.trim();
+    if (!p || p.startsWith('#')) return null;
+
+    let negated = false;
+    if (p.startsWith('!')) {
+        negated = true;
+        p = p.slice(1);
+    }
+
+    // Directory-only marker is irrelevant for basename matching -
+    // strip it and continue.
+    if (p.endsWith('/')) p = p.slice(0, -1);
+
+    // Leading slash anchors to the .gitignore location. After
+    // stripping it we still only match the basename (per request).
+    if (p.startsWith('/')) p = p.slice(1);
+
+    // Patterns with an inner slash are path-anchored - they do not
+    // participate in the "filename match" penalty. Skip them.
+    if (p.includes('/')) return null;
+
+    // Glob -> RegExp. Support * and ? only (covers ~99% of real
+    // .gitignore filename patterns like *.log, .env, *.tmp).
+    let re = '';
+    for (let i = 0; i < p.length; i++) {
+        const c = p[i];
+        if (c === '*') {
+            re += '[^/]*';
+        } else if (c === '?') {
+            re += '[^/]';
+        } else if ('\\^$.|+()[]{}'.includes(c)) {
+            re += '\\' + c;
+        } else {
+            re += c;
+        }
+    }
+
+    let regex;
+    try {
+        regex = new RegExp('^' + re + '$');
+    } catch {
+        return null;
+    }
+
+    return { regex, negated };
+}
+
+// Read the top-level .gitignore from the given root directory.
+// Returns an array of parsed patterns (may be empty). Never throws.
+async function loadRootGitignorePatterns(rootDir) {
+    let content;
+    try {
+        content = await fs.readFile(path.join(rootDir, '.gitignore'), 'utf8');
+    } catch {
+        return [];
+    }
+
+    const patterns = [];
+    for (const line of content.split(/\r?\n/)) {
+        const parsed = parseGitignoreLine(line);
+        if (parsed) patterns.push(parsed);
+    }
+    return patterns;
+}
+
+// Does a bare filename match any of the parsed gitignore patterns?
+// Follows standard gitignore semantics: LAST matching pattern wins,
+// and a "!" pattern can un-ignore a previously matched name.
+function basenameMatchesGitignorePatterns(baseName, patterns) {
+    let matched = false;
+    for (const pat of patterns) {
+        if (pat.regex.test(baseName)) {
+            matched = !pat.negated;
+        }
+    }
+    return matched;
+}
+
+// Apply the gitignore filename penalty IN PLACE and re-sort.
+//
+// A candidate is penalised ONLY when BOTH are true:
+//   (a) at least one search token appears in the basename
+//       (this is what makes it a true "FILENAME MATCH" case -
+//       content-only hits are left completely alone), AND
+//   (b) that basename matches an applicable .gitignore pattern.
+//
+// The entry stays in the results array; only its score is
+// reduced, so the temperature slider can still reveal it.
+function applyGitignoreFilenamePenalty(results, patterns, searchTerm) {
+    if (!patterns || patterns.length === 0) return results;
+
+    const tokens = tokenizeSearchTerm(searchTerm);
+    if (tokens.length === 0) return results;
+
+    for (const r of results) {
+        const baseName = path.basename(r.path);
+        const baseLower = baseName.toLowerCase();
+
+        // (a) Filename itself matched the search term.
+        const termInName = tokens.some(t => baseLower.includes(t));
+        if (!termInName) continue;
+
+        // (b) Filename is gitignored.
+        if (!basenameMatchesGitignorePatterns(baseName, patterns)) continue;
+
+        r.score = Math.max(
+            0,
+            Math.round(r.score * GITIGNORE_FILENAME_PENALTY_MULTIPLIER) - GITIGNORE_FILENAME_PENALTY_FLAT
+        );
+        r.gitignored = true;
+    }
+
+    results.sort((a, b) => b.score - a.score);
+    return results;
+}
+
+// ============================================================
 //  Temperature -> minimum-score threshold.
 //
 //  Behaves like a volume knob for similarity:
@@ -1882,6 +2029,28 @@ async function interactiveMode() {
                 results = await searchFilesForTermScored(filesToSearch, term, caseSensitive, 32);
             } catch (err) {
                 console.error(`${RED}Search error: ${err.message}${RESET}`);
+            }
+
+            // ============================================================
+            //  ADDITIONAL LAYER (post-scoring): .gitignore filename penalty.
+            //
+            //  Runs AFTER all existing scoring layers, leaving them
+            //  completely untouched. It ONLY lowers the score of
+            //  candidates whose filename matched the search term AND
+            //  whose filename matches a .gitignore pattern. Content-only
+            //  matches keep their exact original score.
+            //
+            //  Best-effort: if .gitignore is missing/unreadable, or the
+            //  layer throws for any reason, the original results are
+            //  used unchanged so nothing can break the search.
+            // ============================================================
+            try {
+                const gitignorePatterns = await loadRootGitignorePatterns(currentDirectory);
+                if (gitignorePatterns.length > 0) {
+                    results = applyGitignoreFilenamePenalty(results, gitignorePatterns, term);
+                }
+            } catch {
+                // Ignore - the penalty layer must never abort a search.
             }
 
             const elapsed = Date.now() - startTime;
