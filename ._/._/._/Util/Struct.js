@@ -455,6 +455,230 @@ async function fileContainsTerm(filePath, searchTerm, caseSensitive, termBuffer)
     return text.toLowerCase().includes(searchTerm);
 }
 
+// ============================================================
+//  Fuzzy string similarity - Dice coefficient over character bigrams.
+//  Returns 0..1. Very fast and works well for filename-ish strings.
+// ============================================================
+function diceCoefficient(a, b) {
+    if (a === b) return 1;
+    if (a.length < 2 || b.length < 2) return 0;
+
+    const bigrams = new Map();
+
+    for (let i = 0; i < a.length - 1; i++) {
+        const gram = a.substring(i, i + 2);
+        bigrams.set(gram, (bigrams.get(gram) || 0) + 1);
+    }
+
+    let intersection = 0;
+
+    for (let i = 0; i < b.length - 1; i++) {
+        const gram = b.substring(i, i + 2);
+        const count = bigrams.get(gram) || 0;
+        if (count > 0) {
+            bigrams.set(gram, count - 1);
+            intersection++;
+        }
+    }
+
+    return (2 * intersection) / ((a.length - 1) + (b.length - 1));
+}
+
+// ============================================================
+//  Score a candidate file against the search term.
+//
+//  Weight hierarchy (highest first):
+//    1. Filename (without extension) equals the term     -> strongest
+//    2. Filename starts-with / contains the term
+//    3. Path contains the term
+//    4. Content occurrence count (meaningful but below any name hit)
+//    5. Fuzzy filename similarity (typos / partial names)
+//
+//  Rationale: if the user types "myfilename" and "myfilename.js"
+//  exists, it must dominate the ranking. Content hits are only a
+//  fallback signal.
+// ============================================================
+function scoreFileMatch(filePath, term, contentHits = 0) {
+    const baseName = path.basename(filePath);
+    const baseNoExt = baseName.replace(/\.[^.]+$/, '');
+    const termLower = term.toLowerCase();
+    const baseLower = baseName.toLowerCase();
+    const baseNoExtLower = baseNoExt.toLowerCase();
+    const pathLower = filePath.toLowerCase();
+
+    let score = 0;
+    let nameMatched = false;
+
+    // --- Filename: the dominant signal ---
+    if (baseNoExtLower === termLower) {
+        score += 2000;                        // "myfilename" -> myfilename.js
+        nameMatched = true;
+    } else if (baseLower === termLower) {
+        score += 1900;
+        nameMatched = true;
+    } else if (baseNoExtLower.startsWith(termLower)) {
+        score += 1600;                        // myfilename -> myfilename.utils.js
+        nameMatched = true;
+    } else if (baseNoExtLower.includes(termLower)) {
+        score += 1300;                        // myfilename -> app.myfilename.js
+        nameMatched = true;
+    } else if (baseLower.includes(termLower)) {
+        score += 1100;
+        nameMatched = true;
+    }
+
+    // --- Fuzzy filename similarity (typos / partial matches) ---
+    const sim = diceCoefficient(baseNoExtLower, termLower);
+    score += Math.round(sim * 400);
+
+    // --- Path containment (directory names) ---
+    if (!nameMatched && pathLower.includes(termLower)) {
+        score += 500;
+    }
+
+    // --- Content hits: meaningful, but always below a name hit ---
+    if (contentHits > 0) {
+        score += Math.min(900, 550 + contentHits * 10);
+    }
+
+    return score;
+}
+
+// ============================================================
+//  Same as fileContainsTerm but also counts occurrences (capped).
+//  The cap prevents giant log-like files from dominating scores.
+// ============================================================
+async function fileContainsTermWithCount(filePath, searchTerm, caseSensitive, termBuffer) {
+    let stats;
+
+    try {
+        stats = await fs.stat(filePath);
+    } catch {
+        return { matched: false, hits: 0 };
+    }
+
+    if (stats.size === 0) return { matched: false, hits: 0 };
+    if (stats.size > 16 * 1024 * 1024) return { matched: false, hits: 0 };
+
+    let buffer;
+
+    try {
+        buffer = await fs.readFile(filePath);
+    } catch {
+        return { matched: false, hits: 0 };
+    }
+
+    const scanLen = Math.min(buffer.length, 8192);
+    for (let i = 0; i < scanLen; i++) {
+        if (buffer[i] === 0) return { matched: false, hits: 0 };
+    }
+
+    let hits = 0;
+    const HIT_CAP = 50;
+
+    if (caseSensitive) {
+        let idx = 0;
+        while (hits < HIT_CAP) {
+            idx = buffer.indexOf(termBuffer, idx);
+            if (idx === -1) break;
+            hits++;
+            idx += termBuffer.length;
+        }
+    } else {
+        const text = buffer.toString('utf8').toLowerCase();
+        let idx = 0;
+        while (hits < HIT_CAP) {
+            idx = text.indexOf(searchTerm, idx);
+            if (idx === -1) break;
+            hits++;
+            idx += searchTerm.length;
+        }
+    }
+
+    return { matched: hits > 0, hits };
+}
+
+// ============================================================
+//  Scored parallel search.
+//
+//  Returns an array of { path, score, hits, contentMatched }
+//  sorted by score descending. Files that only match by fuzzy
+//  filename similarity are still included so the temperature
+//  slider in the results view has candidates to reveal at
+//  higher values.
+// ============================================================
+async function searchFilesForTermScored(filePaths, searchTerm, caseSensitive, concurrency = 32) {
+    const results = [];
+
+    if (filePaths.length === 0) return results;
+
+    const termBuffer = Buffer.from(searchTerm, 'utf8');
+    const normalizedTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
+
+    let nextIndex = 0;
+
+    const worker = async () => {
+        while (true) {
+            const i = nextIndex++;
+            if (i >= filePaths.length) return;
+
+            const filePath = filePaths[i];
+
+            try {
+                const { matched, hits } = await fileContainsTermWithCount(
+                    filePath,
+                    normalizedTerm,
+                    caseSensitive,
+                    termBuffer
+                );
+
+                const score = scoreFileMatch(filePath, searchTerm, hits);
+
+                // Keep files that either matched in content OR have a
+                // meaningful fuzzy/similarity score in the filename.
+                if (matched || score >= 300) {
+                    results.push({
+                        path: filePath,
+                        score,
+                        hits,
+                        contentMatched: matched,
+                    });
+                }
+            } catch {
+                // Ignore per-file errors so one bad file doesn't abort the search.
+            }
+        }
+    };
+
+    const workerCount = Math.min(concurrency, filePaths.length);
+    const workers = new Array(workerCount);
+
+    for (let i = 0; i < workerCount; i++) {
+        workers[i] = worker();
+    }
+
+    await Promise.all(workers);
+
+    // Highest score first.
+    results.sort((a, b) => b.score - a.score);
+
+    return results;
+}
+
+// ============================================================
+//  Temperature -> minimum-score threshold.
+//
+//  Behaves like a volume knob for similarity:
+//    0  = only strong filename matches
+//    ~5 = balanced (default) - includes content hits
+//    10 = everything, including weak fuzzy hits
+// ============================================================
+function temperatureToThreshold(temp, maxTemp = 10) {
+    const t = Math.max(0, Math.min(maxTemp, temp)) / maxTemp;
+    // Ease-out curve: strict at 0, smooth slope, fully open at max.
+    return Math.round(1800 * Math.pow(1 - t, 2.2));
+}
+
 // Parallel worker-pool search across the given file paths.
 // concurrency ~= number of in-flight reads. 32 is a sweet spot for local SSDs:
 // high enough to saturate I/O, low enough to avoid EMFILE / thrashing.
@@ -962,61 +1186,132 @@ async function interactiveMode() {
     }
 
     // ========================================================
-    //  FIND-RESULTS view
-    //  Shows ONLY the matched files (all pre-selected).
+    //  FIND-RESULTS view (scored + temperature slider)
+    //
+    //  Accepts an array of scored results:
+    //     { path, score, hits, contentMatched }
+    //
+    //  The TEMPERATURE slider (0..10) acts like a volume knob for
+    //  the minimum-similarity threshold:
+    //     low  -> only strong filename matches are shown/selected
+    //     mid  -> content hits join in (default)
+    //     high -> weak fuzzy filename matches are revealed too
+    //
+    //  The selection mirrors the visible (above-threshold) set:
+    //  raising temperature adds candidates; lowering it removes
+    //  them. Individual toggles still work on top of that.
+    //
     //  Keys:
     //    ↑/↓, PgUp/PgDn  -> navigate
-    //    Space / Enter   -> toggle selection of the file under cursor
-    //    a               -> select all matches
-    //    n               -> unselect all matches
+    //    Space / Enter   -> toggle selection of file under cursor
+    //    [ or -          -> decrease temperature (stricter)
+    //    ] or + or =     -> increase temperature (looser)
+    //    a               -> select all currently visible
+    //    n               -> unselect all currently visible
     //    G (or g)        -> proceed to generate (calls handleGenerate)
     //    B (or Esc)      -> return to the normal browser
     //    Ctrl+C          -> quit
     // ========================================================
-    async function showFindResultsView(matchPaths) {
+    async function showFindResultsView(scoredResults) {
         process.stdin.setRawMode(true);
         process.stdin.resume();
 
+        const MAX_TEMP = 10;
+        let temperature = 5;   // balanced default
         let cursor = 0;
         let scrollOffset = 0;
 
-        const getMaxRows = () => {
-            const rows = process.stdout.rows || 24;
-            return Math.max(1, rows - 6);
+        // Recompute the visible list + mirror selection to match.
+        // Files above the threshold become selected; files below
+        // the threshold get deselected. This gives the "volume-like"
+        // progressive selection feel the user asked for.
+        const recomputeVisible = async () => {
+            const threshold = temperatureToThreshold(temperature, MAX_TEMP);
+            const visible = scoredResults.filter(r => r.score >= threshold);
+            const visibleSet = new Set(visible.map(r => r.path));
+
+            for (const r of scoredResults) {
+                const shouldBeSelected = visibleSet.has(r.path);
+                const isSelected = selectedFiles.has(r.path);
+
+                if (shouldBeSelected && !isSelected) {
+                    await selectFile(r.path);
+                } else if (!shouldBeSelected && isSelected) {
+                    deselectFile(r.path);
+                }
+            }
+
+            // Clamp cursor if the visible list shrank.
+            if (cursor >= visible.length) {
+                cursor = Math.max(0, visible.length - 1);
+            }
+
+            return visible;
         };
 
-        const adjustScroll = () => {
+        const getMaxRows = () => {
+            const rows = process.stdout.rows || 24;
+            return Math.max(1, rows - 7);
+        };
+
+        const adjustScroll = (visibleLength) => {
             const max = getMaxRows();
 
             if (cursor < scrollOffset) scrollOffset = cursor;
             if (cursor >= scrollOffset + max) scrollOffset = cursor - max + 1;
 
-            const maxScroll = Math.max(0, matchPaths.length - max);
+            const maxScroll = Math.max(0, visibleLength - max);
             if (scrollOffset > maxScroll) scrollOffset = maxScroll;
             if (scrollOffset < 0) scrollOffset = 0;
         };
 
-        const renderFind = () => {
+        // Volume-bar style temperature indicator.
+        const buildVolumeBar = (value, max, width = 12) => {
+            const filled = Math.max(0, Math.min(width, Math.round((value / max) * width)));
+            const empty = width - filled;
+            const fillColor = value < 3 ? RED : value < 7 ? YELLOW : GREEN;
+            return `${fillColor}${'█'.repeat(filled)}${RESET}${'░'.repeat(empty)}`;
+        };
+
+        const renderFind = (visible) => {
             clearScreen();
 
             const max = getMaxRows();
-            adjustScroll();
+            adjustScroll(visible.length);
 
-            const visible = matchPaths.slice(scrollOffset, scrollOffset + max);
-            const selectedCount = matchPaths.filter(p => selectedFiles.has(p)).length;
+            const slice = visible.slice(scrollOffset, scrollOffset + max);
+            const selectedVisible = visible.filter(r => selectedFiles.has(r.path)).length;
+            const threshold = temperatureToThreshold(temperature, MAX_TEMP);
 
             console.log(`${BOLD}${GREEN}=== FIND RESULTS ===${RESET}`);
-            console.log(`${BOLD}Matches: ${matchPaths.length} | Selected: ${selectedCount}${RESET}`);
+            console.log(
+                `${BOLD}Candidates: ${scoredResults.length} | Visible: ${visible.length} | Selected (visible): ${selectedVisible}${RESET}`
+            );
+            console.log(
+                `${BOLD}Temperature:${RESET} ${buildVolumeBar(temperature, MAX_TEMP)} ` +
+                `${BOLD}${temperature}/${MAX_TEMP}${RESET}  ` +
+                `${MAGENTA}(min score: ${threshold})${RESET}`
+            );
             console.log('─'.repeat(process.stdout.columns || 80));
-            console.log(`${BOLD}Keys:${RESET} ↑/↓ move, PgUp/PgDn page, Space/Enter toggle, a all, n none, ${GREEN}G${RESET} generate, ${YELLOW}B${RESET} back`);
+            console.log(
+                `${BOLD}Keys:${RESET} ↑/↓ move, PgUp/PgDn page, Space toggle, ` +
+                `${YELLOW}[${RESET}/${YELLOW}]${RESET} temp, a all, n none, ` +
+                `${GREEN}G${RESET} generate, ${YELLOW}B${RESET} back`
+            );
             console.log('─'.repeat(process.stdout.columns || 80));
 
-            visible.forEach((filePath, index) => {
+            slice.forEach((item, index) => {
                 const actualIndex = scrollOffset + index;
-                const isSelected = selectedFiles.has(filePath);
+                const isSelected = selectedFiles.has(item.path);
                 const prefix = isSelected ? `${GREEN}[✔]${RESET}` : '[ ]';
-                const rel = path.relative(currentDirectory, filePath) || filePath;
-                const line = `${prefix} ${rel}`;
+                const rel = path.relative(currentDirectory, item.path) || item.path;
+
+                // [cN] = content match with N hits, [f] = filename-only fuzzy
+                const tag = item.contentMatched
+                    ? `${BLUE}c${String(item.hits).padStart(2, '0')}${RESET}`
+                    : `${MAGENTA}f  ${RESET}`;
+                const scoreStr = `${BOLD}${String(item.score).padStart(4, ' ')}${RESET}`;
+                const line = `${prefix} ${scoreStr} [${tag}] ${rel}`;
 
                 if (actualIndex === cursor) {
                     console.log(`${REVERSE}${line}${RESET}`);
@@ -1025,71 +1320,97 @@ async function interactiveMode() {
                 }
             });
 
-            if (matchPaths.length > max) {
+            if (visible.length > max) {
                 const page = Math.floor(scrollOffset / max) + 1;
-                const totalPages = Math.ceil(matchPaths.length / max);
-                console.log(`─ ${BOLD}${page}${RESET}/${totalPages} ${matchPaths.length} matches`);
+                const totalPages = Math.ceil(visible.length / max);
+                console.log(`─ ${BOLD}${page}${RESET}/${totalPages} ${visible.length} visible`);
+            } else if (visible.length === 0) {
+                console.log(`${YELLOW}(temperature too low - raise it with ] or +)${RESET}`);
             }
         };
 
+        // Initial population of the visible list (auto-selects).
+        let visible = await recomputeVisible();
+
         return new Promise(resolve => {
             const onFindKeypress = async (key) => {
-                const max = getMaxRows();
+                // ---------- temperature controls ----------
+                if (key === '[' || key === '-') {
+                    if (temperature > 0) {
+                        temperature--;
+                        visible = await recomputeVisible();
+                    }
+                    renderFind(visible);
+                    return;
+                }
 
+                if (key === ']' || key === '+' || key === '=') {
+                    if (temperature < MAX_TEMP) {
+                        temperature++;
+                        visible = await recomputeVisible();
+                    }
+                    renderFind(visible);
+                    return;
+                }
+
+                // ---------- navigation ----------
                 if (key === '\u001b[A') {
                     if (cursor > 0) cursor--;
-                    renderFind();
+                    renderFind(visible);
                     return;
                 }
 
                 if (key === '\u001b[B') {
-                    if (cursor < matchPaths.length - 1) cursor++;
-                    renderFind();
+                    if (cursor < visible.length - 1) cursor++;
+                    renderFind(visible);
                     return;
                 }
 
                 if (key === '\u001b[5~') {
-                    cursor = Math.max(0, cursor - max);
-                    renderFind();
+                    cursor = Math.max(0, cursor - getMaxRows());
+                    renderFind(visible);
                     return;
                 }
 
                 if (key === '\u001b[6~') {
-                    cursor = Math.min(matchPaths.length - 1, cursor + max);
-                    renderFind();
+                    cursor = Math.min(visible.length - 1, cursor + getMaxRows());
+                    renderFind(visible);
                     return;
                 }
 
+                // ---------- toggle under cursor ----------
                 if (key === ' ' || key === '\r' || key === '\n') {
-                    const filePath = matchPaths[cursor];
-                    if (filePath) {
-                        await toggleFile(filePath);
+                    const item = visible[cursor];
+                    if (item) {
+                        await toggleFile(item.path);
                     }
-                    renderFind();
+                    renderFind(visible);
                     return;
                 }
 
+                // ---------- bulk select/unselect (visible only) ----------
                 if (key === 'a') {
-                    for (const filePath of matchPaths) {
-                        if (!selectedFiles.has(filePath)) {
-                            await selectFile(filePath);
+                    for (const item of visible) {
+                        if (!selectedFiles.has(item.path)) {
+                            await selectFile(item.path);
                         }
                     }
-                    renderFind();
+                    renderFind(visible);
                     return;
                 }
 
                 if (key === 'n') {
-                    for (const filePath of matchPaths) {
-                        deselectFile(filePath);
+                    for (const item of visible) {
+                        deselectFile(item.path);
                     }
-                    renderFind();
+                    renderFind(visible);
                     return;
                 }
 
+                // ---------- generate ----------
                 if (key === 'g' || key === 'G') {
                     if (selectedFiles.size === 0) {
-                        renderFind();
+                        renderFind(visible);
                         return;
                     }
 
@@ -1105,6 +1426,7 @@ async function interactiveMode() {
                     return;
                 }
 
+                // ---------- back to normal browser ----------
                 if (key === 'b' || key === 'B' || key === '\u001b') {
                     process.stdin.removeListener('data', onFindKeypress);
                     resolve();
@@ -1117,7 +1439,7 @@ async function interactiveMode() {
             };
 
             process.stdin.on('data', onFindKeypress);
-            renderFind();
+            renderFind(visible);
         });
     }
 
@@ -1198,10 +1520,13 @@ async function interactiveMode() {
             process.stdin.removeListener('data', onKeypress);
             process.stdin.setRawMode(false);
 
-            console.log(`\n${YELLOW}${BOLD}=== FIND FILES BY CONTENT ===${RESET}`);
+            console.log(`\n${YELLOW}${BOLD}=== FIND FILES ===${RESET}`);
             console.log(`Recursive search under: ${currentDirectory}`);
             console.log(`${BOLD}Smart case:${RESET} lowercase = case-insensitive, any UPPERCASE = case-sensitive`);
-            console.log(`${MAGENTA}(node_modules, .git and other junk dirs are skipped)${RESET}\n`);
+            console.log(`${MAGENTA}(node_modules, .git and other junk dirs are skipped)${RESET}`);
+            console.log(`${BOLD}Weighting:${RESET} filename matches score highest; content hits score lower.`);
+            console.log(`A temperature slider in the results view lets you relax/strict the`);
+            console.log(`similarity threshold in real time (like a volume knob).\n`);
 
             const rawTerm = await askQuestion('Enter search term (empty to cancel):');
 
@@ -1232,31 +1557,24 @@ async function interactiveMode() {
 
             console.log(`Candidate files: ${formatNumber(filesToSearch.length)}`);
 
-            let matches = [];
+            let results = [];
             try {
-                matches = await searchFilesForTerm(filesToSearch, term, caseSensitive, 32);
+                results = await searchFilesForTermScored(filesToSearch, term, caseSensitive, 32);
             } catch (err) {
                 console.error(`${RED}Search error: ${err.message}${RESET}`);
             }
 
             const elapsed = Date.now() - startTime;
 
-            // Additively select all matches (existing selection is preserved).
-            let newlySelected = 0;
-            for (const filePath of matches) {
-                if (!selectedFiles.has(filePath)) {
-                    await selectFile(filePath);
-                    newlySelected++;
-                }
-            }
-
             console.log(`\n${GREEN}${BOLD}✓ Search complete${RESET}`);
             console.log(`  Elapsed:   ${elapsed} ms`);
             console.log(`  Scanned:   ${formatNumber(filesToSearch.length)} file(s)`);
-            console.log(`  Matched:   ${formatNumber(matches.length)} file(s)`);
-            console.log(`  Added:     ${formatNumber(newlySelected)} new selection(s)`);
+            console.log(`  Matched:   ${formatNumber(results.length)} candidate(s)`);
+            if (results.length > 0) {
+                console.log(`  Top score: ${results[0].score}  (${path.relative(currentDirectory, results[0].path) || results[0].path})`);
+            }
 
-            if (matches.length === 0) {
+            if (results.length === 0) {
                 await askQuestion(`\n${YELLOW}No matches found. Press Enter to return...${RESET}`);
                 process.stdin.setRawMode(true);
                 process.stdin.resume();
@@ -1265,10 +1583,10 @@ async function interactiveMode() {
                 return;
             }
 
-            // NEW: Enter the dedicated FIND-RESULTS view.
-            // Only the matched files are shown, all marked as selected.
-            // The user can toggle them, press G to generate, or B to go back.
-            await showFindResultsView(matches);
+            // Enter the dedicated FIND-RESULTS view with SCORED results.
+            // The view has a temperature slider that filters candidates
+            // and mirrors selection in real time.
+            await showFindResultsView(results);
 
             // Restore the main menu after the find-results view returns (B pressed).
             process.stdin.setRawMode(true);
