@@ -818,6 +818,309 @@ async function interactiveMode() {
         });
     };
 
+    // ========================================================
+    //  Generate flow - extracted so both the main menu and the
+    //  find-results view can trigger it with the G key.
+    // ========================================================
+    async function handleGenerate() {
+        if (selectedFiles.size === 0) {
+            console.log('\nNo files selected.');
+            render();
+            return;
+        }
+
+        // Temporarily disable raw mode for interactive prompts
+        // REMOVE the keypress listener but DO NOT pause stdin
+        process.stdin.removeListener('data', onKeypress);
+        process.stdin.setRawMode(false);
+
+        // STEP 1: Ask about parsing JavaScript files
+        const jsFiles = [...selectedFiles].filter(isJavaScriptFile);
+        
+        if (jsFiles.length > 0) {
+            console.log(`\n${YELLOW}${BOLD}=== CODE PARSER OPTION ===${RESET}`);
+            console.log(`You have ${jsFiles.length} JavaScript/TypeScript file(s) selected.`);
+            console.log(`CodeParser can FILTER these files to include only selected parts.\n`);
+            
+            const parseAnswer = await askQuestion(`Do you want to parse any JavaScript files with CodeParser? (y/n):`);
+            
+            if (parseAnswer.toLowerCase() === 'y' || parseAnswer.toLowerCase() === 'yes') {
+                console.log(`\n${BOLD}JavaScript files available for parsing:${RESET}`);
+                jsFiles.forEach((file, idx) => {
+                    const alreadyParsed = parsedFiles.has(file) ? ' (already parsed)' : '';
+                    console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyParsed}`);
+                });
+                
+                const fileChoice = await askQuestion(`\nWhich files? (all | 1,3,5 | 2-4 | none):`);
+                
+                if (fileChoice.toLowerCase() !== 'none' && fileChoice.trim() !== '') {
+                    let filesToParse = [];
+                    
+                    if (fileChoice.toLowerCase() === 'all') {
+                        filesToParse = jsFiles;
+                    } else {
+                        const indexes = parseIndexes(fileChoice, jsFiles.length);
+                        filesToParse = indexes.map(idx => jsFiles[idx]);
+                    }
+                    
+                    for (const filePath of filesToParse) {
+                        console.log(`\n${YELLOW}${'='.repeat(50)}${RESET}`);
+                        console.log(`${YELLOW}=== Parsing: ${path.basename(filePath)} ===${RESET}`);
+                        console.log(`${YELLOW}${'='.repeat(50)}${RESET}`);
+                        
+                        const parseResult = await runParserMenu(filePath);
+                        
+                        if (parseResult) {
+                            const originalContent = await fs.readFile(filePath, 'utf8');
+                            parsedFiles.set(filePath, {
+                                parsedContent: parseResult.content,
+                                originalSize: originalContent.length,
+                                parsedSize: parseResult.content.length,
+                                stats: parseResult.stats,
+                                notes: parseResult.notes,
+                                validation: parseResult.validation
+                            });
+                            console.log(`\n${GREEN}✓ ${path.basename(filePath)} parsed successfully${RESET}`);
+                        }
+                    }
+                }
+            }
+        } else {
+            console.log(`\n${YELLOW}No JavaScript files selected - skipping parser option.${RESET}`);
+        }
+
+        // STEP 1.5: Ask about reference-only files (NEW)
+        console.log(`\n${YELLOW}${BOLD}=== REFERENCE-ONLY SELECTION ===${RESET}`);
+        const refAnswer = await askQuestion(`Do you want to mark any of the selected files as reference/context only (not to be modified)? (y/n):`);
+        if (refAnswer.toLowerCase() === 'y' || refAnswer.toLowerCase() === 'yes') {
+            console.log(`\n${BOLD}Selected files:${RESET}`);
+            const allSelected = [...selectedFiles];
+            allSelected.forEach((file, idx) => {
+                const alreadyRef = referenceOnlyFiles.has(file) ? ' (already marked)' : '';
+                console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyRef}`);
+            });
+            
+            const refChoice = await askQuestion(`\nWhich files should be reference-only? (all | 1,3,5 | 2-4 | none):`);
+            if (refChoice.toLowerCase() !== 'none' && refChoice.trim() !== '') {
+                let filesToMark = [];
+                
+                if (refChoice.toLowerCase() === 'all') {
+                    filesToMark = allSelected;
+                } else {
+                    const indexes = parseIndexes(refChoice, allSelected.length);
+                    filesToMark = indexes.map(idx => allSelected[idx]);
+                }
+                
+                for (const filePath of filesToMark) {
+                    referenceOnlyFiles.add(filePath);
+                }
+                console.log(`\n${GREEN}Marked ${filesToMark.length} file(s) as reference-only.${RESET}`);
+            }
+        }
+
+        // STEP 2: Ask about AI instructions
+        const includeInstrAnswer = await askQuestion(`\nDo you want to add AI instructions? (y/n):`);
+        const includeInstructions = includeInstrAnswer.toLowerCase() === 'y' || includeInstrAnswer.toLowerCase() === 'yes';
+
+        let userDemand = '';
+        let outputFormat = 'full';
+
+        if (includeInstructions) {
+            userDemand = await askQuestion('Enter your request/demand for the AI (single line):');
+            const formatAnswer = await askQuestion('Output format - (1) Full files, (2) Tagged replacements, (3) Both:');
+            if (formatAnswer === '2') {
+                outputFormat = 'tagged';
+            } else if (formatAnswer === '3') {
+                outputFormat = 'both';
+            } else {
+                outputFormat = 'full';
+            }
+            
+            if (parsedFiles.size > 0 && outputFormat === 'full') {
+                console.log(`\n${YELLOW}💡 Tip: You have parsed files. Tagged format (option 2) works better${RESET}`);
+                console.log(`${YELLOW}   because the parsed content is a filtered subset of the actual file.${RESET}`);
+            }
+        }
+
+        // STEP 3: Generate the struct file with options (including referenceOnlyFiles)
+        await generateStruct([...selectedFiles], 'struct', {
+            includeInstructions,
+            userDemand,
+            outputFormat,
+            parsedFiles,
+            referenceOnlyFiles,
+        });
+
+        // STEP 4: Ask if save paths
+        const saveName = await askQuestion('\nSave selected file paths? Enter a filename (or leave empty to skip):');
+
+        if (saveName) {
+            await savePaths([...selectedFiles], saveName);
+        }
+
+        cleanupAndExit(0);
+    }
+
+    // ========================================================
+    //  FIND-RESULTS view
+    //  Shows ONLY the matched files (all pre-selected).
+    //  Keys:
+    //    ↑/↓, PgUp/PgDn  -> navigate
+    //    Space / Enter   -> toggle selection of the file under cursor
+    //    a               -> select all matches
+    //    n               -> unselect all matches
+    //    G (or g)        -> proceed to generate (calls handleGenerate)
+    //    B (or Esc)      -> return to the normal browser
+    //    Ctrl+C          -> quit
+    // ========================================================
+    async function showFindResultsView(matchPaths) {
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+
+        let cursor = 0;
+        let scrollOffset = 0;
+
+        const getMaxRows = () => {
+            const rows = process.stdout.rows || 24;
+            return Math.max(1, rows - 6);
+        };
+
+        const adjustScroll = () => {
+            const max = getMaxRows();
+
+            if (cursor < scrollOffset) scrollOffset = cursor;
+            if (cursor >= scrollOffset + max) scrollOffset = cursor - max + 1;
+
+            const maxScroll = Math.max(0, matchPaths.length - max);
+            if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+            if (scrollOffset < 0) scrollOffset = 0;
+        };
+
+        const renderFind = () => {
+            clearScreen();
+
+            const max = getMaxRows();
+            adjustScroll();
+
+            const visible = matchPaths.slice(scrollOffset, scrollOffset + max);
+            const selectedCount = matchPaths.filter(p => selectedFiles.has(p)).length;
+
+            console.log(`${BOLD}${GREEN}=== FIND RESULTS ===${RESET}`);
+            console.log(`${BOLD}Matches: ${matchPaths.length} | Selected: ${selectedCount}${RESET}`);
+            console.log('─'.repeat(process.stdout.columns || 80));
+            console.log(`${BOLD}Keys:${RESET} ↑/↓ move, PgUp/PgDn page, Space/Enter toggle, a all, n none, ${GREEN}G${RESET} generate, ${YELLOW}B${RESET} back`);
+            console.log('─'.repeat(process.stdout.columns || 80));
+
+            visible.forEach((filePath, index) => {
+                const actualIndex = scrollOffset + index;
+                const isSelected = selectedFiles.has(filePath);
+                const prefix = isSelected ? `${GREEN}[✔]${RESET}` : '[ ]';
+                const rel = path.relative(currentDirectory, filePath) || filePath;
+                const line = `${prefix} ${rel}`;
+
+                if (actualIndex === cursor) {
+                    console.log(`${REVERSE}${line}${RESET}`);
+                } else {
+                    console.log(line);
+                }
+            });
+
+            if (matchPaths.length > max) {
+                const page = Math.floor(scrollOffset / max) + 1;
+                const totalPages = Math.ceil(matchPaths.length / max);
+                console.log(`─ ${BOLD}${page}${RESET}/${totalPages} ${matchPaths.length} matches`);
+            }
+        };
+
+        return new Promise(resolve => {
+            const onFindKeypress = async (key) => {
+                const max = getMaxRows();
+
+                if (key === '\u001b[A') {
+                    if (cursor > 0) cursor--;
+                    renderFind();
+                    return;
+                }
+
+                if (key === '\u001b[B') {
+                    if (cursor < matchPaths.length - 1) cursor++;
+                    renderFind();
+                    return;
+                }
+
+                if (key === '\u001b[5~') {
+                    cursor = Math.max(0, cursor - max);
+                    renderFind();
+                    return;
+                }
+
+                if (key === '\u001b[6~') {
+                    cursor = Math.min(matchPaths.length - 1, cursor + max);
+                    renderFind();
+                    return;
+                }
+
+                if (key === ' ' || key === '\r' || key === '\n') {
+                    const filePath = matchPaths[cursor];
+                    if (filePath) {
+                        await toggleFile(filePath);
+                    }
+                    renderFind();
+                    return;
+                }
+
+                if (key === 'a') {
+                    for (const filePath of matchPaths) {
+                        if (!selectedFiles.has(filePath)) {
+                            await selectFile(filePath);
+                        }
+                    }
+                    renderFind();
+                    return;
+                }
+
+                if (key === 'n') {
+                    for (const filePath of matchPaths) {
+                        deselectFile(filePath);
+                    }
+                    renderFind();
+                    return;
+                }
+
+                if (key === 'g' || key === 'G') {
+                    if (selectedFiles.size === 0) {
+                        renderFind();
+                        return;
+                    }
+
+                    process.stdin.removeListener('data', onFindKeypress);
+
+                    // handleGenerate() will exit the process when it completes.
+                    await handleGenerate();
+
+                    // Safety net - reached only if handleGenerate() returns
+                    // early (e.g. user abort) without exiting.
+                    process.stdin.on('data', onKeypress);
+                    resolve();
+                    return;
+                }
+
+                if (key === 'b' || key === 'B' || key === '\u001b') {
+                    process.stdin.removeListener('data', onFindKeypress);
+                    resolve();
+                    return;
+                }
+
+                if (key === '\u0003') {
+                    cleanupAndExit(0);
+                }
+            };
+
+            process.stdin.on('data', onFindKeypress);
+            renderFind();
+        });
+    }
+
     const onKeypress = async (key) => {
         const maxEntries = getMaxEntries();
 
@@ -953,20 +1256,21 @@ async function interactiveMode() {
             console.log(`  Matched:   ${formatNumber(matches.length)} file(s)`);
             console.log(`  Added:     ${formatNumber(newlySelected)} new selection(s)`);
 
-            if (matches.length > 0) {
-                const preview = matches.slice(0, 15);
-                console.log(`\n${BOLD}Matches:${RESET}`);
-                preview.forEach(m => {
-                    console.log(`  ${GREEN}•${RESET} ${path.relative(currentDirectory, m) || m}`);
-                });
-                if (matches.length > preview.length) {
-                    console.log(`  ... and ${formatNumber(matches.length - preview.length)} more`);
-                }
+            if (matches.length === 0) {
+                await askQuestion(`\n${YELLOW}No matches found. Press Enter to return...${RESET}`);
+                process.stdin.setRawMode(true);
+                process.stdin.resume();
+                process.stdin.on('data', onKeypress);
+                render();
+                return;
             }
 
-            await askQuestion(`\n${YELLOW}Press Enter to continue...${RESET}`);
+            // NEW: Enter the dedicated FIND-RESULTS view.
+            // Only the matched files are shown, all marked as selected.
+            // The user can toggle them, press G to generate, or B to go back.
+            await showFindResultsView(matches);
 
-            // Restore raw mode + keypress handler and re-render the menu.
+            // Restore the main menu after the find-results view returns (B pressed).
             process.stdin.setRawMode(true);
             process.stdin.resume();
             process.stdin.on('data', onKeypress);
@@ -975,142 +1279,7 @@ async function interactiveMode() {
         }
 
         if (key === 'g' || key === 'G') {
-            if (selectedFiles.size === 0) {
-                console.log('\nNo files selected.');
-                render();
-                return;
-            }
-
-            // Temporarily disable raw mode for interactive prompts
-            // REMOVE the keypress listener but DO NOT pause stdin
-            process.stdin.removeListener('data', onKeypress);
-            process.stdin.setRawMode(false);
-
-            // STEP 1: Ask about parsing JavaScript files
-            const jsFiles = [...selectedFiles].filter(isJavaScriptFile);
-            
-            if (jsFiles.length > 0) {
-                console.log(`\n${YELLOW}${BOLD}=== CODE PARSER OPTION ===${RESET}`);
-                console.log(`You have ${jsFiles.length} JavaScript/TypeScript file(s) selected.`);
-                console.log(`CodeParser can FILTER these files to include only selected parts.\n`);
-                
-                const parseAnswer = await askQuestion(`Do you want to parse any JavaScript files with CodeParser? (y/n):`);
-                
-                if (parseAnswer.toLowerCase() === 'y' || parseAnswer.toLowerCase() === 'yes') {
-                    console.log(`\n${BOLD}JavaScript files available for parsing:${RESET}`);
-                    jsFiles.forEach((file, idx) => {
-                        const alreadyParsed = parsedFiles.has(file) ? ' (already parsed)' : '';
-                        console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyParsed}`);
-                    });
-                    
-                    const fileChoice = await askQuestion(`\nWhich files? (all | 1,3,5 | 2-4 | none):`);
-                    
-                    if (fileChoice.toLowerCase() !== 'none' && fileChoice.trim() !== '') {
-                        let filesToParse = [];
-                        
-                        if (fileChoice.toLowerCase() === 'all') {
-                            filesToParse = jsFiles;
-                        } else {
-                            const indexes = parseIndexes(fileChoice, jsFiles.length);
-                            filesToParse = indexes.map(idx => jsFiles[idx]);
-                        }
-                        
-                        for (const filePath of filesToParse) {
-                            console.log(`\n${YELLOW}${'='.repeat(50)}${RESET}`);
-                            console.log(`${YELLOW}=== Parsing: ${path.basename(filePath)} ===${RESET}`);
-                            console.log(`${YELLOW}${'='.repeat(50)}${RESET}`);
-                            
-                            const parseResult = await runParserMenu(filePath);
-                            
-                            if (parseResult) {
-                                const originalContent = await fs.readFile(filePath, 'utf8');
-                                parsedFiles.set(filePath, {
-                                    parsedContent: parseResult.content,
-                                    originalSize: originalContent.length,
-                                    parsedSize: parseResult.content.length,
-                                    stats: parseResult.stats,
-                                    notes: parseResult.notes,
-                                    validation: parseResult.validation
-                                });
-                                console.log(`\n${GREEN}✓ ${path.basename(filePath)} parsed successfully${RESET}`);
-                            }
-                        }
-                    }
-                }
-            } else {
-                console.log(`\n${YELLOW}No JavaScript files selected - skipping parser option.${RESET}`);
-            }
-
-            // STEP 1.5: Ask about reference-only files (NEW)
-            console.log(`\n${YELLOW}${BOLD}=== REFERENCE-ONLY SELECTION ===${RESET}`);
-            const refAnswer = await askQuestion(`Do you want to mark any of the selected files as reference/context only (not to be modified)? (y/n):`);
-            if (refAnswer.toLowerCase() === 'y' || refAnswer.toLowerCase() === 'yes') {
-                console.log(`\n${BOLD}Selected files:${RESET}`);
-                const allSelected = [...selectedFiles];
-                allSelected.forEach((file, idx) => {
-                    const alreadyRef = referenceOnlyFiles.has(file) ? ' (already marked)' : '';
-                    console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyRef}`);
-                });
-                
-                const refChoice = await askQuestion(`\nWhich files should be reference-only? (all | 1,3,5 | 2-4 | none):`);
-                if (refChoice.toLowerCase() !== 'none' && refChoice.trim() !== '') {
-                    let filesToMark = [];
-                    
-                    if (refChoice.toLowerCase() === 'all') {
-                        filesToMark = allSelected;
-                    } else {
-                        const indexes = parseIndexes(refChoice, allSelected.length);
-                        filesToMark = indexes.map(idx => allSelected[idx]);
-                    }
-                    
-                    for (const filePath of filesToMark) {
-                        referenceOnlyFiles.add(filePath);
-                    }
-                    console.log(`\n${GREEN}Marked ${filesToMark.length} file(s) as reference-only.${RESET}`);
-                }
-            }
-
-            // STEP 2: Ask about AI instructions
-            const includeInstrAnswer = await askQuestion(`\nDo you want to add AI instructions? (y/n):`);
-            const includeInstructions = includeInstrAnswer.toLowerCase() === 'y' || includeInstrAnswer.toLowerCase() === 'yes';
-
-            let userDemand = '';
-            let outputFormat = 'full';
-
-            if (includeInstructions) {
-                userDemand = await askQuestion('Enter your request/demand for the AI (single line):');
-                const formatAnswer = await askQuestion('Output format - (1) Full files, (2) Tagged replacements, (3) Both:');
-                if (formatAnswer === '2') {
-                    outputFormat = 'tagged';
-                } else if (formatAnswer === '3') {
-                    outputFormat = 'both';
-                } else {
-                    outputFormat = 'full';
-                }
-                
-                if (parsedFiles.size > 0 && outputFormat === 'full') {
-                    console.log(`\n${YELLOW}💡 Tip: You have parsed files. Tagged format (option 2) works better${RESET}`);
-                    console.log(`${YELLOW}   because the parsed content is a filtered subset of the actual file.${RESET}`);
-                }
-            }
-
-            // STEP 3: Generate the struct file with options (including referenceOnlyFiles)
-            await generateStruct([...selectedFiles], 'struct', {
-                includeInstructions,
-                userDemand,
-                outputFormat,
-                parsedFiles,
-                referenceOnlyFiles,
-            });
-
-            // STEP 4: Ask if save paths
-            const saveName = await askQuestion('\nSave selected file paths? Enter a filename (or leave empty to skip):');
-
-            if (saveName) {
-                await savePaths([...selectedFiles], saveName);
-            }
-
-            cleanupAndExit(0);
+            await handleGenerate();
             return;
         }
 
