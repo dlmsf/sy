@@ -599,7 +599,317 @@ async function fileContainsTermWithCount(filePath, searchTerm, caseSensitive, te
 }
 
 // ============================================================
+//  Prompt stopwords - a rich dictionary of common words that
+//  show up in natural-language prompts ("please help me find
+//  the login function") but carry very little discriminative
+//  signal when searching source code. They receive a LOWER
+//  weight so that rare, meaningful words dominate the ranking.
+//  Grouped by category for readability.
+// ============================================================
+const PROMPT_STOPWORDS = new Set([
+    // --- articles / determiners ---
+    'a', 'an', 'the', 'this', 'that', 'these', 'those',
+    'some', 'any', 'all', 'each', 'every', 'either', 'neither',
+    'no', 'none', 'both', 'few', 'many', 'much', 'more', 'most',
+    'less', 'least', 'several', 'such', 'another', 'other', 'others',
+
+    // --- pronouns ---
+    'i', 'me', 'my', 'mine', 'myself',
+    'you', 'your', 'yours', 'yourself',
+    'he', 'him', 'his', 'himself',
+    'she', 'her', 'hers', 'herself',
+    'it', 'its', 'itself',
+    'we', 'us', 'our', 'ours', 'ourselves',
+    'they', 'them', 'their', 'theirs', 'themselves',
+    'who', 'whom', 'whose', 'which', 'what', 'whatever', 'whichever',
+    'anyone', 'anybody', 'anything', 'anywhere',
+    'someone', 'somebody', 'something', 'somewhere',
+    'everyone', 'everybody', 'everything', 'everywhere',
+    'nobody', 'nothing', 'nowhere',
+    'one', 'ones', 'thing', 'things', 'stuff', 'way', 'ways',
+
+    // --- be / have / do / auxiliaries ---
+    'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'having',
+    'do', 'does', 'did', 'doing', 'done',
+    'will', 'would', 'shall', 'should',
+    'can', 'could', 'may', 'might', 'must', 'ought',
+    'let', 'lets', 'dare',
+
+    // --- very common request verbs ---
+    'want', 'wants', 'wanted', 'wanting',
+    'need', 'needs', 'needed', 'needing',
+    'like', 'likes', 'liked', 'liking',
+    'get', 'gets', 'got', 'getting', 'gotten',
+    'give', 'gives', 'gave', 'given', 'giving',
+    'take', 'takes', 'took', 'taken', 'taking',
+    'make', 'makes', 'made', 'making',
+    'go', 'goes', 'went', 'gone', 'going',
+    'come', 'comes', 'came', 'coming',
+    'see', 'sees', 'saw', 'seen', 'seeing',
+    'look', 'looks', 'looked', 'looking',
+    'find', 'finds', 'found', 'finding',
+    'search', 'searches', 'searched', 'searching',
+    'show', 'shows', 'showed', 'shown', 'showing',
+    'tell', 'tells', 'told', 'telling',
+    'say', 'says', 'said', 'saying',
+    'ask', 'asks', 'asked', 'asking',
+    'help', 'helps', 'helped', 'helping',
+    'try', 'tries', 'tried', 'trying',
+    'use', 'uses', 'used', 'using',
+    'put', 'puts', 'putting',
+    'set', 'sets', 'setting',
+    'keep', 'keeps', 'kept', 'keeping',
+    'know', 'knows', 'knew', 'known', 'knowing',
+    'think', 'thinks', 'thought', 'thinking',
+    'feel', 'feels', 'felt', 'feeling',
+    'leave', 'leaves', 'left', 'leaving',
+    'call', 'calls', 'called', 'calling',
+    'read', 'reads', 'reading',
+    'write', 'writes', 'wrote', 'written', 'writing',
+    'add', 'adds', 'added', 'adding',
+    'remove', 'removes', 'removed', 'removing',
+    'change', 'changes', 'changed', 'changing',
+    'modify', 'modifies', 'modified', 'modifying',
+    'update', 'updates', 'updated', 'updating',
+    'create', 'creates', 'created', 'creating',
+    'delete', 'deletes', 'deleted', 'deleting',
+    'fix', 'fixes', 'fixed', 'fixing',
+    'move', 'moves', 'moved', 'moving',
+    'start', 'starts', 'started', 'starting',
+    'stop', 'stops', 'stopped', 'stopping',
+    'run', 'runs', 'ran', 'running',
+    'work', 'works', 'worked', 'working',
+    'check', 'checks', 'checked', 'checking',
+    'explain', 'explains', 'explained', 'explaining',
+    'describe', 'describes', 'described', 'describing',
+    'implement', 'implements', 'implemented', 'implementing',
+    'build', 'builds', 'built', 'building',
+    'improve', 'improves', 'improved', 'improving',
+    'apply', 'applies', 'applied', 'applying',
+    'open', 'opens', 'opened', 'opening',
+    'close', 'closes', 'closed', 'closing',
+    'handle', 'handles', 'handled', 'handling',
+    'return', 'returns', 'returned', 'returning',
+    'pass', 'passes', 'passed', 'passing',
+    'allow', 'allows', 'allowed', 'allowing',
+    'prevent', 'prevents', 'prevented', 'preventing',
+    'ensure', 'ensures', 'ensured', 'ensuring',
+    'avoid', 'avoids', 'avoided', 'avoiding',
+    'require', 'requires', 'required', 'requiring',
+    'include', 'includes', 'included', 'including',
+    'contain', 'contains', 'contained', 'containing',
+    'support', 'supports', 'supported', 'supporting',
+    'provide', 'provides', 'provided', 'providing',
+    'consider', 'considers', 'considered', 'considering',
+
+    // --- conjunctions / connectors ---
+    'and', 'or', 'but', 'nor', 'yet', 'so',
+    'if', 'then', 'else', 'otherwise',
+    'when', 'whenever', 'while', 'whereas',
+    'because', 'since', 'as', 'until', 'unless',
+    'although', 'though', 'even', 'however', 'therefore',
+    'thus', 'hence', 'meanwhile', 'moreover', 'furthermore',
+    'besides', 'instead', 'rather', 'also', 'too', 'either',
+    'whether', 'both', 'neither',
+
+    // --- prepositions / particles ---
+    'of', 'in', 'on', 'at', 'by', 'with', 'without',
+    'from', 'to', 'into', 'onto', 'upon',
+    'for', 'about', 'against', 'between', 'among',
+    'through', 'during', 'before', 'after', 'above', 'below',
+    'over', 'under', 'up', 'down', 'out', 'off', 'away',
+    'back', 'forward', 'around', 'near', 'across', 'along',
+    'behind', 'beyond', 'within', 'beside',
+    'per', 'via', 'versus', 'vs',
+
+    // --- adverbs / quantifiers / hedges ---
+    'here', 'there', 'now', 'then', 'today', 'tomorrow', 'yesterday',
+    'always', 'never', 'sometimes', 'often', 'rarely', 'usually',
+    'again', 'once', 'twice', 'already', 'still', 'just', 'only',
+    'very', 'really', 'quite', 'somewhat', 'fairly',
+    'pretty', 'enough', 'almost', 'nearly',
+    'exactly', 'precisely', 'approximately', 'roughly',
+    'probably', 'possibly', 'perhaps', 'maybe', 'definitely',
+    'certainly', 'surely', 'clearly', 'obviously', 'apparently',
+    'actually', 'basically', 'essentially', 'simply', 'literally',
+    'honestly', 'frankly', 'personally', 'generally', 'typically',
+    'normally', 'commonly', 'seldom',
+
+    // --- greetings / politeness ---
+    'hi', 'hello', 'hey', 'yo', 'sup', 'greetings',
+    'please', 'kindly', 'thanks', 'thank', 'thankyou',
+    'sorry', 'excuse', 'pardon', 'welcome',
+    'yes', 'yeah', 'yep', 'yup', 'nope', 'nah',
+    'ok', 'okay', 'sure', 'fine', 'alright', 'cool', 'great',
+
+    // --- vague / context words ---
+    'code', 'file', 'files', 'line', 'lines', 'part', 'parts',
+    'piece', 'pieces', 'section', 'sections', 'area', 'areas',
+    'place', 'places', 'point', 'points', 'spot', 'spots',
+    'kind', 'kinds', 'type', 'types', 'sort', 'sorts',
+    'case', 'cases', 'example', 'examples', 'instance', 'instances',
+    'bit', 'bits', 'little', 'small', 'big', 'large', 'huge', 'tiny',
+    'new', 'old', 'same', 'different', 'similar', 'various',
+    'first', 'second', 'third', 'last', 'next', 'previous',
+    'two', 'three', 'four', 'five',
+    'main', 'primary', 'secondary', 'final', 'initial',
+    'current', 'existing', 'original', 'actual', 'real', 'true',
+    'good', 'bad', 'better', 'best', 'worse', 'worst',
+    'easy', 'hard', 'simple', 'complex', 'quick', 'fast', 'slow',
+
+    // --- meta / AI-assistant phrases ---
+    'ai', 'assistant', 'model', 'bot', 'chat', 'prompt',
+    'request', 'task', 'job', 'question', 'answer', 'response',
+]);
+
+// Split a natural-language query into lowercase word tokens.
+// Keeps only tokens with 2+ chars (drops stray single letters).
+function tokenizeSearchTerm(term) {
+    if (!term) return [];
+    const matches = String(term).toLowerCase().match(/[a-z0-9_$]+/g);
+    return matches ? matches.filter(t => t.length >= 2) : [];
+}
+
+// Weight a single token: stopwords -> low, long unique -> high.
+// Deliberately subtle so nothing is ever fully silenced.
+function wordWeight(token) {
+    if (PROMPT_STOPWORDS.has(token)) return 0.2;
+    if (token.length <= 3) return 0.55;
+    if (token.length <= 5) return 0.8;
+    if (token.length <= 8) return 1.0;
+    return 1.15;
+}
+
+// Read a file once and return its lowercase text (or null on
+// binary / too-large / unreadable). Same guards as
+// fileContainsTermWithCount (16MB cap, NUL-byte binary scan).
+async function readSearchableFileText(filePath) {
+    let stats;
+    try { stats = await fs.stat(filePath); } catch { return null; }
+    if (stats.size === 0) return null;
+    if (stats.size > 16 * 1024 * 1024) return null;
+
+    let buffer;
+    try { buffer = await fs.readFile(filePath); } catch { return null; }
+
+    const scanLen = Math.min(buffer.length, 8192);
+    for (let i = 0; i < scanLen; i++) {
+        if (buffer[i] === 0) return null;
+    }
+
+    return buffer.toString('utf8').toLowerCase();
+}
+
+// Prompt-style scored search. Sums per-token scores weighted by
+// token rarity. Files that match several UNIQUE words get a bonus;
+// files that only match stopwords are damped so noise stays low.
+async function searchFilesForPromptScored(filePaths, tokens, concurrency = 32) {
+    const results = [];
+    if (filePaths.length === 0) return results;
+
+    const tokenInfos = tokens.map(t => ({
+        token: t,
+        weight: wordWeight(t),
+        isUnique: !PROMPT_STOPWORDS.has(t),
+    }));
+
+    const uniqueCount = tokenInfos.filter(t => t.isUnique).length;
+    if (uniqueCount === 0) return results;  // nothing meaningful to search for
+
+    let nextIndex = 0;
+
+    const worker = async () => {
+        while (true) {
+            const i = nextIndex++;
+            if (i >= filePaths.length) return;
+            const filePath = filePaths[i];
+
+            try {
+                const textLower = await readSearchableFileText(filePath);
+                if (textLower === null) continue;
+
+                const baseName = path.basename(filePath);
+                const baseNoExt = baseName.replace(/\.[^.]+$/, '');
+                const baseLower = baseNoExt.toLowerCase();
+                const pathLower = filePath.toLowerCase();
+
+                let weightedScore = 0;
+                let totalHits = 0;
+                let uniqueMatched = 0;
+                let commonMatched = 0;
+
+                for (const info of tokenInfos) {
+                    const HIT_CAP = 50;
+                    let hits = 0;
+                    let idx = 0;
+                    while (hits < HIT_CAP) {
+                        idx = textLower.indexOf(info.token, idx);
+                        if (idx === -1) break;
+                        hits++;
+                        idx += info.token.length;
+                    }
+
+                    let nameScore = 0;
+                    if (baseLower === info.token) nameScore = 2000;
+                    else if (baseLower.startsWith(info.token)) nameScore = 1600;
+                    else if (baseLower.includes(info.token)) nameScore = 1300;
+                    else if (pathLower.includes(info.token)) nameScore = 500;
+
+                    if (hits > 0 || nameScore > 0) {
+                        if (info.isUnique) uniqueMatched++;
+                        else commonMatched++;
+                    }
+
+                    const hitsComponent = hits > 0 ? Math.min(700, 200 + hits * 15) : 0;
+                    weightedScore += (nameScore + hitsComponent) * info.weight;
+                    totalHits += hits;
+                }
+
+                // Bonus when multiple UNIQUE tokens all hit - the
+                // strongest indicator of relevance for a prompt search.
+                if (uniqueMatched >= 2) weightedScore += uniqueMatched * uniqueMatched * 80;
+                if (uniqueMatched >= 4) weightedScore += 200;
+
+                // Damp files that only matched stopwords (pure noise).
+                if (uniqueMatched === 0 && commonMatched > 0) {
+                    weightedScore *= 0.35;
+                }
+
+                const finalScore = Math.round(weightedScore);
+
+                if (finalScore >= 200) {
+                    results.push({
+                        path: filePath,
+                        score: finalScore,
+                        hits: totalHits,
+                        contentMatched: totalHits > 0,
+                    });
+                }
+            } catch {
+                // Ignore per-file errors so one bad file doesn't abort the search.
+            }
+        }
+    };
+
+    const workerCount = Math.min(concurrency, filePaths.length);
+    const workers = new Array(workerCount);
+    for (let i = 0; i < workerCount; i++) workers[i] = worker();
+    await Promise.all(workers);
+
+    results.sort((a, b) => b.score - a.score);
+    return results;
+}
+
+// ============================================================
 //  Scored parallel search.
+//
+//  Two paths:
+//    * Single-token query -> original exact-match behaviour
+//      (filename dominant, content hit secondary, fuzzy bonus).
+//    * Multi-word prompt  -> token-weighted prompt search:
+//      unique words score more, common prompt stopwords score
+//      much less. See searchFilesForPromptScored().
 //
 //  Returns an array of { path, score, hits, contentMatched }
 //  sorted by score descending. Files that only match by fuzzy
@@ -611,6 +921,14 @@ async function searchFilesForTermScored(filePaths, searchTerm, caseSensitive, co
     const results = [];
 
     if (filePaths.length === 0) return results;
+
+    // Detect prompt-style query (2+ word tokens). If so, use the
+    // token-weighted prompt scorer. Single-token queries keep the
+    // original exact-match behaviour completely untouched.
+    const promptTokens = tokenizeSearchTerm(searchTerm);
+    if (promptTokens.length >= 2) {
+        return searchFilesForPromptScored(filePaths, promptTokens, concurrency);
+    }
 
     const termBuffer = Buffer.from(searchTerm, 'utf8');
     const normalizedTerm = caseSensitive ? searchTerm : searchTerm.toLowerCase();
@@ -1525,6 +1843,8 @@ async function interactiveMode() {
             console.log(`${BOLD}Smart case:${RESET} lowercase = case-insensitive, any UPPERCASE = case-sensitive`);
             console.log(`${MAGENTA}(node_modules, .git and other junk dirs are skipped)${RESET}`);
             console.log(`${BOLD}Weighting:${RESET} filename matches score highest; content hits score lower.`);
+            console.log(`${BOLD}Long prompts:${RESET} the query is tokenized - unique words get more weight,`);
+            console.log(`common prompt words (please, help, find, the, ...) get much less.`);
             console.log(`A temperature slider in the results view lets you relax/strict the`);
             console.log(`similarity threshold in real time (like a volume knob).\n`);
 
