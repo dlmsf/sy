@@ -40,6 +40,10 @@ class ClipboardMonitor {
 
         // Auto-pause-after-commands mode
         this.pauseAfterMode = false;
+
+        // Next-diff mode: after commands finish, the next clipboard content must be
+        // different from the last one before it gets processed automatically.
+        this.nextDiffMode = false;
     }
 
     async question(query) {
@@ -496,6 +500,9 @@ class ClipboardMonitor {
                     if (this.pauseAfterMode && allCommandsFinished) {
                         this.autoPauseAfterCommands();
                     }
+                    if (this.nextDiffMode && allCommandsFinished) {
+                        await this.armNextDiff();
+                    }
                 }
             }
             
@@ -509,6 +516,15 @@ class ClipboardMonitor {
         }
         this.isPaused = true;
         console.log('\n⏸️  Auto-paused after commands finished - Press P to resume');
+    }
+
+    async armNextDiff() {
+        // After the profile commands finish, capture the current clipboard content
+        // as the new baseline. This ensures the monitor will NOT automatically grab
+        // the next clipboard content unless it is DIFFERENT from the last one.
+        const currentContent = await this.getClipboardContent();
+        this.lastClipboardContent = currentContent;
+        console.log('✓ Next-Diff mode: waiting for clipboard content different from the last...');
     }
 
     async showProfiles() {
@@ -530,6 +546,7 @@ class ClipboardMonitor {
             if (profile.defaultTag) defaultFlags.push('tag');
             if (profile.defaultNotify) defaultFlags.push('notify');
             if (profile.defaultPauseAfter) defaultFlags.push('pause-after');
+            if (profile.defaultNextDiff) defaultFlags.push('next-diff');
             console.log(`   Default flags: ${defaultFlags.length > 0 ? defaultFlags.join(', ') : 'none'}`);
             profile.commands.forEach((cmd, cmdIndex) => {
                 console.log(`     ${cmdIndex + 1}. ${cmd}`);
@@ -562,6 +579,7 @@ class ClipboardMonitor {
         const defaultTag = (await this.question('Enable --tag by default? (y/n): ')).toLowerCase() === 'y';
         const defaultNotify = (await this.question('Enable --notify by default? (y/n): ')).toLowerCase() === 'y';
         const defaultPauseAfter = (await this.question('Enable --pause-after by default? (y/n): ')).toLowerCase() === 'y';
+        const defaultNextDiff = (await this.question('Enable --next-diff by default? (y/n): ')).toLowerCase() === 'y';
 
         this.config.profiles[name] = {
             outputFile,
@@ -569,7 +587,8 @@ class ClipboardMonitor {
             defaultBg,
             defaultTag,
             defaultNotify,
-            defaultPauseAfter
+            defaultPauseAfter,
+            defaultNextDiff
         };
         
         await this.saveConfig();
@@ -614,6 +633,11 @@ class ClipboardMonitor {
         const pauseAfterInput = await this.question(`Enable --pause-after by default? (current: ${currentPauseAfter ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
         if (pauseAfterInput.toLowerCase() === 'y') this.config.profiles[name].defaultPauseAfter = true;
         else if (pauseAfterInput.toLowerCase() === 'n') this.config.profiles[name].defaultPauseAfter = false;
+
+        const currentNextDiff = this.config.profiles[name].defaultNextDiff || false;
+        const nextDiffInput = await this.question(`Enable --next-diff by default? (current: ${currentNextDiff ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
+        if (nextDiffInput.toLowerCase() === 'y') this.config.profiles[name].defaultNextDiff = true;
+        else if (nextDiffInput.toLowerCase() === 'n') this.config.profiles[name].defaultNextDiff = false;
         
         console.log('Current commands:');
         this.config.profiles[name].commands.forEach((cmd, index) => {
@@ -631,6 +655,38 @@ class ClipboardMonitor {
             }
             this.config.profiles[name].commands = this.config.profiles[name].commands.concat(newCommands);
             console.log(`✓ ${newCommands.length} command(s) appended.`);
+        }
+
+        const insertCommands = await this.question('Do you want to insert commands at a specific position? (y/n): ');
+        if (insertCommands.toLowerCase() === 'y') {
+            const total = this.config.profiles[name].commands.length;
+            const positionInput = await this.question('Insert at position (e.g., "23" = after command 2, before command 3; use "0" for the beginning): ');
+            const cleaned = (positionInput || '').trim().replace(/[^0-9]/g, '');
+            let insertIndex;
+            if (cleaned.length === 0) {
+                console.log('Invalid position input. Defaulting to end (append).');
+                insertIndex = this.config.profiles[name].commands.length;
+            } else {
+                // For "23", the "after" position is the first digit.
+                // For a single number "2", it also means "after command 2".
+                const afterPos = parseInt(cleaned[0], 10);
+                insertIndex = afterPos;
+                if (insertIndex < 0) insertIndex = 0;
+                if (insertIndex > total) insertIndex = total;
+            }
+            const insertedCommands = [];
+            console.log('Enter new commands to insert (one per line, empty line to finish):');
+            while (true) {
+                const command = await this.question(`Insert command ${insertedCommands.length + 1}: `);
+                if (!command) break;
+                insertedCommands.push(command);
+            }
+            if (insertedCommands.length > 0) {
+                this.config.profiles[name].commands.splice(insertIndex, 0, ...insertedCommands);
+                console.log(`✓ ${insertedCommands.length} command(s) inserted at position ${insertIndex + 1}.`);
+            } else {
+                console.log('No commands entered. Nothing inserted.');
+            }
         }
         
         await this.saveConfig();
@@ -674,7 +730,8 @@ class ClipboardMonitor {
             defaultBg: sourceProfile.defaultBg,
             defaultTag: sourceProfile.defaultTag,
             defaultNotify: sourceProfile.defaultNotify,
-            defaultPauseAfter: sourceProfile.defaultPauseAfter
+            defaultPauseAfter: sourceProfile.defaultPauseAfter,
+            defaultNextDiff: sourceProfile.defaultNextDiff
         };
         await this.saveConfig();
         console.log(`✓ Profile "${sourceName}" duplicated as "${newName}".`);
@@ -760,6 +817,9 @@ class ClipboardMonitor {
             console.log('🔒 TAG RESTRICT MODE: Only content with CODEREPLACER tags will be processed');
             console.log('   (Struct generator instructions will be ignored)');
         }
+        if (this.nextDiffMode) {
+            console.log('🔁 NEXT-DIFF MODE: After commands finish, only clipboard content different from the last will be processed');
+        }
         if (this.bgMode && isBackground) {
             console.log('🔍 BACKGROUND TRACKING: Directory changes will be monitored');
             console.log(`   Current root: ${this.currentRoot}`);
@@ -816,7 +876,7 @@ class ClipboardMonitor {
     }
 
     // Create background process script
-    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false, pauseAfterMode = false) {
+    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false, pauseAfterMode = false, nextDiffMode = false) {
         return `
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -851,6 +911,7 @@ class BackgroundClipboardMonitor {
         this.lastTrackedDir = process.cwd();
         this.notifyMode = ${notifyMode};
         this.pauseAfterMode = ${pauseAfterMode};
+        this.nextDiffMode = ${nextDiffMode};
         this.profileName = '${profileName || ''}';
         
         this.logFile = path.join(os.homedir(), '.clipboard-monitor', 'clipwait-bg-' + BG_TOKEN + '.log');
@@ -1212,6 +1273,11 @@ class BackgroundClipboardMonitor {
                         this.isPaused = true;
                         this.log('⏸️  Auto-paused after commands finished');
                     }
+                    if (this.nextDiffMode && allCommandsFinished) {
+                        const freshContent = await this.getClipboardContent();
+                        this.lastClipboardContent = freshContent;
+                        this.log('✓ Next-Diff mode: waiting for clipboard content different from the last...');
+                    }
                 }
             }
         }
@@ -1506,6 +1572,9 @@ monitor.start().catch(error => {
         if (pauseAfterMode) {
             console.log('⏸️  Auto-pause-after-commands mode enabled.');
         }
+        if (this.nextDiffMode) {
+            console.log('🔁 Next-Diff mode enabled: after commands finish, only clipboard content different from the last will be processed.');
+        }
         
         // Generate unique token for this background process
         const bgToken = `bg_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
@@ -1520,7 +1589,8 @@ monitor.start().catch(error => {
             info.sessionId,
             bgToken,
             notifyMode,
-            pauseAfterMode
+            pauseAfterMode,
+            this.nextDiffMode
         );
         
         // Write background script to temp file
@@ -1593,6 +1663,7 @@ monitor.start().catch(error => {
         let statusMode = false;
         let notifyMode = false;
         let pauseAfterMode = false;
+        let nextDiffMode = false;
         let argProfile = null;
         
         // Parse arguments in any order, track explicit flags
@@ -1601,6 +1672,7 @@ monitor.start().catch(error => {
         let explicitTag = false;
         let explicitNotify = false;
         let explicitPauseAfter = false;
+        let explicitNextDiff = false;
         for (const arg of args) {
             if (arg === '--tag') {
                 tagMode = true;
@@ -1616,6 +1688,9 @@ monitor.start().catch(error => {
             } else if (arg === '--pause-after') {
                 pauseAfterMode = true;
                 explicitPauseAfter = true;
+            } else if (arg === '--next-diff') {
+                nextDiffMode = true;
+                explicitNextDiff = true;
             } else {
                 remainingArgs.push(arg);
             }
@@ -1636,6 +1711,7 @@ monitor.start().catch(error => {
                 if (!explicitTag && profile.defaultTag) tagMode = true;
                 if (!explicitNotify && profile.defaultNotify) notifyMode = true;
                 if (!explicitPauseAfter && profile.defaultPauseAfter) pauseAfterMode = true;
+                if (!explicitNextDiff && profile.defaultNextDiff) nextDiffMode = true;
             }
         }
         
@@ -1653,6 +1729,11 @@ monitor.start().catch(error => {
         if (pauseAfterMode) {
             this.pauseAfterMode = true;
             console.log('⏸️  Auto-Pause After Commands mode enabled: monitoring will pause after all commands finish.');
+        }
+
+        if (nextDiffMode) {
+            this.nextDiffMode = true;
+            console.log('🔁 Next-Diff mode enabled: after commands finish, only clipboard content different from the last will be processed.');
         }
         
         // If background mode is enabled and no profile specified, open manager
