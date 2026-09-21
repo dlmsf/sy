@@ -40,6 +40,8 @@ class ClipboardMonitor {
 
         // Auto-pause-after-commands mode
         this.pauseAfterMode = false;
+        // Auto-wait variant of pause-after (continue automatically, no manual resume)
+        this.pauseAfterAutoMode = false;
 
         // Next-diff mode: after commands finish, the next clipboard content must be
         // different from the last one before it gets processed automatically.
@@ -144,6 +146,53 @@ class ClipboardMonitor {
         return false;
     }
 
+    shellQuote(str) {
+        return "'" + String(str).replace(/'/g, "'\\''") + "'";
+    }
+
+    filterShellNoise(text) {
+        if (!text) return text;
+        const lines = String(text).split('\n');
+        const kept = lines.filter(line => {
+            const l = line.trim();
+            if (!l) return false;
+            if (/cannot set terminal process group/i.test(l)) return false;
+            if (/no job control in this shell/i.test(l)) return false;
+            return true;
+        });
+        return kept.join('\n').trim();
+    }
+
+    // Runs a command with the default /bin/sh first (unchanged behavior for
+    // everything that already works). If and only if it fails with "not found"
+    // (e.g. the user's 'clip' shell function/alias), it retries through the
+    // user's interactive shell so aliases/functions from their rc files work.
+    async runCommandWithFallback(command) {
+        try {
+            return await execAsync(command);
+        } catch (error) {
+            const msg = ((error && error.stderr) || '') + ((error && error.message) || '');
+            if (!/not found|command not found/i.test(msg)) {
+                throw error;
+            }
+            return await this.runCommandViaInteractiveShell(command);
+        }
+    }
+
+    async runCommandViaInteractiveShell(command) {
+        const shell = process.env.SHELL || '/bin/bash';
+        const scriptFile = path.join(
+            os.tmpdir(),
+            `clipwait-cmd-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.sh`
+        );
+        await fs.writeFile(scriptFile, command, 'utf8');
+        try {
+            return await execAsync(`${this.shellQuote(shell)} -i ${this.shellQuote(scriptFile)}`);
+        } finally {
+            try { await fs.unlink(scriptFile); } catch (e) { /* ignore */ }
+        }
+    }
+
     async executeCommands(profile) {
         if (!profile.commands || profile.commands.length === 0) {
             console.log('No commands to execute');
@@ -167,16 +216,19 @@ class ClipboardMonitor {
             console.log(`[${i + 1}/${profile.commands.length}] Executing: ${command}`);
             
             try {
-                const { stdout, stderr } = await execAsync(command);
-                if (stdout) {
-                    console.log(`  Output: ${stdout.trim()}`);
+                const { stdout, stderr } = await this.runCommandWithFallback(command);
+                const cleanStdout = (stdout || '').trim();
+                const cleanStderr = this.filterShellNoise(stderr);
+                if (cleanStdout) {
+                    console.log(`  Output: ${cleanStdout}`);
                 }
-                if (stderr) {
-                    console.log(`  Stderr: ${stderr.trim()}`);
+                if (cleanStderr) {
+                    console.log(`  Stderr: ${cleanStderr}`);
                 }
                 console.log(`  ✓ Command completed successfully`);
             } catch (error) {
-                console.error(`  ✗ Command failed: ${error.message}`);
+                const cleanMessage = this.filterShellNoise(error.message) || error.message;
+                console.error(`  ✗ Command failed: ${cleanMessage}`);
                 allSucceeded = false;
                 const continueExec = await this.question('  Continue with next commands? (y/n): ');
                 if (continueExec.toLowerCase() !== 'y') {
@@ -498,7 +550,11 @@ class ClipboardMonitor {
                         this.sendCompletionSignal();
                     }
                     if (this.pauseAfterMode && allCommandsFinished) {
-                        this.autoPauseAfterCommands();
+                        if (this.pauseAfterAutoMode) {
+                            console.log('✓ Auto mode: monitoring continues, waiting for the next clipboard change...');
+                        } else {
+                            this.autoPauseAfterCommands();
+                        }
                     }
                     if (this.nextDiffMode && allCommandsFinished) {
                         await this.armNextDiff();
@@ -545,7 +601,7 @@ class ClipboardMonitor {
             if (profile.defaultBg) defaultFlags.push('bg');
             if (profile.defaultTag) defaultFlags.push('tag');
             if (profile.defaultNotify) defaultFlags.push('notify');
-            if (profile.defaultPauseAfter) defaultFlags.push('pause-after');
+            if (profile.defaultPauseAfter) defaultFlags.push(profile.defaultPauseAfterAuto ? 'pause-after-auto' : 'pause-after');
             if (profile.defaultNextDiff) defaultFlags.push('next-diff');
             console.log(`   Default flags: ${defaultFlags.length > 0 ? defaultFlags.join(', ') : 'none'}`);
             profile.commands.forEach((cmd, cmdIndex) => {
@@ -579,6 +635,10 @@ class ClipboardMonitor {
         const defaultTag = (await this.question('Enable --tag by default? (y/n): ')).toLowerCase() === 'y';
         const defaultNotify = (await this.question('Enable --notify by default? (y/n): ')).toLowerCase() === 'y';
         const defaultPauseAfter = (await this.question('Enable --pause-after by default? (y/n): ')).toLowerCase() === 'y';
+        let defaultPauseAfterAuto = false;
+        if (defaultPauseAfter) {
+            defaultPauseAfterAuto = (await this.question('  Use auto-wait mode for --pause-after (continue automatically without pressing P)? (y/n): ')).toLowerCase() === 'y';
+        }
         const defaultNextDiff = (await this.question('Enable --next-diff by default? (y/n): ')).toLowerCase() === 'y';
 
         this.config.profiles[name] = {
@@ -588,6 +648,7 @@ class ClipboardMonitor {
             defaultTag,
             defaultNotify,
             defaultPauseAfter,
+            defaultPauseAfterAuto,
             defaultNextDiff
         };
         
@@ -633,6 +694,15 @@ class ClipboardMonitor {
         const pauseAfterInput = await this.question(`Enable --pause-after by default? (current: ${currentPauseAfter ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
         if (pauseAfterInput.toLowerCase() === 'y') this.config.profiles[name].defaultPauseAfter = true;
         else if (pauseAfterInput.toLowerCase() === 'n') this.config.profiles[name].defaultPauseAfter = false;
+
+        if (this.config.profiles[name].defaultPauseAfter) {
+            const currentPauseAfterAuto = this.config.profiles[name].defaultPauseAfterAuto || false;
+            const pauseAfterAutoInput = await this.question(`Use auto-wait mode for --pause-after (no need to press P)? (current: ${currentPauseAfterAuto ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
+            if (pauseAfterAutoInput.toLowerCase() === 'y') this.config.profiles[name].defaultPauseAfterAuto = true;
+            else if (pauseAfterAutoInput.toLowerCase() === 'n') this.config.profiles[name].defaultPauseAfterAuto = false;
+        } else {
+            this.config.profiles[name].defaultPauseAfterAuto = false;
+        }
 
         const currentNextDiff = this.config.profiles[name].defaultNextDiff || false;
         const nextDiffInput = await this.question(`Enable --next-diff by default? (current: ${currentNextDiff ? 'yes' : 'no'}) [y/n/Enter to keep]: `);
@@ -731,6 +801,7 @@ class ClipboardMonitor {
             defaultTag: sourceProfile.defaultTag,
             defaultNotify: sourceProfile.defaultNotify,
             defaultPauseAfter: sourceProfile.defaultPauseAfter,
+            defaultPauseAfterAuto: sourceProfile.defaultPauseAfterAuto,
             defaultNextDiff: sourceProfile.defaultNextDiff
         };
         await this.saveConfig();
@@ -817,6 +888,13 @@ class ClipboardMonitor {
             console.log('🔒 TAG RESTRICT MODE: Only content with CODEREPLACER tags will be processed');
             console.log('   (Struct generator instructions will be ignored)');
         }
+        if (this.pauseAfterMode) {
+            if (this.pauseAfterAutoMode) {
+                console.log('⏸️  AUTO-WAIT AFTER COMMANDS: monitoring continues automatically after commands finish');
+            } else {
+                console.log('⏸️  AUTO-PAUSE AFTER COMMANDS: monitoring pauses after all commands finish');
+            }
+        }
         if (this.nextDiffMode) {
             console.log('🔁 NEXT-DIFF MODE: After commands finish, only clipboard content different from the last will be processed');
         }
@@ -876,7 +954,7 @@ class ClipboardMonitor {
     }
 
     // Create background process script
-    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false, pauseAfterMode = false, nextDiffMode = false) {
+    createBackgroundScript(profileName, tagMode, shellPid, tty, sessionId, bgToken, notifyMode = false, pauseAfterMode = false, pauseAfterAutoMode = false, nextDiffMode = false) {
         return `
 import { exec } from 'child_process';
 import { promisify } from 'util';
@@ -911,6 +989,7 @@ class BackgroundClipboardMonitor {
         this.lastTrackedDir = process.cwd();
         this.notifyMode = ${notifyMode};
         this.pauseAfterMode = ${pauseAfterMode};
+        this.pauseAfterAutoMode = ${pauseAfterAutoMode};
         this.nextDiffMode = ${nextDiffMode};
         this.profileName = '${profileName || ''}';
         
@@ -1187,6 +1266,46 @@ class BackgroundClipboardMonitor {
         }
     }
     
+    shellQuote(str) {
+        return "'" + String(str).replace(/'/g, "'\\\\''") + "'";
+    }
+
+    filterShellNoise(text) {
+        if (!text) return text;
+        const lines = String(text).split('\\n');
+        const kept = lines.filter(line => {
+            const l = line.trim();
+            if (!l) return false;
+            if (/cannot set terminal process group/i.test(l)) return false;
+            if (/no job control in this shell/i.test(l)) return false;
+            return true;
+        });
+        return kept.join('\\n').trim();
+    }
+
+    async runCommandWithFallback(command) {
+        try {
+            return await execAsync(command);
+        } catch (error) {
+            const msg = ((error && error.stderr) || '') + ((error && error.message) || '');
+            if (!/not found|command not found/i.test(msg)) {
+                throw error;
+            }
+            return await this.runCommandViaInteractiveShell(command);
+        }
+    }
+
+    async runCommandViaInteractiveShell(command) {
+        const shell = process.env.SHELL || '/bin/bash';
+        const scriptFile = path.join(os.tmpdir(), 'clipwait-cmd-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.sh');
+        await fs.writeFile(scriptFile, command, 'utf8');
+        try {
+            return await execAsync(this.shellQuote(shell) + ' -i ' + this.shellQuote(scriptFile));
+        } finally {
+            try { await fs.unlink(scriptFile); } catch (e) { /* ignore */ }
+        }
+    }
+
     async executeCommands(profile) {
         if (!profile.commands || profile.commands.length === 0) {
             return true; // nothing to execute, considered finished
@@ -1200,12 +1319,15 @@ class BackgroundClipboardMonitor {
             await this.updateMetadataActivity('command', command);
             
             try {
-                const { stdout, stderr } = await execAsync(command);
-                if (stdout) this.log('  Output: ' + stdout.trim());
-                if (stderr) this.log('  Stderr: ' + stderr.trim());
+                const { stdout, stderr } = await this.runCommandWithFallback(command);
+                const cleanStdout = (stdout || '').trim();
+                const cleanStderr = this.filterShellNoise(stderr);
+                if (cleanStdout) this.log('  Output: ' + cleanStdout);
+                if (cleanStderr) this.log('  Stderr: ' + cleanStderr);
                 this.log('  ✓ Command completed successfully');
             } catch (error) {
-                this.log('  ✗ Command failed: ' + error.message);
+                const cleanMessage = this.filterShellNoise(error.message) || error.message;
+                this.log('  ✗ Command failed: ' + cleanMessage);
                 return false; // did not finish all commands
             }
         }
@@ -1270,8 +1392,12 @@ class BackgroundClipboardMonitor {
                         this.sendCompletionSignal();
                     }
                     if (this.pauseAfterMode && allCommandsFinished) {
-                        this.isPaused = true;
-                        this.log('⏸️  Auto-paused after commands finished');
+                        if (this.pauseAfterAutoMode) {
+                            this.log('✓ Auto mode: monitoring continues, waiting for the next clipboard change...');
+                        } else {
+                            this.isPaused = true;
+                            this.log('⏸️  Auto-paused after commands finished');
+                        }
                     }
                     if (this.nextDiffMode && allCommandsFinished) {
                         const freshContent = await this.getClipboardContent();
@@ -1548,7 +1674,7 @@ monitor.start().catch(error => {
         });
     }
 
-    async startBackgroundMode(profileName, notifyMode = false, pauseAfterMode = false) {
+    async startBackgroundMode(profileName, notifyMode = false, pauseAfterMode = false, pauseAfterAutoMode = false) {
         console.log('🚀 Starting ClipWait in background mode with terminal tracking...');
         
         // Capture terminal info before backgrounding
@@ -1570,7 +1696,11 @@ monitor.start().catch(error => {
             console.log('🔔 Notification mode enabled: will send terminal signal when commands finish.');
         }
         if (pauseAfterMode) {
-            console.log('⏸️  Auto-pause-after-commands mode enabled.');
+            if (pauseAfterAutoMode) {
+                console.log('⏸️  Auto-wait-after-commands mode enabled (no manual resume needed).');
+            } else {
+                console.log('⏸️  Auto-pause-after-commands mode enabled.');
+            }
         }
         if (this.nextDiffMode) {
             console.log('🔁 Next-Diff mode enabled: after commands finish, only clipboard content different from the last will be processed.');
@@ -1590,6 +1720,7 @@ monitor.start().catch(error => {
             bgToken,
             notifyMode,
             pauseAfterMode,
+            pauseAfterAutoMode,
             this.nextDiffMode
         );
         
@@ -1663,6 +1794,7 @@ monitor.start().catch(error => {
         let statusMode = false;
         let notifyMode = false;
         let pauseAfterMode = false;
+        let pauseAfterAutoMode = false;
         let nextDiffMode = false;
         let argProfile = null;
         
@@ -1672,6 +1804,8 @@ monitor.start().catch(error => {
         let explicitTag = false;
         let explicitNotify = false;
         let explicitPauseAfter = false;
+        let explicitPauseAfterAuto = false;
+        let explicitPauseChosen = false;
         let explicitNextDiff = false;
         for (const arg of args) {
             if (arg === '--tag') {
@@ -1688,6 +1822,12 @@ monitor.start().catch(error => {
             } else if (arg === '--pause-after') {
                 pauseAfterMode = true;
                 explicitPauseAfter = true;
+                explicitPauseChosen = true;
+            } else if (arg === '--pause-after-auto') {
+                pauseAfterMode = true;
+                pauseAfterAutoMode = true;
+                explicitPauseAfterAuto = true;
+                explicitPauseChosen = true;
             } else if (arg === '--next-diff') {
                 nextDiffMode = true;
                 explicitNextDiff = true;
@@ -1710,7 +1850,14 @@ monitor.start().catch(error => {
                 if (!explicitBg && profile.defaultBg) bgModeRequested = true;
                 if (!explicitTag && profile.defaultTag) tagMode = true;
                 if (!explicitNotify && profile.defaultNotify) notifyMode = true;
-                if (!explicitPauseAfter && profile.defaultPauseAfter) pauseAfterMode = true;
+                if (!explicitPauseChosen) {
+                    if (profile.defaultPauseAfterAuto) {
+                        pauseAfterMode = true;
+                        pauseAfterAutoMode = true;
+                    } else if (profile.defaultPauseAfter) {
+                        pauseAfterMode = true;
+                    }
+                }
                 if (!explicitNextDiff && profile.defaultNextDiff) nextDiffMode = true;
             }
         }
@@ -1728,7 +1875,12 @@ monitor.start().catch(error => {
 
         if (pauseAfterMode) {
             this.pauseAfterMode = true;
-            console.log('⏸️  Auto-Pause After Commands mode enabled: monitoring will pause after all commands finish.');
+            if (pauseAfterAutoMode) {
+                this.pauseAfterAutoMode = true;
+                console.log('⏸️  Auto-Wait After Commands mode enabled: monitoring will continue automatically after commands finish (no need to press P).');
+            } else {
+                console.log('⏸️  Auto-Pause After Commands mode enabled: monitoring will pause after all commands finish.');
+            }
         }
 
         if (nextDiffMode) {
@@ -1750,7 +1902,7 @@ monitor.start().catch(error => {
                 return;
             }
             
-            await this.startBackgroundMode(argProfile, notifyMode, pauseAfterMode);
+            await this.startBackgroundMode(argProfile, notifyMode, pauseAfterMode, pauseAfterAutoMode);
             this.rl.close();
             return;
         }
