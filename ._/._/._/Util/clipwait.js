@@ -575,12 +575,25 @@ class ClipboardMonitor {
     }
 
     async armNextDiff() {
-        // After the profile commands finish, capture the current clipboard content
-        // as the new baseline. This ensures the monitor will NOT automatically grab
-        // the next clipboard content unless it is DIFFERENT from the last one.
+        // After the profile commands finish, we wait for a clipboard content
+        // that is DIFFERENT from the last one that was actually processed.
+        //
+        // IMPORTANT: we must NOT re-baseline to whatever is currently in the
+        // clipboard. If the user copied the next content while the commands
+        // were still running, re-baselining would silently swallow it and
+        // force the user to copy a second time. Keeping lastClipboardContent
+        // as the last processed content guarantees the very next new
+        // clipboard is picked up on the first check (no "copy twice").
+        //
+        // The "same as the previously ignored content" case is handled
+        // naturally: if the clipboard still holds the last processed content,
+        // it keeps being ignored because it equals lastClipboardContent.
         const currentContent = await this.getClipboardContent();
-        this.lastClipboardContent = currentContent;
-        console.log('✓ Next-Diff mode: waiting for clipboard content different from the last...');
+        if (currentContent === this.lastClipboardContent) {
+            console.log('✓ Next-Diff mode: waiting for clipboard content different from the last...');
+        } else {
+            console.log('✓ Next-Diff mode: new clipboard content already present, it will be processed on the next check...');
+        }
     }
 
     async showProfiles() {
@@ -1400,9 +1413,16 @@ class BackgroundClipboardMonitor {
                         }
                     }
                     if (this.nextDiffMode && allCommandsFinished) {
+                        // Do NOT re-baseline to the current clipboard here.
+                        // If the user copied the next content while the commands
+                        // were still running, re-baselining would silently
+                        // swallow it and force the user to copy twice.
                         const freshContent = await this.getClipboardContent();
-                        this.lastClipboardContent = freshContent;
-                        this.log('✓ Next-Diff mode: waiting for clipboard content different from the last...');
+                        if (freshContent === this.lastClipboardContent) {
+                            this.log('✓ Next-Diff mode: waiting for clipboard content different from the last...');
+                        } else {
+                            this.log('✓ Next-Diff mode: new clipboard content already present, it will be processed on the next check...');
+                        }
                     }
                 }
             }
