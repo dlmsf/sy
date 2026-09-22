@@ -12624,8 +12624,8 @@ class SelfBuilder extends SyAPP_Func {
     // cycles each area independently through:
     //     line → none → discrete → line
     // Default is 'line', so untouched projects look identical.
-    const gTop = S.pinnedTopSeparator || 'line'
-    const gBot = S.pinnedBottomSeparator || 'line'
+    const gTop = this.State.pinnedTopSeparator || 'line'
+    const gBot = this.State.pinnedBottomSeparator || 'line'
     const gIcon = (v) => v === 'none' ? '▫' : v === 'discrete' ? '·' : '─'
     const gTag  = (v) => v === 'none' ? 'none (smooth)'
                        : v === 'discrete' ? 'discrete (· · ·)'
