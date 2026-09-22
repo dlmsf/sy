@@ -8768,6 +8768,412 @@ function levenshteinDistance(str1, str2) {
         this.Builds.get(id).Buttons.push(fieldObj);
     };
 
+    // --------------------------- TextEditor Method ---------------------------
+
+    /**
+     * Open a full-screen, nano-like text editor OUTSIDE the func flow.
+     *
+     * The method behaves like `this.Field()`: it stores its value under
+     * `texteditor_<name>` in the user's storage and adds a button to the
+     * current build. The button does nothing until clicked — clicking it
+     * passes a trigger prop to `LoadScreen`, which flows back into this
+     * method on the next Build pass, where the editor opens synchronously
+     * (awaited), fully restoring the terminal on exit so the next SyAPP
+     * menu renders cleanly without ever locking the terminal.
+     *
+     * Safe to call as:
+     *   const value = await this.TextEditor(uid, 'myfile', { label: 'Notes' })
+     *
+     * @param {string} id - User/build ID
+     * @param {string} name - Unique name for this editor (used as storage key)
+     * @param {Object} [config] - Editor configuration
+     * @param {string} [config.label] - Label shown on the button
+     * @param {string} [config.buttonText] - Custom button text (default: '📝 <label>')
+     * @param {string} [config.title] - Title shown inside the editor
+     * @param {string} [config.initialValue=''] - Starting content
+     * @param {Function} [config.onChange] - Callback invoked when content changes
+     * @param {boolean} [config.pinned] - Pin the button to the bottom area
+     * @param {boolean} [config.pinnedTop] - Pin the button to the top area
+     * @returns {Promise<string>} The current stored value
+     */
+    this.TextEditor = async (id, name, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.TextEditor() Error - userBuild not found | BuildID: ${id}`);
+        return '';
+      }
+
+      const storageKey = `texteditor_${name}`;
+      let value = this.Storages.Get(id, storageKey);
+      if (value === undefined) {
+        value = config.initialValue || '';
+        this.Storages.Set(id, storageKey, value);
+      }
+
+      const build = this.Builds.get(id);
+      const triggerProp = `__textEditor_${name}`;
+      const currentProps = build.Session.ActualProps || {};
+
+      // If the trigger prop is present, the user clicked the button and
+      // we now need to open the editor. We do it HERE, inside the build
+      // phase, because the terminal is guaranteed to be released by
+      // cleanupMenuState() before the next Build pass runs.
+      if (currentProps[triggerProp]) {
+        delete currentProps[triggerProp];
+        try {
+          const newValue = await this._openTextEditor(id, {
+            title: config.title || config.label || name,
+            initialContent: this.Storages.Get(id, storageKey) || ''
+          });
+          if (newValue !== null && newValue !== undefined) {
+            this.Storages.Set(id, storageKey, newValue);
+            if (typeof config.onChange === 'function') {
+              try {
+                config.onChange(newValue);
+              } catch (e) {
+                if (this.Log) console.error('TextEditor onChange error:', e);
+              }
+            }
+          }
+        } catch (err) {
+          if (this.Log) console.error('TextEditor error:', err);
+        }
+      }
+
+      const buttonCfg = {
+        name: config.buttonText || `📝 ${config.label || name}`,
+        props: { [triggerProp]: true }
+      };
+      if (config.pinned !== undefined) buttonCfg.pinned = config.pinned;
+      if (config.pinnedTop !== undefined) buttonCfg.pinnedTop = config.pinnedTop;
+      this.Button(id, buttonCfg);
+
+      return this.Storages.Get(id, storageKey);
+    };
+
+    /**
+     * Internal: run the nano-like editor. Restores every terminal mode
+     * on exit, regardless of how the user leaves the editor.
+     * @private
+     */
+    this._openTextEditor = async (id, config = {}) => {
+      const title = String(config.title || 'text');
+      const initialContent = String(config.initialContent || '');
+
+      return new Promise((resolve) => {
+        // -------- Save terminal state --------
+        let wasRaw = false;
+        try { wasRaw = !!stdin.isRaw; } catch (_) {}
+
+        const hud = this._syappInstance && this._syappInstance.HUD;
+        const mouseWasEnabled = !!(hud && hud.isMouseEnabled);
+
+        // -------- Disable mouse tracking & drop keypress listeners --------
+        if (mouseWasEnabled && hud) {
+          try { stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'); } catch (_) {}
+          try { stdin.removeListener('data', hud.handleMouseData); } catch (_) {}
+          hud.isMouseEnabled = false;
+        }
+        try { stdin.removeAllListeners('keypress'); } catch (_) {}
+
+        // -------- Enter alternate screen, hide cursor --------
+        try {
+          stdout.write('\x1b[?1049h');
+          stdout.write('\x1b[?25l');
+          stdout.write('\x1b[2J\x1b[H');
+        } catch (_) {}
+
+        // -------- Editor state --------
+        let lines = initialContent.length > 0 ? initialContent.split('\n') : [''];
+        let cursorRow = 0, cursorCol = 0;
+        let scrollRow = 0, scrollCol = 0;
+        let modified = false;
+        let statusMessage = '';
+        let clipboard = null;
+        let running = true, finished = false;
+        let awaitingConfirm = false;
+
+        const getCols = () => Math.max(20, stdout.columns || 80);
+        const getRows = () => Math.max(5, stdout.rows || 24);
+
+        const drawScreen = () => {
+          if (finished || !running) return;
+          try {
+            const cols = getCols();
+            const rows = getRows();
+            const contentRows = Math.max(1, rows - 3);
+
+            // Keep cursor in the visible window
+            if (cursorRow < scrollRow) scrollRow = cursorRow;
+            if (cursorRow >= scrollRow + contentRows) scrollRow = cursorRow - contentRows + 1;
+            if (scrollRow < 0) scrollRow = 0;
+
+            if (cursorCol < scrollCol) scrollCol = cursorCol;
+            if (cursorCol >= scrollCol + cols) scrollCol = cursorCol - cols + 1;
+            if (scrollCol < 0) scrollCol = 0;
+
+            const out = [];
+
+            // Header
+            out.push('\x1b[H');
+            const modTag = modified ? ' [Modified]' : '';
+            const hLeft = ` ${title}${modTag}`;
+            const hRight = ` Ln ${cursorRow + 1}, Col ${cursorCol + 1} `;
+            let hPad = cols - hLeft.length - hRight.length;
+            if (hPad < 0) hPad = 0;
+            out.push('\x1b[7m' + hLeft + (hPad > 0 ? ' '.repeat(hPad) : '') + hRight + '\x1b[0m');
+
+            // Content
+            for (let i = 0; i < contentRows; i++) {
+              out.push('\x1b[' + (i + 2) + ';1H\x1b[2K');
+              const lineIdx = scrollRow + i;
+              if (lineIdx < lines.length) {
+                let display = lines[lineIdx];
+                if (scrollCol > 0) display = display.slice(scrollCol);
+                if (display.length > cols) display = display.slice(0, cols);
+                out.push(display);
+              }
+            }
+
+            // Status line
+            out.push('\x1b[' + (rows - 1) + ';1H\x1b[2K\x1b[7m');
+            let sDisp = statusMessage || '';
+            if (sDisp.length > cols) sDisp = sDisp.slice(0, cols);
+            out.push(sDisp + (sDisp.length < cols ? ' '.repeat(cols - sDisp.length) : ''));
+            out.push('\x1b[0m');
+
+            // Help line
+            out.push('\x1b[' + rows + ';1H\x1b[2K\x1b[7m');
+            const helpText = '^S Save  ^X Exit  ^K Cut line  ^U Paste  Arrows: Move';
+            let hDisp = helpText.length > cols ? helpText.slice(0, cols) : helpText;
+            out.push(hDisp + (hDisp.length < cols ? ' '.repeat(cols - hDisp.length) : ''));
+            out.push('\x1b[0m');
+
+            // Position cursor & show
+            const sRow = cursorRow - scrollRow + 2;
+            const sCol = cursorCol - scrollCol + 1;
+            out.push('\x1b[' + sRow + ';' + sCol + 'H');
+            out.push('\x1b[?25h');
+
+            stdout.write(out.join(''));
+          } catch (_) { /* ignore draw errors */ }
+        };
+
+        const setStatus = (msg, ms = 0) => {
+          statusMessage = msg;
+          drawScreen();
+          if (ms > 0) {
+            setTimeout(() => {
+              if (running && statusMessage === msg) {
+                statusMessage = '';
+                drawScreen();
+              }
+            }, ms);
+          }
+        };
+
+        const cleanup = () => {
+          try { stdin.removeListener('data', handleData); } catch (_) {}
+          try { stdout.removeListener('resize', handleResize); } catch (_) {}
+        };
+
+        const finish = (result) => {
+          if (finished) return;
+          finished = true;
+          running = false;
+          cleanup();
+
+          // Leave alternate buffer
+          try {
+            stdout.write('\x1b[?25l');
+            stdout.write('\x1b[?1049l');
+          } catch (_) {}
+
+          // Restore raw mode to exactly what it was
+          try {
+            if (stdin.isRaw !== wasRaw) stdin.setRawMode(wasRaw);
+          } catch (_) {}
+
+          // Make sure cursor is visible
+          try { stdout.write('\x1b[?25h'); } catch (_) {}
+
+          resolve(result);
+        };
+
+        const handleData = (data) => {
+          if (finished || !running || awaitingConfirm) return;
+          const str = data.toString();
+          if (str.length === 0) return;
+
+          // ---- Ctrl+X: exit (with save prompt when dirty) ----
+          if (str === '\x18') {
+            if (modified) {
+              awaitingConfirm = true;
+              setStatus('Save modified buffer? (Y/N, Esc=Cancel)');
+              const confirm = (d2) => {
+                stdin.removeListener('data', confirm);
+                awaitingConfirm = false;
+                const s2 = d2.toString();
+                if (s2 === 'y' || s2 === 'Y') {
+                  finish(lines.join('\n'));
+                } else if (s2 === 'n' || s2 === 'N') {
+                  finish(null);
+                } else {
+                  statusMessage = '';
+                  drawScreen();
+                }
+              };
+              stdin.once('data', confirm);
+              return;
+            }
+            finish(lines.join('\n'));
+            return;
+          }
+
+          // ---- Ctrl+S: mark saved, keep editing ----
+          if (str === '\x13') {
+            modified = false;
+            setStatus('Saved', 800);
+            return;
+          }
+
+          // ---- Ctrl+K: cut line ----
+          if (str === '\x0b') {
+            clipboard = lines[cursorRow];
+            lines.splice(cursorRow, 1);
+            if (lines.length === 0) lines.push('');
+            if (cursorRow >= lines.length) cursorRow = lines.length - 1;
+            cursorCol = Math.min(cursorCol, (lines[cursorRow] || '').length);
+            modified = true;
+            drawScreen();
+            return;
+          }
+
+          // ---- Ctrl+U: uncut / paste line ----
+          if (str === '\x15') {
+            if (clipboard !== null) {
+              lines.splice(cursorRow, 0, clipboard);
+              cursorRow++;
+              cursorCol = 0;
+              modified = true;
+              drawScreen();
+            }
+            return;
+          }
+
+          // ---- Ctrl+C / Ctrl+D: exit without saving ----
+          if (str === '\x03' || str === '\x04') {
+            finish(null);
+            return;
+          }
+
+          // ---- Escape sequences (arrows, home, end, delete) ----
+          if (str[0] === '\x1b') {
+            if (str[1] === '[') {
+              const last = str[str.length - 1];
+              if (last === 'A') {
+                if (cursorRow > 0) cursorRow--;
+                cursorCol = Math.min(cursorCol, (lines[cursorRow] || '').length);
+              } else if (last === 'B') {
+                if (cursorRow < lines.length - 1) cursorRow++;
+                cursorCol = Math.min(cursorCol, (lines[cursorRow] || '').length);
+              } else if (last === 'C') {
+                const l = lines[cursorRow] || '';
+                if (cursorCol < l.length) cursorCol++;
+                else if (cursorRow < lines.length - 1) { cursorRow++; cursorCol = 0; }
+              } else if (last === 'D') {
+                if (cursorCol > 0) cursorCol--;
+                else if (cursorRow > 0) { cursorRow--; cursorCol = (lines[cursorRow] || '').length; }
+              } else if (last === 'H') {
+                cursorCol = 0;
+              } else if (last === 'F') {
+                cursorCol = (lines[cursorRow] || '').length;
+              } else if (last === '~') {
+                const mid = str.slice(2, -1);
+                if (mid === '1') cursorCol = 0;
+                else if (mid === '4') cursorCol = (lines[cursorRow] || '').length;
+                else if (mid === '3') {
+                  const l = lines[cursorRow] || '';
+                  if (cursorCol < l.length) {
+                    lines[cursorRow] = l.slice(0, cursorCol) + l.slice(cursorCol + 1);
+                    modified = true;
+                  } else if (cursorRow < lines.length - 1) {
+                    lines[cursorRow] = l + lines[cursorRow + 1];
+                    lines.splice(cursorRow + 1, 1);
+                    modified = true;
+                  }
+                }
+              }
+            }
+            drawScreen();
+            return;
+          }
+
+          // ---- Printable characters, Enter, Backspace, Tab ----
+          let needRedraw = false;
+          for (const ch of str) {
+            const code = ch.charCodeAt(0);
+            if (ch === '\r' || ch === '\n') {
+              const l = lines[cursorRow] || '';
+              lines[cursorRow] = l.slice(0, cursorCol);
+              lines.splice(cursorRow + 1, 0, l.slice(cursorCol));
+              cursorRow++;
+              cursorCol = 0;
+              modified = true;
+              needRedraw = true;
+            } else if (ch === '\x7f' || ch === '\b') {
+              const l = lines[cursorRow] || '';
+              if (cursorCol > 0) {
+                lines[cursorRow] = l.slice(0, cursorCol - 1) + l.slice(cursorCol);
+                cursorCol--;
+                modified = true;
+                needRedraw = true;
+              } else if (cursorRow > 0) {
+                const prev = lines[cursorRow - 1];
+                cursorCol = prev.length;
+                lines[cursorRow - 1] = prev + l;
+                lines.splice(cursorRow, 1);
+                cursorRow--;
+                modified = true;
+                needRedraw = true;
+              }
+            } else if (code === 9) {
+              const l = lines[cursorRow] || '';
+              lines[cursorRow] = l.slice(0, cursorCol) + '    ' + l.slice(cursorCol);
+              cursorCol += 4;
+              modified = true;
+              needRedraw = true;
+            } else if (code >= 32 && code < 127) {
+              const l = lines[cursorRow] || '';
+              lines[cursorRow] = l.slice(0, cursorCol) + ch + l.slice(cursorCol);
+              cursorCol++;
+              modified = true;
+              needRedraw = true;
+            }
+          }
+          if (needRedraw) drawScreen();
+        };
+
+        const handleResize = () => {
+          if (running) drawScreen();
+        };
+
+        // -------- Attach input --------
+        try {
+          stdin.setRawMode(true);
+          stdin.resume();
+          stdin.on('data', handleData);
+        } catch (e) {
+          finish(null);
+          return;
+        }
+
+        try { stdout.on('resize', handleResize); } catch (_) {}
+
+        // -------- First draw --------
+        drawScreen();
+      });
+    };
+
     // --------------------------- Args Method ---------------------------
 
     /**
@@ -10956,6 +11362,16 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}this.Field(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'texteditor': {
+          const cfg = {}
+          if (it.label) cfg.label = it.label
+          if (it.initialValue) cfg.initialValue = it.initialValue
+          if (it.buttonText) cfg.buttonText = it.buttonText
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
+          L.push(`${indent}await this.TextEditor(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'page':
           L.push(`${indent}await this.Page(id, ${JSON.stringify(it.name)}, async () => {`)
           emit(it.items || [], indent + '  ')
@@ -11111,6 +11527,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   SideButton: 'button',
   Buttons: 'buttonsGroup',
   Field: 'field',
+  TextEditor: 'texteditor',
   Page: 'page',
   PinnedTop: 'pinnedTop',
   PinnedBottom: 'pinnedBottom',
@@ -11156,6 +11573,8 @@ function _sbMakeItemForMethod(methodName, id) {
       return { ...base, items: [] }
     case 'field':
       return { ...base, name: 'field_' + id, label: 'Label', initialValue: '' }
+    case 'texteditor':
+      return { ...base, name: 'editor_' + id, label: 'Text Editor', initialValue: '' }
     case 'page':
       return { ...base, name: 'page_' + id, items: [] }
     case 'pinnedTop':
@@ -12235,6 +12654,15 @@ class SelfBuilder extends SyAPP_Func {
             pinnedTop: it.pinnedTop
           })
           break
+        case 'texteditor':
+          await this.TextEditor(id, it.name, {
+            label: it.label,
+            initialValue: it.initialValue,
+            buttonText: it.buttonText,
+            pinned: it.pinned,
+            pinnedTop: it.pinnedTop
+          })
+          break
         case 'page':
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
@@ -12567,6 +12995,15 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('name', 'Name', 'string')
         mkProp('label', 'Label', 'string')
         mkProp('initialValue', 'Initial', 'string')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
+        break
+
+      case 'texteditor':
+        mkProp('name', 'Name', 'string')
+        mkProp('label', 'Label', 'string')
+        mkProp('initialValue', 'Initial', 'string')
+        mkProp('buttonText', 'Button Text', 'string')
         mkToggle('pinned', 'Pinned Btm')
         mkToggle('pinnedTop', 'Pinned Top')
         break
