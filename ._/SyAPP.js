@@ -3741,6 +3741,16 @@ class userBuild {
     this.last_dropdown_button = undefined
     /** @type {Object|undefined} */
     this.GotoNow = undefined
+
+    /**
+     * Page navigation registry — collects every page that requested an
+     * auto-generated navigation button during the current Build pass.
+     * After the build function finishes, the collected entries are
+     * rendered as a single `this.Buttons([...])` row, with the currently
+     * selected page visually marked.
+     * @type {Array<{name: string, label?: string, pinPosition: 'top'|'bottom'}>}
+     */
+    this.PageNav = []
   }
 }
 
@@ -5303,7 +5313,9 @@ this.DropDownManager = {
       pagelabel: undefined,
       jumpTo: 1,
       lock: false,
-      lockKey: undefined
+      lockKey: undefined,
+      pinButton: undefined,
+      pinPosition: undefined
     }) => {
       if (this.Builds.has(id)) {
         const userBuild = this.Builds.get(id);
@@ -5332,6 +5344,32 @@ this.DropDownManager = {
           if (currentProps._unlock === lockKey) {
             this.Storages.Delete(id, lockKey);
             delete userBuild.Session.ActualProps._unlock;
+          }
+        }
+
+        // ------------------------------------------------------------------
+        // PAGE NAV BUTTON REGISTRATION
+        // ------------------------------------------------------------------
+        // When `pinButton` is true (either passed per-page or enabled
+        // globally via SyAPP({ autoPinPages: true })), register this page
+        // so the Build() pass can render ONE this.Buttons([...]) row with
+        // all page nav buttons, marking the currently selected page.
+        // `pinPosition` (default 'bottom') controls whether the whole
+        // nav row lives in the pinned-bottom area or the pinned-top area.
+        // ------------------------------------------------------------------
+        const pinButton = config.pinButton !== undefined
+          ? !!config.pinButton
+          : !!(this._syappInstance && this._syappInstance.autoPinPages);
+        const pinPosition = config.pinPosition === 'top' ? 'top' : 'bottom';
+
+        if (pinButton && name) {
+          if (!Array.isArray(userBuild.PageNav)) userBuild.PageNav = [];
+          if (!userBuild.PageNav.some(p => p.name === name)) {
+            userBuild.PageNav.push({
+              name: name,
+              label: config.pagelabel || name,
+              pinPosition: pinPosition
+            });
           }
         }
 
@@ -9475,6 +9513,41 @@ function levenshteinDistance(str1, str2) {
 
         const userBuild = this.Builds.get(sessionId)
 
+        // ------------------------------------------------------------------
+        // PAGE NAVIGATION ROW
+        // ------------------------------------------------------------------
+        // Pages that requested a pin button (via this.Page({ pinButton: true })
+        // or globally via SyAPP({ autoPinPages: true })) were registered in
+        // userBuild.PageNav during the build pass. Render them now as
+        // ONE this.Buttons([...]) row per pin position, marking the
+        // currently-selected page with ● / ○.
+        // ------------------------------------------------------------------
+        if (Array.isArray(userBuild.PageNav) && userBuild.PageNav.length > 0) {
+          const activePage = (userBuild.Session.ActualProps && userBuild.Session.ActualProps.page) || '';
+
+          const buildNavConfigs = (list, isTop) => list.map(p => {
+            const isSelected = p.name === activePage;
+            const marker = isSelected ? '● ' : '○ ';
+            const cfg = {
+              name: `${marker}${p.label || p.name}`,
+              props: { page: p.name }
+            };
+            if (isTop) cfg.pinnedTop = true;
+            else cfg.pinned = true;
+            return cfg;
+          });
+
+          const topNavs = userBuild.PageNav.filter(p => p.pinPosition === 'top');
+          const bottomNavs = userBuild.PageNav.filter(p => p.pinPosition !== 'top');
+
+          if (topNavs.length > 0) {
+            this.Buttons(sessionId, buildNavConfigs(topNavs, true));
+          }
+          if (bottomNavs.length > 0) {
+            this.Buttons(sessionId, buildNavConfigs(bottomNavs, false));
+          }
+        }
+
         if (userBuild._hasAlerts || this.AlertStorage.has(sessionId)) {
           this.ProcessAlerts(sessionId);
         }
@@ -10235,6 +10308,24 @@ this.HUD = new TerminalHUD({
      * @type {number}
      */
     this.maxFuncHistorySize = userConfig.maxFuncHistorySize || 20;
+
+    /**
+     * When true, every this.Page() call automatically adds a navigation
+     * button (pinned at the bottom by default) unless the page opts out
+     * via `config.pinButton: false`.
+     *
+     * Individual pages can still override this per-call by passing
+     * `pinButton: false` (to opt out) or `pinButton: true` (to opt in
+     * even when the global default is off), and can choose where the
+     * button is pinned with `pinPosition: 'top' | 'bottom'`.
+     *
+     * All registered page nav buttons are collected and rendered as ONE
+     * `this.Buttons([...])` row per Build pass, with the currently
+     * selected page visually marked (● selected / ○ unselected).
+     *
+     * @type {boolean}
+     */
+    this.autoPinPages = userConfig.autoPinPages || false;
 
     // Initialize admin manager with main session as admin
     /** @type {AdminManager} */
@@ -11372,11 +11463,18 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.TextEditor(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
           break
         }
-        case 'page':
+        case 'page': {
+          const pageCfg = {}
+          if (it.pinButton) pageCfg.pinButton = true
+          if (it.pinPosition === 'top') pageCfg.pinPosition = 'top'
+          const cfgStr = Object.keys(pageCfg).length > 0
+            ? `, ${JSON.stringify(pageCfg)}`
+            : ''
           L.push(`${indent}await this.Page(id, ${JSON.stringify(it.name)}, async () => {`)
           emit(it.items || [], indent + '  ')
-          L.push(`${indent}})`)
+          L.push(`${indent}}${cfgStr})`)
           break
+        }
         case 'dropdown': {
           const cfg = {
             up_buttontext: it.up_buttontext || 'Show more',
@@ -11576,7 +11674,17 @@ function _sbMakeItemForMethod(methodName, id) {
     case 'texteditor':
       return { ...base, name: 'editor_' + id, label: 'Text Editor', initialValue: '' }
     case 'page':
-      return { ...base, name: 'page_' + id, items: [] }
+      return {
+        ...base,
+        name: 'page_' + id,
+        items: [],
+        // When pinButton is enabled, this page registers itself for the
+        // auto-generated navigation row (see SyAPP_Func.Page). Defaults
+        // to false so existing projects remain unchanged.
+        pinButton: false,
+        // Where the nav button is pinned: 'bottom' (default) or 'top'.
+        pinPosition: 'bottom'
+      }
     case 'pinnedTop':
       // Pinned-top container: children render inside a this.PinnedTop()
       // block, so everything created inside is auto-marked pinnedTop.
@@ -12185,6 +12293,16 @@ class SelfBuilder extends SyAPP_Func {
       if (it) it[prop] = !it[prop]
     }
 
+    // Cycle a page's pin position (bottom ↔ top). Used by the page
+    // editor's "Pin Position" button.
+    if (p.__cyclePinPosition) {
+      const it = this._findItem(p.__cyclePinPosition)
+      if (it) {
+        it.pinPosition = (it.pinPosition === 'top') ? 'bottom' : 'top'
+        this.Alert(id, `📌 Pin position → ${it.pinPosition}`, { duration: 2000 })
+      }
+    }
+
     if (p.__editProp) {
       const [iid, prop, kind] = String(p.__editProp).split('::')
       this._pendingEdit = { itemId: iid, prop, kind: kind || 'string' }
@@ -12666,13 +12784,19 @@ class SelfBuilder extends SyAPP_Func {
         case 'page':
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
+            const pinTag = it.pinButton
+              ? ColorText.dim(` [📌 ${it.pinPosition === 'top' ? 'top' : 'bottom'}]`)
+              : ''
             this.Button(id, {
-              name: `📄 ${it.name}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}`,
+              name: `📄 ${it.name}${hasItems ? ColorText.dim(` (${it.items.length})`) : ''}${pinTag}`,
               props: { page: it.name }
             })
           } else {
             await this.Page(id, it.name, async () => {
               await this._renderItems(id, it.items || [], props)
+            }, {
+              pinButton: !!it.pinButton,
+              pinPosition: it.pinPosition === 'top' ? 'top' : 'bottom'
             })
           }
           break
@@ -13010,6 +13134,13 @@ class SelfBuilder extends SyAPP_Func {
 
       case 'page':
         mkProp('name', 'Page Name', 'string')
+        mkToggle('pinButton', 'Auto Nav Button')
+        // Pin position cycle: bottom ↔ top.
+        propButtons.push({
+          name: `📌 Pin Position: ${(it.pinPosition === 'top') ? 'top' : 'bottom'}   (click to cycle)`,
+          props: { __cyclePinPosition: it.id },
+          pinned: true
+        })
         break
 
       case 'dropdown':
@@ -13482,7 +13613,13 @@ function _sbContainerItem(method, rest) {
   }
   switch (method) {
     case 'Page':
-      return { type: 'page', name: name || `page_${_sbNid()}`, items: nested }
+      return {
+        type: 'page',
+        name: name || `page_${_sbNid()}`,
+        items: nested,
+        pinButton: !!cfg.pinButton,
+        pinPosition: cfg.pinPosition === 'top' ? 'top' : 'bottom'
+      }
     case 'DropDown':
       return {
         type: 'dropdown',
