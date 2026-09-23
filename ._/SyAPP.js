@@ -9212,6 +9212,447 @@ function levenshteinDistance(str1, str2) {
       });
     };
 
+    // --------------------------- Cells Method ---------------------------
+
+    /**
+     * Column index → letter (0=A, 1=B, ..., 25=Z, 26=AA, ...)
+     * @private
+     */
+    this._cellsColLabel = (idx) => {
+      let label = '';
+      let n = Math.max(0, idx | 0);
+      while (n >= 0) {
+        label = String.fromCharCode(65 + (n % 26)) + label;
+        n = Math.floor(n / 26) - 1;
+      }
+      return label;
+    };
+
+    /**
+     * Cell reference "A1" → { row, col } (0-based). null on bad input.
+     * @private
+     */
+    this._cellsParseRef = (ref) => {
+      const m = String(ref).match(/^([A-Z]+)(\d+)$/);
+      if (!m) return null;
+      let col = 0;
+      for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+      return { col: col - 1, row: parseInt(m[2], 10) - 1 };
+    };
+
+    /**
+     * (row, col) → cell reference string like "A1"
+     * @private
+     */
+    this._cellsRefFromRC = (row, col) => `${this._cellsColLabel(col)}${row + 1}`;
+
+    /**
+     * Recompute the value of every cell. Formula cells (raw starting
+     * with "=") are evaluated as PURE JavaScript with `with(cells)`, so
+     * any cell reference (A1, B2, ...) is available as a bare identifier
+     * and every JS operator/builtin works. Iterates until stable or 10
+     * rounds (enough for typical dependency chains; cycles show as the
+     * last computed value with no error, matching spreadsheet grace).
+     * @private
+     */
+    this._cellsEvaluate = (state) => {
+      const raw = state.cells || {};
+      const result = {};
+
+      // Pass 1 — literals
+      for (const [ref, cell] of Object.entries(raw)) {
+        const upper = String(ref).toUpperCase();
+        const r = String(cell && cell.raw != null ? cell.raw : '');
+        if (r.startsWith('=')) {
+          result[upper] = { formula: r.slice(1), value: undefined, display: '…', error: null };
+        } else {
+          let v = r;
+          if (r !== '' && !isNaN(Number(r))) v = Number(r);
+          result[upper] = { value: v, display: r, error: null };
+        }
+      }
+
+      // Pass 2+ — formulas, iterate until stable
+      let changed = true, iter = 0;
+      while (changed && iter < 10) {
+        changed = false; iter++;
+        const scope = {};
+        for (const ref of Object.keys(result)) {
+          Object.defineProperty(scope, ref, {
+            get() { const c = result[ref]; return c ? c.value : undefined; },
+            enumerable: true, configurable: true
+          });
+        }
+        scope.get = (r) => { const c = result[String(r).toUpperCase()]; return c ? c.value : undefined; };
+        scope.cell = scope.get;
+
+        for (const [ref, cell] of Object.entries(result)) {
+          if (cell.formula === undefined) continue;
+          try {
+            const fn = new Function('cells', `with(cells){ return (${cell.formula}); }`);
+            const val = fn(scope);
+            if (cell.value !== val || cell.error !== null) {
+              cell.value = val;
+              cell.display = val == null ? '' : String(val);
+              cell.error = null;
+              changed = true;
+            }
+          } catch (e) {
+            if (cell.error !== e.message) {
+              cell.error = e.message;
+              cell.display = '#ERR';
+              changed = true;
+            }
+          }
+        }
+      }
+      return result;
+    };
+
+    /**
+     * Full-screen cells grid editor. Mirrors the TextEditor pattern so
+     * the terminal is fully restored on exit, and the HUD menu is never
+     * left in an inconsistent state. Supports:
+     *   • frozen column header (A, B, C, …) and row header (1, 2, 3, …)
+     *   • aligned horizontal + vertical scrolling (all rows scroll together)
+     *   • pure-JS formulas with cross-cell access via `with(cells)`
+     *   • auto-extend: moving past the last row/column grows the sheet
+     * @private
+     */
+    this._openCellsEditor = async (id, name, config = {}) => {
+      const storageKey = `cells_${name}`;
+      const state = this.Storages.Get(id, storageKey);
+      if (!state) return;
+
+      return new Promise((resolve) => {
+        // ---- Save terminal state ----
+        let wasRaw = false;
+        try { wasRaw = !!stdin.isRaw; } catch (_) {}
+        const hud = this._syappInstance && this._syappInstance.HUD;
+        const mouseWasEnabled = !!(hud && hud.isMouseEnabled);
+
+        if (mouseWasEnabled && hud) {
+          try { stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l'); } catch (_) {}
+          try { stdin.removeListener('data', hud.handleMouseData); } catch (_) {}
+          hud.isMouseEnabled = false;
+        }
+        try { stdin.removeAllListeners('keypress'); } catch (_) {}
+
+        try {
+          stdout.write('\x1b[?1049h');
+          stdout.write('\x1b[?25l');
+          stdout.write('\x1b[2J\x1b[H');
+        } catch (_) {}
+
+        // ---- Editor state ----
+        let cursorRow = state.cursorRow || 0;
+        let cursorCol = state.cursorCol || 0;
+        let scrollRow = 0;
+        let scrollCol = 0;
+        let editing = false;
+        let editBuffer = '';
+        let running = true;
+        let finished = false;
+        let statusMessage = '';
+
+        const cellWidth = 10;
+        const rowHeaderWidth = 5;
+        const colStep = cellWidth + 1;
+
+        let computed = this._cellsEvaluate(state);
+
+        const getCols = () => Math.max(20, stdout.columns || 80);
+        const getRows = () => Math.max(6, stdout.rows || 24);
+        const visibleCols = () => Math.max(1, Math.floor((getCols() - rowHeaderWidth) / colStep));
+        const visibleRows = () => Math.max(1, getRows() - 4);
+
+        const drawScreen = () => {
+          if (finished || !running) return;
+          try {
+            const cols = getCols();
+            const rows = getRows();
+            const visCols = visibleCols();
+            const visRows = visibleRows();
+
+            // Viewport follows cursor — same axis only.
+            if (cursorCol < scrollCol) scrollCol = cursorCol;
+            if (cursorCol >= scrollCol + visCols) scrollCol = cursorCol - visCols + 1;
+            if (cursorRow < scrollRow) scrollRow = cursorRow;
+            if (cursorRow >= scrollRow + visRows) scrollRow = cursorRow - visRows + 1;
+            if (scrollCol < 0) scrollCol = 0;
+            if (scrollRow < 0) scrollRow = 0;
+
+            const out = [];
+            out.push('\x1b[H');
+
+            // Title bar
+            const cursorRef = this._cellsRefFromRC(cursorRow, cursorCol);
+            const cell = computed[cursorRef];
+            const editingTag = editing ? ' [EDIT]' : '';
+            const title = ` 📊 ${name}${editingTag}`;
+            const rightInfo = ` ${cursorRef} `;
+            let pad = cols - title.length - rightInfo.length;
+            if (pad < 0) pad = 0;
+            out.push('\x1b[7m' + title + ' '.repeat(pad) + rightInfo + '\x1b[0m');
+
+            // Frozen column header (A, B, C, …) — scrolls with columns
+            out.push('\x1b[2;1H\x1b[2K');
+            let headerLine = ' '.repeat(rowHeaderWidth);
+            for (let c = 0; c < visCols; c++) {
+              const colIdx = scrollCol + c;
+              if (colIdx >= state.cols) break;
+              const label = this._cellsColLabel(colIdx);
+              const padded = label.padEnd(cellWidth);
+              if (colIdx === cursorCol) headerLine += '\x1b[7m' + padded + '\x1b[0m ';
+              else headerLine += '\x1b[1m' + padded + '\x1b[0m ';
+            }
+            out.push(headerLine);
+
+            // Rows — frozen row header (1, 2, 3, …) — scrolls with rows
+            for (let r = 0; r < visRows; r++) {
+              const rowIdx = scrollRow + r;
+              const screenRow = 3 + r;
+              out.push('\x1b[' + screenRow + ';1H\x1b[2K');
+              if (rowIdx >= state.rows) break;
+              const rowLabel = String(rowIdx + 1).padStart(rowHeaderWidth - 1) + ' ';
+              let line = (rowIdx === cursorRow)
+                ? '\x1b[7m' + rowLabel + '\x1b[0m'
+                : rowLabel;
+
+              for (let c = 0; c < visCols; c++) {
+                const colIdx = scrollCol + c;
+                if (colIdx >= state.cols) break;
+                const ref = this._cellsRefFromRC(rowIdx, colIdx);
+                const isCursor = (rowIdx === cursorRow && colIdx === cursorCol);
+                let display = '';
+                if (editing && isCursor) display = editBuffer;
+                else { const cc = computed[ref]; display = cc ? (cc.display || '') : ''; }
+                if (display.length > cellWidth - 1) display = display.slice(0, cellWidth - 2) + '…';
+                const padded = display.padEnd(cellWidth);
+                line += (isCursor ? '\x1b[7m' + padded + '\x1b[0m ' : padded + ' ');
+              }
+              out.push(line);
+            }
+
+            // Status / help
+            out.push('\x1b[' + rows + ';1H\x1b[2K\x1b[7m');
+            let help;
+            if (editing) help = ' Enter: commit   Esc: cancel   (formulas = pure JS: =A1+B2)';
+            else if (cell && cell.error) help = ` ✗ ${cell.error}`;
+            else help = statusMessage || ' Arrows: move  Enter: edit  Del: clear  Ctrl+X: exit  (edges auto-extend)';
+            if (help.length > cols) help = help.slice(0, cols);
+            out.push(help + ' '.repeat(Math.max(0, cols - help.length)));
+            out.push('\x1b[0m');
+
+            // Cursor
+            const csr = 3 + (cursorRow - scrollRow);
+            const csc = rowHeaderWidth + (cursorCol - scrollCol) * colStep + 1;
+            out.push('\x1b[' + csr + ';' + csc + 'H');
+            out.push('\x1b[?25h');
+
+            stdout.write(out.join(''));
+          } catch (_) { /* ignore draw errors */ }
+        };
+
+        const setStatus = (msg, ms) => {
+          statusMessage = msg;
+          drawScreen();
+          if (ms > 0) setTimeout(() => {
+            if (running && statusMessage === msg) { statusMessage = ''; drawScreen(); }
+          }, ms);
+        };
+
+        const finish = () => {
+          if (finished) return;
+          finished = true; running = false;
+          try { stdin.removeListener('data', handleData); } catch (_) {}
+          try { stdout.removeListener('resize', handleResize); } catch (_) {}
+
+          try { stdout.write('\x1b[?25l\x1b[?1049l'); } catch (_) {}
+          try { if (stdin.isRaw !== wasRaw) stdin.setRawMode(wasRaw); } catch (_) {}
+          try { stdout.write('\x1b[?25h'); } catch (_) {}
+
+          state.cursorRow = cursorRow;
+          state.cursorCol = cursorCol;
+          state.scrollRow = scrollRow;
+          state.scrollCol = scrollCol;
+          this.Storages.Set(id, storageKey, state);
+          resolve();
+        };
+
+        const commitEdit = () => {
+          const ref = this._cellsRefFromRC(cursorRow, cursorCol);
+          if (!state.cells) state.cells = {};
+          if (editBuffer === '') delete state.cells[ref];
+          else state.cells[ref] = { raw: editBuffer };
+          this.Storages.Set(id, storageKey, state);
+          computed = this._cellsEvaluate(state);
+          editing = false;
+          editBuffer = '';
+        };
+
+        const clearCell = () => {
+          const ref = this._cellsRefFromRC(cursorRow, cursorCol);
+          if (state.cells && state.cells[ref]) {
+            delete state.cells[ref];
+            this.Storages.Set(id, storageKey, state);
+            computed = this._cellsEvaluate(state);
+          }
+        };
+
+        const extendRows = (n) => { state.rows = Math.max(state.rows, n); this.Storages.Set(id, storageKey, state); };
+        const extendCols = (n) => { state.cols = Math.max(state.cols, n); this.Storages.Set(id, storageKey, state); };
+
+        const handleData = (data) => {
+          if (finished || !running) return;
+          const str = data.toString();
+          if (str.length === 0) return;
+
+          // Ctrl+X exit, Ctrl+C exit (when not editing)
+          if (str === '\x18' || (str === '\x03' && !editing)) {
+            if (editing) { editing = false; editBuffer = ''; drawScreen(); return; }
+            finish(); return;
+          }
+
+          if (editing) {
+            let needRedraw = false;
+            for (const ch of str) {
+              const code = ch.charCodeAt(0);
+              if (ch === '\r' || ch === '\n') { commitEdit(); needRedraw = true; break; }
+              else if (ch === '\x1b') { editing = false; editBuffer = ''; needRedraw = true; break; }
+              else if (ch === '\x7f' || ch === '\b') {
+                if (editBuffer.length > 0) { editBuffer = editBuffer.slice(0, -1); needRedraw = true; }
+              } else if (code >= 32 && code < 127) { editBuffer += ch; needRedraw = true; }
+            }
+            if (needRedraw) drawScreen();
+            return;
+          }
+
+          // Arrow navigation (keeps the OTHER axis fixed; extends on edges)
+          if (str[0] === '\x1b') {
+            if (str[1] === '[') {
+              const last = str[str.length - 1];
+              if (last === 'A') {
+                if (cursorRow > 0) cursorRow--;
+              } else if (last === 'B') {
+                if (cursorRow < state.rows - 1) cursorRow++;
+                else { extendRows(state.rows + 10); cursorRow++; setStatus('＋10 rows', 1200); }
+              } else if (last === 'C') {
+                if (cursorCol < state.cols - 1) cursorCol++;
+                else { extendCols(state.cols + 1); cursorCol++; setStatus(`＋col ${this._cellsColLabel(cursorCol)}`, 1200); }
+              } else if (last === 'D') {
+                if (cursorCol > 0) cursorCol--;
+              } else if (last === '~') {
+                const mid = str.slice(2, -1);
+                if (mid === '3') clearCell();
+              }
+            }
+            drawScreen();
+            return;
+          }
+
+          // Enter → edit cell
+          if (str === '\r' || str === '\n') {
+            const ref = this._cellsRefFromRC(cursorRow, cursorCol);
+            const c = state.cells && state.cells[ref];
+            editBuffer = c ? (c.raw || '') : '';
+            editing = true;
+            drawScreen();
+            return;
+          }
+
+          // Printable char → start editing with that char
+          const code = str.charCodeAt(0);
+          if (code >= 32 && code < 127) {
+            const ref = this._cellsRefFromRC(cursorRow, cursorCol);
+            const c = state.cells && state.cells[ref];
+            editBuffer = c ? (c.raw || '') : '';
+            editing = true;
+            editBuffer += str;
+            drawScreen();
+            return;
+          }
+        };
+
+        const handleResize = () => { if (running) drawScreen(); };
+
+        try {
+          stdin.setRawMode(true);
+          stdin.resume();
+          stdin.on('data', handleData);
+        } catch (e) { finish(); return; }
+
+        try { stdout.on('resize', handleResize); } catch (_) {}
+
+        drawScreen();
+      });
+    };
+
+    /**
+     * Create a spreadsheet ("Cells") launcher for this func.
+     *
+     * Pressing the launcher button opens a full-screen editor with:
+     *   • Frozen column header (A, B, C, …) and row header (1, 2, 3, …)
+     *   • Aligned horizontal + vertical scrolling (all rows move together)
+     *   • Pure-JS formulas — reference other cells directly: `=A1+B2`
+     *   • Auto-extension of the sheet when moving past the last row/column
+     *
+     * Only ONE Cells instance per Func view is supported. To have more
+     * than one, put each inside its own `this.Page()`.
+     *
+     * @param {string} id - User/build ID
+     * @param {string} name - Unique name for this Cells instance
+     * @param {Object} [config] - Cells configuration
+     * @param {number} [config.rows=100] - Initial number of rows
+     * @param {number} [config.cols=26] - Initial number of columns (26 = A..Z)
+     * @param {string} [config.label] - Launcher button label (default '📊 <name>')
+     * @param {boolean} [config.pinned] - Pin the launcher to the bottom
+     * @param {boolean} [config.pinnedTop] - Pin the launcher to the top
+     * @returns {Promise<Object>} The current Cells state object
+     */
+    this.Cells = async (id, name, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Cells() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const storageKey = `cells_${name}`;
+      const rows = Math.max(1, parseInt(config.rows, 10) || 100);
+      const cols = Math.max(1, parseInt(config.cols, 10) || 26);
+
+      let state = this.Storages.Get(id, storageKey);
+      if (!state) {
+        state = { rows, cols, cells: {}, cursorRow: 0, cursorCol: 0, scrollRow: 0, scrollCol: 0 };
+        this.Storages.Set(id, storageKey, state);
+      } else {
+        if (state.rows < rows) state.rows = rows;
+        if (state.cols < cols) state.cols = cols;
+      }
+
+      const build = this.Builds.get(id);
+      const triggerProp = `__cells_open_${name}`;
+      const curProps = (build.Session && build.Session.ActualProps) || {};
+
+      if (curProps[triggerProp]) {
+        delete curProps[triggerProp];
+        try {
+          await this._openCellsEditor(id, name, config);
+        } catch (err) {
+          if (this.Log) console.error('Cells editor error:', err);
+        }
+      }
+
+      const buttonCfg = {
+        name: config.label || `📊 ${name}`,
+        props: { [triggerProp]: true }
+      };
+      if (config.pinned !== undefined) buttonCfg.pinned = config.pinned;
+      if (config.pinnedTop !== undefined) buttonCfg.pinnedTop = config.pinnedTop;
+      this.Button(id, buttonCfg);
+
+      return this.Storages.Get(id, storageKey);
+    };
+
     // --------------------------- Args Method ---------------------------
 
     /**
@@ -11549,6 +11990,16 @@ function _genFuncJS(state, syappRelPath) {
         case 'json':
           L.push(`${indent}await this.JSON(id, ${JSON.stringify(it.config || {})})`)
           break
+        case 'cells': {
+          const cfg = {}
+          if (it.label) cfg.label = it.label
+          if (it.rows && it.rows !== 100) cfg.rows = it.rows
+          if (it.cols && it.cols !== 26) cfg.cols = it.cols
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
+          L.push(`${indent}await this.Cells(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'args': {
           const cfg = {
             required: it.schema || [],
@@ -11638,6 +12089,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   File: 'file',
   JSON: 'json',
   Args: 'args',
+  Cells: 'cells',
   Get: 'route',
   Post: 'route',
   Put: 'route',
@@ -11719,6 +12171,18 @@ function _sbMakeItemForMethod(methodName, id) {
         key: id,
         schema: [],
         items: []
+      }
+    case 'cells':
+      // Spreadsheet launcher. Opens a full-screen editor with frozen
+      // headers, aligned scrolling and pure-JS formulas.
+      return {
+        ...base,
+        name: 'sheet_' + id,
+        label: 'Sheet',
+        rows: 100,
+        cols: 26,
+        pinned: false,
+        pinnedTop: false
       }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
@@ -12879,6 +13343,17 @@ class SelfBuilder extends SyAPP_Func {
         case 'json':
           this.Button(id, { name: `🔍 JSON`, props: {} })
           break
+        case 'cells':
+          // Render the real Cells launcher in view mode so the editor
+          // behaves identically to a hand-written this.Cells(...) call.
+          await this.Cells(id, it.name, {
+            label: it.label,
+            rows: it.rows || 100,
+            cols: it.cols || 26,
+            pinned: it.pinned,
+            pinnedTop: it.pinnedTop
+          })
+          break
         case 'args':
           // Args container: behaves like a page in edit mode (click to
           // step inside and add/modify its children) and executes the
@@ -13213,6 +13688,15 @@ class SelfBuilder extends SyAPP_Func {
 
       case 'json':
         mkProp('config', 'Config', 'json')
+        break
+
+      case 'cells':
+        mkProp('name', 'Name', 'string')
+        mkProp('label', 'Label', 'string')
+        mkProp('rows', 'Rows', 'number')
+        mkProp('cols', 'Cols', 'number')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
         break
 
       case 'args':
