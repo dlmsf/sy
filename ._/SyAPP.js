@@ -9233,10 +9233,11 @@ function levenshteinDistance(str1, str2) {
      * @private
      */
     this._cellsParseRef = (ref) => {
-      const m = String(ref).match(/^([A-Z]+)(\d+)$/);
+      // Case-insensitive: "A1", "a1" and "Aa1" all parse identically.
+      const m = String(ref).match(/^([A-Za-z]+)(\d+)$/);
       if (!m) return null;
       let col = 0;
-      for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+      for (const ch of m[1].toUpperCase()) col = col * 26 + (ch.charCodeAt(0) - 64);
       return { col: col - 1, row: parseInt(m[2], 10) - 1 };
     };
 
@@ -9278,10 +9279,18 @@ function levenshteinDistance(str1, str2) {
         changed = false; iter++;
         const scope = {};
         for (const ref of Object.keys(result)) {
-          Object.defineProperty(scope, ref, {
+          // Case-insensitive access: both "A1" and "a1" resolve to the
+          // same cell, so formulas may be written with any casing the
+          // user prefers (`=a1+1` is now equivalent to `=A1+1`).
+          const desc = {
             get() { const c = result[ref]; return c ? c.value : undefined; },
             enumerable: true, configurable: true
-          });
+          };
+          Object.defineProperty(scope, ref, desc);
+          const lower = ref.toLowerCase();
+          if (lower !== ref) {
+            Object.defineProperty(scope, lower, desc);
+          }
         }
         scope.get = (r) => { const c = result[String(r).toUpperCase()]; return c ? c.value : undefined; };
         scope.cell = scope.get;
@@ -9422,11 +9431,14 @@ function levenshteinDistance(str1, str2) {
         // References are matched as word-boundary letter+digit pairs;
         // matches inside string literals are extremely rare in practice
         // and are left alone (still valid, just over-shifted).
+        // Shift every A1-style reference in a formula by (dRow, dCol).
+        // Case-insensitive: `a1+2` is treated exactly like `A1+2`, and
+        // the resulting refs are always normalised to uppercase.
         const shiftFormulaRefs = (formula, dRow, dCol) => {
           if (!formula) return formula;
-          return formula.replace(/\b([A-Z]+)(\d+)\b/g, (m, col, row) => {
+          return formula.replace(/\b([A-Za-z]+)(\d+)\b/g, (m, col, row) => {
             let colNum = 0;
-            for (const ch of col) colNum = colNum * 26 + (ch.charCodeAt(0) - 64);
+            for (const ch of col.toUpperCase()) colNum = colNum * 26 + (ch.charCodeAt(0) - 64);
             colNum -= 1;
             const newCol = colNum + dCol;
             const newRow = parseInt(row, 10) - 1 + dRow;
@@ -9435,11 +9447,123 @@ function levenshteinDistance(str1, str2) {
           });
         };
 
+        // -----------------------------------------------------------------
+        // FORMULA PATTERN DETECTION
+        // -----------------------------------------------------------------
+        // Given two consecutive formulas F1 and F2 in the fill direction,
+        // try to detect the implicit series they describe, and return a
+        // generator function `gen(k)` that yields the k-th formula
+        // (gen(0) ≡ F1, gen(1) ≡ F2, gen(2) ≡ F3, ...). Returns null
+        // when the two formulas do not describe a consistent pattern.
+        //
+        // Examples (fill down):
+        //   F1 = "=A1+2",      F2 = "=A2+4"       → gen(2) = "=A3+6"
+        //   F1 = "=A1*B1",     F2 = "=A2*B2"      → gen(2) = "=A3*B3"
+        //   F1 = "=SUM(A1:A5)",F2 = "=SUM(A2:A6)" → gen(2) = "=SUM(A3:A7)"
+        //   F1 = "=A1+A2+A3",  F2 = "=A2+A3+A4"   → gen(2) = "=A3+A4+A5"
+        //
+        // The detector requires:
+        //   • identical placeholder structure after ref/number extraction;
+        //   • same number of refs and same number of constants;
+        //   • every ref shifted consistently along the fill axis
+        //     (columns unchanged for row-fill, rows unchanged for col-fill);
+        //   • every ref actually moving (axis delta ≠ 0);
+        //   • a constant delta for each extracted constant (constants may
+        //     evolve independently, so `=A1+2*3` → `=A2+4*5` produces
+        //     deltas [2, 2] and extrapolates cleanly).
+        // -----------------------------------------------------------------
+        const detectFormulaPattern = (F1, F2, axis) => {
+          const parseFormula = (f) => {
+            const body = f.startsWith('=') ? f.slice(1) : f;
+            const constants = [];
+            const refs = [];
+            let structure = body;
+
+            // Extract cell references first (case-insensitive), replacing
+            // each with a unique null-byte-delimited placeholder so the
+            // structure can never collide with a real token in the formula.
+            structure = structure.replace(/\b([A-Za-z]+)(\d+)\b/g, (m, col, row) => {
+              let colNum = 0;
+              for (const ch of col.toUpperCase()) colNum = colNum * 26 + (ch.charCodeAt(0) - 64);
+              const idx = refs.length;
+              refs.push({ colNum: colNum - 1, row: parseInt(row, 10) - 1 });
+              return `\x00R${idx}\x00`;
+            });
+
+            // Extract standalone numeric constants (any remaining digit
+            // sequence after refs have been removed).
+            structure = structure.replace(/\b\d+(?:\.\d+)?\b/g, (m) => {
+              const idx = constants.length;
+              constants.push(parseFloat(m));
+              return `\x00N${idx}\x00`;
+            });
+
+            return { structure, constants, refs };
+          };
+
+          const p1 = parseFormula(F1);
+          const p2 = parseFormula(F2);
+
+          if (p1.structure !== p2.structure) return null;
+          if (p1.refs.length !== p2.refs.length) return null;
+          if (p1.constants.length !== p2.constants.length) return null;
+
+          // Verify consistent ref deltas along the fill axis.
+          let dRow = 0, dCol = 0;
+          if (p1.refs.length > 0) {
+            const r1 = p1.refs[0], r2 = p2.refs[0];
+            dRow = r2.row - r1.row;
+            dCol = r2.colNum - r1.colNum;
+            for (let i = 1; i < p1.refs.length; i++) {
+              const a = p1.refs[i], b = p2.refs[i];
+              if ((b.row - a.row) !== dRow) return null;
+              if ((b.colNum - a.colNum) !== dCol) return null;
+            }
+          }
+
+          if (axis === 'row') {
+            if (dCol !== 0) return null; // refs must move only vertically
+            if (dRow === 0) return null; // and must actually move
+          } else {
+            if (dRow !== 0) return null; // refs must move only horizontally
+            if (dCol === 0) return null; // and must actually move
+          }
+
+          // Constant deltas between F1 and F2. Different constants may
+          // evolve independently, so we keep a delta per constant index.
+          const constDeltas = p1.constants.map((c, i) => p2.constants[i] - c);
+
+          return (k) => {
+            let result = p1.structure;
+            for (let i = 0; i < p1.refs.length; i++) {
+              const r = p1.refs[i];
+              const newRow = r.row + k * dRow;
+              const newCol = r.colNum + k * dCol;
+              if (newRow < 0 || newCol < 0) return null;
+              const ref = this._cellsRefFromRC(newRow, newCol);
+              result = result.replace(`\x00R${i}\x00`, () => ref);
+            }
+            for (let i = 0; i < p1.constants.length; i++) {
+              const v = p1.constants[i] + k * constDeltas[i];
+              result = result.replace(`\x00N${i}\x00`, () => String(v));
+            }
+            return '=' + result;
+          };
+        };
+
         // ---- Fill down --------------------------------------------------------
-        // Replicates the top row of the selection downward. Per column:
-        //   • formula cells      → formula copied, relative refs shifted
-        //   • numeric pairs      → arithmetic progression continues
-        //   • anything else      → verbatim copy
+        // Replicates the top row of the selection downward. Per column, in
+        // priority order:
+        //   1. Formula pattern detected from the first TWO rows (e.g.
+        //      `=A1+2` → `=A2+4` continues as `=A3+6`, `=A4+8`, ...):
+        //      both refs and numeric constants evolve together.
+        //   2. Plain formula ref shift (classic Ctrl+D): only refs move,
+        //      constants stay frozen.
+        //   3. Numeric pairs: arithmetic progression continues.
+        //   4. Empty source: destination is cleared.
+        //   5. Anything else: verbatim copy.
+        // All comparisons are case-insensitive, so `=a1+2` and `=A1+2`
+        // are interchangeable both when detecting and when generating.
         const fillDown = () => {
           if (!selectMode) {
             setStatus('Select a range first (Shift+Arrows)', 2000);
@@ -9459,10 +9583,24 @@ function levenshteinDistance(str1, str2) {
             const srcCell = state.cells[srcRef];
             const srcRaw = srcCell ? (srcCell.raw || '') : '';
             const isFormula = srcRaw.startsWith('=');
+
+            // --- Pattern detection: needs a second formula row below ---
+            // Look at the cell directly below the source and, if it also
+            // contains a formula, try to derive an extrapolation function
+            // from the (F1, F2) pair. Otherwise fall back to simple shift.
+            let formulaGen = null;
+            if (isFormula && r2 >= r1 + 1) {
+              const secondRef = this._cellsRefFromRC(r1 + 1, c);
+              const secondCell = state.cells[secondRef];
+              const secondRaw = secondCell ? (secondCell.raw || '') : '';
+              if (secondRaw.startsWith('=')) {
+                formulaGen = detectFormulaPattern(srcRaw, secondRaw, 'row');
+              }
+            }
+
+            // --- Numeric series detection (existing behaviour) ---
             const srcNum = (!isFormula && srcRaw !== '' && !isNaN(Number(srcRaw)))
               ? Number(srcRaw) : null;
-
-            // Detect an arithmetic series if a second numeric row exists.
             let increment = null;
             if (srcNum !== null) {
               const secondRef = this._cellsRefFromRC(r1 + 1, c);
@@ -9475,13 +9613,27 @@ function levenshteinDistance(str1, str2) {
 
             for (let r = r1 + 1; r <= r2; r++) {
               const dstRef = this._cellsRefFromRC(r, c);
+
+              // 1. Formula pattern extrapolation (highest priority)
+              if (formulaGen) {
+                const generated = formulaGen(r - r1);
+                if (generated) {
+                  state.cells[dstRef] = { raw: generated };
+                  continue;
+                }
+              }
+
+              // 2. Classic formula ref shift (constants frozen)
               if (isFormula) {
                 state.cells[dstRef] = { raw: '=' + shiftFormulaRefs(srcRaw.slice(1), r - r1, 0) };
               } else if (increment !== null) {
+                // 3. Numeric arithmetic progression
                 state.cells[dstRef] = { raw: String(srcNum + increment * (r - r1)) };
               } else if (srcRaw === '') {
+                // 4. Empty source: clear the destination
                 delete state.cells[dstRef];
               } else {
+                // 5. Verbatim copy
                 state.cells[dstRef] = { raw: srcRaw };
               }
             }
@@ -9493,7 +9645,8 @@ function levenshteinDistance(str1, str2) {
         };
 
         // ---- Fill right -------------------------------------------------------
-        // Mirrors fillDown on the column axis.
+        // Mirrors fillDown on the column axis. The same pattern detection
+        // applies, e.g. `=A1+2` → `=B1+4` continues as `=C1+6`, `=D1+8`.
         const fillRight = () => {
           if (!selectMode) {
             setStatus('Select a range first (Shift+Arrows)', 2000);
@@ -9513,9 +9666,21 @@ function levenshteinDistance(str1, str2) {
             const srcCell = state.cells[srcRef];
             const srcRaw = srcCell ? (srcCell.raw || '') : '';
             const isFormula = srcRaw.startsWith('=');
+
+            // --- Pattern detection from the first two columns ---
+            let formulaGen = null;
+            if (isFormula && c2 >= c1 + 1) {
+              const secondRef = this._cellsRefFromRC(r, c1 + 1);
+              const secondCell = state.cells[secondRef];
+              const secondRaw = secondCell ? (secondCell.raw || '') : '';
+              if (secondRaw.startsWith('=')) {
+                formulaGen = detectFormulaPattern(srcRaw, secondRaw, 'col');
+              }
+            }
+
+            // --- Numeric series detection ---
             const srcNum = (!isFormula && srcRaw !== '' && !isNaN(Number(srcRaw)))
               ? Number(srcRaw) : null;
-
             let increment = null;
             if (srcNum !== null) {
               const secondRef = this._cellsRefFromRC(r, c1 + 1);
@@ -9528,13 +9693,27 @@ function levenshteinDistance(str1, str2) {
 
             for (let c = c1 + 1; c <= c2; c++) {
               const dstRef = this._cellsRefFromRC(r, c);
+
+              // 1. Formula pattern extrapolation
+              if (formulaGen) {
+                const generated = formulaGen(c - c1);
+                if (generated) {
+                  state.cells[dstRef] = { raw: generated };
+                  continue;
+                }
+              }
+
+              // 2. Classic formula ref shift (constants frozen)
               if (isFormula) {
                 state.cells[dstRef] = { raw: '=' + shiftFormulaRefs(srcRaw.slice(1), 0, c - c1) };
               } else if (increment !== null) {
+                // 3. Numeric arithmetic progression
                 state.cells[dstRef] = { raw: String(srcNum + increment * (c - c1)) };
               } else if (srcRaw === '') {
+                // 4. Clear
                 delete state.cells[dstRef];
               } else {
+                // 5. Verbatim copy
                 state.cells[dstRef] = { raw: srcRaw };
               }
             }
