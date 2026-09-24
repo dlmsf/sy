@@ -1,300 +1,401 @@
 #!/usr/bin/env node
 
 /**
- * shinstall.js – Modular install.sh generator
- * Fixed version with proper command link creation and update detection
+ * shinstall.js – Modular install.sh generator  (rewrite v4)
+ *
+ * Guarantees:
+ *  1. ONLY install.sh is ever written (plus old-install.sh when the user
+ *     explicitly asks for it via menu 3 / 6, or --emb / --old).
+ *  2. Legacy files (.shinstallrc, .shinstall-features, install.sh.bak)
+ *     are deleted at startup AND on exit / SIGINT / SIGTERM, just in case
+ *     an older version of this tool left them behind.
+ *  3. Feature selection uses node:readline/promises so consecutive awaits
+ *     work reliably. The loop exits ONLY on the literal word "done"
+ *     (or "0"/"q"). Empty input never exits.
+ *  4. Generated install.sh is idempotent: every dependency is checked
+ *     with "command -v" and the package manager, and only missing pieces
+ *     are installed. apt-get update runs at most once per run, and only
+ *     if something actually needs installing.
+ *  5. Compiled languages (c/cpp/go/rust/java) are compiled once during
+ *     install.sh. The generated command wrappers just exec the compiled
+ *     binary; they never compile.
  */
 
-import fs from 'fs';
-import path from 'path';
-import readline from 'readline';
-import { promisify } from 'util';
-import { execSync } from 'child_process';
+import * as readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+import fs from 'node:fs';
+import { promisify } from 'node:util';
+import { execSync } from 'node:child_process';
 
-const access = promisify(fs.access);
-const readFile = promisify(fs.readFile);
+const unlink    = promisify(fs.unlink);
 const writeFile = promisify(fs.writeFile);
-const mkdir = promisify(fs.mkdir);
-const copyFile = promisify(fs.copyFile);
-const rename = promisify(fs.rename);
-const unlink = promisify(fs.unlink);
-const stat = promisify(fs.stat);
-const readdir = promisify(fs.readdir);
+const rename    = promisify(fs.rename);
+const access    = promisify(fs.access);
 
-const rl = readline.createInterface({
-  input: process.stdin,
-  output: process.stdout,
-  terminal: true
-});
+// ---------------------------------------------------------------------------
+// Legacy cleanup (belt + suspenders)
+// ---------------------------------------------------------------------------
+const LEGACY_FILES = ['.shinstallrc', '.shinstall-features', 'install.sh.bak'];
 
-const question = (query) => new Promise(resolve => rl.question(query, resolve));
+function removeLegacyFilesSync() {
+  for (const f of LEGACY_FILES) {
+    try { fs.unlinkSync(f); } catch { /* ignore */ }
+  }
+}
 
-// ==================== CONFIGURATION DEFAULTS ====================
-const DEFAULTS = {
+// Remove at startup (in case a previous version left them behind).
+removeLegacyFilesSync();
+
+// Remove on exit / Ctrl+C / SIGTERM.
+const onExit = () => { removeLegacyFilesSync(); };
+process.on('exit', onExit);
+process.on('SIGINT',  () => { removeLegacyFilesSync(); process.exit(130); });
+process.on('SIGTERM', () => { removeLegacyFilesSync(); process.exit(143); });
+
+// ---------------------------------------------------------------------------
+// readline/promises
+// ---------------------------------------------------------------------------
+const rl  = readline.createInterface({ input, output });
+const ask = (q) => rl.question(q);
+
+// ---------------------------------------------------------------------------
+// Session-only state (never persisted)
+// ---------------------------------------------------------------------------
+const SESSION = {
+  config: null,
+  features: new Set()
+};
+
+const BASE_DEFAULTS = {
   projectName: 'MyApp',
-  installDir: '/usr/local/etc/MyApp',
   binDir: '/usr/local/bin',
   repoDir: process.cwd(),
   mainSourceDir: '.',
-  nodeEntryPointsSrc: 'app.js',
-  nodeEntryPointsCmd: 'myapp',
+  mainEntryPointsSrc: 'app.js',
+  mainEntryPointsCmd: 'myapp',
   shellScriptsSrc: '',
   shellScriptsCmd: '',
   postInstallScripts: '',
-  preservationWhitelist: '',
-  enableBuild: false,
-  enableNodeInstall: false,
-  enableDebInstall: false,
-  enablePm2Extract: false,
-  enablePkgCli: false,
-  enableWsave: false,
-  enableGitConfig: false,
-  enableShellFallback: false,
-  enableOldWrapper: false,
-  oldScriptPath: null
+  preservationWhitelist: ''
 };
 
-// ==================== FEATURE DEFINITIONS ====================
-const features = [
-  {
-    id: 'build',
-    name: 'Build system',
-    description: 'Include build mode with versioning, exclusions, and save/load configurations.',
-    default: false,
-    generate: (config) => buildFeatureSnippet(config)
-  },
-  {
-    id: 'nodeinstall',
-    name: 'Node.js auto-install',
-    description: 'Automatically install Node.js if missing (requires internet).',
-    default: false,
-    generate: (config) => nodeInstallFeatureSnippet(config)
-  },
-  {
-    id: 'debs',
-    name: 'Debian package installation',
-    description: 'Install .deb packages from local directories.',
-    default: false,
-    generate: (config) => debInstallFeatureSnippet(config)
-  },
-  {
-    id: 'pm2',
-    name: 'PM2 extraction',
-    description: 'Extract a bundled PM2 tar.gz archive.',
-    default: false,
-    generate: (config) => pm2ExtractFeatureSnippet(config)
-  },
-  {
-    id: 'pkgcli',
-    name: 'pkg CLI utility',
-    description: 'Create a pkg command for managing package.json.',
-    default: false,
-    generate: (config) => pkgCliFeatureSnippet(config)
-  },
-  {
-    id: 'wsave',
-    name: 'wsave permission fixer',
-    description: 'Create wsave command to fix VSCode save permissions.',
-    default: false,
-    generate: (config) => wsaveFeatureSnippet(config)
-  },
-  {
-    id: 'gitconfig',
-    name: 'git-config command',
-    description: 'Create git-config command to run Git.js setup.',
-    default: false,
-    generate: (config) => gitConfigFeatureSnippet(config)
-  },
-  {
-    id: 'shellfallback',
-    name: 'Shell script bash→ash fallback',
-    description: 'Wrap .sh commands with automatic bash→ash fallback.',
-    default: false,
-    generate: (config) => shellFallbackFeatureSnippet(config)
-  },
-  {
-    id: 'oldwrapper',
-    name: 'Old script wrapper',
-    description: 'Generate a wrapper to run the old install.sh with --old.',
-    default: false,
-    generate: (config) => oldWrapperFeatureSnippet(config)
+const defaultInstallDir = (name) => `/usr/local/etc/${name}`;
+
+function getConfig() {
+  if (!SESSION.config) {
+    SESSION.config = {
+      ...BASE_DEFAULTS,
+      installDir: defaultInstallDir(BASE_DEFAULTS.projectName)
+    };
   }
+  return SESSION.config;
+}
+
+// ---------------------------------------------------------------------------
+// Feature list
+// ---------------------------------------------------------------------------
+const features = [
+  { id: 'autodeps',      name: 'Auto language detection & dependencies',
+    generate: () => autoDepsFeatureSnippet() },
+  { id: 'debs',          name: 'Debian package installation',
+    generate: () => debInstallFeatureSnippet() },
+  { id: 'pm2',           name: 'PM2 extraction',
+    generate: () => pm2ExtractFeatureSnippet() },
+  { id: 'pkgcli',        name: 'pkg CLI utility',
+    generate: () => pkgCliFeatureSnippet() },
+  { id: 'wsave',         name: 'wsave permission fixer',
+    generate: () => wsaveFeatureSnippet() },
+  { id: 'gitconfig',     name: 'git-config command',
+    generate: () => gitConfigFeatureSnippet() },
+  { id: 'shellfallback', name: 'Shell script bash→ash fallback',
+    generate: () => shellFallbackFeatureSnippet() },
+  { id: 'oldwrapper',    name: 'Old script wrapper (--old support)',
+    generate: () => oldWrapperFeatureSnippet() }
 ];
 
-// ==================== FEATURE SNIPPET GENERATORS ====================
+// ---------------------------------------------------------------------------
+// Feature snippets
+// ---------------------------------------------------------------------------
 
-function buildFeatureSnippet(config) {
+function autoDepsFeatureSnippet() {
   return `
 # =============================================================================
-# BUILD SYSTEM (auto-generated)
+# AUTO LANGUAGE DETECTION & DEPENDENCIES  (idempotent)
 # =============================================================================
-BUILD_MODE=false
-BUILD_TAR=false
-BUILD_CONFIG=false
-BUILD_MESSAGE_MODE=false
-BUILD_VERSION=""
-BUILD_SAVE_NAME=""
-BUILD_DIR="\${REPO_DIR}/build"
-BUILD_SAVE_FILE="\${REPO_DIR}/buildsaves.cfg"
+INSTALL_DEPS=true
+APT_UPDATED=false
 
-do_build() {
-    echo "Build functionality is not fully implemented in this generated script."
-    echo "Please use the shinstall.js tool to regenerate with full build support."
-    exit 0
-}
-`;
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Is a package already installed?  Try the native package manager first.
+pkg_installed() {
+    pkg="$1"
+    if have_cmd dpkg;   then dpkg -s "$pkg"       >/dev/null 2>&1 && return 0; fi
+    if have_cmd rpm;    then rpm -q "$pkg"        >/dev/null 2>&1 && return 0; fi
+    if have_cmd apk;    then apk info -e "$pkg"   >/dev/null 2>&1 && return 0; fi
+    if have_cmd pacman; then pacman -Q  "$pkg"    >/dev/null 2>&1 && return 0; fi
+    return 1
 }
 
-function nodeInstallFeatureSnippet(config) {
-  return `
-# =============================================================================
-# NODE.JS AUTO-INSTALL (auto-generated)
-# =============================================================================
-INSTALL_NODE=false
+# Run apt-get update at most once per install.sh invocation, and only
+# when we're actually about to install something.
+apt_update_once() {
+    [ "$APT_UPDATED" = "true" ] && return 0
+    APT_UPDATED=true
+    if have_cmd apt-get; then $SUDO apt-get update -qq
+    elif have_cmd apt;   then $SUDO apt update -qq
+    fi
+}
 
-ensure_nodejs() {
-    [ "\$INSTALL_NODE" = false ] && return 0
-    if command -v node >/dev/null 2>&1; then
-        echo "Node.js already installed."
+# Install the given packages, skipping any that are already present.
+install_packages() {
+    [ $# -eq 0 ] && return 0
+    to_install=""
+    for pkg in "$@"; do
+        if pkg_installed "$pkg"; then
+            echo "    already installed: $pkg"
+        else
+            echo "    MISSING:           $pkg"
+            to_install="$to_install $pkg"
+        fi
+    done
+    if [ -z "$to_install" ]; then
+        echo "    -> nothing to install"
         return 0
     fi
-    echo "Attempting to install Node.js..."
-    if command -v apt >/dev/null 2>&1; then
-        sudo apt update && sudo apt install -y nodejs
-    elif command -v apk >/dev/null 2>&1; then
-        apk add nodejs npm
-    else
-        echo "Unsupported distribution. Please install Node.js manually."
+    echo "    -> installing:$to_install"
+    apt_update_once
+    if have_cmd apt-get; then $SUDO apt-get install -y $to_install
+    elif have_cmd apt;   then $SUDO apt install -y $to_install
+    elif have_cmd apk;   then $SUDO apk add $to_install
+    elif have_cmd dnf;   then $SUDO dnf install -y $to_install
+    elif have_cmd yum;   then $SUDO yum install -y $to_install
+    elif have_cmd pacman; then $SUDO pacman -S --noconfirm $to_install
+    else echo "    no supported package manager; install manually:$to_install"; return 1
     fi
 }
+
+# Skip if the toolchain commands are already present; otherwise check
+# the package manager, then install only the missing packages.
+install_language_deps() {
+    lang="$1"
+    case "$lang" in
+        node)
+            if have_cmd node && have_cmd npm; then
+                echo "    node/npm: present at $(command -v node)"; return 0
+            fi
+            install_packages nodejs npm ;;
+        python)
+            if have_cmd python3; then
+                echo "    python3: present at $(command -v python3)"; return 0
+            fi
+            install_packages python3 ;;
+        ruby)
+            if have_cmd ruby; then
+                echo "    ruby:    present at $(command -v ruby)"; return 0
+            fi
+            install_packages ruby ;;
+        php)
+            if have_cmd php; then
+                echo "    php:     present at $(command -v php)"; return 0
+            fi
+            install_packages php-cli php ;;
+        perl)
+            if have_cmd perl; then
+                echo "    perl:    present at $(command -v perl)"; return 0
+            fi
+            install_packages perl ;;
+        shell)
+            if have_cmd bash; then
+                echo "    bash:    present at $(command -v bash)"; return 0
+            fi
+            install_packages bash ;;
+        java)
+            if have_cmd javac && have_cmd java; then
+                echo "    javac:   present at $(command -v javac)"; return 0
+            fi
+            install_packages default-jdk ;;
+        c)
+            if have_cmd gcc; then
+                echo "    gcc:     present at $(command -v gcc)"; return 0
+            fi
+            install_packages build-essential gcc ;;
+        cpp)
+            if have_cmd g++; then
+                echo "    g++:     present at $(command -v g++)"; return 0
+            fi
+            install_packages build-essential g++ ;;
+        go)
+            if have_cmd go; then
+                echo "    go:      present at $(command -v go)"; return 0
+            fi
+            install_packages golang-go ;;
+        rust)
+            if have_cmd rustc; then
+                echo "    rustc:   present at $(command -v rustc)"; return 0
+            fi
+            install_packages rustc cargo ;;
+    esac
+}
 `;
 }
 
-function debInstallFeatureSnippet(config) {
+function debInstallFeatureSnippet() {
   return `
 # =============================================================================
-# DEBIAN PACKAGE INSTALLATION (auto-generated)
+# DEBIAN PACKAGE INSTALLATION (idempotent)
 # =============================================================================
 SKIP_DEBS=false
-DEB_DIR="\${REPO_DIR}/deb-packages"
-DEB_SERVER_DIR="\${REPO_DIR}/deb-packages-server"
+DEB_DIR="$REPO_DIR/deb-packages"
+
+deb_installed() { dpkg -s "$1" >/dev/null 2>&1; }
 
 install_debs() {
-    [ "\$SKIP_DEBS" = true ] && return 0
-    [ ! -d "\$DEB_DIR" ] && return 0
-    echo "Installing .deb packages..."
-    find "\$DEB_DIR" -name '*.deb' -exec sudo dpkg -i {} \\;
+    [ "$SKIP_DEBS" = true ] && return 0
+    [ ! -d "$DEB_DIR" ] && return 0
+    echo "Checking .deb packages in $DEB_DIR..."
+    find "$DEB_DIR" -name '*.deb' -type f | while read -r deb; do
+        pkg=$(dpkg-deb -f "$deb" Package 2>/dev/null || basename "$deb" .deb)
+        if deb_installed "$pkg"; then
+            echo "  already installed: $pkg"
+        else
+            echo "  installing: $deb"
+            $SUDO dpkg -i "$deb" || $SUDO apt-get install -f -y
+        fi
+    done
 }
 `;
 }
 
-function pm2ExtractFeatureSnippet(config) {
+function pm2ExtractFeatureSnippet() {
   return `
 # =============================================================================
-# PM2 EXTRACTION (auto-generated)
+# PM2 EXTRACTION
 # =============================================================================
-PM2_TAR_GZ="\${REPO_DIR}/archives/pm2.tar.gz"
-PM2_EXTRACT_DIR="\${INSTALL_DIR}/vendor/pm2"
+PM2_TAR_GZ="$REPO_DIR/archives/pm2.tar.gz"
+PM2_EXTRACT_DIR="$INSTALL_DIR/vendor/pm2"
 
 extract_pm2() {
-    [ -f "\$PM2_TAR_GZ" ] || return 0
+    [ -f "$PM2_TAR_GZ" ] || return 0
+    if [ -d "$PM2_EXTRACT_DIR" ] && [ -n "$(ls -A "$PM2_EXTRACT_DIR" 2>/dev/null)" ]; then
+        echo "  PM2 already extracted; skipping."
+        return 0
+    fi
     echo "Extracting PM2..."
-    mkdir -p "\$PM2_EXTRACT_DIR"
-    tar -xzf "\$PM2_TAR_GZ" -C "\$PM2_EXTRACT_DIR" --strip-components=1
+    mkdir -p "$PM2_EXTRACT_DIR"
+    tar -xzf "$PM2_TAR_GZ" -C "$PM2_EXTRACT_DIR" --strip-components=1
 }
 `;
 }
 
-function pkgCliFeatureSnippet(config) {
+function pkgCliFeatureSnippet() {
   return `
 # =============================================================================
-# PKG CLI UTILITY (auto-generated)
+# PKG CLI UTILITY
 # =============================================================================
 create_pkg_cli() {
-    echo "Creating pkg CLI utility..."
-    cat > "\$INSTALL_DIR/pkg-cli.js" << 'EOF'
+    mkdir -p "$INSTALL_DIR/wrappers"
+    cat > "$INSTALL_DIR/wrappers/pkg" << 'PKGEOF'
 #!/usr/bin/env node
 console.log("pkg command placeholder");
-EOF
-    chmod +x "\$INSTALL_DIR/pkg-cli.js"
-    ln -sf "\$INSTALL_DIR/pkg-cli.js" "\$BIN_DIR/pkg"
+PKGEOF
+    chmod +x "$INSTALL_DIR/wrappers/pkg"
+    link_cmd "$INSTALL_DIR/wrappers/pkg" "pkg"
 }
 `;
 }
 
-function wsaveFeatureSnippet(config) {
+function wsaveFeatureSnippet() {
   return `
 # =============================================================================
-# WSAVE PERMISSION FIXER (auto-generated)
+# WSAVE PERMISSION FIXER
 # =============================================================================
 create_wsave() {
-    echo "Creating wsave command..."
-    cat > "\$INSTALL_DIR/wsave" << 'EOF'
+    mkdir -p "$INSTALL_DIR/wrappers"
+    cat > "$INSTALL_DIR/wrappers/wsave" << 'WSAVEEOF'
 #!/bin/sh
-# Fix VSCode save permissions silently
 USERNAME="\${SUDO_USER:-\$USER}"
 chown -R "\$USERNAME:\$USERNAME" /home >/dev/null 2>&1
 chmod -R u+rwX /home >/dev/null 2>&1
-EOF
-    chmod +x "\$INSTALL_DIR/wsave"
-    ln -sf "\$INSTALL_DIR/wsave" "\$BIN_DIR/wsave"
+WSAVEEOF
+    chmod +x "$INSTALL_DIR/wrappers/wsave"
+    link_cmd "$INSTALL_DIR/wrappers/wsave" "wsave"
 }
 `;
 }
 
-function gitConfigFeatureSnippet(config) {
+function gitConfigFeatureSnippet() {
   return `
 # =============================================================================
-# GIT-CONFIG COMMAND (auto-generated)
+# GIT-CONFIG COMMAND
 # =============================================================================
 create_git_config() {
-    echo "Creating git-config command..."
-    mkdir -p "\$INSTALL_DIR/wrappers"
-    cat > "\$INSTALL_DIR/wrappers/git-config" << 'EOF'
+    mkdir -p "$INSTALL_DIR/wrappers"
+    cat > "$INSTALL_DIR/wrappers/git-config" << GITEOF
 #!/bin/sh
-GIT_JS=\$(find "\$INSTALL_DIR" -name "Git.js" -type f | head -1)
-[ -z "\$GIT_JS" ] && { echo "Git.js not found"; exit 1; }
-cd "\$INSTALL_DIR"
-exec node "\$GIT_JS" --setup "\$@"
-EOF
-    chmod +x "\$INSTALL_DIR/wrappers/git-config"
-    ln -sf "\$INSTALL_DIR/wrappers/git-config" "\$BIN_DIR/git-config"
+GIT_JS=\\$(find "$INSTALL_DIR" -name 'Git.js' -type f 2>/dev/null | head -1)
+[ -z "\\$GIT_JS" ] && { echo "Git.js not found"; exit 1; }
+cd "$INSTALL_DIR"
+exec node "\\$GIT_JS" --setup "\\$@"
+GITEOF
+    chmod +x "$INSTALL_DIR/wrappers/git-config"
+    link_cmd "$INSTALL_DIR/wrappers/git-config" "git-config"
 }
 `;
 }
 
-function shellFallbackFeatureSnippet(config) {
+function shellFallbackFeatureSnippet() {
   return `
 # =============================================================================
-# SHELL SCRIPT BASH→ASH FALLBACK (auto-generated)
+# SHELL SCRIPT BASH→ASH FALLBACK
 # =============================================================================
 create_shell_commands() {
-    echo "Creating shell script wrappers..."
-    # This function would create wrappers for each shell script
-    # in the SHELL_SCRIPTS_SRC list, with fallback logic.
+    [ -z "$SHELL_SCRIPTS_SRC" ] && return 0
+    mkdir -p "$INSTALL_DIR/wrappers"
+    idx=1
+    for src in $SHELL_SCRIPTS_SRC; do
+        cmd=$(echo "$SHELL_SCRIPTS_CMD" | tr ' ' '\\n' | sed -n "\${idx}p")
+        [ -z "$cmd" ] && { idx=$((idx+1)); continue; }
+        src_path="$INSTALL_DIR/$src"
+        if [ ! -f "$src_path" ]; then
+            echo "  warning: shell script not found: $src_path"
+            idx=$((idx+1)); continue
+        fi
+        chmod +x "$src_path"
+        wrapper="$INSTALL_DIR/wrappers/$cmd"
+        cat > "$wrapper" << SHEOF
+#!/bin/sh
+if command -v bash >/dev/null 2>&1; then
+    exec bash "$src_path" "\\$@"
+else
+    exec sh "$src_path" "\\$@"
+fi
+SHEOF
+        chmod +x "$wrapper"
+        link_cmd "$wrapper" "$cmd"
+        echo "  created shell command: $cmd"
+        idx=$((idx+1))
+    done
 }
 `;
 }
 
-function oldWrapperFeatureSnippet(config) {
+function oldWrapperFeatureSnippet() {
   return `
 # =============================================================================
-# OLD SCRIPT WRAPPER (auto-generated)
+# OLD SCRIPT WRAPPER (--old)
 # =============================================================================
-OLD_SCRIPT_PATH="\${REPO_DIR}/old-install.sh"
-if [ "\$1" = "--old" ] && [ -f "\$OLD_SCRIPT_PATH" ]; then
-    echo "Running old install script..."
-    exec bash "\$OLD_SCRIPT_PATH" "\${@:2}"
-fi
+OLD_SCRIPT_PATH="$REPO_DIR/old-install.sh"
 `;
 }
 
-// ==================== INSTALL.SH TEMPLATE ASSEMBLY ====================
+// ---------------------------------------------------------------------------
+// install.sh assembly
+// ---------------------------------------------------------------------------
 
 function generateInstallSh(config, enabledFeatures) {
   const parts = [];
 
-  // Header
   parts.push(`#!/bin/sh
 # =============================================================================
 # ${config.projectName} Installation Script
@@ -302,315 +403,440 @@ function generateInstallSh(config, enabledFeatures) {
 # =============================================================================
 `);
 
-  // Project info
   parts.push(`
 PROJECT_NAME="${config.projectName}"
 INSTALL_DIR="${config.installDir}"
 BIN_DIR="${config.binDir}"
-REPO_DIR=\$(pwd)
+REPO_DIR=$(pwd)
 MAIN_SOURCE_DIR="${config.mainSourceDir}"
-BACKUP_DIR="\${INSTALL_DIR}_old_\$(date +%s)"
+MAIN_ENTRY_POINTS_SRC="${config.mainEntryPointsSrc}"
+MAIN_ENTRY_POINTS_CMD="${config.mainEntryPointsCmd}"
 `);
 
-  // Node command mapping (always present)
-  parts.push(`
-# Node.js command mapping
-NODE_ENTRY_POINTS_SRC="${config.nodeEntryPointsSrc}"
-NODE_ENTRY_POINTS_CMD="${config.nodeEntryPointsCmd}"
-`);
-
-  // Shell script mapping (if configured)
   if (config.shellScriptsSrc) {
     parts.push(`
-# Shell script command mapping
 SHELL_SCRIPTS_SRC="${config.shellScriptsSrc}"
 SHELL_SCRIPTS_CMD="${config.shellScriptsCmd}"
 `);
   }
-
-  // Post-install scripts (if configured)
   if (config.postInstallScripts) {
-    parts.push(`
-# Post-install scripts
-POST_INSTALL_SCRIPTS="${config.postInstallScripts}"
-`);
+    parts.push(`\nPOST_INSTALL_SCRIPTS="${config.postInstallScripts}"\n`);
   }
-
-  // Preservation whitelist (if configured)
   if (config.preservationWhitelist) {
-    parts.push(`
-# Preservation whitelist
-PRESERVATION_WHITELIST="${config.preservationWhitelist}"
-`);
+    parts.push(`\nPRESERVATION_WHITELIST="${config.preservationWhitelist}"\n`);
   }
 
-  // Include feature snippets
-  for (const feature of features) {
-    if (enabledFeatures.has(feature.id)) {
-      parts.push(feature.generate(config));
-    }
-  }
-
-  // Core functions
   parts.push(`
-# =============================================================================
-# CORE FUNCTIONS
-# =============================================================================
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
-
-copy_files() {
-    mkdir -p "\$INSTALL_DIR"
-    echo "Copying files..."
-    (cd "\$MAIN_SOURCE_DIR" && find . -type f -not -path '*/.git/*' -exec cp --parents {} "\$INSTALL_DIR" \\;)
-}
-
-create_command_links() {
-    # Create node command links with proper shebang
-    src_list="\$NODE_ENTRY_POINTS_SRC"
-    cmd_list="\$NODE_ENTRY_POINTS_CMD"
-    idx=1
-    for src in \$src_list; do
-        cmd=\$(echo "\$cmd_list" | tr ' ' '\\n' | sed -n "\${idx}p")
-        [ -z "\$cmd" ] && continue
-        src_path="\$INSTALL_DIR/\$src"
-        
-        if [ ! -f "\$src_path" ]; then
-            echo "Warning: Source file not found: \$src_path"
-            idx=\$((idx + 1))
-            continue
-        fi
-        
-        # Ensure the file has a shebang
-        if ! head -1 "\$src_path" | grep -q '^#!'; then
-            echo "Adding shebang to \$src_path"
-            sed -i '1i #!/usr/bin/env node' "\$src_path"
-        fi
-        
-        chmod +x "\$src_path"
-        
-        # Create wrapper script in INSTALL_DIR
-        wrapper="\$INSTALL_DIR/wrappers/\$cmd"
-        mkdir -p "\$INSTALL_DIR/wrappers"
-        
-        cat > "\$wrapper" << EOF
-#!/bin/sh
-exec node "\$src_path" "\\\$@"
-EOF
-        
-        chmod +x "\$wrapper"
-        
-        # Create symlink in BIN_DIR
-        ln -sf "\$wrapper" "\$BIN_DIR/\$cmd"
-        echo "Created command: \$cmd -> \$src_path"
-        
-        idx=\$((idx + 1))
-    done
-}
-
-remove_links() {
-    cmd_list="\$NODE_ENTRY_POINTS_CMD"
-    for cmd in \$cmd_list; do
-        [ -L "\$BIN_DIR/\$cmd" ] && rm -f "\$BIN_DIR/\$cmd"
-    done
-    [ -d "\$INSTALL_DIR/wrappers" ] && rm -rf "\$INSTALL_DIR/wrappers"
-}
-
-execute_post_install_scripts() {
-    [ -z "\$POST_INSTALL_SCRIPTS" ] && return 0
-    echo "Executing post-install scripts..."
-    cd "\$INSTALL_DIR"
-    for script in \$POST_INSTALL_SCRIPTS; do
-        [ -f "\$script" ] && sh "\$script"
-    done
-    cd - >/dev/null
-}
-
-cleanup() {
-    sudo dpkg --configure -a >/dev/null 2>&1 || true
-}
-
-show_help() {
-    echo "Usage: \$0 [OPTIONS]"
-    echo "Install \$PROJECT_NAME"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help       Show this help"
-    echo "  --node           Auto-install Node.js if missing"
-    echo "  --force          Force update without asking"
-    echo "  --remove         Remove existing installation"
-    echo ""
-    echo "Commands created:"
-    for cmd in \$NODE_ENTRY_POINTS_CMD; do
-        echo "  \$cmd"
-    done
-}
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+fi
 `);
 
-  // Add --old handling if enabled
   if (enabledFeatures.has('oldwrapper')) {
     parts.push(`
-# Check for --old flag first
-if [ "\$1" = "--old" ] && [ -f "\${REPO_DIR}/old-install.sh" ]; then
+OLD_SCRIPT_PATH="$REPO_DIR/old-install.sh"
+if [ "$1" = "--old" ] && [ -f "$OLD_SCRIPT_PATH" ]; then
     echo "Running old install script..."
     shift
-    exec bash "\${REPO_DIR}/old-install.sh" "\$@"
+    exec bash "$OLD_SCRIPT_PATH" "$@"
 fi
 `);
   }
 
-  // Parse arguments
+  for (const feature of features) {
+    if (enabledFeatures.has(feature.id)) {
+      parts.push(feature.generate());
+    }
+  }
+
   parts.push(`
-# Parse arguments
+# =============================================================================
+# CORE HELPERS
+# =============================================================================
+detect_language() {
+    case "$1" in
+        *.js|*.mjs|*.cjs|*.ts)    echo "node" ;;
+        *.py)                     echo "python" ;;
+        *.rb)                     echo "ruby" ;;
+        *.php)                    echo "php" ;;
+        *.pl)                     echo "perl" ;;
+        *.sh)                     echo "shell" ;;
+        *.java)                   echo "java" ;;
+        *.c|*.h)                  echo "c" ;;
+        *.cpp|*.cc|*.cxx|*.hpp)   echo "cpp" ;;
+        *.go)                     echo "go" ;;
+        *.rs)                     echo "rust" ;;
+        *)                        echo "unknown" ;;
+    esac
+}
+
+link_cmd() {
+    target="$1"; name="$2"
+    if [ -w "$BIN_DIR" ]; then
+        ln -sf "$target" "$BIN_DIR/$name"
+    else
+        $SUDO ln -sf "$target" "$BIN_DIR/$name"
+    fi
+}
+
+copy_files() {
+    src_dir="$1"; dst_dir="$2"
+    [ -d "$src_dir" ] || { echo "Source dir not found: $src_dir"; return 1; }
+    mkdir -p "$dst_dir"
+    echo "Copying files from $src_dir to $dst_dir..."
+    cp -R "$src_dir"/. "$dst_dir"/ 2>/dev/null || true
+    rm -rf "$dst_dir/.git" "$dst_dir/node_modules"
+}
+
+remove_links() {
+    cmd_list="$MAIN_ENTRY_POINTS_CMD"
+    for cmd in $cmd_list; do
+        [ -L "$BIN_DIR/$cmd" ] && $SUDO rm -f "$BIN_DIR/$cmd"
+    done
+    [ -d "$INSTALL_DIR/wrappers" ] && rm -rf "$INSTALL_DIR/wrappers"
+}
+
+execute_post_install_scripts() {
+    [ -z "$POST_INSTALL_SCRIPTS" ] && return 0
+    echo "Executing post-install scripts..."
+    cd "$INSTALL_DIR" || return 0
+    for script in $POST_INSTALL_SCRIPTS; do
+        [ -f "$script" ] && sh "$script"
+    done
+    cd - >/dev/null 2>&1 || true
+}
+
+cleanup() {
+    $SUDO dpkg --configure -a >/dev/null 2>&1 || true
+}
+`);
+
+  parts.push(`
+# =============================================================================
+# COMPILE STEP (once, at install time)
+# =============================================================================
+compile_entry() {
+    lang="$1"; src="$2"; out="$3"
+    case "$lang" in
+        c)    command -v gcc   >/dev/null 2>&1 || { echo "  gcc missing";   return 1; }; gcc   -O2 -o "$out" "$src" ;;
+        cpp)  command -v g++   >/dev/null 2>&1 || { echo "  g++ missing";   return 1; }; g++   -O2 -o "$out" "$src" ;;
+        go)   command -v go    >/dev/null 2>&1 || { echo "  go missing";    return 1; }; go    build -o "$out" "$src" ;;
+        rust) command -v rustc >/dev/null 2>&1 || { echo "  rustc missing"; return 1; }; rustc -O   -o "$out" "$src" ;;
+        java) command -v javac >/dev/null 2>&1 || { echo "  javac missing"; return 1; }; javac -d "$(dirname "$src")" "$src" ;;
+        *)    return 0 ;;
+    esac
+}
+
+build_compiled_entries() {
+    mkdir -p "$INSTALL_DIR/bin"
+    idx=1
+    for src in $MAIN_ENTRY_POINTS_SRC; do
+        cmd=$(echo "$MAIN_ENTRY_POINTS_CMD" | tr ' ' '\\n' | sed -n "\${idx}p")
+        [ -z "$cmd" ] && { idx=$((idx+1)); continue; }
+        src_path="$INSTALL_DIR/$src"
+        [ ! -f "$src_path" ] && { idx=$((idx+1)); continue; }
+        lang=$(detect_language "$src_path")
+        case "$lang" in
+            c|cpp|go|rust)
+                out="$INSTALL_DIR/bin/$cmd"
+                echo "Compiling $src_path -> $out"
+                compile_entry "$lang" "$src_path" "$out" || true
+                ;;
+            java)
+                echo "Compiling Java source $src_path"
+                compile_entry "java" "$src_path" "" || true
+                ;;
+        esac
+        idx=$((idx+1))
+    done
+}
+`);
+
+  parts.push(`
+# =============================================================================
+# COMMAND WRAPPERS (never compile here)
+# =============================================================================
+create_command_links() {
+    mkdir -p "$INSTALL_DIR/wrappers"
+    src_list="$MAIN_ENTRY_POINTS_SRC"
+    cmd_list="$MAIN_ENTRY_POINTS_CMD"
+    idx=1
+    for src in $src_list; do
+        cmd=$(echo "$cmd_list" | tr ' ' '\\n' | sed -n "\${idx}p")
+        [ -z "$cmd" ] && { idx=$((idx+1)); continue; }
+        src_path="$INSTALL_DIR/$src"
+        if [ ! -f "$src_path" ]; then
+            echo "  warning: source file not found: $src_path"
+            idx=$((idx+1)); continue
+        fi
+        lang=$(detect_language "$src_path")
+        wrapper="$INSTALL_DIR/wrappers/$cmd"
+        echo "Creating command '$cmd' for $src_path (language: $lang)"
+
+        case "$lang" in
+            node)
+                if ! head -1 "$src_path" | grep -q '^#!'; then
+                    tmp="$(mktemp)"
+                    { echo '#!/usr/bin/env node'; cat "$src_path"; } > "$tmp"
+                    mv "$tmp" "$src_path"
+                fi
+                chmod +x "$src_path"
+                cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec node "$src_path" "\\$@"
+WRAPEOF
+                ;;
+            python) cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec python3 "$src_path" "\\$@"
+WRAPEOF
+                ;;
+            ruby) cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec ruby "$src_path" "\\$@"
+WRAPEOF
+                ;;
+            php) cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec php "$src_path" "\\$@"
+WRAPEOF
+                ;;
+            perl) cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec perl "$src_path" "\\$@"
+WRAPEOF
+                ;;
+            shell) cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec bash "$src_path" "\\$@"
+WRAPEOF
+                ;;
+            c|cpp|go|rust)
+                binary="$INSTALL_DIR/bin/$cmd"
+                if [ -x "$binary" ]; then
+                    cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec "$binary" "\\$@"
+WRAPEOF
+                else
+                    echo "  error: binary not built for $src_path (compiler missing?)"
+                    idx=$((idx+1)); continue
+                fi
+                ;;
+            java)
+                cls=$(basename "$src_path" .java)
+                cls_dir=$(dirname "$src_path")
+                cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec java -cp "$cls_dir" "$cls" "\\$@"
+WRAPEOF
+                ;;
+            *)
+                chmod +x "$src_path" 2>/dev/null || true
+                cat > "$wrapper" << WRAPEOF
+#!/bin/sh
+exec "$src_path" "\\$@"
+WRAPEOF
+                ;;
+        esac
+        chmod +x "$wrapper"
+        link_cmd "$wrapper" "$cmd"
+        echo "  -> $BIN_DIR/$cmd"
+        idx=$((idx+1))
+    done
+}
+`);
+
+  parts.push(`
+show_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo "Install $PROJECT_NAME"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help       Show this help"
+    echo "  --deps           Force dependency installation check"
+    echo "  --force, -f      Force update without asking"
+    echo "  --remove, -r     Remove existing installation"
+    echo ""
+    echo "Commands created:"
+    for cmd in $MAIN_ENTRY_POINTS_CMD; do
+        echo "  $cmd"
+    done
+}
+
 FORCE_UPDATE=false
 FORCE_REMOVE=false
-while [ \$# -gt 0 ]; do
-    case "\$1" in
-        -h|--help) show_help; exit 0 ;;
-        --node|--nodejs) INSTALL_NODE=true ;;
-        --build) BUILD_MODE=true ;;
-        --tar) BUILD_TAR=true ;;
-        --config) BUILD_CONFIG=true ;;
-        --message) BUILD_MESSAGE_MODE=true ;;
-        --force|-f) FORCE_UPDATE=true ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)   show_help; exit 0 ;;
+        --deps)      INSTALL_DEPS=true ;;
+        --force|-f)  FORCE_UPDATE=true ;;
         --remove|-r) FORCE_REMOVE=true ;;
         *) ;;
     esac
     shift
 done
-`);
 
-  // Check for existing installation
-  parts.push(`
-# Check if already installed
-if [ -d "\$INSTALL_DIR" ]; then
-    if [ "\$FORCE_REMOVE" = true ]; then
+if [ -d "$INSTALL_DIR" ]; then
+    if [ "$FORCE_REMOVE" = true ]; then
         echo "Removing existing installation..."
         remove_links
-        rm -rf "\$INSTALL_DIR"
+        $SUDO rm -rf "$INSTALL_DIR"
         echo "Removed. Proceeding with fresh install..."
-    elif [ "\$FORCE_UPDATE" = true ]; then
+    elif [ "$FORCE_UPDATE" = true ]; then
         echo "Forcing update..."
-        mv -f "\$INSTALL_DIR" "\$BACKUP_DIR"
         remove_links
-        echo "Proceeding with update..."
     else
-        echo "Existing installation found at \$INSTALL_DIR"
-        echo ""
-        echo "Choose an option:"
+        echo "Existing installation found at $INSTALL_DIR"
         echo "  1. Update (replace existing files)"
         echo "  2. Remove (delete existing installation)"
         echo "  3. Exit"
         printf "Enter your choice (1/2/3): "
         read choice
-        case "\$choice" in
-            1)
-                echo "Updating..."
-                mv -f "\$INSTALL_DIR" "\$BACKUP_DIR"
-                remove_links
-                ;;
+        case "$choice" in
+            1) echo "Updating..."; remove_links ;;
             2)
                 echo "Removing..."
                 remove_links
-                rm -rf "\$INSTALL_DIR"
+                $SUDO rm -rf "$INSTALL_DIR"
                 echo "Removed successfully."
                 exit 0
                 ;;
-            3)
-                echo "Exiting."
-                exit 0
-                ;;
-            *)
-                echo "Invalid choice. Exiting."
-                exit 1
-                ;;
+            *) echo "Exiting."; exit 0 ;;
         esac
     fi
 fi
 `);
 
-  // Call feature functions conditionally
-  if (enabledFeatures.has('nodeinstall')) {
+  if (enabledFeatures.has('autodeps')) {
     parts.push(`
-# Run Node.js auto-install if requested
-ensure_nodejs
+if [ "$INSTALL_DEPS" != "false" ]; then
+    echo "Checking language toolchains for entry points..."
+    for src in $MAIN_ENTRY_POINTS_SRC; do
+        lang=$(detect_language "$src")
+        [ "$lang" = "unknown" ] && { echo "  $src: unknown language, skipping"; continue; }
+        echo "  $src -> $lang"
+        install_language_deps "$lang"
+    done
+fi
 `);
   }
 
-  if (enabledFeatures.has('debs')) {
-    parts.push(`
-# Install .deb packages if enabled
-install_debs
-`);
-  }
+  if (enabledFeatures.has('debs')) parts.push(`install_debs`);
 
   parts.push(`
-# Create installation directory and copy files
-copy_files
-`);
-
-  if (enabledFeatures.has('pm2')) {
-    parts.push(`
-# Extract PM2 if enabled
-extract_pm2
-`);
-  }
-
-  parts.push(`
-# Create command links
+copy_files "$MAIN_SOURCE_DIR" "$INSTALL_DIR"
+build_compiled_entries
 create_command_links
 `);
 
-  if (enabledFeatures.has('pkgcli')) {
-    parts.push(`
-# Create pkg CLI
-create_pkg_cli
-`);
-  }
-
-  if (enabledFeatures.has('wsave')) {
-    parts.push(`
-# Create wsave command
-create_wsave
-`);
-  }
-
-  if (enabledFeatures.has('gitconfig')) {
-    parts.push(`
-# Create git-config command
-create_git_config
-`);
-  }
-
-  if (enabledFeatures.has('shellfallback')) {
-    parts.push(`
-# Create shell script commands
-create_shell_commands
-`);
-  }
+  if (enabledFeatures.has('pm2'))           parts.push(`extract_pm2`);
+  if (enabledFeatures.has('pkgcli'))        parts.push(`create_pkg_cli`);
+  if (enabledFeatures.has('wsave'))         parts.push(`create_wsave`);
+  if (enabledFeatures.has('gitconfig'))     parts.push(`create_git_config`);
+  if (enabledFeatures.has('shellfallback')) parts.push(`create_shell_commands`);
 
   parts.push(`
-# Execute post-install scripts
 execute_post_install_scripts
-
 cleanup
 
 echo ""
 echo "Installation completed!"
 echo ""
 echo "Available commands:"
-for cmd in \$NODE_ENTRY_POINTS_CMD; do
-    echo "  \$cmd"
+for cmd in $MAIN_ENTRY_POINTS_CMD; do
+    echo "  $cmd"
 done
 echo ""
-echo "Installation directory: \$INSTALL_DIR"
+echo "Installation directory: $INSTALL_DIR"
 `);
 
   return parts.join('\n');
 }
 
-// ==================== INTERACTIVE MENU ====================
+// ---------------------------------------------------------------------------
+// Feature chooser
+// ---------------------------------------------------------------------------
+
+function renderFeatureList(enabled) {
+  console.log('');
+  console.log('Feature list:');
+  for (let i = 0; i < features.length; i++) {
+    const mark = enabled.has(features[i].id) ? '[X]' : '[ ]';
+    console.log(`  ${i + 1}. ${mark} ${features[i].name}`);
+  }
+  console.log('');
+}
+
+/**
+ * Multi-select loop.  Accepts one or more numbers per line (space/comma).
+ * Exits ONLY on the literal word "done" (or "0"/"q").
+ * Empty input does nothing — never exits.
+ */
+async function chooseFeaturesInteractive() {
+  const enabled = SESSION.features;
+
+  console.log('Toggle features by entering numbers separated by spaces or commas');
+  console.log('(example: "1 3 5" or "1,3,5").');
+  console.log('Type "all", "none", "list", or "done" (finishes the selection).');
+
+  while (true) {
+    renderFeatureList(enabled);
+
+    const raw = await ask('features> ');
+    if (raw === undefined || raw === null) {
+      // stdin closed (EOF) — treat as done.
+      console.log('(stdin closed, finishing selection)');
+      break;
+    }
+
+    const input = String(raw).trim();
+    const lower = input.toLowerCase();
+
+    if (lower === 'done' || lower === '0' || lower === 'q' ||
+        lower === 'quit' || lower === 'exit') {
+      break;
+    }
+    if (input === '') {
+      // Do nothing; loop and re-show the list.
+      continue;
+    }
+    if (lower === 'list') {
+      continue;
+    }
+    if (lower === 'all') {
+      for (const f of features) enabled.add(f.id);
+      continue;
+    }
+    if (lower === 'none') {
+      enabled.clear();
+      continue;
+    }
+
+    const tokens = input.split(/[\s,]+/).filter(Boolean);
+    for (const tok of tokens) {
+      const n = Number.parseInt(tok, 10);
+      if (Number.isInteger(n) && n >= 1 && n <= features.length) {
+        const id = features[n - 1].id;
+        if (enabled.has(id)) {
+          enabled.delete(id);
+          console.log(`  turned OFF: ${features[n - 1].name}`);
+        } else {
+          enabled.add(id);
+          console.log(`  turned ON : ${features[n - 1].name}`);
+        }
+      } else {
+        console.log(`  ignored: "${tok}" (not a feature number)`);
+      }
+    }
+  }
+  return enabled;
+}
+
+// ---------------------------------------------------------------------------
+// Interactive menu
+// ---------------------------------------------------------------------------
 
 async function interactiveMenu() {
   console.clear();
@@ -621,13 +847,12 @@ async function interactiveMenu() {
   console.log('');
 
   const existingInstall = await fileExists('install.sh');
-  const existingOld = await fileExists('old-install.sh');
 
   console.log('Options:');
   console.log('1. Create a new install.sh from scratch');
   if (existingInstall) {
-    console.log('2. Modify existing install.sh');
-    console.log('3. emb old script (backup as old-install.sh and generate new)');
+    console.log('2. Modify existing install.sh (overwrite)');
+    console.log('3. Embed old script (backup as old-install.sh and generate new)');
   }
   console.log('4. Toggle features');
   console.log('5. Configure project settings');
@@ -636,31 +861,24 @@ async function interactiveMenu() {
   console.log('0. Exit');
   console.log('');
 
-  const choice = await question('Select an option: ');
-  switch (choice.trim()) {
-    case '1':
-      await createNewInstall();
-      break;
+  const choice = (await ask('Select an option: ')).trim();
+  switch (choice) {
+    case '1': await createNewInstall(); break;
     case '2':
       if (existingInstall) await modifyExistingInstall();
       else console.log('No existing install.sh found.');
       break;
     case '3':
-      if (existingInstall) await eatOldScript();
-      else console.log('No existing install.sh to emb.');
+      if (existingInstall) await embedOldScript();
+      else console.log('No existing install.sh to embed.');
       break;
     case '4':
-      await toggleFeatures();
+      await chooseFeaturesInteractive();
+      console.log('Feature set updated (in-memory only).');
       break;
-    case '5':
-      await configureSettings();
-      break;
-    case '6':
-      await generateOldWrapper();
-      break;
-    case '7':
-      await removeOldWrapper();
-      break;
+    case '5': await configureSettings(); break;
+    case '6': await generateOldWrapper(); break;
+    case '7': await removeOldWrapper(); break;
     case '0':
       console.log('Goodbye!');
       rl.close();
@@ -669,86 +887,61 @@ async function interactiveMenu() {
       console.log('Invalid choice.');
   }
   console.log('\nPress Enter to continue...');
-  await question('');
-  interactiveMenu();
+  await ask('');
+  return interactiveMenu();
 }
 
 async function createNewInstall() {
   console.log('\n--- Create new install.sh ---');
   const config = await gatherProjectConfig();
-  const enabledFeatures = await selectFeatures();
-  const content = generateInstallSh(config, enabledFeatures);
+
+  console.log('\nNow choose the features for this install.sh.');
+  await chooseFeaturesInteractive();
+
+  const content = generateInstallSh(config, SESSION.features);
   await writeFile('install.sh', content, 'utf8');
-  try {
-    execSync('chmod +x install.sh');
-  } catch (e) {
-    // ignore chmod errors on some systems
-  }
-  console.log('install.sh generated successfully.');
+  try { execSync('chmod +x install.sh'); } catch { /* ignore */ }
+  console.log('\ninstall.sh generated successfully.');
+  console.log('Selected features: ' +
+    (SESSION.features.size ? Array.from(SESSION.features).join(', ') : 'none'));
 }
 
 async function modifyExistingInstall() {
   console.log('\n--- Modify existing install.sh ---');
-  console.log('This will overwrite the current install.sh with a newly generated one.');
-  const confirm = await question('Are you sure? (y/n): ');
-  if (confirm.toLowerCase() !== 'y') return;
-  // Backup existing
-  await copyFile('install.sh', 'install.sh.bak');
+  const confirm = (await ask('This will overwrite install.sh. Continue? (y/n): ')).toLowerCase();
+  if (confirm !== 'y') return;
   await createNewInstall();
-  console.log('Old install.sh backed up as install.sh.bak');
 }
 
-async function eatOldScript() {
-  console.log('\n--- emb old script ---');
-  console.log('The existing install.sh will be backed up as old-install.sh');
-  const confirm = await question('Proceed? (y/n): ');
-  if (confirm.toLowerCase() !== 'y') return;
-  // Rename current to old-install.sh
+async function embedOldScript() {
+  console.log('\n--- Embed old script ---');
+  const confirm = (await ask('Backup install.sh as old-install.sh and generate a new one? (y/n): ')).toLowerCase();
+  if (confirm !== 'y') return;
   await rename('install.sh', 'old-install.sh');
-  // Generate new
   await createNewInstall();
   console.log('Old script saved as old-install.sh. Use install.sh --old to run it.');
 }
 
-async function toggleFeatures() {
-  console.log('\n--- Toggle Features ---');
-  const enabled = await loadFeatureState();
-  console.log('Current feature states (enable/disable):');
-  for (let i = 0; i < features.length; i++) {
-    console.log(`${i + 1}. [${enabled.has(features[i].id) ? 'X' : ' '}] ${features[i].name} - ${features[i].description}`);
-  }
-  console.log('Enter number to toggle, or 0 when done.');
-  while (true) {
-    const input = await question('> ');
-    const num = parseInt(input.trim());
-    if (num === 0) break;
-    if (num >= 1 && num <= features.length) {
-      const id = features[num - 1].id;
-      if (enabled.has(id)) enabled.delete(id);
-      else enabled.add(id);
-      console.log(`Toggled ${features[num - 1].name} to ${enabled.has(id) ? 'ON' : 'OFF'}.`);
-    } else {
-      console.log('Invalid number.');
-    }
-  }
-  await saveFeatureState(enabled);
-}
-
 async function configureSettings() {
   console.log('\n--- Configure Project Settings ---');
-  const projectName = await question(`Project name (default: ${DEFAULTS.projectName}): `);
-  const installDir = await question(`Install directory (default: ${DEFAULTS.installDir}): `);
-  const nodeSrc = await question(`Node entry point source (default: ${DEFAULTS.nodeEntryPointsSrc}): `);
-  const nodeCmd = await question(`Node command name (default: ${DEFAULTS.nodeEntryPointsCmd}): `);
-  const config = {
-    ...DEFAULTS,
-    projectName: projectName || DEFAULTS.projectName,
-    installDir: installDir || DEFAULTS.installDir,
-    nodeEntryPointsSrc: nodeSrc || DEFAULTS.nodeEntryPointsSrc,
-    nodeEntryPointsCmd: nodeCmd || DEFAULTS.nodeEntryPointsCmd,
-  };
-  await saveConfig(config);
-  console.log('Settings saved to .shinstallrc');
+  const config = getConfig();
+  const projectName = (await ask(`Project name (${config.projectName}): `)) || config.projectName;
+  config.projectName = projectName;
+
+  const defInstall = defaultInstallDir(projectName);
+  const installDir = (await ask(`Install directory (${defInstall}): `)) || defInstall;
+  config.installDir = installDir;
+
+  const binDir = (await ask(`Bin directory (${config.binDir}): `)) || config.binDir;
+  config.binDir = binDir;
+
+  const mainSrc = (await ask(`Main entry point source (${config.mainEntryPointsSrc}): `)) || config.mainEntryPointsSrc;
+  config.mainEntryPointsSrc = mainSrc;
+
+  const mainCmd = (await ask(`Main command name (${config.mainEntryPointsCmd}): `)) || config.mainEntryPointsCmd;
+  config.mainEntryPointsCmd = mainCmd;
+
+  console.log('Settings updated (in-memory only; nothing written to disk).');
 }
 
 async function generateOldWrapper() {
@@ -757,22 +950,17 @@ async function generateOldWrapper() {
     console.log('old-install.sh already exists. Nothing to do.');
     return;
   }
-  if (!await fileExists('install.sh')) {
+  if (!(await fileExists('install.sh'))) {
     console.log('No install.sh found to wrap.');
     return;
   }
   const wrapperContent = `#!/bin/sh
-# Wrapper to run the old install script.
-# This file was generated by shinstall.js.
-exec bash "\$(dirname "\$0")/install.sh" --old "\$@"
+# Wrapper that runs the old install script via install.sh --old
+exec bash "$(dirname "$0")/install.sh" --old "$@"
 `;
   await writeFile('old-install.sh', wrapperContent, 'utf8');
-  try {
-    execSync('chmod +x old-install.sh');
-  } catch (e) {
-    // ignore
-  }
-  console.log('old-install.sh wrapper created. Use ./old-install.sh [args] to run the old script.');
+  try { execSync('chmod +x old-install.sh'); } catch { /* ignore */ }
+  console.log('old-install.sh wrapper created.');
 }
 
 async function removeOldWrapper() {
@@ -784,117 +972,75 @@ async function removeOldWrapper() {
   }
 }
 
-// ==================== HELPER FUNCTIONS ====================
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-async function fileExists(filePath) {
-  try {
-    await access(filePath, fs.constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
+async function fileExists(p) {
+  try { await access(p, fs.constants.F_OK); return true; } catch { return false; }
 }
 
 async function gatherProjectConfig() {
-  const config = { ...DEFAULTS };
-  console.log('\nEnter project details (press Enter to accept defaults):');
-  const projectName = await question(`Project name (${config.projectName}): `);
-  if (projectName) config.projectName = projectName;
-  const installDir = await question(`Install directory (${config.installDir}): `);
-  if (installDir) config.installDir = installDir;
-  const nodeSrc = await question(`Node entry point source (${config.nodeEntryPointsSrc}): `);
-  if (nodeSrc) config.nodeEntryPointsSrc = nodeSrc;
-  const nodeCmd = await question(`Node command name (${config.nodeEntryPointsCmd}): `);
-  if (nodeCmd) config.nodeEntryPointsCmd = nodeCmd;
+  const config = getConfig();
+  console.log('\nEnter project details (Enter = accept default):');
+
+  const projectName = (await ask(`Project name (${config.projectName}): `)) || config.projectName;
+  config.projectName = projectName;
+
+  const defInstall = defaultInstallDir(projectName);
+  const installDir = (await ask(`Install directory (${defInstall}): `)) || defInstall;
+  config.installDir = installDir;
+
+  const binDir = (await ask(`Bin directory (${config.binDir}): `)) || config.binDir;
+  config.binDir = binDir;
+
+  const mainSrc = (await ask(`Main entry point source (${config.mainEntryPointsSrc}): `)) || config.mainEntryPointsSrc;
+  config.mainEntryPointsSrc = mainSrc;
+
+  const mainCmd = (await ask(`Main command name (${config.mainEntryPointsCmd}): `)) || config.mainEntryPointsCmd;
+  config.mainEntryPointsCmd = mainCmd;
+
   return config;
 }
 
-async function selectFeatures() {
-  console.log('\nSelect features to enable (comma separated numbers, "all", or press Enter for none):');
-  for (let i = 0; i < features.length; i++) {
-    console.log(`${i + 1}. ${features[i].name} - ${features[i].description}`);
-  }
-  const input = await question('Selection: ');
-  const enabled = new Set();
-  if (input.trim().toLowerCase() === 'all') {
-    features.forEach(f => enabled.add(f.id));
-  } else if (input.trim() !== '') {
-    const nums = input.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-    nums.forEach(n => {
-      if (n >= 1 && n <= features.length) enabled.add(features[n - 1].id);
-    });
-  }
-  return enabled;
-}
-
-async function loadFeatureState() {
-  try {
-    const data = await readFile('.shinstall-features', 'utf8');
-    return new Set(data.split('\n').filter(Boolean));
-  } catch {
-    return new Set();
-  }
-}
-
-async function saveFeatureState(enabledSet) {
-  await writeFile('.shinstall-features', Array.from(enabledSet).join('\n'), 'utf8');
-}
-
-async function saveConfig(config) {
-  await writeFile('.shinstallrc', JSON.stringify(config, null, 2), 'utf8');
-}
-
-async function loadConfig() {
-  try {
-    const data = await readFile('.shinstallrc', 'utf8');
-    return JSON.parse(data);
-  } catch {
-    return { ...DEFAULTS };
-  }
-}
-
-// ==================== CLI ENTRY POINT ====================
+// ---------------------------------------------------------------------------
+// CLI entry point
+// ---------------------------------------------------------------------------
 
 async function main() {
   const args = process.argv.slice(2);
+
   if (args.includes('--help') || args.includes('-h')) {
     console.log(`
 shinstall.js – Modular install.sh generator
 
 Usage:
   node shinstall.js               Interactive menu
-  node shinstall.js --new         Create a new install.sh (prompts for config)
-  node shinstall.js --emb         Backup existing install.sh as old-install.sh and generate new
+  node shinstall.js --new         Create a new install.sh
+  node shinstall.js --emb         Backup install.sh as old-install.sh and generate new
   node shinstall.js --old         Generate an old-install.sh wrapper
   node shinstall.js --no-old      Remove the old-install.sh wrapper
   node shinstall.js --help        Show this help
+
+Guarantees:
+  - Only install.sh is written.
+  - old-install.sh is written only when explicitly requested.
+  - .shinstallrc / .shinstall-features / install.sh.bak are deleted at
+    startup and on exit, so a previous version can't leave them behind.
 `);
     process.exit(0);
   }
 
-  if (args.includes('--new')) {
-    await createNewInstall();
-    process.exit(0);
-  }
-  if (args.includes('--emb')) {
-    await eatOldScript();
-    process.exit(0);
-  }
-  if (args.includes('--old')) {
-    await generateOldWrapper();
-    process.exit(0);
-  }
-  if (args.includes('--no-old')) {
-    await removeOldWrapper();
-    process.exit(0);
-  }
+  if (args.includes('--new'))    { await createNewInstall();   process.exit(0); }
+  if (args.includes('--emb'))    { await embedOldScript();     process.exit(0); }
+  if (args.includes('--old'))    { await generateOldWrapper(); process.exit(0); }
+  if (args.includes('--no-old')) { await removeOldWrapper();   process.exit(0); }
 
-  // Default: interactive menu
   await interactiveMenu();
 }
 
-// Run
-main().catch(err => {
+main().catch((err) => {
   console.error('Error:', err);
+  removeLegacyFilesSync();
   process.exit(1);
 });
