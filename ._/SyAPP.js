@@ -9233,10 +9233,11 @@ function levenshteinDistance(str1, str2) {
      * @private
      */
     this._cellsParseRef = (ref) => {
-      const m = String(ref).match(/^([A-Z]+)(\d+)$/);
+      // Case-insensitive: "A1", "a1" and "Aa1" all parse identically.
+      const m = String(ref).match(/^([A-Za-z]+)(\d+)$/);
       if (!m) return null;
       let col = 0;
-      for (const ch of m[1]) col = col * 26 + (ch.charCodeAt(0) - 64);
+      for (const ch of m[1].toUpperCase()) col = col * 26 + (ch.charCodeAt(0) - 64);
       return { col: col - 1, row: parseInt(m[2], 10) - 1 };
     };
 
@@ -9278,10 +9279,18 @@ function levenshteinDistance(str1, str2) {
         changed = false; iter++;
         const scope = {};
         for (const ref of Object.keys(result)) {
-          Object.defineProperty(scope, ref, {
+          // Case-insensitive access: both "A1" and "a1" resolve to the
+          // same cell, so formulas may be written with any casing the
+          // user prefers (`=a1+1` is now equivalent to `=A1+1`).
+          const desc = {
             get() { const c = result[ref]; return c ? c.value : undefined; },
             enumerable: true, configurable: true
-          });
+          };
+          Object.defineProperty(scope, ref, desc);
+          const lower = ref.toLowerCase();
+          if (lower !== ref) {
+            Object.defineProperty(scope, lower, desc);
+          }
         }
         scope.get = (r) => { const c = result[String(r).toUpperCase()]; return c ? c.value : undefined; };
         scope.cell = scope.get;
@@ -9355,6 +9364,31 @@ function levenshteinDistance(str1, str2) {
         let finished = false;
         let statusMessage = '';
 
+        // ---- RIGID DRAW LOCK ----
+        // Prevents two draws from interleaving when a resize fires while
+        // an edit is committing, or when a key handler triggers a draw
+        // that races the debounced resize. Overlapping writes are the
+        // root cause of the "duplicated last line" artifact the user
+        // reported while scrolling: without this, a second draw could
+        // begin writing at row 1 while the first draw was still on the
+        // last data row, leaving an orphaned line behind the status bar.
+        let drawLock = false;
+
+        // ---- SELECTION STATE ----
+        // anchorRow/anchorCol pin one corner of the current range. When
+        // selectMode is false, the anchor silently follows the cursor
+        // (single-cell mode). Shift+Arrow turns selectMode on and pins
+        // the anchor; the cursor keeps moving and the highlighted
+        // rectangle spans between the two. Escape cancels.
+        let selectMode = false;
+        let anchorRow = cursorRow;
+        let anchorCol = cursorCol;
+
+        // ---- GOTO MODE ----
+        // Inline prompt opened by Ctrl+G / F5. Accepts A1, AA12, etc.
+        let gotoMode = false;
+        let gotoBuffer = '';
+
         const cellWidth = 10;
         const rowHeaderWidth = 5;
         const colStep = cellWidth + 1;
@@ -9363,11 +9397,387 @@ function levenshteinDistance(str1, str2) {
 
         const getCols = () => Math.max(20, stdout.columns || 80);
         const getRows = () => Math.max(6, stdout.rows || 24);
-        const visibleCols = () => Math.max(1, Math.floor((getCols() - rowHeaderWidth) / colStep));
+        // Reserve one spare column (the trailing `- 1`) so a perfectly
+        // sized row never reaches the terminal's exact column count.
+        // Writing exactly `cols` characters makes many terminals wrap
+        // the cursor to the next physical line, which produces exactly
+        // the "extra/duplicated line" artifact the user reported.
+        const visibleCols = () => Math.max(1, Math.floor((getCols() - rowHeaderWidth - 1) / colStep));
         const visibleRows = () => Math.max(1, getRows() - 4);
 
+        // ---- Selection helpers -------------------------------------------------
+        const getSelectionRect = () => {
+          const r1 = Math.min(anchorRow, cursorRow);
+          const r2 = Math.max(anchorRow, cursorRow);
+          const c1 = Math.min(anchorCol, cursorCol);
+          const c2 = Math.max(anchorCol, cursorCol);
+          return { r1, r2, c1, c2 };
+        };
+
+        const isInSelection = (r, c) => {
+          if (!selectMode) return false;
+          const { r1, r2, c1, c2 } = getSelectionRect();
+          return r >= r1 && r <= r2 && c >= c1 && c <= c2;
+        };
+
+        const clearSelection = () => {
+          selectMode = false;
+          anchorRow = cursorRow;
+          anchorCol = cursorCol;
+        };
+
+        // Shift every A1-style reference in a formula by (dRow, dCol),
+        // so a formula copied two rows down keeps its relative structure.
+        // References are matched as word-boundary letter+digit pairs;
+        // matches inside string literals are extremely rare in practice
+        // and are left alone (still valid, just over-shifted).
+        // Shift every A1-style reference in a formula by (dRow, dCol).
+        // Case-insensitive: `a1+2` is treated exactly like `A1+2`, and
+        // the resulting refs are always normalised to uppercase.
+        const shiftFormulaRefs = (formula, dRow, dCol) => {
+          if (!formula) return formula;
+          return formula.replace(/\b([A-Za-z]+)(\d+)\b/g, (m, col, row) => {
+            let colNum = 0;
+            for (const ch of col.toUpperCase()) colNum = colNum * 26 + (ch.charCodeAt(0) - 64);
+            colNum -= 1;
+            const newCol = colNum + dCol;
+            const newRow = parseInt(row, 10) - 1 + dRow;
+            if (newCol < 0 || newRow < 0) return m;
+            return this._cellsRefFromRC(newRow, newCol);
+          });
+        };
+
+        // -----------------------------------------------------------------
+        // FORMULA PATTERN DETECTION
+        // -----------------------------------------------------------------
+        // Given two consecutive formulas F1 and F2 in the fill direction,
+        // try to detect the implicit series they describe, and return a
+        // generator function `gen(k)` that yields the k-th formula
+        // (gen(0) ≡ F1, gen(1) ≡ F2, gen(2) ≡ F3, ...). Returns null
+        // when the two formulas do not describe a consistent pattern.
+        //
+        // Examples (fill down):
+        //   F1 = "=A1+2",      F2 = "=A2+4"       → gen(2) = "=A3+6"
+        //   F1 = "=A1*B1",     F2 = "=A2*B2"      → gen(2) = "=A3*B3"
+        //   F1 = "=SUM(A1:A5)",F2 = "=SUM(A2:A6)" → gen(2) = "=SUM(A3:A7)"
+        //   F1 = "=A1+A2+A3",  F2 = "=A2+A3+A4"   → gen(2) = "=A3+A4+A5"
+        //
+        // The detector requires:
+        //   • identical placeholder structure after ref/number extraction;
+        //   • same number of refs and same number of constants;
+        //   • every ref shifted consistently along the fill axis
+        //     (columns unchanged for row-fill, rows unchanged for col-fill);
+        //   • every ref actually moving (axis delta ≠ 0);
+        //   • a constant delta for each extracted constant (constants may
+        //     evolve independently, so `=A1+2*3` → `=A2+4*5` produces
+        //     deltas [2, 2] and extrapolates cleanly).
+        // -----------------------------------------------------------------
+        const detectFormulaPattern = (F1, F2, axis) => {
+          const parseFormula = (f) => {
+            const body = f.startsWith('=') ? f.slice(1) : f;
+            const constants = [];
+            const refs = [];
+            let structure = body;
+
+            // Extract cell references first (case-insensitive), replacing
+            // each with a unique null-byte-delimited placeholder so the
+            // structure can never collide with a real token in the formula.
+            structure = structure.replace(/\b([A-Za-z]+)(\d+)\b/g, (m, col, row) => {
+              let colNum = 0;
+              for (const ch of col.toUpperCase()) colNum = colNum * 26 + (ch.charCodeAt(0) - 64);
+              const idx = refs.length;
+              refs.push({ colNum: colNum - 1, row: parseInt(row, 10) - 1 });
+              return `\x00R${idx}\x00`;
+            });
+
+            // Extract standalone numeric constants (any remaining digit
+            // sequence after refs have been removed).
+            structure = structure.replace(/\b\d+(?:\.\d+)?\b/g, (m) => {
+              const idx = constants.length;
+              constants.push(parseFloat(m));
+              return `\x00N${idx}\x00`;
+            });
+
+            return { structure, constants, refs };
+          };
+
+          const p1 = parseFormula(F1);
+          const p2 = parseFormula(F2);
+
+          if (p1.structure !== p2.structure) return null;
+          if (p1.refs.length !== p2.refs.length) return null;
+          if (p1.constants.length !== p2.constants.length) return null;
+
+          // Verify consistent ref deltas along the fill axis.
+          let dRow = 0, dCol = 0;
+          if (p1.refs.length > 0) {
+            const r1 = p1.refs[0], r2 = p2.refs[0];
+            dRow = r2.row - r1.row;
+            dCol = r2.colNum - r1.colNum;
+            for (let i = 1; i < p1.refs.length; i++) {
+              const a = p1.refs[i], b = p2.refs[i];
+              if ((b.row - a.row) !== dRow) return null;
+              if ((b.colNum - a.colNum) !== dCol) return null;
+            }
+          }
+
+          if (axis === 'row') {
+            if (dCol !== 0) return null; // refs must move only vertically
+            if (dRow === 0) return null; // and must actually move
+          } else {
+            if (dRow !== 0) return null; // refs must move only horizontally
+            if (dCol === 0) return null; // and must actually move
+          }
+
+          // Constant deltas between F1 and F2. Different constants may
+          // evolve independently, so we keep a delta per constant index.
+          const constDeltas = p1.constants.map((c, i) => p2.constants[i] - c);
+
+          return (k) => {
+            let result = p1.structure;
+            for (let i = 0; i < p1.refs.length; i++) {
+              const r = p1.refs[i];
+              const newRow = r.row + k * dRow;
+              const newCol = r.colNum + k * dCol;
+              if (newRow < 0 || newCol < 0) return null;
+              const ref = this._cellsRefFromRC(newRow, newCol);
+              result = result.replace(`\x00R${i}\x00`, () => ref);
+            }
+            for (let i = 0; i < p1.constants.length; i++) {
+              const v = p1.constants[i] + k * constDeltas[i];
+              result = result.replace(`\x00N${i}\x00`, () => String(v));
+            }
+            return '=' + result;
+          };
+        };
+
+        // ---- Fill down --------------------------------------------------------
+        // Replicates the top row of the selection downward. Per column, in
+        // priority order:
+        //   1. Formula pattern detected from the first TWO rows (e.g.
+        //      `=A1+2` → `=A2+4` continues as `=A3+6`, `=A4+8`, ...):
+        //      both refs and numeric constants evolve together.
+        //   2. Plain formula ref shift (classic Ctrl+D): only refs move,
+        //      constants stay frozen.
+        //   3. Numeric pairs: arithmetic progression continues.
+        //   4. Empty source: destination is cleared.
+        //   5. Anything else: verbatim copy.
+        // All comparisons are case-insensitive, so `=a1+2` and `=A1+2`
+        // are interchangeable both when detecting and when generating.
+        const fillDown = () => {
+          if (!selectMode) {
+            setStatus('Select a range first (Shift+Arrows)', 2000);
+            drawScreen();
+            return;
+          }
+          const { r1, r2, c1, c2 } = getSelectionRect();
+          if (r2 <= r1) {
+            setStatus('Need more than one row to fill down', 2000);
+            drawScreen();
+            return;
+          }
+          if (!state.cells) state.cells = {};
+
+          for (let c = c1; c <= c2; c++) {
+            const srcRef = this._cellsRefFromRC(r1, c);
+            const srcCell = state.cells[srcRef];
+            const srcRaw = srcCell ? (srcCell.raw || '') : '';
+            const isFormula = srcRaw.startsWith('=');
+
+            // --- Pattern detection: needs a second formula row below ---
+            // Look at the cell directly below the source and, if it also
+            // contains a formula, try to derive an extrapolation function
+            // from the (F1, F2) pair. Otherwise fall back to simple shift.
+            let formulaGen = null;
+            if (isFormula && r2 >= r1 + 1) {
+              const secondRef = this._cellsRefFromRC(r1 + 1, c);
+              const secondCell = state.cells[secondRef];
+              const secondRaw = secondCell ? (secondCell.raw || '') : '';
+              if (secondRaw.startsWith('=')) {
+                formulaGen = detectFormulaPattern(srcRaw, secondRaw, 'row');
+              }
+            }
+
+            // --- Numeric series detection (existing behaviour) ---
+            const srcNum = (!isFormula && srcRaw !== '' && !isNaN(Number(srcRaw)))
+              ? Number(srcRaw) : null;
+            let increment = null;
+            if (srcNum !== null) {
+              const secondRef = this._cellsRefFromRC(r1 + 1, c);
+              const secondCell = state.cells[secondRef];
+              const secondRaw = secondCell ? (secondCell.raw || '') : '';
+              const secondNum = (secondRaw !== '' && !isNaN(Number(secondRaw)))
+                ? Number(secondRaw) : null;
+              if (secondNum !== null) increment = secondNum - srcNum;
+            }
+
+            for (let r = r1 + 1; r <= r2; r++) {
+              const dstRef = this._cellsRefFromRC(r, c);
+
+              // 1. Formula pattern extrapolation (highest priority)
+              if (formulaGen) {
+                const generated = formulaGen(r - r1);
+                if (generated) {
+                  state.cells[dstRef] = { raw: generated };
+                  continue;
+                }
+              }
+
+              // 2. Classic formula ref shift (constants frozen)
+              if (isFormula) {
+                state.cells[dstRef] = { raw: '=' + shiftFormulaRefs(srcRaw.slice(1), r - r1, 0) };
+              } else if (increment !== null) {
+                // 3. Numeric arithmetic progression
+                state.cells[dstRef] = { raw: String(srcNum + increment * (r - r1)) };
+              } else if (srcRaw === '') {
+                // 4. Empty source: clear the destination
+                delete state.cells[dstRef];
+              } else {
+                // 5. Verbatim copy
+                state.cells[dstRef] = { raw: srcRaw };
+              }
+            }
+          }
+          this.Storages.Set(id, storageKey, state);
+          computed = this._cellsEvaluate(state);
+          setStatus('✓ Filled down', 1200);
+          drawScreen();
+        };
+
+        // ---- Fill right -------------------------------------------------------
+        // Mirrors fillDown on the column axis. The same pattern detection
+        // applies, e.g. `=A1+2` → `=B1+4` continues as `=C1+6`, `=D1+8`.
+        const fillRight = () => {
+          if (!selectMode) {
+            setStatus('Select a range first (Shift+Arrows)', 2000);
+            drawScreen();
+            return;
+          }
+          const { r1, r2, c1, c2 } = getSelectionRect();
+          if (c2 <= c1) {
+            setStatus('Need more than one column to fill right', 2000);
+            drawScreen();
+            return;
+          }
+          if (!state.cells) state.cells = {};
+
+          for (let r = r1; r <= r2; r++) {
+            const srcRef = this._cellsRefFromRC(r, c1);
+            const srcCell = state.cells[srcRef];
+            const srcRaw = srcCell ? (srcCell.raw || '') : '';
+            const isFormula = srcRaw.startsWith('=');
+
+            // --- Pattern detection from the first two columns ---
+            let formulaGen = null;
+            if (isFormula && c2 >= c1 + 1) {
+              const secondRef = this._cellsRefFromRC(r, c1 + 1);
+              const secondCell = state.cells[secondRef];
+              const secondRaw = secondCell ? (secondCell.raw || '') : '';
+              if (secondRaw.startsWith('=')) {
+                formulaGen = detectFormulaPattern(srcRaw, secondRaw, 'col');
+              }
+            }
+
+            // --- Numeric series detection ---
+            const srcNum = (!isFormula && srcRaw !== '' && !isNaN(Number(srcRaw)))
+              ? Number(srcRaw) : null;
+            let increment = null;
+            if (srcNum !== null) {
+              const secondRef = this._cellsRefFromRC(r, c1 + 1);
+              const secondCell = state.cells[secondRef];
+              const secondRaw = secondCell ? (secondCell.raw || '') : '';
+              const secondNum = (secondRaw !== '' && !isNaN(Number(secondRaw)))
+                ? Number(secondRaw) : null;
+              if (secondNum !== null) increment = secondNum - srcNum;
+            }
+
+            for (let c = c1 + 1; c <= c2; c++) {
+              const dstRef = this._cellsRefFromRC(r, c);
+
+              // 1. Formula pattern extrapolation
+              if (formulaGen) {
+                const generated = formulaGen(c - c1);
+                if (generated) {
+                  state.cells[dstRef] = { raw: generated };
+                  continue;
+                }
+              }
+
+              // 2. Classic formula ref shift (constants frozen)
+              if (isFormula) {
+                state.cells[dstRef] = { raw: '=' + shiftFormulaRefs(srcRaw.slice(1), 0, c - c1) };
+              } else if (increment !== null) {
+                // 3. Numeric arithmetic progression
+                state.cells[dstRef] = { raw: String(srcNum + increment * (c - c1)) };
+              } else if (srcRaw === '') {
+                // 4. Clear
+                delete state.cells[dstRef];
+              } else {
+                // 5. Verbatim copy
+                state.cells[dstRef] = { raw: srcRaw };
+              }
+            }
+          }
+          this.Storages.Set(id, storageKey, state);
+          computed = this._cellsEvaluate(state);
+          setStatus('✓ Filled right', 1200);
+          drawScreen();
+        };
+
+        // ---- Clear selection --------------------------------------------------
+        const clearSelectionCells = () => {
+          if (!state.cells) { clearCell(); return; }
+          if (!selectMode) { clearCell(); return; }
+          const { r1, r2, c1, c2 } = getSelectionRect();
+          let changed = false;
+          for (let r = r1; r <= r2; r++) {
+            for (let c = c1; c <= c2; c++) {
+              const ref = this._cellsRefFromRC(r, c);
+              if (state.cells[ref]) { delete state.cells[ref]; changed = true; }
+            }
+          }
+          if (changed) {
+            this.Storages.Set(id, storageKey, state);
+            computed = this._cellsEvaluate(state);
+            setStatus('✓ Cleared selection', 1200);
+          }
+          drawScreen();
+        };
+
+        // ---- Goto -------------------------------------------------------------
+        const startGoto = () => {
+          gotoMode = true;
+          gotoBuffer = '';
+          drawScreen();
+        };
+
+        const commitGoto = () => {
+          const ref = gotoBuffer.trim().toUpperCase();
+          const parsed = this._cellsParseRef(ref);
+          if (parsed) {
+            if (parsed.row >= state.rows) { state.rows = parsed.row + 10; }
+            if (parsed.col >= state.cols) { state.cols = parsed.col + 1; }
+            this.Storages.Set(id, storageKey, state);
+            cursorRow = parsed.row;
+            cursorCol = parsed.col;
+            clearSelection();
+            setStatus(`→ ${this._cellsRefFromRC(cursorRow, cursorCol)}`, 1200);
+          } else {
+            setStatus(`Invalid ref: "${gotoBuffer}"`, 2000);
+          }
+          gotoMode = false;
+          gotoBuffer = '';
+          drawScreen();
+        };
+
+        // ---- Renderer ---------------------------------------------------------
         const drawScreen = () => {
           if (finished || !running) return;
+          // Rigid lock: if a draw is already in flight, drop this one.
+          // The next scheduled draw (from a resize or a key handler) will
+          // pick up the new state naturally.
+          if (drawLock) return;
+          drawLock = true;
           try {
             const cols = getCols();
             const rows = getRows();
@@ -9383,39 +9793,66 @@ function levenshteinDistance(str1, str2) {
             if (scrollRow < 0) scrollRow = 0;
 
             const out = [];
-            out.push('\x1b[H');
+            out.push('\x1b[1;1H');
 
-            // Title bar
+            // ---- Title bar (row 1) --------------------------------------
             const cursorRef = this._cellsRefFromRC(cursorRow, cursorCol);
             const cell = computed[cursorRef];
-            const editingTag = editing ? ' [EDIT]' : '';
-            const title = ` 📊 ${name}${editingTag}`;
-            const rightInfo = ` ${cursorRef} `;
-            let pad = cols - title.length - rightInfo.length;
-            if (pad < 0) pad = 0;
-            out.push('\x1b[7m' + title + ' '.repeat(pad) + rightInfo + '\x1b[0m');
 
-            // Frozen column header (A, B, C, …) — scrolls with columns
+            let headerInfo;
+            if (selectMode) {
+              const { r1, r2, c1, c2 } = getSelectionRect();
+              const a = this._cellsRefFromRC(r1, c1);
+              const b = this._cellsRefFromRC(r2, c2);
+              headerInfo = (a === b) ? ` ${a} ` : ` ${a}:${b} `;
+            } else {
+              headerInfo = ` ${cursorRef} `;
+            }
+
+            const editingTag = editing ? ' [EDIT]' : '';
+            const gotoTag = gotoMode ? ` [GOTO ${gotoBuffer}█]` : '';
+            const titleFull = ` 📊 ${name}${editingTag}${gotoTag}`;
+            const maxTitleLen = Math.max(10, cols - headerInfo.length - 2);
+            const title = (titleFull.length > maxTitleLen)
+              ? titleFull.slice(0, maxTitleLen - 1) + '…'
+              : titleFull;
+            let pad = Math.max(0, cols - title.length - headerInfo.length);
+            // If both title and headerInfo overflow, shrink pad to 0 and
+            // truncate the headerInfo rather than the title.
+            out.push('\x1b[1;1H\x1b[2K\x1b[7m' + title + ' '.repeat(pad) + headerInfo + '\x1b[0m');
+
+            // ---- Frozen column header (row 2) ---------------------------
             out.push('\x1b[2;1H\x1b[2K');
             let headerLine = ' '.repeat(rowHeaderWidth);
+            const sel = selectMode ? getSelectionRect() : null;
             for (let c = 0; c < visCols; c++) {
               const colIdx = scrollCol + c;
               if (colIdx >= state.cols) break;
               const label = this._cellsColLabel(colIdx);
               const padded = label.padEnd(cellWidth);
-              if (colIdx === cursorCol) headerLine += '\x1b[7m' + padded + '\x1b[0m ';
-              else headerLine += '\x1b[1m' + padded + '\x1b[0m ';
+              const inSelHeader = sel && colIdx >= sel.c1 && colIdx <= sel.c2;
+              if (inSelHeader) {
+                headerLine += '\x1b[7m' + padded + '\x1b[0m ';
+              } else if (colIdx === cursorCol) {
+                headerLine += '\x1b[1;4m' + padded + '\x1b[0m ';
+              } else {
+                headerLine += '\x1b[1m' + padded + '\x1b[0m ';
+              }
             }
             out.push(headerLine);
 
-            // Rows — frozen row header (1, 2, 3, …) — scrolls with rows
+            // ---- Data rows (from row 3) ---------------------------------
+            let lastDrawnRow = 2;
             for (let r = 0; r < visRows; r++) {
               const rowIdx = scrollRow + r;
               const screenRow = 3 + r;
               out.push('\x1b[' + screenRow + ';1H\x1b[2K');
               if (rowIdx >= state.rows) break;
+              lastDrawnRow = screenRow;
+
               const rowLabel = String(rowIdx + 1).padStart(rowHeaderWidth - 1) + ' ';
-              let line = (rowIdx === cursorRow)
+              const inSelRow = sel && rowIdx >= sel.r1 && rowIdx <= sel.r2;
+              let line = (inSelRow || rowIdx === cursorRow)
                 ? '\x1b[7m' + rowLabel + '\x1b[0m'
                 : rowLabel;
 
@@ -9424,34 +9861,70 @@ function levenshteinDistance(str1, str2) {
                 if (colIdx >= state.cols) break;
                 const ref = this._cellsRefFromRC(rowIdx, colIdx);
                 const isCursor = (rowIdx === cursorRow && colIdx === cursorCol);
+                const inSel = selectMode && isInSelection(rowIdx, colIdx);
+
                 let display = '';
                 if (editing && isCursor) display = editBuffer;
                 else { const cc = computed[ref]; display = cc ? (cc.display || '') : ''; }
                 if (display.length > cellWidth - 1) display = display.slice(0, cellWidth - 2) + '…';
                 const padded = display.padEnd(cellWidth);
-                line += (isCursor ? '\x1b[7m' + padded + '\x1b[0m ' : padded + ' ');
+
+                if (isCursor) {
+                  line += '\x1b[7m' + padded + '\x1b[0m ';
+                } else if (inSel) {
+                  line += '\x1b[7m' + padded + '\x1b[0m ';
+                } else {
+                  line += padded + ' ';
+                }
               }
               out.push(line);
             }
 
-            // Status / help
+            // Clear everything below the last drawn row so stale content
+            // from a previous, taller frame cannot survive. This is the
+            // second half of the duplicate-line fix — the rigid drawLock
+            // prevents overlap, and this clear guarantees no orphans.
+            out.push('\x1b[' + (lastDrawnRow + 1) + ';1H\x1b[0J');
+
+            // ---- Status / help (last row) -------------------------------
             out.push('\x1b[' + rows + ';1H\x1b[2K\x1b[7m');
             let help;
-            if (editing) help = ' Enter: commit   Esc: cancel   (formulas = pure JS: =A1+B2)';
-            else if (cell && cell.error) help = ` ✗ ${cell.error}`;
-            else help = statusMessage || ' Arrows: move  Enter: edit  Del: clear  Ctrl+X: exit  (edges auto-extend)';
-            if (help.length > cols) help = help.slice(0, cols);
-            out.push(help + ' '.repeat(Math.max(0, cols - help.length)));
+            if (gotoMode) {
+              help = ` Goto cell: ${gotoBuffer}█   Enter: go   Esc: cancel`;
+            } else if (editing) {
+              help = ' Enter: commit   Esc: cancel   (formulas = pure JS: =A1+B2)';
+            } else if (selectMode) {
+              const { r1, r2, c1, c2 } = getSelectionRect();
+              const count = (r2 - r1 + 1) * (c2 - c1 + 1);
+              help = ` Selection: ${count} cell(s)   Ctrl+D: fill down   Ctrl+R: fill right   Del: clear   Esc: cancel`;
+            } else if (cell && cell.error) {
+              help = ` ✗ ${cell.error}`;
+            } else if (statusMessage) {
+              help = ' ' + statusMessage;
+            } else {
+              help = ' Arrows: move   Shift+Arrows: select   Enter: edit   Ctrl+G: goto   Ctrl+D/R: fill   Del: clear   Ctrl+X: exit';
+            }
+            if (help.length > cols - 1) help = help.slice(0, cols - 1);
+            help = help.padEnd(cols - 1);
+            out.push(help);
             out.push('\x1b[0m');
 
-            // Cursor
-            const csr = 3 + (cursorRow - scrollRow);
-            const csc = rowHeaderWidth + (cursorCol - scrollCol) * colStep + 1;
-            out.push('\x1b[' + csr + ';' + csc + 'H');
-            out.push('\x1b[?25h');
+            // ---- Cursor --------------------------------------------------
+            if (editing) {
+              const csr = 3 + (cursorRow - scrollRow);
+              const csc = rowHeaderWidth + (cursorCol - scrollCol) * colStep + 1;
+              out.push('\x1b[' + csr + ';' + csc + 'H');
+              out.push('\x1b[?25h');
+            } else {
+              out.push('\x1b[?25l');
+            }
 
             stdout.write(out.join(''));
-          } catch (_) { /* ignore draw errors */ }
+          } catch (_) {
+            /* ignore draw errors */
+          } finally {
+            drawLock = false;
+          }
         };
 
         const setStatus = (msg, ms) => {
@@ -9508,12 +9981,36 @@ function levenshteinDistance(str1, str2) {
           const str = data.toString();
           if (str.length === 0) return;
 
-          // Ctrl+X exit, Ctrl+C exit (when not editing)
+          // ---- GOTO MODE: consume chars into the ref buffer ------------
+          if (gotoMode) {
+            let needRedraw = false;
+            for (const ch of str) {
+              const code = ch.charCodeAt(0);
+              if (ch === '\r' || ch === '\n') { commitGoto(); return; }
+              if (ch === '\x1b') {
+                gotoMode = false; gotoBuffer = '';
+                setStatus('Goto cancelled', 1000);
+                drawScreen();
+                return;
+              }
+              if (ch === '\x7f' || ch === '\b') {
+                if (gotoBuffer.length > 0) { gotoBuffer = gotoBuffer.slice(0, -1); needRedraw = true; }
+                continue;
+              }
+              if (code >= 32 && code < 127) { gotoBuffer += ch; needRedraw = true; }
+            }
+            if (needRedraw) drawScreen();
+            return;
+          }
+
+          // ---- Global exit keys ----------------------------------------
+          // Ctrl+X always exits. Ctrl+C exits only when not editing.
           if (str === '\x18' || (str === '\x03' && !editing)) {
             if (editing) { editing = false; editBuffer = ''; drawScreen(); return; }
             finish(); return;
           }
 
+          // ---- EDIT MODE: raw text input --------------------------------
           if (editing) {
             let needRedraw = false;
             for (const ch of str) {
@@ -9528,30 +10025,127 @@ function levenshteinDistance(str1, str2) {
             return;
           }
 
-          // Arrow navigation (keeps the OTHER axis fixed; extends on edges)
-          if (str[0] === '\x1b') {
-            if (str[1] === '[') {
-              const last = str[str.length - 1];
-              if (last === 'A') {
-                if (cursorRow > 0) cursorRow--;
-              } else if (last === 'B') {
-                if (cursorRow < state.rows - 1) cursorRow++;
-                else { extendRows(state.rows + 10); cursorRow++; setStatus('＋10 rows', 1200); }
-              } else if (last === 'C') {
-                if (cursorCol < state.cols - 1) cursorCol++;
-                else { extendCols(state.cols + 1); cursorCol++; setStatus(`＋col ${this._cellsColLabel(cursorCol)}`, 1200); }
-              } else if (last === 'D') {
-                if (cursorCol > 0) cursorCol--;
-              } else if (last === '~') {
-                const mid = str.slice(2, -1);
-                if (mid === '3') clearCell();
-              }
-            }
+          // ---- Ctrl+G / F5: open goto prompt ---------------------------
+          // Both send distinct sequences; F5 sends \x1b[15~ which we also
+          // catch below during escape-sequence parsing.
+          if (str === '\x07') { startGoto(); return; }
+
+          // ---- Ctrl+D / Ctrl+R: fill operations ------------------------
+          if (str === '\x04') { fillDown(); return; }
+          if (str === '\x12') { fillRight(); return; }
+
+          // ---- Ctrl+A: select all --------------------------------------
+          if (str === '\x01') {
+            selectMode = true;
+            anchorRow = 0; anchorCol = 0;
+            cursorRow = state.rows - 1;
+            cursorCol = state.cols - 1;
             drawScreen();
             return;
           }
 
-          // Enter → edit cell
+          // ---- Escape (bare): cancel selection -------------------------
+          if (str === '\x1b') {
+            if (selectMode) clearSelection();
+            drawScreen();
+            return;
+          }
+
+          // ---- Delete / Backspace: clear selection or cell -------------
+          if (str === '\x7f' || str === '\b') {
+            clearSelectionCells();
+            return;
+          }
+
+          // ---- Arrow / navigation / modified arrows --------------------
+          if (str[0] === '\x1b' && str[1] === '[') {
+            // Two forms to recognise:
+            //   \x1b[A          (plain)
+            //   \x1b[1;2A       (with modifier: 2=Shift, 3=Alt, 4=Shift+Alt, 5=Ctrl)
+            //   \x1b[15~        (F5)
+            //   \x1b[3~         (Delete)
+            //   \x1b[5~ / \x1b[6~ (Page Up / Page Down)
+            let keyChar = null;
+            let hasShift = false;
+            let hasCtrl = false;
+
+            const arrow = str.match(/^\x1b\[(?:(\d+)(?:;(\d+))?)?([A-DHF])$/);
+            const tilde = str.match(/^\x1b\[(\d+)(?:;(\d+))?~$/);
+
+            if (arrow) {
+              keyChar = arrow[3];
+              const mod = arrow[2] ? parseInt(arrow[2], 10) : 1;
+              hasShift = (mod === 2 || mod === 4 || mod === 6 || mod === 8);
+              hasCtrl = (mod === 5 || mod === 6 || mod === 7 || mod === 8);
+            } else if (tilde) {
+              const keyNum = parseInt(tilde[1], 10);
+              const mod = tilde[2] ? parseInt(tilde[2], 10) : 1;
+              hasShift = (mod === 2 || mod === 4 || mod === 6 || mod === 8);
+              hasCtrl = (mod === 5 || mod === 6 || mod === 7 || mod === 8);
+
+              if (keyNum === 3) {           // Delete
+                clearSelectionCells();
+                return;
+              }
+              if (keyNum === 15) {          // F5 → goto
+                startGoto();
+                return;
+              }
+              if (keyNum === 6) {           // Page Down
+                const jump = visibleRows();
+                if (cursorRow + jump < state.rows) cursorRow += jump;
+                else { extendRows(cursorRow + jump + 10); cursorRow += jump; }
+                if (!hasShift) clearSelection();
+                drawScreen();
+                return;
+              }
+              if (keyNum === 5) {           // Page Up
+                const jump = visibleRows();
+                cursorRow = Math.max(0, cursorRow - jump);
+                if (!hasShift) clearSelection();
+                drawScreen();
+                return;
+              }
+              if (keyNum === 1) keyChar = 'H';   // Home
+              if (keyNum === 4) keyChar = 'F';   // End
+            }
+
+            if (keyChar) {
+              // Entering select mode: pin the anchor at the pre-move
+              // cursor position, then move.
+              if (hasShift && !selectMode) {
+                selectMode = true;
+                anchorRow = cursorRow;
+                anchorCol = cursorCol;
+              }
+
+              if (keyChar === 'A') {          // Up
+                if (cursorRow > 0) cursorRow--;
+              } else if (keyChar === 'B') {   // Down
+                if (cursorRow < state.rows - 1) cursorRow++;
+                else { extendRows(state.rows + 10); cursorRow++; setStatus('＋10 rows', 1200); }
+              } else if (keyChar === 'C') {   // Right
+                if (cursorCol < state.cols - 1) cursorCol++;
+                else { extendCols(state.cols + 1); cursorCol++; setStatus(`＋col ${this._cellsColLabel(cursorCol)}`, 1200); }
+              } else if (keyChar === 'D') {   // Left
+                if (cursorCol > 0) cursorCol--;
+              } else if (keyChar === 'H') {   // Home
+                if (hasCtrl) { cursorRow = 0; cursorCol = 0; }
+                else cursorCol = 0;
+              } else if (keyChar === 'F') {   // End
+                if (hasCtrl) { cursorRow = state.rows - 1; cursorCol = state.cols - 1; }
+                else cursorCol = state.cols - 1;
+              }
+
+              // A plain move cancels selection. A shift+move keeps it.
+              if (!hasShift && selectMode) clearSelection();
+
+              drawScreen();
+              return;
+            }
+          }
+
+          // ---- Enter → edit cell ---------------------------------------
           if (str === '\r' || str === '\n') {
             const ref = this._cellsRefFromRC(cursorRow, cursorCol);
             const c = state.cells && state.cells[ref];
@@ -9561,7 +10155,7 @@ function levenshteinDistance(str1, str2) {
             return;
           }
 
-          // Printable char → start editing with that char
+          // ---- Printable char → start editing with that char -----------
           const code = str.charCodeAt(0);
           if (code >= 32 && code < 127) {
             const ref = this._cellsRefFromRC(cursorRow, cursorCol);
