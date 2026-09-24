@@ -10,8 +10,9 @@ static PM = SyPM
 static APP =  SyAPP
 
 static async Start(name = 'sy'){
-  await SyDB.Connect(name)
-  let app = new SyAPP(Sy,{mainFuncName : name})
+ 
+ await SyDB.Connect(name)
+ new SyAPP(Sy,{mainFuncName : name})
  
 }
 
