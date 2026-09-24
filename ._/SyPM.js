@@ -2119,33 +2119,111 @@ main
     }
 
     /**
-     * Opens a real-time monitoring dashboard for all managed processes
+     * Opens a real-time monitoring dashboard for all managed processes.
+     *
+     * Features:
+     *   - Responsive to terminal size changes (re-renders on SIGWINCH)
+     *   - Scrollable process list with infinite scroll (PgUp/PgDn, Home/End, g/G)
+     *   - Keyboard selection (arrow keys) to open the live log of a specific process
+     *   - Return from log view back to the list (q / Esc / b)
+     *   - Alternate screen buffer + hidden cursor: the original terminal is restored on exit
+     *   - Raw-mode input with escape-sequence buffering (handles split arrow-key chunks)
+     *
+     * Keybindings (list view):
+     *   ↑/↓ or j/k     Move selection
+     *   PgUp/PgDn      Page through the process list
+     *   Home/End or g/G Jump to first/last process
+     *   Enter or Space Open live log of selected process
+     *   q or Ctrl+C    Quit the dashboard
+     *
+     * Keybindings (log view):
+     *   ↑/↓ or j/k     Scroll log by one line
+     *   PgUp/PgDn      Scroll log by one page
+     *   Home/End or g/G Jump to top / jump to bottom (enables follow)
+     *   f              Toggle follow (auto-scroll to newest)
+     *   q / Esc / b    Return to process list
+     *   Ctrl+C         Quit the dashboard
+     *
      * @static
      */
     static monit() {
-        process.stdout.write('\x1Bc');
+        const stdout = process.stdout;
+        const stdin = process.stdin;
 
-        let isRunning = true;
+        if (!stdout.isTTY || !stdin.isTTY) {
+            console.error('SyPM --monit requires an interactive terminal (TTY).');
+            return;
+        }
 
-        const cleanup = () => {
-            isRunning = false;
-            process.stdout.write('\x1B[?25h');
-            console.log('\n\n📊 Monitoring stopped.');
-            process.exit(0);
+        const ESC = '\x1B';
+        const stripAnsi = (s) => String(s).replace(/\x1B\[[0-9;]*m/g, '');
+
+        // ---------- ANSI / terminal helpers ----------
+        const write = (s) => {
+            try { stdout.write(s); } catch (_) { /* ignore */ }
+        };
+        const hideCursor = () => write(`${ESC}[?25l`);
+        const showCursor = () => write(`${ESC}[?25h`);
+        const enterAltScreen = () => write(`${ESC}[?1049h`);
+        const exitAltScreen = () => write(`${ESC}[?1049l`);
+
+        const truncVisible = (str, len) => {
+            if (len <= 0) return '';
+            if (stripAnsi(str).length <= len) return str;
+            let out = '';
+            let count = 0;
+            let i = 0;
+            while (i < str.length && count < len) {
+                if (str[i] === ESC) {
+                    const m = str.substring(i).match(/^\x1B\[[0-9;]*m/);
+                    if (m) {
+                        out += m[0];
+                        i += m[0].length;
+                        continue;
+                    }
+                }
+                out += str[i];
+                i++;
+                count++;
+            }
+            return out + '\x1B[0m';
         };
 
-        process.on('SIGINT', cleanup);
-        process.on('SIGTERM', cleanup);
+        const padVisible = (str, len) => {
+            const v = stripAnsi(str);
+            if (v.length > len) return truncVisible(str, len);
+            if (v.length === len) return str;
+            return str + ' '.repeat(len - v.length);
+        };
 
-        process.stdout.write('\x1B[?25l');
+        const getSize = () => ({
+            width: Math.max(50, stdout.columns || 100),
+            height: Math.max(10, stdout.rows || 24)
+        });
 
-        const refreshInterval = 1000;
+        // ---------- State ----------
+        const state = {
+            mode: 'list',
+            selectedIndex: 0,
+            scrollOffset: 0,
+            processes: [],
+            logProcess: null,
+            logFilePath: null,
+            logLines: [],
+            logScroll: 0,
+            logFollow: true,
+            lastLogSize: -1,
+            isRunning: true,
+            refreshTimer: null
+        };
 
+        // ---------- Data helpers ----------
         const formatUptime = (createdAt) => {
-            const start = new Date(createdAt);
-            const now = new Date();
-            const diff = Math.floor((now - start) / 1000);
-
+            if (!createdAt) return 'N/A';
+            const t = new Date(createdAt).getTime();
+            if (isNaN(t)) return 'N/A';
+            const diff = Math.floor((Date.now() - t) / 1000);
+            if (diff < 0) return '0s';
             if (diff < 60) return `${diff}s`;
             if (diff < 3600) return `${Math.floor(diff / 60)}m`;
             if (diff < 86400) return `${Math.floor(diff / 3600)}h`;
@@ -2153,6 +2231,7 @@ main
         };
 
         const getMemoryUsage = (pid) => {
+            if (!pid) return 'N/A';
             try {
                 if (os.platform() === 'win32') {
                     const output = execSync(`wmic process where ProcessId=${pid} get WorkingSetSize 2>nul`, { encoding: 'utf-8' });
@@ -2170,13 +2249,12 @@ main
                         return `${(memKB / 1024).toFixed(1)} MB`;
                     }
                 }
-            } catch (error) {
-                // Process might not exist or permission denied
-            }
+            } catch (_) { /* process missing or no permission */ }
             return 'N/A';
         };
 
         const getCPUUsage = (pid) => {
+            if (!pid) return 'N/A';
             try {
                 if (os.platform() !== 'win32') {
                     const output = execSync(`ps -o %cpu= -p ${pid} 2>/dev/null`, { encoding: 'utf-8' });
@@ -2185,94 +2263,490 @@ main
                         return `${cpuPercent.toFixed(1)}%`;
                     }
                 }
-            } catch (error) {
-                // Process might not exist or permission denied
-            }
+            } catch (_) { /* process missing or no permission */ }
             return 'N/A';
         };
 
-        const renderDashboard = () => {
-            if (!isRunning) return;
+        const readLogFile = (filePath) => {
+            try {
+                const content = fs.readFileSync(filePath, 'utf-8');
+                const lines = content.split('\n');
+                const LIMIT = 5000;
+                if (lines.length > LIMIT) {
+                    return lines.slice(lines.length - LIMIT);
+                }
+                return lines;
+            } catch (e) {
+                return [`(error reading log: ${e.message})`];
+            }
+        };
 
-            process.stdout.write('\x1B[H');
+        // ---------- View builders ----------
+        const renderList = (width, height) => {
+            try {
+                state.processes = SyPM.list();
+            } catch (_) {
+                state.processes = [];
+            }
+            const procs = state.processes;
 
-            const systemInfo = this._detectSystem();
+            if (state.selectedIndex >= procs.length) state.selectedIndex = Math.max(0, procs.length - 1);
+            if (state.selectedIndex < 0) state.selectedIndex = 0;
+
+            const lines = [];
+
+            // --- Header ---
+            const systemInfo = SyPM._detectSystem();
             const totalMem = os.totalmem();
-            const freeMem = os.freemem();
-            const usedMem = totalMem - freeMem;
-            const memPercent = ((usedMem / totalMem) * 100).toFixed(1);
+            const usedMem = totalMem - os.freemem();
+            const memPct = totalMem > 0 ? ((usedMem / totalMem) * 100).toFixed(1) : '0.0';
+            const aliveCount = procs.filter(p => p.status === 'Running' || p.status === 'Restarting').length;
 
-            const processes = this.list();
-            const aliveCount = processes.filter(p =>
-                p.status === 'Running' || p.status === 'Restarting'
-            ).length;
+            lines.push(`${ESC}[1;36m SyPM Process Monitor ${ESC}[0m${ESC}[90m [list]${ESC}[0m`);
+            const infoStr = ` OS: ${systemInfo.platform}  |  Cores: ${os.cpus().length}  |  Mem: ${memPct}%  |  Procs: ${procs.length} (alive: ${aliveCount})`;
+            lines.push(truncVisible(`${ESC}[90m${infoStr}${ESC}[0m`, width));
+            lines.push(`${ESC}[90m${'─'.repeat(Math.max(1, width))}${ESC}[0m`);
 
-            console.log('╔════════════════════════════════════════════════════════════════════════════════╗');
-            console.log('║                          SyPM Process Monitor                                   ║');
-            console.log('╠════════════════════════════════════════════════════════════════════════════════╣');
-            console.log(`║  OS: ${systemInfo.platform.padEnd(15)} | CPU Cores: ${String(os.cpus().length).padEnd(6)} | Memory: ${memPercent}% used         ║`);
-            console.log(`║  Total Processes: ${String(processes.length).padEnd(3)} | Alive: ${String(aliveCount).padEnd(3)} | Dead: ${String(processes.length - aliveCount).padEnd(3)}                      ║`);
-            console.log('╠════════════════════════════════════════════════════════════════════════════════╣');
+            // --- Column widths ---
+            const colNum = 4;
+            const colName = Math.max(10, Math.min(30, Math.floor(width * 0.20)));
+            const colPid = 8;
+            const colStatus = 11;
+            const colUptime = 7;
+            const colMem = 9;
+            const colCpu = 6;
+            const fixed = 2 + colNum + colName + colPid + colStatus + colUptime + colMem + colCpu + 7;
+            const colType = Math.max(6, width - fixed);
 
-            if (processes.length === 0) {
-                console.log('║                        No processes currently managed                            ║');
+            const headerRow =
+                '  ' +
+                padVisible('#', colNum) + ' ' +
+                padVisible('Name', colName) + ' ' +
+                padVisible('PID', colPid) + ' ' +
+                padVisible('Status', colStatus) + ' ' +
+                padVisible('Uptime', colUptime) + ' ' +
+                padVisible('Memory', colMem) + ' ' +
+                padVisible('CPU', colCpu) + ' ' +
+                padVisible('Type', colType);
+            lines.push(`${ESC}[1m${truncVisible(headerRow, width)}${ESC}[0m`);
+            lines.push(`${ESC}[90m${'─'.repeat(Math.max(1, width))}${ESC}[0m`);
+
+            // Build createdAt lookup (list() output doesn't include it)
+            const createdAtMap = new Map();
+            try {
+                for (const r of SyPM._loadRegistry()) {
+                    createdAtMap.set(r.id, r.createdAt || r.lastUpdate);
+                }
+            } catch (_) { /* ignore */ }
+
+            // --- Viewport ---
+            const footerLines = 2;
+            const headerLines = lines.length;
+            const visibleRows = Math.max(1, height - headerLines - footerLines);
+
+            // Adjust scroll to keep selection visible (infinite scroll through all procs)
+            let offset = state.scrollOffset;
+            if (state.selectedIndex < offset) offset = state.selectedIndex;
+            if (state.selectedIndex >= offset + visibleRows) {
+                offset = state.selectedIndex - visibleRows + 1;
+            }
+            const maxOffset = Math.max(0, procs.length - visibleRows);
+            if (offset > maxOffset) offset = maxOffset;
+            if (offset < 0) offset = 0;
+            state.scrollOffset = offset;
+
+            const showAbove = offset > 0;
+            const showBelow = (offset + visibleRows) < procs.length;
+
+            if (procs.length === 0) {
+                lines.push(`${ESC}[90m  No processes currently managed.${ESC}[0m`);
             } else {
-                console.log('║ Name                 │ PID    │ Status    │ Uptime │ Memory  │ CPU  │ Type       ║');
-                console.log('╟──────────────────────┼────────┼───────────┼────────┼─────────┼──────┼────────────╢');
+                if (showAbove) {
+                    lines.push(`${ESC}[90m  ▲ ${offset} more above${ESC}[0m`);
+                }
 
-                for (const proc of processes) {
-                    const name = proc.name.substring(0, 20).padEnd(20);
-                    const pid = String(proc.pid).padEnd(6);
+                // Reserve room for below indicator too
+                const indicators = (showAbove ? 1 : 0) + (showBelow ? 1 : 0);
+                const dataRows = Math.max(1, visibleRows - indicators);
+                const end = Math.min(procs.length, offset + dataRows);
+
+                for (let i = offset; i < end; i++) {
+                    const p = procs[i];
+                    const selected = (i === state.selectedIndex);
+                    const marker = selected ? `${ESC}[7m▶${ESC}[0m` : ' ';
 
                     let statusStr;
-                    switch (proc.status) {
-                        case 'Running':
-                            statusStr = '\x1b[32mRunning\x1b[0m    ';
-                            break;
-                        case 'Restarting':
-                            statusStr = '\x1b[33mRestarting\x1b[0m ';
-                            break;
-                        case 'Dead':
-                            statusStr = '\x1b[31mDead\x1b[0m       ';
-                            break;
-                        case 'Stopped':
-                            statusStr = '\x1b[90mStopped\x1b[0m    ';
-                            break;
-                        default:
-                            statusStr = proc.status.padEnd(9);
+                    switch (p.status) {
+                        case 'Running':    statusStr = `${ESC}[32mRunning${ESC}[0m`; break;
+                        case 'Restarting': statusStr = `${ESC}[33mRestarting${ESC}[0m`; break;
+                        case 'Dead':       statusStr = `${ESC}[31mDead${ESC}[0m`; break;
+                        case 'Stopped':    statusStr = `${ESC}[90mStopped${ESC}[0m`; break;
+                        default:           statusStr = String(p.status || '');
                     }
 
-                    const uptime = proc.createdAt ? formatUptime(proc.createdAt).padEnd(6) : 'N/A   ';
-                    const memory = getMemoryUsage(proc.pid).padEnd(7);
-                    const cpu = getCPUUsage(proc.pid).padEnd(4);
-                    const type = (proc.type || 'node_script').substring(0, 10).padEnd(10);
+                    const uptime = formatUptime(createdAtMap.get(p.id));
+                    const mem = getMemoryUsage(p.pid);
+                    const cpu = getCPUUsage(p.pid);
 
-                    console.log(`║ ${name} │ ${pid} │ ${statusStr}│ ${uptime} │ ${memory} │ ${cpu} │ ${type} ║`);
+                    let row = `${marker} `;
+                    row += padVisible(String(i + 1), colNum) + ' ';
+                    row += padVisible(truncVisible(String(p.name || ''), colName), colName) + ' ';
+                    row += padVisible(String(p.pid == null ? '' : p.pid), colPid) + ' ';
+                    row += padVisible(statusStr, colStatus) + ' ';
+                    row += padVisible(uptime, colUptime) + ' ';
+                    row += padVisible(mem, colMem) + ' ';
+                    row += padVisible(cpu, colCpu) + ' ';
+                    row += padVisible(truncVisible(String(p.type || 'node_script'), colType), colType);
+
+                    if (selected) {
+                        row = `${ESC}[1m${row}${ESC}[0m`;
+                    }
+
+                    lines.push(truncVisible(row, width));
+                }
+
+                if (showBelow) {
+                    const remaining = Math.max(0, procs.length - (offset + dataRows));
+                    lines.push(`${ESC}[90m  ▼ ${remaining} more below${ESC}[0m`);
                 }
             }
 
-            console.log('╠════════════════════════════════════════════════════════════════════════════════╣');
-            console.log('║  Press Ctrl+C to exit                                                          ║');
-            console.log(`║  Last update: ${new Date().toLocaleTimeString()}                                                     ║`);
-            console.log('╚════════════════════════════════════════════════════════════════════════════════╝');
+            // Fill remaining rows so old lines don't linger
+            while (lines.length < height - footerLines) {
+                lines.push('');
+            }
+
+            // --- Footer ---
+            lines.push(`${ESC}[90m${'─'.repeat(Math.max(1, width))}${ESC}[0m`);
+            const position = procs.length === 0 ? '0/0' : `${state.selectedIndex + 1}/${procs.length}`;
+            const footer = ` ↑/↓ move   Enter: view log   PgUp/PgDn page   Home/End jump   q quit    [${position}]`;
+            lines.push(truncVisible(`${ESC}[90m${footer}${ESC}[0m`, width));
+
+            return lines;
         };
 
-        renderDashboard();
-        const interval = setInterval(renderDashboard, refreshInterval);
+        const renderLog = (width, height) => {
+            const lines = [];
+            const p = state.logProcess;
 
-        const originalCleanup = cleanup;
-        process.removeAllListeners('SIGINT');
-        process.removeAllListeners('SIGTERM');
+            const title = p ? ` Log: ${p.name} ` : ' Log ';
+            lines.push(`${ESC}[1;36m${truncVisible(title, width)}${ESC}[0m${ESC}[90m [log]${ESC}[0m`);
+            if (p) {
+                const sub = ` ID: ${p.id}   PID: ${p.pid}   Type: ${p.type || 'node_script'}   File: ${state.logFilePath || ''}`;
+                lines.push(truncVisible(`${ESC}[90m${sub}${ESC}[0m`, width));
+            } else {
+                lines.push('');
+            }
+            lines.push(`${ESC}[90m${'─'.repeat(Math.max(1, width))}${ESC}[0m`);
 
-        const enhancedCleanup = () => {
-            clearInterval(interval);
-            originalCleanup();
+            const footerLines = 2;
+            const headerLines = lines.length;
+            const visibleRows = Math.max(1, height - headerLines - footerLines);
+
+            const total = state.logLines.length;
+            const maxScroll = Math.max(0, total - visibleRows);
+
+            if (state.logFollow) {
+                state.logScroll = maxScroll;
+            }
+            if (state.logScroll > maxScroll) state.logScroll = maxScroll;
+            if (state.logScroll < 0) state.logScroll = 0;
+
+            const start = state.logScroll;
+            const end = Math.min(total, start + visibleRows);
+
+            if (total === 0) {
+                lines.push(`${ESC}[90m  (no log content yet)${ESC}[0m`);
+            } else {
+                if (start > 0) {
+                    lines.push(`${ESC}[90m  ▲ ${start} lines above${ESC}[0m`);
+                }
+                for (let i = start; i < end; i++) {
+                    lines.push(truncVisible(state.logLines[i] || '', width));
+                }
+                if (end < total) {
+                    lines.push(`${ESC}[90m  ▼ ${total - end} lines below${ESC}[0m`);
+                }
+            }
+
+            while (lines.length < height - footerLines) {
+                lines.push('');
+            }
+
+            lines.push(`${ESC}[90m${'─'.repeat(Math.max(1, width))}${ESC}[0m`);
+            const range = total > 0 ? `${start + 1}-${end}/${total}` : `0/0`;
+            const follow = state.logFollow ? `${ESC}[32mFOLLOW${ESC}[0m` : `${ESC}[33mPAUSED${ESC}[0m`;
+            const footer = ` ↑/↓ scroll   PgUp/PgDn page   Home/End   f ${state.logFollow ? 'pause' : 'follow'}   q/Esc back    [${range}] ${follow}`;
+            lines.push(truncVisible(footer, width));
+
+            return lines;
         };
 
-        process.on('SIGINT', enhancedCleanup);
-        process.on('SIGTERM', enhancedCleanup);
+        const render = () => {
+            if (!state.isRunning) return;
+            const { width, height } = getSize();
 
-        process.stdin.resume();
+            let lines;
+            try {
+                lines = (state.mode === 'log')
+                    ? renderLog(width, height)
+                    : renderList(width, height);
+            } catch (err) {
+                lines = [`${ESC}[31mRender error: ${err.message}${ESC}[0m`];
+            }
+
+            let out = '';
+            for (let row = 0; row < height; row++) {
+                out += `${ESC}[${row + 1};1H${ESC}[2K`;
+                out += (lines[row] || '');
+            }
+            write(out);
+        };
+
+        // ---------- Log content refresh ----------
+        const refreshLogContent = () => {
+            if (state.mode !== 'log' || !state.logFilePath) return false;
+            try {
+                const stat = fs.statSync(state.logFilePath);
+                if (stat.size !== state.lastLogSize) {
+                    state.lastLogSize = stat.size;
+                    state.logLines = readLogFile(state.logFilePath);
+                    return true;
+                }
+            } catch (_) { /* log may not exist yet */ }
+            return false;
+        };
+
+        // ---------- Mode transitions ----------
+        const enterLogView = () => {
+            const p = state.processes[state.selectedIndex];
+            if (!p) return;
+            let proc = null;
+            try {
+                const registry = SyPM._loadRegistry();
+                proc = registry.find(r => r.id === p.id);
+            } catch (_) { /* ignore */ }
+            if (!proc) return;
+
+            state.logProcess = proc;
+            state.logFilePath = proc.log;
+            state.logLines = readLogFile(proc.log);
+            state.lastLogSize = -1;
+            state.logScroll = 0;
+            state.logFollow = true;
+            state.mode = 'log';
+            refreshLogContent();
+            render();
+        };
+
+        const exitLogView = () => {
+            state.mode = 'list';
+            state.logProcess = null;
+            state.logFilePath = null;
+            state.logLines = [];
+            state.lastLogSize = -1;
+            state.logScroll = 0;
+            state.logFollow = true;
+            render();
+        };
+
+        // ---------- Input handling ----------
+        const pageSize = () => {
+            const { height } = getSize();
+            return Math.max(1, height - 8);
+        };
+
+        const moveSelection = (delta) => {
+            const procs = state.processes;
+            if (procs.length === 0) return;
+            let next = state.selectedIndex + delta;
+            if (next < 0) next = 0;
+            if (next > procs.length - 1) next = procs.length - 1;
+            state.selectedIndex = next;
+        };
+
+        const handleInput = (data) => {
+            if (!state.isRunning) return;
+
+            // Ctrl+C always quits
+            if (data === '\x03') {
+                shutdown();
+                return;
+            }
+
+            if (state.mode === 'list') {
+                const procs = state.processes;
+                if (data === `${ESC}[A` || data === `${ESC}[OA` || data === 'k') {
+                    moveSelection(-1); render();
+                } else if (data === `${ESC}[B` || data === `${ESC}[OB` || data === 'j') {
+                    moveSelection(1); render();
+                } else if (data === `${ESC}[5~`) {
+                    moveSelection(-pageSize()); render();
+                } else if (data === `${ESC}[6~`) {
+                    moveSelection(pageSize()); render();
+                } else if (data === `${ESC}[H` || data === `${ESC}[1~` || data === 'g') {
+                    state.selectedIndex = 0; render();
+                } else if (data === `${ESC}[F` || data === `${ESC}[4~` || data === 'G') {
+                    state.selectedIndex = Math.max(0, procs.length - 1); render();
+                } else if (data === '\r' || data === '\n' || data === ' ') {
+                    enterLogView();
+                } else if (data === 'q' || data === 'Q') {
+                    shutdown();
+                }
+            } else if (state.mode === 'log') {
+                if (data === 'q' || data === 'Q' || data === 'b' || data === 'B' || data === ESC) {
+                    exitLogView();
+                } else if (data === `${ESC}[A` || data === `${ESC}[OA` || data === 'k') {
+                    state.logFollow = false;
+                    state.logScroll = Math.max(0, state.logScroll - 1);
+                    render();
+                } else if (data === `${ESC}[B` || data === `${ESC}[OB` || data === 'j') {
+                    state.logFollow = false;
+                    state.logScroll += 1;
+                    render();
+                } else if (data === `${ESC}[5~`) {
+                    state.logFollow = false;
+                    state.logScroll = Math.max(0, state.logScroll - pageSize());
+                    render();
+                } else if (data === `${ESC}[6~`) {
+                    state.logFollow = false;
+                    state.logScroll += pageSize();
+                    render();
+                } else if (data === `${ESC}[H` || data === `${ESC}[1~` || data === 'g') {
+                    state.logFollow = false;
+                    state.logScroll = 0;
+                    render();
+                } else if (data === `${ESC}[F` || data === `${ESC}[4~` || data === 'G') {
+                    state.logFollow = true;
+                    render();
+                } else if (data === 'f' || data === 'F') {
+                    state.logFollow = !state.logFollow;
+                    render();
+                }
+            }
+        };
+
+        // Input buffering to handle split escape sequences from some terminals
+        const KNOWN_SEQS = [
+            `${ESC}[A`, `${ESC}[B`, `${ESC}[C`, `${ESC}[D`,
+            `${ESC}[H`, `${ESC}[F`,
+            `${ESC}[1~`, `${ESC}[2~`, `${ESC}[3~`, `${ESC}[4~`, `${ESC}[5~`, `${ESC}[6~`,
+            `${ESC}[7~`, `${ESC}[8~`,
+            `${ESC}[OA`, `${ESC}[OB`, `${ESC}[OC`, `${ESC}[OD`
+        ];
+        let inputBuffer = '';
+        let inputTimer = null;
+
+        const flushInput = () => {
+            const data = inputBuffer;
+            inputBuffer = '';
+            if (inputTimer) { clearTimeout(inputTimer); inputTimer = null; }
+            if (data) handleInput(data);
+        };
+
+        const onData = (chunk) => {
+            inputBuffer += chunk;
+            // Not an escape sequence: flush immediately
+            if (!inputBuffer.startsWith(ESC)) {
+                flushInput();
+                return;
+            }
+            // Complete known sequence: flush immediately
+            if (KNOWN_SEQS.includes(inputBuffer)) {
+                flushInput();
+                return;
+            }
+            // Known prefix of a longer sequence: wait briefly for the rest
+            const isPrefix = KNOWN_SEQS.some(seq => seq.startsWith(inputBuffer));
+            if (isPrefix && inputBuffer.length < 6) {
+                if (inputTimer) clearTimeout(inputTimer);
+                inputTimer = setTimeout(flushInput, 40);
+                return;
+            }
+            // Unknown escape sequence: flush it
+            flushInput();
+        };
+
+        // ---------- Lifecycle ----------
+        const onResize = () => {
+            // Re-render at the new terminal size
+            render();
+        };
+
+        const shutdown = () => {
+            if (!state.isRunning) return;
+            state.isRunning = false;
+
+            if (state.refreshTimer) {
+                clearInterval(state.refreshTimer);
+                state.refreshTimer = null;
+            }
+            if (inputTimer) {
+                clearTimeout(inputTimer);
+                inputTimer = null;
+            }
+
+            try { stdin.removeListener('data', onData); } catch (_) {}
+            try {
+                stdin.setRawMode(false);
+                stdin.pause();
+            } catch (_) {}
+
+            try { process.removeListener('SIGWINCH', onResize); } catch (_) {}
+            try { process.removeListener('SIGINT', shutdown); } catch (_) {}
+            try { process.removeListener('SIGTERM', shutdown); } catch (_) {}
+            try { process.removeListener('uncaughtException', onUncaught); } catch (_) {}
+
+            showCursor();
+            exitAltScreen();
+            console.log('📊 Monitoring stopped.');
+            process.exit(0);
+        };
+
+        const onUncaught = (err) => {
+            // Always restore the terminal on unexpected errors
+            try { showCursor(); } catch (_) {}
+            try { exitAltScreen(); } catch (_) {}
+            console.error('SyPM monit crashed:', err && err.stack ? err.stack : err);
+            process.exit(1);
+        };
+
+        // ---------- Start ----------
+        enterAltScreen();
+        hideCursor();
+
+        try {
+            stdin.setRawMode(true);
+            stdin.resume();
+            stdin.setEncoding('utf8');
+            stdin.on('data', onData);
+        } catch (e) {
+            console.error('Failed to enable raw mode:', e.message);
+            try { stdin.setRawMode(false); } catch (_) {}
+            showCursor();
+            exitAltScreen();
+            return;
+        }
+
+        process.on('SIGWINCH', onResize);
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+        process.on('uncaughtException', onUncaught);
+
+        // Initial paint
+        render();
+
+        // Periodic refresh (1s)
+        state.refreshTimer = setInterval(() => {
+            if (!state.isRunning) return;
+            if (state.mode === 'list') {
+                render();
+            } else {
+                if (refreshLogContent()) {
+                    render();
+                }
+            }
+        }, 1000);
     }
 
     /**
