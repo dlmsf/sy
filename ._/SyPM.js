@@ -500,38 +500,88 @@ main
     }
 
     /**
+     * Checks if a daemon service is currently running on the host init system.
+     * Note: enabling a daemon (for auto-start on boot) does NOT start it, so we
+     * must query the runtime state of the service, not just its enablement.
+     * @static
+     * @private
+     * @param {string} processId - Unique process identifier
+     * @returns {boolean} True if the init-system service is active/running
+     */
+    static _isDaemonServiceRunning(processId) {
+        const systemInfo = this._detectSystem();
+        try {
+            if (systemInfo.initSystem === 'systemd') {
+                const serviceName = `sypm-${processId}.service`;
+                const output = execSync(`systemctl is-active ${serviceName} 2>/dev/null`, { encoding: 'utf-8' }).trim();
+                return output === 'active';
+            } else if (systemInfo.initSystem === 'openrc') {
+                const serviceName = `sypm-${processId}`;
+                const output = execSync(`rc-service ${serviceName} status 2>/dev/null`, { encoding: 'utf-8' });
+                return output.includes('started') || output.includes('running');
+            }
+        } catch (_) {
+            // Service not installed / init system unsupported
+        }
+        return false;
+    }
+
+    /**
+     * Checks if a tracked PID is currently alive
+     * @static
+     * @private
+     * @param {number} pid - Process ID
+     * @returns {boolean} True if the process is alive
+     */
+    static _isPidAlive(pid) {
+        if (!pid) return false;
+        try {
+            process.kill(pid, 0);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    /**
+     * Determines whether a daemon-managed process is alive.
+     * A daemon process is considered alive when ANY of the following is true:
+     *   - its tracked PID is alive
+     *   - its monitor PID (auto-restart wrapper) is alive
+     *   - the underlying init-system service is active
+     * This prevents the false "dead" reports that happened when the service
+     * was only enabled (for boot auto-start) but the spawned process was the
+     * one actually running.
+     * @static
+     * @private
+     * @param {Object} proc - Registry process entry
+     * @returns {boolean} True if the daemon process is running
+     */
+    static _isDaemonProcessAlive(proc) {
+        if (this._isPidAlive(proc.pid)) return true;
+        if (proc.monitorPid && proc.monitorPid !== proc.pid && this._isPidAlive(proc.monitorPid)) return true;
+        if (this._isDaemonServiceRunning(proc.id)) return true;
+        return false;
+    }
+
+    /**
      * Syncs daemon processes status with system services
      * @static
      * @private
      */
     static _syncDaemonStatus() {
         const registry = this._loadRegistry();
-        const systemInfo = this._detectSystem();
         let updated = false;
 
         for (const proc of registry) {
             if (proc.config?.daemon) {
-                let serviceRunning = false;
+                const isRunning = this._isDaemonProcessAlive(proc);
 
-                try {
-                    if (systemInfo.initSystem === 'systemd') {
-                        const serviceName = `sypm-${proc.id}.service`;
-                        const output = execSync(`systemctl is-active ${serviceName} 2>/dev/null`, { encoding: 'utf-8' }).trim();
-                        serviceRunning = (output === 'active');
-                    } else if (systemInfo.initSystem === 'openrc') {
-                        const serviceName = `sypm-${proc.id}`;
-                        const output = execSync(`rc-service ${serviceName} status 2>/dev/null`, { encoding: 'utf-8' });
-                        serviceRunning = (output.includes('started') || output.includes('running'));
-                    }
-                } catch (error) {
-                    serviceRunning = false;
-                }
-
-                if (serviceRunning && proc.status !== 'running') {
+                if (isRunning && proc.status !== 'running') {
                     proc.status = 'running';
                     updated = true;
                     console.log(`✓ Updated status for daemon process ${proc.name}: running`);
-                } else if (!serviceRunning && proc.status === 'running') {
+                } else if (!isRunning && (proc.status === 'running' || proc.status === 'restarting')) {
                     proc.status = 'dead';
                     updated = true;
                     console.log(`✓ Updated status for daemon process ${proc.name}: dead`);
@@ -1353,7 +1403,23 @@ main
 
         for (const proc of registry) {
             if (proc.config?.daemon) {
-                let displayStatus = proc.status.charAt(0).toUpperCase() + proc.status.slice(1);
+                // Daemon processes must not be reported as dead merely because the
+                // init service is inactive: the real process may still be alive
+                // (e.g. service was only enabled for boot, not started yet).
+                const isAlive = this._isDaemonProcessAlive(proc);
+                let status = proc.status;
+
+                if (isAlive && proc.status !== 'running') {
+                    status = 'running';
+                    proc.status = status;
+                    this._saveRegistry(registry);
+                } else if (!isAlive && (proc.status === 'running' || proc.status === 'restarting')) {
+                    status = 'dead';
+                    proc.status = status;
+                    this._saveRegistry(registry);
+                }
+
+                let displayStatus = status.charAt(0).toUpperCase() + status.slice(1);
 
                 processList.push({
                     status: displayStatus,
@@ -1652,6 +1718,15 @@ main
         }
 
         if (!proc) return false;
+
+        // Daemon processes may be kept alive by the init system even when the
+        // originally tracked PID has exited (or was re-spawned). Check both the
+        // tracked PID(s) and the underlying service before declaring it dead.
+        // This prevents live daemons from being pruned by cleanup() and from
+        // vanishing out of --list / --monit.
+        if (proc.config?.daemon) {
+            return this._isDaemonProcessAlive(proc);
+        }
 
         try {
             if (proc.isAutoRestart && proc.monitorPid) {
