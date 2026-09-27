@@ -2095,8 +2095,14 @@ if (configuration.remember) {
         while (cellScrolls.length < numCells) cellScrolls.push(0);
 
         const stripAnsi = (s) => String(s == null ? '' : s).replace(/\x1b\[[0-9;]*m/g, '');
+        // HARDENED: every branch returns a STRING, matching the same
+        // guarantee now provided by renderOptionLine's text extraction.
+        // This prevents `undefined.length` crashes inside renderGridLine
+        // when a cell item is null/undefined, or when both `it.name` and
+        // `JSON.stringify(it)` produce `undefined` (functions, symbols,
+        // objects whose `toJSON()` returns `undefined`).
         const itemText = (it) => {
-          if (!it) return '';
+          if (it === null || it === undefined) return '';
           if (typeof it === 'string') return it;
           if (it.type === 'cellText') return String(it.text || '');
           if (it.type === 'field') {
@@ -2104,7 +2110,13 @@ if (configuration.remember) {
             const val = String(it.value || '');
             return label ? `${label}: ░${val}░` : `░${val}░`;
           }
-          return it.name || JSON.stringify(it);
+          if (typeof it.name === 'string') return it.name;
+          try {
+            const json = JSON.stringify(it);
+            return typeof json === 'string' ? json : '';
+          } catch (_) {
+            return '';
+          }
         };
 
         let focusCellIdx = -1;
@@ -2241,13 +2253,36 @@ if (configuration.remember) {
         }
 
         // Build the raw (unstyled) text for every column in this line.
+        //
+        // HARDENED: every entry produced by this map is GUARANTEED to be
+        // a STRING. Previously the final expression
+        //
+        //     return typeof option === 'string' ? option : option.name || JSON.stringify(option);
+        //
+        // could yield `undefined` (when `option` was a function / symbol /
+        // an object whose `toJSON()` returned `undefined`) or a NON-string
+        // (e.g. an array or number used as `option.name`). Downstream, the
+        // renderer does `sep.length + text.length`, so any non-string
+        // value blew up with:
+        //
+        //   TypeError: Cannot read properties of undefined (reading 'length')
+        //
+        // This wrapper eliminates the entire class of failure without
+        // changing any visible layout or navigation behaviour.
         const texts = lineOptions.map((option, columnIndex) => {
+          // Null / undefined slot → render as empty cell instead of crash.
+          if (option === null || option === undefined) return '';
+
+          // Plain string option (kept for safety; normalizeOptions usually
+          // converts these into `{ name }` objects first).
+          if (typeof option === 'string') return option;
+
           if (option.type === 'field') {
             const maxLen = this.fieldMaxWidth || 20;
             let val = '';
             const label = option.label || '';
             if (this.isEditing && lineIndex === focusLine && columnIndex === focusColumn && this.activeField) {
-              val = this.activeField.value;
+              val = this.activeField.value || '';
               const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
               const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
               return label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
@@ -2257,7 +2292,19 @@ if (configuration.remember) {
               return label ? `${label}: ░${truncated}░` : `░${truncated}░`;
             }
           }
-          return typeof option === 'string' ? option : option.name || JSON.stringify(option);
+
+          // Prefer an explicit, real string name.
+          if (typeof option.name === 'string') return option.name;
+
+          // Final fallback: JSON stringification, guarded so that
+          // functions / symbols / non-serialisable objects (which make
+          // JSON.stringify return `undefined`) become an empty string.
+          try {
+            const json = JSON.stringify(option);
+            return typeof json === 'string' ? json : '';
+          } catch (_) {
+            return '';
+          }
         });
 
         // ---------- Resolve this line's horizontal scroll offset ----------
