@@ -1999,6 +1999,15 @@ if (configuration.remember) {
       let downHoldDetected = false;
       let downLastSeenTime = 0;
 
+      // Double-tap detection for LEFT / RIGHT arrows — used to hop
+      // between grid cells with a fast double-tap (mirrors ↑/↓).
+      let lastLeftPressTime = 0;
+      let leftHoldDetected = false;
+      let leftLastSeenTime = 0;
+      let lastRightPressTime = 0;
+      let rightHoldDetected = false;
+      let rightLastSeenTime = 0;
+
       // Reset the hold flag if no key event has been seen for HOLD_RESET_MS
       const checkKeyRelease = () => {
         const now = Date.now();
@@ -2010,6 +2019,29 @@ if (configuration.remember) {
           downHoldDetected = false;
           lastDownPressTime = 0;
         }
+        if (leftHoldDetected && (now - leftLastSeenTime) > HOLD_RESET_MS) {
+          leftHoldDetected = false;
+          lastLeftPressTime = 0;
+        }
+        if (rightHoldDetected && (now - rightLastSeenTime) > HOLD_RESET_MS) {
+          rightHoldDetected = false;
+          lastRightPressTime = 0;
+        }
+      };
+
+      // Helper: which cell (if any) does the given column belong to on a
+      // grid line? Returns null when the line is not a grid line.
+      const getGridCellInfo = (lineIdx, columnIdx) => {
+        const lineData = normalizedOptions[lineIdx];
+        if (!lineData || !lineData._grid) return null;
+        const ranges = lineData._gridCellRanges || [];
+        for (let ci = 0; ci < ranges.length; ci++) {
+          const r = ranges[ci];
+          if (columnIdx >= r.start && columnIdx < r.end) {
+            return { cellIdx: ci, ranges };
+          }
+        }
+        return null;
       };
 
       const computeViewport = () => {
@@ -2033,6 +2065,165 @@ if (configuration.remember) {
         );
       };
 
+      // ------------------------------------------------------------------
+      // GRID LINE RENDERING
+      // ------------------------------------------------------------------
+      const renderGridLine = (lineOptions, lineIndex, focusLine, focusColumn, termWidth, hScrollMap) => {
+        const grid = lineOptions._grid;
+        const ranges = lineOptions._gridCellRanges || [];
+        const numCells = ranges.length;
+        if (numCells === 0) return '';
+
+        const cfg = grid.config || {};
+        const maxRatio = (typeof cfg.maxCellRatio === 'number' && cfg.maxCellRatio > 0)
+          ? cfg.maxCellRatio
+          : 0.2;
+        const maxCellWidth = Math.max(8, Math.floor(termWidth * maxRatio));
+        const totalGap = Math.max(0, numCells - 1);
+        const availableWidth = Math.max(1, termWidth - totalGap);
+        const cellWidth = Math.min(
+          maxCellWidth,
+          Math.max(6, Math.floor(availableWidth / numCells))
+        );
+
+        if (!hScrollMap.__grid) hScrollMap.__grid = {};
+        const gridKey = `g${lineIndex}_${grid.name || ''}`;
+        if (!hScrollMap.__grid[gridKey]) {
+          hScrollMap.__grid[gridKey] = new Array(numCells).fill(0);
+        }
+        const cellScrolls = hScrollMap.__grid[gridKey];
+        while (cellScrolls.length < numCells) cellScrolls.push(0);
+
+        const stripAnsi = (s) => String(s == null ? '' : s).replace(/\x1b\[[0-9;]*m/g, '');
+        const itemText = (it) => {
+          if (!it) return '';
+          if (typeof it === 'string') return it;
+          if (it.type === 'cellText') return String(it.text || '');
+          if (it.type === 'field') {
+            const label = it.label || '';
+            const val = String(it.value || '');
+            return label ? `${label}: ░${val}░` : `░${val}░`;
+          }
+          return it.name || JSON.stringify(it);
+        };
+
+        let focusCellIdx = -1;
+        let focusItemIdx = -1;
+        if (lineIndex === focusLine) {
+          for (let ci = 0; ci < numCells; ci++) {
+            const r = ranges[ci];
+            if (focusColumn >= r.start && focusColumn < r.end) {
+              focusCellIdx = ci;
+              focusItemIdx = focusColumn - r.start;
+              break;
+            }
+          }
+        }
+
+        if (focusCellIdx >= 0) {
+          const cell = grid.cells[focusCellIdx];
+          const items = (cell && cell.items) || [];
+          let scroll = cellScrolls[focusCellIdx] || 0;
+          if (focusItemIdx < scroll) scroll = focusItemIdx;
+          if (scroll < 0) scroll = 0;
+          if (scroll >= items.length && items.length > 0) scroll = items.length - 1;
+
+          const reserveRight = 6;
+          const measure = (from, to) => {
+            let w = 0;
+            if (from > 0) w += stripAnsi(`◀${from} `).length;
+            for (let i = from; i <= to && i < items.length; i++) {
+              if (i > from) w += 2;
+              w += stripAnsi(itemText(items[i])).length;
+            }
+            return w;
+          };
+          let w = measure(scroll, focusItemIdx);
+          while (w > cellWidth - reserveRight && scroll < focusItemIdx) {
+            scroll++;
+            w = measure(scroll, focusItemIdx);
+          }
+          cellScrolls[focusCellIdx] = scroll;
+        }
+
+        const parts = [];
+        for (let ci = 0; ci < numCells; ci++) {
+          const cell = grid.cells[ci];
+          const items = (cell && cell.items) || [];
+          const texts = items.map(itemText);
+          let scroll = cellScrolls[ci] || 0;
+          if (scroll < 0) scroll = 0;
+          if (scroll > 0 && scroll >= items.length) scroll = Math.max(0, items.length - 1);
+          cellScrolls[ci] = scroll;
+
+          let cellStr = '';
+          let cw = 0;
+
+          if (scroll > 0) {
+            const ind = ColorText.dim(`◀${scroll} `);
+            cellStr += ind;
+            cw += stripAnsi(ind).length;
+          }
+
+          let lastRendered = scroll - 1;
+          for (let i = scroll; i < texts.length; i++) {
+            const sep = (i > scroll) ? '  ' : '';
+            const raw = texts[i];
+            const clean = stripAnsi(raw);
+            const isFirst = (i === scroll);
+            const hasMoreAfter = i < texts.length - 1;
+            const reserveRight = hasMoreAfter ? 6 : 0;
+
+            if (!isFirst && cw + sep.length + clean.length + reserveRight > cellWidth) {
+              break;
+            }
+
+            let renderTxt = raw;
+            if (isFirst) {
+              const maxLen = cellWidth - cw - (hasMoreAfter ? 6 : 0);
+              if (clean.length > maxLen && maxLen > 1) {
+                renderTxt = clean.slice(0, Math.max(1, maxLen - 1)) + '…';
+              }
+            }
+
+            const isFocused = (lineIndex === focusLine && ci === focusCellIdx && i === focusItemIdx);
+            if (isFocused) {
+              if (this.highlightColor) {
+                cellStr += `${sep}${this.highlightColor}${renderTxt}${this.resetColor()}`;
+              } else {
+                cellStr += `${sep}→ ${renderTxt}`;
+              }
+            } else {
+              cellStr += sep + renderTxt;
+            }
+            cw += sep.length + stripAnsi(renderTxt).length;
+            lastRendered = i;
+          }
+
+          const rightMore = texts.length - 1 - lastRendered;
+          if (rightMore > 0) {
+            let ind = ` ${rightMore}▶`;
+            if (cw + ind.length > cellWidth) {
+              const max = cellWidth - cw;
+              ind = max > 1 ? ind.slice(0, max) : '';
+            }
+            if (ind) {
+              cellStr += ColorText.dim(ind);
+              cw += stripAnsi(ind).length;
+            }
+          }
+
+          const visibleLen = stripAnsi(cellStr).length;
+          if (visibleLen < cellWidth) {
+            cellStr += ' '.repeat(cellWidth - visibleLen);
+          }
+
+          parts.push(cellStr);
+        }
+
+        return parts.join(ColorText.dim('│'));
+      };
+
       // Render a single line of options into a string.
       //
       // This version applies HORIZONTAL scrolling: if the combined width
@@ -2043,6 +2234,11 @@ if (configuration.remember) {
       // exactly mirroring the vertical viewport behaviour above.
       const renderOptionLine = (lineOptions, lineIndex, focusLine, focusColumn) => {
         const termWidth = stdout.columns || 80;
+
+        // Grid lines carry a `_grid` marker (see this.Grid()).
+        if (lineOptions._grid) {
+          return renderGridLine(lineOptions, lineIndex, focusLine, focusColumn, termWidth, hScrollByLine);
+        }
 
         // Build the raw (unstyled) text for every column in this line.
         const texts = lineOptions.map((option, columnIndex) => {
@@ -2440,15 +2636,65 @@ if (configuration.remember) {
             break;
           }
 
-          case 'left':
+          case 'left': {
+            const now = Date.now();
+            checkKeyRelease();
+            leftLastSeenTime = now;
+
+            if (!leftHoldDetected) {
+              const elapsed = now - lastLeftPressTime;
+              if (lastLeftPressTime !== 0 && elapsed <= DOUBLE_TAP_WINDOW_MS) {
+                if (elapsed < 50) {
+                  leftHoldDetected = true;
+                  lastLeftPressTime = 0;
+                } else {
+                  lastLeftPressTime = 0;
+                  const gi = getGridCellInfo(line, column);
+                  if (gi && gi.cellIdx > 0) {
+                    const prevRange = gi.ranges[gi.cellIdx - 1];
+                    setFocus(line, prevRange.start);
+                    break;
+                  }
+                }
+              } else {
+                lastLeftPressTime = now;
+              }
+            }
+
             if (column > 0) column--;
             setFocus(line, column);
             break;
+          }
 
-          case 'right':
+          case 'right': {
+            const now = Date.now();
+            checkKeyRelease();
+            rightLastSeenTime = now;
+
+            if (!rightHoldDetected) {
+              const elapsed = now - lastRightPressTime;
+              if (lastRightPressTime !== 0 && elapsed <= DOUBLE_TAP_WINDOW_MS) {
+                if (elapsed < 50) {
+                  rightHoldDetected = true;
+                  lastRightPressTime = 0;
+                } else {
+                  lastRightPressTime = 0;
+                  const gi = getGridCellInfo(line, column);
+                  if (gi && gi.cellIdx < gi.ranges.length - 1) {
+                    const nextRange = gi.ranges[gi.cellIdx + 1];
+                    setFocus(line, nextRange.start);
+                    break;
+                  }
+                }
+              } else {
+                lastRightPressTime = now;
+              }
+            }
+
             if (column < normalizedOptions[line].length - 1) column++;
             setFocus(line, column);
             break;
+          }
 
           case 'return':
             await selectOption('keyboard');
@@ -2820,19 +3066,34 @@ normalizeOptions(options) {
   
   for (const option of options) {
     if (Array.isArray(option)) {
-      // Handle array of options (already flattened)
       const line = option.map(item => 
         typeof item === 'string' ? { name: item } : item
       );
       result.push(line);
     } else if (option?.type === 'options') {
-      // Handle options group - flatten it into the current line
       const line = option.value.map(item => 
         typeof item === 'string' ? { name: item } : item
       );
       result.push(line);
+    } else if (option?.type === 'grid') {
+      // Grid: flatten every cell's items into ONE navigable line so the
+      // HUD's focus/linear-index maths work unchanged. Per-cell grouping
+      // and per-cell horizontal scroll are preserved via `_grid` and
+      // `_gridCellRanges` markers attached to the flattened line.
+      const cells = Array.isArray(option.cells) ? option.cells : [];
+      const line = [];
+      const ranges = [];
+      for (const cell of cells) {
+        const start = line.length;
+        for (const it of (cell.items || [])) {
+          line.push(it);
+        }
+        ranges.push({ start, end: line.length });
+      }
+      line._grid = option;
+      line._gridCellRanges = ranges;
+      result.push(line);
     } else {
-      // Single option
       const item = typeof option === 'string' ? { name: option } : option;
       result.push([item]);
     }
@@ -3427,6 +3688,75 @@ setFocus(newLine, newColumn);
     }
 
     if (row < 0 || row >= normalizedOptions.length) return -1;
+
+    // GRID hit-testing: side-by-side cells, each `cellWidth` wide with a
+    // 1-char '│' separator between them.
+    if (normalizedOptions[row] && normalizedOptions[row]._grid) {
+      const line = normalizedOptions[row];
+      const grid = line._grid;
+      const ranges = line._gridCellRanges || [];
+      const numCells = ranges.length;
+      if (numCells === 0) return -1;
+
+      const termWidth = stdout.columns || 80;
+      const cfg = grid.config || {};
+      const maxRatio = (typeof cfg.maxCellRatio === 'number' && cfg.maxCellRatio > 0)
+        ? cfg.maxCellRatio
+        : 0.2;
+      const maxCellWidth = Math.max(8, Math.floor(termWidth * maxRatio));
+      const totalGap = Math.max(0, numCells - 1);
+      const availableWidth = Math.max(1, termWidth - totalGap);
+      const cellWidth = Math.min(
+        maxCellWidth,
+        Math.max(6, Math.floor(availableWidth / numCells))
+      );
+
+      const hMap = (state && state.hScrollByLine) ? state.hScrollByLine : {};
+      const gMap = (hMap.__grid) ? hMap.__grid : {};
+      const gridKey = `g${row}_${grid.name || ''}`;
+      const cellScrolls = gMap[gridKey] || new Array(numCells).fill(0);
+
+      let x = terminalX;
+      let cellIdx = -1;
+      let cellOffsetX = 0;
+      for (let ci = 0; ci < numCells; ci++) {
+        if (ci > 0) {
+          if (x < 1) break;
+          x -= 1;
+        }
+        if (x < cellWidth) { cellIdx = ci; cellOffsetX = x; break; }
+        x -= cellWidth;
+      }
+      if (cellIdx < 0) return -1;
+
+      const range = ranges[cellIdx];
+      const scroll = Math.max(0, cellScrolls[cellIdx] || 0);
+      const cell = grid.cells[cellIdx];
+      const items = (cell && cell.items) || [];
+      const strip = (s) => String(s == null ? '' : s).replace(/\x1b\[[0-9;]*m/g, '');
+      const textOf = (it) => {
+        if (!it) return '';
+        if (typeof it === 'string') return it;
+        if (it.type === 'cellText') return String(it.text || '');
+        if (it.type === 'field') {
+          const label = it.label || '';
+          const val = String(it.value || '');
+          return label ? `${label}: ░${val}░` : `░${val}░`;
+        }
+        return it.name || '';
+      };
+
+      let curX = 0;
+      if (scroll > 0) curX += strip(`◀${scroll} `).length;
+      for (let i = scroll; i < items.length; i++) {
+        const w = strip(textOf(items[i])).length;
+        if (cellOffsetX >= curX && cellOffsetX <= curX + w + 2) {
+          return this.getLinearIndexFromCoordinates(normalizedOptions, row, range.start + i);
+        }
+        curX += w + 2;
+      }
+      return -1;
+    }
 
     // Find the column inside that row.
     //
@@ -8534,6 +8864,12 @@ function levenshteinDistance(str1, str2) {
       const button_obj = this._makeButtonObj(id, finalConfig);
       if (!button_obj) return;
 
+      // 0) Inside a Grid cell — capture into the cell's own item list.
+      if (__build._cellItems) {
+        __build._cellItems.push(button_obj);
+        return;
+      }
+
       // 1) Inside a horizontal dropdown → merge into that dropdown's group
       if (this._placeInHorizontalDropdown(id, [button_obj])) return;
 
@@ -8611,6 +8947,13 @@ function levenshteinDistance(str1, str2) {
       }
       if (objs.length === 0) return;
 
+      // Inside a Grid cell — every button in this group becomes part of
+      // the cell's horizontal flow.
+      if (__build._cellItems) {
+        for (const obj of objs) __build._cellItems.push(obj);
+        return;
+      }
+
       // Inside a horizontal dropdown → merge into that dropdown's group
       if (this._placeInHorizontalDropdown(id, objs)) return;
 
@@ -8650,6 +8993,12 @@ function levenshteinDistance(str1, str2) {
 
       const obj = this._makeButtonObj(id, finalConfig);
       if (!obj) return;
+
+      // Inside a Grid cell — capture into the cell's own list.
+      if (__build._cellItems) {
+        __build._cellItems.push(obj);
+        return;
+      }
 
       // Inside a horizontal dropdown → merge into that dropdown's group
       if (this._placeInHorizontalDropdown(id, [obj])) return;
@@ -8692,7 +9041,15 @@ function levenshteinDistance(str1, str2) {
           else if (userBuild._pinContext === 'bottom') effective.pinned = true;
         }
 
-        if (effective.pinnedTop) {
+        if (userBuild._cellItems) {
+          // Inside a Grid cell — capture text as a cell item.
+          userBuild._cellItems.push({
+            type: 'cellText',
+            text: text,
+            action: () => {},
+            metadata: { props: {}, path: this.Name }
+          })
+        } else if (effective.pinnedTop) {
           if (effective.separator !== undefined) {
             userBuild.PinnedTopSeparator = effective.separator
           }
@@ -8802,8 +9159,14 @@ function levenshteinDistance(str1, str2) {
             }
         };
 
-        // Add it as an item in the current build, similar to a button but with type 'field'
-        this.Builds.get(id).Buttons.push(fieldObj);
+        // Add it as an item in the current build, similar to a button but
+        // with type 'field'. Inside a Grid cell it is captured into the
+        // cell's own horizontal flow instead.
+        if (__build._cellItems) {
+            __build._cellItems.push(fieldObj);
+        } else {
+            __build.Buttons.push(fieldObj);
+        }
     };
 
     // --------------------------- TextEditor Method ---------------------------
@@ -10245,6 +10608,84 @@ function levenshteinDistance(str1, str2) {
       this.Button(id, buttonCfg);
 
       return this.Storages.Get(id, storageKey);
+    };
+
+    // --------------------------- Grid Method ---------------------------
+
+    /**
+     * Create a responsive, horizontally-scrollable grid row.
+     *
+     * Each element of `cellBuilders` is an async function that builds ONE
+     * cell's content, using the same Text/Button/Buttons/SideButton/Field
+     * API a `this.Page` body would use. Cells render SIDE-BY-SIDE on the
+     * same terminal row. Inside a cell, Button layouts horizontally.
+     * Each cell caps at `maxCellRatio` (default 0.2 = 1/5) of terminal
+     * width and keeps its OWN `◀N`/`N▶` horizontal scroll viewport.
+     *
+     * @param {string} id - User/build ID
+     * @param {string} name - Grid name (persists per-cell scroll state)
+     * @param {Array<Function|{build:Function}|{items:Array}>} cellBuilders
+     * @param {Object} [config]
+     * @param {number} [config.maxCellRatio=0.2]
+     * @param {number} [config.gap=2]
+     * @returns {Promise<void>}
+     */
+    this.Grid = async (id, name, cellBuilders = [], config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Grid() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+      const userBuild = this.Builds.get(id);
+      const cells = [];
+
+      for (let i = 0; i < cellBuilders.length; i++) {
+        const cb = cellBuilders[i];
+        const cellItems = [];
+
+        const prevCellItems = userBuild._cellItems;
+        userBuild._cellItems = cellItems;
+
+        try {
+          if (typeof cb === 'function') {
+            await cb();
+          } else if (cb && typeof cb.build === 'function') {
+            await cb.build();
+          } else if (cb && typeof cb === 'object' && Array.isArray(cb.items)) {
+            for (const it of cb.items) cellItems.push(it);
+          }
+        } catch (e) {
+          if (this.Log) console.error(`this.Grid() cell ${i} error:`, e);
+          cellItems.push({
+            name: `[cell error: ${e.message}]`,
+            action: () => {},
+            metadata: { props: {}, path: this.Name }
+          });
+        } finally {
+          userBuild._cellItems = prevCellItems;
+        }
+
+        const flat = [];
+        for (const it of cellItems) {
+          if (it && it.type === 'options' && Array.isArray(it.value)) {
+            for (const sub of it.value) flat.push(sub);
+          } else {
+            flat.push(it);
+          }
+        }
+        cells.push({ items: flat });
+      }
+
+      userBuild.Buttons.push({
+        type: 'grid',
+        name: name || `grid_${Date.now().toString(36)}`,
+        cells,
+        config: {
+          maxCellRatio: (typeof config.maxCellRatio === 'number' && config.maxCellRatio > 0 && config.maxCellRatio <= 1)
+            ? config.maxCellRatio
+            : 0.2,
+          gap: (typeof config.gap === 'number') ? config.gap : 2
+        }
+      });
     };
 
     // --------------------------- Args Method ---------------------------
@@ -12594,6 +13035,25 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.Cells(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'grid': {
+          const cells = Array.isArray(it.cells) ? it.cells : []
+          const cfgParts = []
+          if (it.maxCellRatio && it.maxCellRatio !== 0.2) {
+            cfgParts.push(`maxCellRatio: ${it.maxCellRatio}`)
+          }
+          if (it.gap !== undefined && it.gap !== 2) {
+            cfgParts.push(`gap: ${it.gap}`)
+          }
+          const cfgStr = cfgParts.length > 0 ? `, { ${cfgParts.join(', ')} }` : ''
+          L.push(`${indent}await this.Grid(id, ${JSON.stringify(it.name || 'grid')}, [`)
+          for (const cell of cells) {
+            L.push(`${indent}  async () => {`)
+            emit(cell.items || [], indent + '    ')
+            L.push(`${indent}  },`)
+          }
+          L.push(`${indent}]${cfgStr})`)
+          break
+        }
         case 'args': {
           const cfg = {
             required: it.schema || [],
@@ -12684,6 +13144,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   JSON: 'json',
   Args: 'args',
   Cells: 'cells',
+  Grid: 'grid',
   Get: 'route',
   Post: 'route',
   Put: 'route',
@@ -12777,6 +13238,15 @@ function _sbMakeItemForMethod(methodName, id) {
         cols: 26,
         pinned: false,
         pinnedTop: false
+      }
+    case 'grid':
+      // Horizontal grid of cells. Starts with ONE empty cell.
+      return {
+        ...base,
+        name: 'grid_' + id,
+        cells: [{ items: [] }],
+        maxCellRatio: 0.2,
+        gap: 2
       }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
@@ -12935,12 +13405,24 @@ class SelfBuilder extends SyAPP_Func {
     items = items || this.State.items
     for (const it of items) {
       if (it.id === id) return it
-      if ((it.type === 'page' || it.type === 'dropdown' || it.type === 'codeblock' ||
-           it.type === 'args' || it.type === 'buttonsGroup' ||
-           it.type === 'pinnedTop' || it.type === 'pinnedBottom') &&
-          Array.isArray(it.items)) {
+
+      // Recurse into ANY nested `items` array (page, dropdown, codeblock,
+      // args, buttonsGroup, pinnedTop, pinnedBottom).
+      if (Array.isArray(it.items)) {
         const f = this._findItem(id, it.items)
         if (f) return f
+      }
+
+      // Recurse into grid cells so any item nested inside a cell is
+      // reachable (edit, delete, reorder — all work on them). This is
+      // what makes clicking the ○/◉ dot actually open the pinned editor.
+      if (Array.isArray(it.cells)) {
+        for (const cell of it.cells) {
+          if (cell && Array.isArray(cell.items)) {
+            const f = this._findItem(id, cell.items)
+            if (f) return f
+          }
+        }
       }
     }
     return null
@@ -13017,6 +13499,20 @@ class SelfBuilder extends SyAPP_Func {
       if (item && item.type === 'pinnedBottom') {
         if (!Array.isArray(item.items)) item.items = []
         return { kind: 'pinnedBottom', item, items: item.items }
+      }
+    }
+    // Grid cell container: "__sbgc__:<gridId>:<cellIdx>"
+    if (typeof pageName === 'string' && pageName.startsWith('__sbgc__:')) {
+      const rest = pageName.slice(9)
+      const colonIdx = rest.indexOf(':')
+      const gridId = colonIdx >= 0 ? rest.slice(0, colonIdx) : rest
+      const cellIdx = colonIdx >= 0 ? (parseInt(rest.slice(colonIdx + 1), 10) || 0) : 0
+      const item = this._findItem(gridId)
+      if (item && item.type === 'grid') {
+        if (!Array.isArray(item.cells)) item.cells = [{ items: [] }]
+        if (!item.cells[cellIdx]) item.cells[cellIdx] = { items: [] }
+        if (!Array.isArray(item.cells[cellIdx].items)) item.cells[cellIdx].items = []
+        return { kind: 'gridCell', item, cellIdx, items: item.cells[cellIdx].items }
       }
     }
     const pageItem = S.items.find(i => i.type === 'page' && i.name === pageName)
@@ -13309,23 +13805,32 @@ class SelfBuilder extends SyAPP_Func {
       this.Storages.Set(id, 'sb_new_open', false)
     }
 
-    // Recursive delete across page hierarchy
+    // Recursive delete across the FULL container hierarchy (pages,
+    // dropdowns, codeblocks, args, buttonsGroup, pinned areas AND grid
+    // cells).
     if (p.__del) {
-      const removeFrom = (arr) => {
+      const recurseFind = (arr) => {
         const idx = arr.findIndex(x => x.id === p.__del)
         if (idx >= 0) { arr.splice(idx, 1); return true }
         for (const it of arr) {
-          if (it.type === 'page' && Array.isArray(it.items)) {
-            if (removeFrom(it.items)) return true
+          if (Array.isArray(it.items)) {
+            if (recurseFind(it.items)) return true
+          }
+          if (Array.isArray(it.cells)) {
+            for (const cell of it.cells) {
+              if (cell && Array.isArray(cell.items)) {
+                if (recurseFind(cell.items)) return true
+              }
+            }
           }
         }
         return false
       }
-      removeFrom(S.items)
+      recurseFind(S.items)
       if (this.EditItemId === p.__del) this.EditItemId = null
     }
 
-    // Recursive reorder (up/down) across page hierarchy
+    // Recursive reorder (up/down) across the FULL container hierarchy.
     const moveInTree = (arr, targetId, dir) => {
       const i = arr.findIndex(x => x.id === targetId)
       if (i >= 0) {
@@ -13334,11 +13839,55 @@ class SelfBuilder extends SyAPP_Func {
         return false
       }
       for (const it of arr) {
-        if (it.type === 'page' && Array.isArray(it.items)) {
+        if (Array.isArray(it.items)) {
           if (moveInTree(it.items, targetId, dir)) return true
+        }
+        if (Array.isArray(it.cells)) {
+          for (const cell of it.cells) {
+            if (cell && Array.isArray(cell.items)) {
+              if (moveInTree(cell.items, targetId, dir)) return true
+            }
+          }
         }
       }
       return false
+    }
+
+    // Grid cell management from the cell's OWN toolbar.
+    if (p.__gridAddCell) {
+      const parts = String(p.__gridAddCell).split(':')
+      const gid = parts[0]
+      const cidx = parseInt(parts[1], 10) || 0
+      const g = this._findItem(gid)
+      if (g && g.type === 'grid') {
+        if (!Array.isArray(g.cells)) g.cells = []
+        g.cells.splice(cidx + 1, 0, { items: [] })
+        this.Storages.Set(id, 'sb_new_open', false)
+        const newProps = { ...(this.Builds.get(id)?.Session?.ActualProps || {}) }
+        newProps.page = `__sbgc__:${gid}:${cidx + 1}`
+        delete newProps.__add
+        delete newProps.__toggleNew
+        this.Builds.get(id).Session.ActualProps = newProps
+        this.Alert(id, '＋ Cell added', { duration: 1500 })
+        return
+      }
+    }
+    if (p.__gridDelCell) {
+      const parts = String(p.__gridDelCell).split(':')
+      const gid = parts[0]
+      const cidx = parseInt(parts[1], 10) || 0
+      const g = this._findItem(gid)
+      if (g && g.type === 'grid' && Array.isArray(g.cells) && g.cells.length > 1) {
+        g.cells.splice(cidx, 1)
+        const newIdx = Math.max(0, cidx - 1)
+        const newProps = { ...(this.Builds.get(id)?.Session?.ActualProps || {}) }
+        newProps.page = `__sbgc__:${gid}:${newIdx}`
+        delete newProps.__add
+        delete newProps.__toggleNew
+        this.Builds.get(id).Session.ActualProps = newProps
+        this.Alert(id, '− Cell removed', { duration: 1500 })
+        return
+      }
     }
     if (p.__up)   moveInTree(S.items, p.__up, 'up')
     if (p.__down) moveInTree(S.items, p.__down, 'down')
@@ -13424,13 +13973,48 @@ class SelfBuilder extends SyAPP_Func {
                   ? `📌 Pinned Top`
                   : container.kind === 'pinnedBottom'
                     ? `📌 Pinned Bottom`
-                    : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
-      this.Buttons(id, [
+                    : container.kind === 'gridCell'
+                      ? `▦ ${_fit(container.item.name || 'grid', 20)} cell ${container.cellIdx + 1}`
+                      : ColorText.red(`(missing: ${_fit(curPage, 30)})`)
+
+      const navRow = [
         { name: '← Root', props: { page: '' }, pinnedTop: true },
         { name: label, pinnedTop: true },
         { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
           props: { __toggleNew: 1 }, pinnedTop: true }
-      ])
+      ]
+
+      if (container.kind === 'gridCell') {
+        const gridCells = Array.isArray(container.item.cells) ? container.item.cells : []
+        const totalCells = gridCells.length || 1
+        const cIdx = container.cellIdx
+        navRow.push({
+          name: cIdx > 0 ? '◀ Cell' : ColorText.dim('◀ Cell'),
+          props: cIdx > 0 ? { page: `__sbgc__:${container.item.id}:${cIdx - 1}` } : {},
+          pinnedTop: true
+        })
+        navRow.push({
+          name: ColorText.dim(`${cIdx + 1}/${totalCells}`),
+          props: {},
+          pinnedTop: true
+        })
+        navRow.push({
+          name: cIdx < totalCells - 1 ? 'Cell ▶' : ColorText.dim('Cell ▶'),
+          props: cIdx < totalCells - 1 ? { page: `__sbgc__:${container.item.id}:${cIdx + 1}` } : {},
+          pinnedTop: true
+        })
+        navRow.push({
+          name: '＋ Cell',
+          props: { __gridAddCell: `${container.item.id}:${cIdx}` },
+          pinnedTop: true
+        })
+        navRow.push({
+          name: ColorText.red('− Cell'),
+          props: totalCells > 1 ? { __gridDelCell: `${container.item.id}:${cIdx}` } : {},
+          pinnedTop: true
+        })
+      }
+      this.Buttons(id, navRow)
       if (newOpen) {
         // Break the toolbar options group + draw a separator line between
         // the toolbar and the opened "+New" menu, so the two never merge
@@ -13490,6 +14074,7 @@ class SelfBuilder extends SyAPP_Func {
       else if (container.kind === 'buttonsGroup') lbl = `⧾ Buttons Group`
       else if (container.kind === 'pinnedTop')  lbl = `📌 Pinned Top`
       else if (container.kind === 'pinnedBottom') lbl = `📌 Pinned Bottom`
+      else if (container.kind === 'gridCell')   lbl = `▦ ${container.item.name || 'grid'} cell ${container.cellIdx + 1}`
       else                                       lbl = `? ${curPage}`
       ctx = ColorText.dim(` | ${_fit(lbl, 40)}`)
     }
@@ -13948,6 +14533,25 @@ class SelfBuilder extends SyAPP_Func {
             pinnedTop: it.pinnedTop
           })
           break
+        case 'grid': {
+          if (this.Editing) {
+            const cellCount = Array.isArray(it.cells) ? it.cells.length : 0
+            this.Button(id, {
+              name: `${ColorText.brightMagenta('▦')} Grid (${cellCount} cell${cellCount === 1 ? '' : 's'})`,
+              props: { page: `__sbgc__:${it.id}:0` }
+            })
+          } else {
+            const cells = Array.isArray(it.cells) ? it.cells : []
+            const cellBuilders = cells.map(cell => async () => {
+              await this._renderItems(id, cell.items || [], props)
+            })
+            await this.Grid(id, it.name || 'grid', cellBuilders, {
+              maxCellRatio: it.maxCellRatio,
+              gap: it.gap
+            })
+          }
+          break
+        }
         case 'args':
           // Args container: behaves like a page in edit mode (click to
           // step inside and add/modify its children) and executes the
@@ -14308,6 +14912,19 @@ class SelfBuilder extends SyAPP_Func {
       case 'code':
         mkProp('value', 'Code', 'string')
         break
+
+      case 'grid': {
+        mkProp('name', 'Name', 'string')
+        mkProp('maxCellRatio', 'Max Cell Ratio', 'number')
+        mkProp('gap', 'Gap', 'number')
+        const cellCount = Array.isArray(it.cells) ? it.cells.length : 0
+        propButtons.push({
+          name: ColorText.brightMagenta(`▦ Open cells (${cellCount})`),
+          props: { page: `__sbgc__:${it.id}:0` },
+          pinned: true
+        })
+        break
+      }
     }
 
     if (propButtons.length > 0) this.Buttons(id, propButtons)
@@ -14821,6 +15438,30 @@ function _sbCallToItem(call, sessionVar) {
       return { type: 'file', config: {} }
     case 'JSON':
       return { type: 'json', config: {} }
+    case 'Grid': {
+      const nameVal = _sbParseValue(rest[0])
+      const cellsArg = rest[1] || ''
+      const cells = []
+      const trimmed = String(cellsArg).trim()
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        const inner = trimmed.slice(1, -1)
+        const parts = _sbSplitArgs(inner)
+        for (const p of parts) {
+          const body = _sbExtractArrowBody(p)
+          const cellItems = body !== null ? _sbParseBody(body) : []
+          cells.push({ items: cellItems })
+        }
+      }
+      const cfg = rest[2] !== undefined ? _sbObjArg(rest[2]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'grid',
+        name: typeof nameVal === 'string' ? nameVal : 'grid',
+        cells,
+        maxCellRatio: typeof cfg.maxCellRatio === 'number' ? cfg.maxCellRatio : 0.2,
+        gap: typeof cfg.gap === 'number' ? cfg.gap : 2
+      }
+    }
     case 'Get':
     case 'Post':
     case 'Put':
