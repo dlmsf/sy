@@ -9597,7 +9597,9 @@ function levenshteinDistance(str1, str2) {
      */
     this._cellsParseRef = (ref) => {
       // Case-insensitive: "A1", "a1" and "Aa1" all parse identically.
-      const m = String(ref).match(/^([A-Za-z]+)(\d+)$/);
+      // `$` lock markers ($A$1, $A1, A$1) are stripped so the goto
+      // prompt can accept absolute-style references too.
+      const m = String(ref).replace(/\$/g, '').match(/^([A-Za-z]+)(\d+)$/);
       if (!m) return null;
       let col = 0;
       for (const ch of m[1].toUpperCase()) col = col * 26 + (ch.charCodeAt(0) - 64);
@@ -9654,8 +9656,36 @@ function levenshteinDistance(str1, str2) {
           if (lower !== ref) {
             Object.defineProperty(scope, lower, desc);
           }
+
+          // Absolute-style aliases: register $A$1, $A1 and A$1 as
+          // read-only aliases pointing to the same cell. This makes
+          // `=$B$1*2` (plain formula) and `` =`${$B$1}` `` (template
+          // literal) both resolve to the same value, matching exactly
+          // the shift-time behaviour of shiftFormulaRefs().
+          const rm = ref.match(/^([A-Z]+)(\d+)$/);
+          if (rm) {
+            const col = rm[1], row = rm[2];
+            const variants = [
+              '$' + col + '$' + row,
+              '$' + col + row,
+              col + '$' + row
+            ];
+            for (const v of variants) {
+              if (v === ref) continue;
+              try { Object.defineProperty(scope, v, desc); } catch (_) {}
+              const vl = v.toLowerCase();
+              if (vl !== v) {
+                try { Object.defineProperty(scope, vl, desc); } catch (_) {}
+              }
+            }
+          }
         }
-        scope.get = (r) => { const c = result[String(r).toUpperCase()]; return c ? c.value : undefined; };
+        // get()/cell() also accept $-prefixed references.
+        scope.get = (r) => {
+          const key = String(r).toUpperCase().replace(/\$/g, '');
+          const c = result[key];
+          return c ? c.value : undefined;
+        };
         scope.cell = scope.get;
 
         for (const [ref, cell] of Object.entries(result)) {
@@ -9723,6 +9753,7 @@ function levenshteinDistance(str1, str2) {
         let scrollCol = 0;
         let editing = false;
         let editBuffer = '';
+        let editCursor = 0;
         let running = true;
         let finished = false;
         let statusMessage = '';
@@ -9790,24 +9821,132 @@ function levenshteinDistance(str1, str2) {
         };
 
         // Shift every A1-style reference in a formula by (dRow, dCol),
-        // so a formula copied two rows down keeps its relative structure.
-        // References are matched as word-boundary letter+digit pairs;
-        // matches inside string literals are extremely rare in practice
-        // and are left alone (still valid, just over-shifted).
-        // Shift every A1-style reference in a formula by (dRow, dCol).
-        // Case-insensitive: `a1+2` is treated exactly like `A1+2`, and
-        // the resulting refs are always normalised to uppercase.
+        // supporting:
+        //   • $ lock markers:  $A1  (col locked),  A$1  (row locked),
+        //                       $A$1 (both locked)
+        //   • template literals: only refs inside ${...} interpolations
+        //                        are shifted; the surrounding template
+        //                        string portions are copied verbatim, so
+        //                        a literal `$` (e.g. `$${A1}` → `$` + A1)
+        //                        is never mistaken for a lock marker and
+        //                        `${` is always detected correctly even
+        //                        when preceded by another `$`.
+        // Case-insensitive: `a1+2` is treated like `A1+2`; output refs
+        // are always uppercased.
         const shiftFormulaRefs = (formula, dRow, dCol) => {
           if (!formula) return formula;
-          return formula.replace(/\b([A-Za-z]+)(\d+)\b/g, (m, col, row) => {
+
+          const shiftRef = (colLock, col, rowLock, row) => {
             let colNum = 0;
             for (const ch of col.toUpperCase()) colNum = colNum * 26 + (ch.charCodeAt(0) - 64);
             colNum -= 1;
-            const newCol = colNum + dCol;
-            const newRow = parseInt(row, 10) - 1 + dRow;
-            if (newCol < 0 || newRow < 0) return m;
-            return this._cellsRefFromRC(newRow, newCol);
-          });
+            const newCol = colLock ? colNum : colNum + dCol;
+            const newRow = rowLock ? parseInt(row, 10) - 1 : parseInt(row, 10) - 1 + dRow;
+            if (newCol < 0 || newRow < 0) return `${colLock}${col}${rowLock}${row}`;
+            return `${colLock}${this._cellsColLabel(newCol)}${rowLock}${newRow + 1}`;
+          };
+
+          const isIdentChar = (ch) => !!ch && /[A-Za-z0-9_]/.test(ch);
+
+          // Walk a plain-code region, shifting any refs found inside it.
+          const processCode = (code) => {
+            let out = '';
+            let i = 0;
+            while (i < code.length) {
+              const before = i > 0 ? code[i - 1] : '';
+              if (isIdentChar(before)) { out += code[i]; i++; continue; }
+              const rest = code.slice(i);
+              const m = rest.match(/^(\$?)([A-Za-z]+)(\$?)(\d+)/);
+              if (m && !isIdentChar(code[i + m[0].length])) {
+                out += shiftRef(m[1], m[2], m[3], m[4]);
+                i += m[0].length;
+                continue;
+              }
+              out += code[i];
+              i++;
+            }
+            return out;
+          };
+
+          let out = '';
+          let i = 0;
+          const n = formula.length;
+          while (i < n) {
+            const c = formula[i];
+
+            // Plain string literal → copy verbatim.
+            if (c === '"' || c === "'") {
+              const start = i;
+              const delim = c;
+              i++;
+              while (i < n) {
+                if (formula[i] === '\\') { i += 2; continue; }
+                if (formula[i] === delim) { i++; break; }
+                i++;
+              }
+              out += formula.slice(start, i);
+              continue;
+            }
+
+            // Template literal → copy verbatim except inside ${...}.
+            if (c === '`') {
+              out += '`';
+              i++;
+              while (i < n) {
+                if (formula[i] === '\\') {
+                  out += formula.slice(i, i + 2);
+                  i += 2;
+                  continue;
+                }
+                if (formula[i] === '`') {
+                  out += '`';
+                  i++;
+                  break;
+                }
+                if (formula[i] === '$' && formula[i + 1] === '{') {
+                  out += '${';
+                  i += 2;
+                  // Scan forward to the matching close brace, skipping
+                  // any inner strings so braces inside them don't count.
+                  let depth = 1;
+                  const exprStart = i;
+                  while (i < n && depth > 0) {
+                    const ch = formula[i];
+                    if (ch === '"' || ch === "'") {
+                      const d = ch;
+                      i++;
+                      while (i < n) {
+                        if (formula[i] === '\\') { i += 2; continue; }
+                        if (formula[i] === d) { i++; break; }
+                        i++;
+                      }
+                      continue;
+                    }
+                    if (ch === '{') depth++;
+                    else if (ch === '}') {
+                      depth--;
+                      if (depth === 0) break;
+                    }
+                    i++;
+                  }
+                  const expr = formula.slice(exprStart, i);
+                  out += processCode(expr);
+                  if (i < n && formula[i] === '}') { out += '}'; i++; }
+                  continue;
+                }
+                out += formula[i];
+                i++;
+              }
+              continue;
+            }
+
+            // Plain code region — collect up to the next string start.
+            const codeStart = i;
+            while (i < n && formula[i] !== '"' && formula[i] !== "'" && formula[i] !== '`') i++;
+            out += processCode(formula.slice(codeStart, i));
+          }
+
+          return out;
         };
 
         // -----------------------------------------------------------------
@@ -10172,9 +10311,34 @@ function levenshteinDistance(str1, str2) {
               headerInfo = ` ${cursorRef} `;
             }
 
-            const editingTag = editing ? ' [EDIT]' : '';
+            // Build the left-hand segment of the title bar. During editing
+            // the FULL formula is shown, auto-scrolled so the cursor
+            // (marked with █) is always visible — this is what makes long
+            // formulas readable while typing.
+            const baseTag = ` 📊 ${name}`;
+            let editingTag = '';
+            if (editing) {
+              const prefix = ' [EDIT] ';
+              const avail = Math.max(
+                8,
+                cols - baseTag.length - prefix.length - headerInfo.length - 2
+              );
+              let start = 0;
+              if (editCursor >= avail) start = editCursor - avail + 1;
+              if (start < 0) start = 0;
+              const end = Math.min(editBuffer.length, start + avail);
+              const visible = editBuffer.slice(start, end);
+              const cursorInVisible = editCursor - start;
+              let marked =
+                visible.slice(0, cursorInVisible) +
+                '█' +
+                visible.slice(cursorInVisible);
+              if (start > 0) marked = '…' + marked;
+              if (end < editBuffer.length) marked = marked + '…';
+              editingTag = prefix + marked;
+            }
             const gotoTag = gotoMode ? ` [GOTO ${gotoBuffer}█]` : '';
-            const titleFull = ` 📊 ${name}${editingTag}${gotoTag}`;
+            const titleFull = baseTag + editingTag + gotoTag;
             const maxTitleLen = Math.max(10, cols - headerInfo.length - 2);
             const title = (titleFull.length > maxTitleLen)
               ? titleFull.slice(0, maxTitleLen - 1) + '…'
@@ -10227,8 +10391,19 @@ function levenshteinDistance(str1, str2) {
                 const inSel = selectMode && isInSelection(rowIdx, colIdx);
 
                 let display = '';
-                if (editing && isCursor) display = editBuffer;
-                else { const cc = computed[ref]; display = cc ? (cc.display || '') : ''; }
+                if (editing && isCursor) {
+                  // Small window around the cursor inside the cell itself.
+                  const w = Math.max(1, cellWidth - 1);
+                  let s = 0;
+                  if (editCursor >= w) s = editCursor - w + 1;
+                  const e = Math.min(editBuffer.length, s + w);
+                  const vis = editBuffer.slice(s, e);
+                  const ci = editCursor - s;
+                  display = vis.slice(0, ci) + '█' + vis.slice(ci);
+                } else {
+                  const cc = computed[ref];
+                  display = cc ? (cc.display || '') : '';
+                }
                 if (display.length > cellWidth - 1) display = display.slice(0, cellWidth - 2) + '…';
                 const padded = display.padEnd(cellWidth);
 
@@ -10325,6 +10500,7 @@ function levenshteinDistance(str1, str2) {
           computed = this._cellsEvaluate(state);
           editing = false;
           editBuffer = '';
+          editCursor = 0;
         };
 
         const clearCell = () => {
@@ -10373,16 +10549,71 @@ function levenshteinDistance(str1, str2) {
             finish(); return;
           }
 
-          // ---- EDIT MODE: raw text input --------------------------------
+          // ---- EDIT MODE: raw text input with cursor navigation --------
+          // Escape sequences (arrows, Home/End, Delete) are parsed BEFORE
+          // the per-char loop so they don't get misinterpreted as a bare
+          // Escape (which would cancel editing). The tracked `editCursor`
+          // position lets the user navigate freely inside long formulas.
           if (editing) {
+            if (str.startsWith('\x1b[')) {
+              const arrowMatch = str.match(/^\x1b\[(?:(\d+)(?:;(\d+))?)?([A-DHF])$/);
+              const tildeMatch = str.match(/^\x1b\[(\d+)(?:;(\d+))?~$/);
+              let handled = false;
+
+              if (arrowMatch) {
+                const keyChar = arrowMatch[3];
+                if (keyChar === 'D') { if (editCursor > 0) editCursor--; handled = true; }
+                else if (keyChar === 'C') { if (editCursor < editBuffer.length) editCursor++; handled = true; }
+                else if (keyChar === 'H') { editCursor = 0; handled = true; }
+                else if (keyChar === 'F') { editCursor = editBuffer.length; handled = true; }
+                // Up / Down move to the start / end of the single-line buffer.
+                else if (keyChar === 'A') { editCursor = 0; handled = true; }
+                else if (keyChar === 'B') { editCursor = editBuffer.length; handled = true; }
+              } else if (tildeMatch) {
+                const keyNum = parseInt(tildeMatch[1], 10);
+                if (keyNum === 3) {
+                  // Delete: remove the character under the cursor.
+                  if (editCursor < editBuffer.length) {
+                    editBuffer = editBuffer.slice(0, editCursor) + editBuffer.slice(editCursor + 1);
+                  }
+                  handled = true;
+                } else if (keyNum === 1) { editCursor = 0; handled = true; }
+                else if (keyNum === 4) { editCursor = editBuffer.length; handled = true; }
+              }
+
+              // Unknown escape sequence → swallow silently, never insert raw bytes.
+              if (handled) drawScreen();
+              return;
+            }
+
+            // Bare Escape → cancel editing (discard buffer).
+            if (str === '\x1b') {
+              editing = false;
+              editBuffer = '';
+              editCursor = 0;
+              drawScreen();
+              return;
+            }
+
+            // Printable/control characters insert/delete at the cursor.
             let needRedraw = false;
             for (const ch of str) {
               const code = ch.charCodeAt(0);
-              if (ch === '\r' || ch === '\n') { commitEdit(); needRedraw = true; break; }
-              else if (ch === '\x1b') { editing = false; editBuffer = ''; needRedraw = true; break; }
-              else if (ch === '\x7f' || ch === '\b') {
-                if (editBuffer.length > 0) { editBuffer = editBuffer.slice(0, -1); needRedraw = true; }
-              } else if (code >= 32 && code < 127) { editBuffer += ch; needRedraw = true; }
+              if (ch === '\r' || ch === '\n') {
+                commitEdit();
+                needRedraw = true;
+                break;
+              } else if (ch === '\x7f' || ch === '\b') {
+                if (editCursor > 0) {
+                  editBuffer = editBuffer.slice(0, editCursor - 1) + editBuffer.slice(editCursor);
+                  editCursor--;
+                  needRedraw = true;
+                }
+              } else if (code >= 32 && code < 127) {
+                editBuffer = editBuffer.slice(0, editCursor) + ch + editBuffer.slice(editCursor);
+                editCursor++;
+                needRedraw = true;
+              }
             }
             if (needRedraw) drawScreen();
             return;
@@ -10513,6 +10744,7 @@ function levenshteinDistance(str1, str2) {
             const ref = this._cellsRefFromRC(cursorRow, cursorCol);
             const c = state.cells && state.cells[ref];
             editBuffer = c ? (c.raw || '') : '';
+            editCursor = editBuffer.length;
             editing = true;
             drawScreen();
             return;
@@ -10524,8 +10756,10 @@ function levenshteinDistance(str1, str2) {
             const ref = this._cellsRefFromRC(cursorRow, cursorCol);
             const c = state.cells && state.cells[ref];
             editBuffer = c ? (c.raw || '') : '';
+            editCursor = editBuffer.length;
             editing = true;
             editBuffer += str;
+            editCursor = editBuffer.length;
             drawScreen();
             return;
           }
