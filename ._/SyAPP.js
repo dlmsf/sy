@@ -4280,6 +4280,8 @@ class SyAPP_Func {
    * @param {boolean|null} [config.refreshMode=null] - Refresh mode override (null=use global, true=force on, false=force off)
    * @param {Function} [config.onEnter] - Deprecated: Use Lifecycle hooks instead
    * @param {boolean} [config.onEnterOnce=false] - Deprecated: Use Lifecycle hooks instead
+   * @param {Function} [config.syappInit] - Global SyAPP-level init hook. Executes ONCE after the parent SyAPP instance finishes construction. SyAPP will NOT load the first screen (and will NOT run any refresh tick) until this hook's returned Promise has FULLY resolved. Receives a context object: { syapp, mainFuncName, mainFuncOriginalName, serverConfig, config, userConfig, funcs, sessions, mainSessionId, logMaster, colorText, configManager }.
+   * @param {boolean} [config.syappInitOnce=true] - If true (default), the syappInit hook runs only once per SyAPP instance.
    */
   constructor(name, build = async (props = { session: new Session }) => { }, config = {
     routes: [{ name: '', stream: false, method: '', input_model: {}, output_model: {}, input_validate: {} }],
@@ -4289,7 +4291,9 @@ class SyAPP_Func {
     group: '',
     refreshMode: null,
     onEnter: undefined,
-    onEnterOnce: false
+    onEnterOnce: false,
+    syappInit: undefined,
+    syappInitOnce: true
   }) {
     /** @type {string} */
     this.Name = name
@@ -4311,6 +4315,49 @@ class SyAPP_Func {
     this.OnEnter = config.onEnter
     /** @type {boolean} If true, OnEnter runs only once per user session */
     this.OnEnterOnce = config.onEnterOnce || false
+
+    // ============================================================
+    // SyAPP INIT PROCESS (global, SyAPP-instance level)
+    // ============================================================
+    // Executed ONCE after the parent SyAPP instance finishes its
+    // construction. SyAPP will not proceed to the first screen (nor
+    // will it schedule any refresh tick) until the returned Promise
+    // has FULLY resolved — including any awaited async work inside.
+    //
+    // The handler receives the full SyAPP context, including the
+    // resolved `mainFuncName` (whether it came from the class's own
+    // name or from `{ mainFuncName: ... }` passed to
+    // `new SyAPP(MyFunc, { mainFuncName: 'Custom' })`).
+    //
+    // @example
+    //   new SyAPP_Func('myapp', buildFn, {
+    //     syappInit: async ({ mainFuncName, syapp, userConfig }) => {
+    //       console.log('SyAPP starting as', mainFuncName)
+    //       await seedDatabase()
+    //     }
+    //   })
+    // ============================================================
+
+    /**
+     * SyAPP-instance init hook. Receives a context object with the
+     * SyAPP instance, its resolved mainFuncName, serverConfig, funcs,
+     * sessions, and the raw user config.
+     * @type {Function|undefined}
+     */
+    this.SyAPPInit = config.syappInit
+
+    /**
+     * If true (default), SyAPPInit runs only once per SyAPP instance.
+     * @type {boolean}
+     */
+    this.SyAPPInitOnce = config.syappInitOnce !== false
+
+    /**
+     * Internal flag tracking whether SyAPPInit already ran.
+     * @type {boolean}
+     * @private
+     */
+    this._syappInitExecuted = false
 
     /** @type {Map<string, Map<string, {data: Object, expiry: number, position: number, textLineIndex: number}>>} */
     this.AlertStorage = new Map()
@@ -12010,6 +12057,21 @@ class SyAPP {
       userConfig = mainFuncOrConfig || {};
     }
 
+    /**
+     * Raw config object passed to `new SyAPP(...)`. Preserved so the
+     * SyAPP init process can expose it to user-provided init handlers.
+     * @type {Object}
+     */
+    this._userConfig = userConfig;
+
+    /**
+     * Resolves once the SyAPP init process (if any) has fully finished.
+     * Everything that must wait for init — the first LoadScreen, the
+     * refresh loop, HTTP request handling — awaits this promise.
+     * @type {Promise<void>}
+     */
+    this._syappInitReady = Promise.resolve();
+
 /** @type {TerminalHUD} */
 this.HUD = new TerminalHUD({
   clickMode: userConfig.mouseClickMode || 'single'   // default to single click
@@ -12126,7 +12188,10 @@ this.HUD = new TerminalHUD({
         return; // Already running
       }
       
-      const intervalId = setInterval(() => {
+      const intervalId = setInterval(async () => {
+        // Hard gate: never refresh before the SyAPP init has finished.
+        await this._syappInitReady;
+
         // Find all sessions currently on this function
         for (const [sessionId, session] of this.Sessions) {
           if (session.ActualPath === funcName) {
@@ -12182,14 +12247,25 @@ this.HUD = new TerminalHUD({
     };
 
     // Refresh mode
+    //
+    // NOTE: the refresh tick callback awaits `this._syappInitReady`
+    // before touching any session, so the first refresh cannot fire
+    // while the SyAPP init process is still running.
     if (this.GlobalRefreshMode) {
-      this.Refresher = setInterval(async () => {  
+      this.Refresher = setInterval(async () => {
+        // Hard gate: never refresh before the SyAPP init has finished.
+        await this._syappInitReady;
+
         let sessions = [...this.Sessions.keys()]
-        
+
         sessions.forEach(k => {
           const session = this.Sessions.get(k);
           const currentFuncName = session.ActualPath;
-          
+
+          // Skip sessions that have not been loaded yet (init still
+          // gating the very first screen).
+          if (!currentFuncName) return;
+
           // Check if the current function allows refresh
           if (this._shouldRefreshFunction(currentFuncName)) {
             if (session.ActualProps?.page) {
@@ -12593,9 +12669,72 @@ this.HUD = new TerminalHUD({
       }
   });
 
-    if (!this.serverConfig.enableHTTP) {
-      this.LoadScreen();
-    }
+    // ============================================================
+    // SyAPP INIT PROCESS — FULLY BLOCKING GATE
+    // ============================================================
+    // Build the init promise chain. Everything that must wait for
+    // init — the first LoadScreen below, the refresh interval
+    // (already gated on `this._syappInitReady`), and any per-function
+    // refresher scheduled by ProcessFuncs — will resolve this
+    // promise and check its state.
+    //
+    // The handler executes on the MAIN function instance (the one
+    // registered under the resolved `this.MainFunc.Name`). It runs
+    // once per SyAPP instance when `syappInitOnce` is true (default).
+    // ============================================================
+    this._syappInitReady = (async () => {
+      const mainFunc = this.Funcs.get(this.MainFunc.Name);
+      if (!mainFunc) return;
+      if (typeof mainFunc.SyAPPInit !== 'function') return;
+      if (mainFunc.SyAPPInitOnce && mainFunc._syappInitExecuted) return;
+
+      const initContext = {
+        syapp: this,
+        mainFuncName: this.MainFunc.Name,
+        mainFuncOriginalName: this.MainFunc.OriginalName,
+        serverConfig: this.serverConfig,
+        config: this.serverConfig,
+        userConfig: this._userConfig,
+        funcs: this.Funcs,
+        sessions: this.Sessions,
+        mainSessionId: this.MainSessionID,
+        logMaster: LogMaster,
+        colorText: ColorText,
+        configManager: ConfigManager
+      };
+
+      try {
+        // Await the FULL completion of the hook. If the user returns
+        // a Promise (async function, or a chained .then / new Promise),
+        // we wait for it to settle. Errors are logged but do NOT
+        // prevent SyAPP from starting.
+        const result = mainFunc.SyAPPInit(initContext);
+        if (result instanceof Promise) {
+          await result;
+        }
+        if (mainFunc.SyAPPInitOnce) mainFunc._syappInitExecuted = true;
+      } catch (err) {
+        console.error(`SyAPP init error in ${mainFunc.Name}:`, err);
+      }
+    })();
+
+    // Gate the first screen on the init process. The `.then` callback
+    // runs strictly AFTER the init handler's promise has settled, so
+    // the first LoadScreen never races with init work.
+    this._syappInitReady
+      .then(() => {
+        if (!this.serverConfig.enableHTTP) {
+          return this.LoadScreen();
+        }
+      })
+      .catch(err => {
+        console.error('SyAPP init gate error:', err);
+        // Even on init failure we still boot the UI so the app is
+        // never left hanging.
+        if (!this.serverConfig.enableHTTP) {
+          this.LoadScreen();
+        }
+      });
   }
 
   // --------------------------- Admin Methods ---------------------------

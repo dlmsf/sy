@@ -545,7 +545,9 @@ class Sy extends SyAPP.Func() {
           });
         });
       },
-      { linked: [Config] }
+      { linked: [Config],syappInit : async ({ mainFuncName, syapp, userConfig, sessions }) => {
+        await SyDB.Connect(mainFuncName)
+      } }
     );
   }
 }
