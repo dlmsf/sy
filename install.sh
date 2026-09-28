@@ -29,6 +29,17 @@ NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Pa
 NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc labssh qemujs codeparser jsinfo bundler portclear replacer gitview struct shinstall codereplacer clipwait proxy singleinstall"
 
 # =============================================================================
+# DEV-ONLY NODE.JS COMMAND MAPPING (installed only when --dev is passed)
+# =============================================================================
+# Same format as the main NODE_ENTRY_POINTS_* pair above.
+# Position i in NODE_ENTRY_POINTS_SRC_DEV pairs with position i in
+# NODE_ENTRY_POINTS_CMD_DEV. Leave empty for no extra dev commands.
+# Remember to also add each dev command name to get_command_working_dir()
+# below (in the DEV-ONLY section) so it uses the right working directory.
+NODE_ENTRY_POINTS_SRC_DEV="._/SyAPP.js"
+NODE_ENTRY_POINTS_CMD_DEV="syapp"
+
+# =============================================================================
 # SHELL SCRIPT COMMAND MAPPING (OPTIONAL - for .sh files with bash→ash fallback)
 # =============================================================================
 # Format: Space-separated pairs of (source_file command_name)
@@ -114,6 +125,14 @@ get_command_working_dir() {
         "shinstall") echo "caller" ;; 
         "replacer") echo "caller" ;;  
         "bundler") echo "caller" ;;  
+        
+        # =====================================================================
+        # DEV-ONLY NODE.JS COMMANDS (installed only when --dev is passed)
+        # =====================================================================
+        # Add your dev command names here exactly like the main commands above.
+        # Example:
+        # "mydevcmd") echo "caller" ;;
+        # "anotherdev") echo "global" ;;
         
         # =====================================================================
         # SHELL SCRIPT COMMANDS - ADD YOURS HERE
@@ -221,6 +240,7 @@ BUILD_INFO_FILE=false           # Changed from implicit true to false
 FORCE_UPDATE=false              # NEW: skip interactive menu and force update
 FORCE_REMOVE=false              # NEW: skip interactive menu and force remove
 FORCE_REMOVE_UPDATE=false       # NEW: force remove existing then install fresh
+DEV_MODE=false                  # NEW: install extra dev-only commands when --dev is passed
 
 # NEW: List for files/directories manually included from actual filesystem (gitignored files)
 BUILD_INCLUDE_LIST="/tmp/build_include_$$.txt"
@@ -2318,6 +2338,7 @@ show_help() {
     echo "  --update, -u     Force update without interactive menu"
     echo "  --remove, -r     Force remove existing installation without interactive menu"
     echo "  --reinstall, -ru Force remove existing then install fresh (remove + update)"
+    echo "  --dev            Normal install + extra dev-only commands (see *_DEV lists)"
     echo "  --build          Create a build from the last commit"
     echo "  --tar            Create a tar.gz archive (use with --build)"
     echo "  --config         Interactive file exclusion (use with --build)"
@@ -2344,6 +2365,12 @@ show_help() {
         echo "  $cmd"
     done
     
+    if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+        for cmd in $NODE_ENTRY_POINTS_CMD_DEV; do
+            echo "  $cmd (dev)"
+        done
+    fi
+    
     if [ -n "$SHELL_SCRIPTS_CMD" ]; then
         for cmd in $SHELL_SCRIPTS_CMD; do
             echo "  $cmd (shell script)"
@@ -2359,6 +2386,13 @@ show_help() {
         working_dir=$(get_command_working_dir "$cmd")
         echo "  $cmd: $working_dir"
     done
+    
+    if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+        for cmd in $NODE_ENTRY_POINTS_CMD_DEV; do
+            working_dir=$(get_command_working_dir "$cmd")
+            echo "  $cmd: $working_dir (dev)"
+        done
+    fi
     
     if [ -n "$SHELL_SCRIPTS_CMD" ]; then
         for cmd in $SHELL_SCRIPTS_CMD; do
@@ -2800,6 +2834,15 @@ remove_links() {
         dest_path="$BIN_DIR/$cmd"
         [ -L "$dest_path" ] && rm -f "$dest_path"
     done
+    
+    # Remove dev-only command links (if any were installed previously)
+    if [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+        echo "$NODE_ENTRY_POINTS_CMD_DEV" | tr ' ' '\n' | while read cmd; do
+            [ -z "$cmd" ] && continue
+            dest_path="$BIN_DIR/$cmd"
+            [ -L "$dest_path" ] && rm -f "$dest_path"
+        done
+    fi
     
     # Remove shell script command links
     if [ -n "$SHELL_SCRIPTS_CMD" ]; then
@@ -3575,9 +3618,28 @@ create_command_links() {
     # Create git-config command
     create_git_config_command "$install_dir"
     
-    # Create arrays from space-separated lists
-    src_list="$NODE_ENTRY_POINTS_SRC"
-    cmd_list="$NODE_ENTRY_POINTS_CMD"
+    # Create node command links for the main command lists
+    create_node_command_links_from_lists "$install_dir" "$NODE_ENTRY_POINTS_SRC" "$NODE_ENTRY_POINTS_CMD"
+    
+    # Create node command links for the dev-only lists (only when --dev was passed)
+    if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+        log_message "Installing dev-only commands (--dev mode)..."
+        create_node_command_links_from_lists "$install_dir" "$NODE_ENTRY_POINTS_SRC_DEV" "$NODE_ENTRY_POINTS_CMD_DEV"
+    fi
+    
+    # Create shell script commands (bash→ash fallback)
+    create_shell_command_links "$install_dir"
+}
+
+# =============================================================================
+# Reusable helper: create node command wrappers for a given src/cmd list pair.
+# Shared by the main command list and the dev-only (--dev) command list so both
+# go through the exact same wiring and get_command_working_dir() lookup.
+# =============================================================================
+create_node_command_links_from_lists() {
+    install_dir="$1"
+    src_list="$2"
+    cmd_list="$3"
     
     # Process each command
     idx=1
@@ -3644,9 +3706,6 @@ EOF
         
         idx=$((idx + 1))
     done
-    
-    # Create shell script commands (bash→ash fallback)
-    create_shell_command_links "$install_dir"
 }
 
 # =============================================================================
@@ -3912,10 +3971,11 @@ for arg in "$@"; do
         --config) BUILD_CONFIG=true ;;
         --message) BUILD_MESSAGE_MODE=true ;;
         --version) BUILD_MODE=true; BUILD_VERSION="latest" ;;
+        --dev) DEV_MODE=true ;;
     esac
     # Handle --build with optional save name
     # This catches: ./install.sh --build mysave  OR  ./install.sh --build --tar mysave
-    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-u" ] && [ "$arg" != "--remove" ] && [ "$arg" != "-r" ] && [ "$arg" != "--reinstall" ] && [ "$arg" != "-ru" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
+    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "--dev" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-u" ] && [ "$arg" != "--remove" ] && [ "$arg" != "-r" ] && [ "$arg" != "--reinstall" ] && [ "$arg" != "-ru" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
         BUILD_SAVE_NAME="$arg"
     fi
     # Handle --version with specific version number
@@ -4013,6 +4073,11 @@ if [ -d "$INSTALL_DIR" ]; then
         for cmd in $NODE_ENTRY_POINTS_CMD; do
             echo "  $cmd"
         done
+        if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+            for cmd in $NODE_ENTRY_POINTS_CMD_DEV; do
+                echo "  $cmd (dev)"
+            done
+        fi
         if [ -n "$SHELL_SCRIPTS_CMD" ]; then
             for cmd in $SHELL_SCRIPTS_CMD; do
                 echo "  $cmd"
@@ -4026,6 +4091,12 @@ if [ -d "$INSTALL_DIR" ]; then
             working_dir=$(get_command_working_dir "$cmd")
             echo "  $cmd: $working_dir"
         done
+        if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+            for cmd in $NODE_ENTRY_POINTS_CMD_DEV; do
+                working_dir=$(get_command_working_dir "$cmd")
+                echo "  $cmd: $working_dir (dev)"
+            done
+        fi
         if [ -n "$SHELL_SCRIPTS_CMD" ]; then
             for cmd in $SHELL_SCRIPTS_CMD; do
                 working_dir=$(get_command_working_dir "$cmd")
@@ -4123,6 +4194,13 @@ for cmd in $NODE_ENTRY_POINTS_CMD; do
     echo "  $cmd"
 done
 
+# Display dev-only commands if --dev was passed
+if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+    for cmd in $NODE_ENTRY_POINTS_CMD_DEV; do
+        echo "  $cmd (dev)"
+    done
+fi
+
 # Display shell script commands if configured
 if [ -n "$SHELL_SCRIPTS_CMD" ]; then
     for cmd in $SHELL_SCRIPTS_CMD; do
@@ -4139,6 +4217,14 @@ for cmd in $NODE_ENTRY_POINTS_CMD; do
     working_dir=$(get_command_working_dir "$cmd")
     echo "  $cmd: $working_dir"
 done
+
+# Display dev-only command working directories if --dev was passed
+if [ "$DEV_MODE" = true ] && [ -n "$NODE_ENTRY_POINTS_CMD_DEV" ]; then
+    for cmd in $NODE_ENTRY_POINTS_CMD_DEV; do
+        working_dir=$(get_command_working_dir "$cmd")
+        echo "  $cmd: $working_dir (dev)"
+    done
+fi
 
 # Display shell command working directories if configured
 if [ -n "$SHELL_SCRIPTS_CMD" ]; then
