@@ -241,12 +241,12 @@ echo "Installing '${appName}' as command '${commandName}'..."
 # ---------------------------------------------------------------------------
 if ! have_cmd node; then
     echo "Node.js not found - attempting installation..."
-    if   have_cmd apt-get; then $SUDO apt-get update -qq && $SUDO apt-get install -y nodejs npm
-    elif have_cmd apt;     then $SUDO apt update -qq     && $SUDO apt install -y nodejs npm
-    elif have_cmd apk;     then $SUDO apk add --no-cache nodejs npm
+    if   have_cmd apt-get; then $SUDO apt-get update -qq && $SUDO apt-get install -y nodejs
+    elif have_cmd apt;     then $SUDO apt update -qq     && $SUDO apt install -y nodejs
+    elif have_cmd apk;     then $SUDO apk add --no-cache nodejs
     elif have_cmd dnf;     then $SUDO dnf install -y nodejs
     elif have_cmd yum;     then $SUDO yum install -y nodejs
-    elif have_cmd pacman;  then $SUDO pacman -S --noconfirm nodejs npm
+    elif have_cmd pacman;  then $SUDO pacman -S --noconfirm nodejs
     else
         echo "No supported package manager found; please install Node.js manually." >&2
         exit 1
