@@ -7,6 +7,7 @@ import { promisify } from 'util'
 import os from 'os'
 import FastHTTP from './FastHTTP/FastHTTP.js'
 import RacksLab from './RacksLab/RacksLab.js'
+import GoDaddyManager from './DomainManager.js'
 
 const execAsync = promisify(exec)
 
@@ -64,6 +65,7 @@ class Misc extends SyAPP.Func() {
                 await this.DropDown(uid,'devapps',async () => {
                     this.Button(uid,'RacksLab',{path : 'rackslab'})
                     this.Button(uid,'FastHTTP',{path : 'fasthttp'})
+                    this.Button(uid,'DomainManager',{path : 'GoDaddyManager'})
                     this.Button(uid,{name : 'DownloadHUD',props : {downloadhub : true}})
                 },{up_buttontext : 'Dev Apps',down_buttontext : 'Dev Apps'})
                 
@@ -76,7 +78,7 @@ class Misc extends SyAPP.Func() {
                 this.Button(uid,{name : '← Return',path : 'config'})
 
             }
-        ,{linked : [FastHTTP,RacksLab]})
+        ,{linked : [FastHTTP,RacksLab,GoDaddyManager]})
     }
 }
 
