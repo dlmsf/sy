@@ -5,10 +5,16 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { writeFileSync, readdirSync, existsSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 
 const PROCESS_NAME = 'sypm_proxy_server'
 const LE_LIVE = '/etc/letsencrypt/live'
 const LE_ARCHIVE = '/etc/letsencrypt/archive'
+
+// Async sleep helper — used by process transitions to wait for PIDs to
+// actually disappear and ports to actually be released, instead of a
+// fixed delay that races with the OS teardown.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ------------------------------------------------------------------
 // Certificate discovery — mirrors the original behaviour, but now also
@@ -144,6 +150,157 @@ class Proxy extends SyAPP.Func() {
   _setOpts(id, o)  { this.Storages.Set(id, 'px_opts', o) }
   _newId()         { return `r_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}` }
 
+  // ------------------------------------------------------------------
+  // Process management helpers — used by every process transition
+  // (start / stop / restart / hard reset) so that we NEVER leave more
+  // than one proxy process alive, and we NEVER leave an orphan holding
+  // the HTTP/HTTPS ports.
+  // ------------------------------------------------------------------
+
+  /** True if a PID is currently alive. */
+  _isAlive(pid) {
+    if (!pid) return false
+    try { process.kill(pid, 0); return true } catch { return false }
+  }
+
+  /** Return the PIDs currently listening on a TCP port (empty if none). */
+  _pidsOnPort(port) {
+    if (!port) return []
+    try {
+      const out = execSync(`lsof -ti:${port} 2>/dev/null || true`, { encoding: 'utf-8' }).trim()
+      if (!out) return []
+      return out.split(/\s+/)
+        .map((s) => parseInt(s, 10))
+        .filter((n) => Number.isFinite(n) && n > 1)
+    } catch { return [] }
+  }
+
+  /** SIGKILL everything holding the given ports. Returns the killed PIDs. */
+  _killPortHolders(ports) {
+    const killed = []
+    const seen = new Set()
+    for (const port of ports) {
+      if (!port) continue
+      for (const pid of this._pidsOnPort(port)) {
+        if (seen.has(pid)) continue
+        seen.add(pid)
+        try { process.kill(pid, 'SIGKILL'); killed.push(pid) } catch {}
+      }
+    }
+    return killed
+  }
+
+  /**
+   * Wait (polling) until the given ports have no listeners. Returns true
+   * when they are free, false on timeout. This is what makes the "apply
+   * settings" flow reliable: we never spawn a new proxy until the old
+   * one has actually released its ports.
+   */
+  async _waitForPortsFree(ports, timeoutMs = 8000) {
+    const list = ports.filter(Boolean)
+    if (list.length === 0) return true
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const busy = list.filter((p) => this._pidsOnPort(p).length > 0)
+      if (busy.length === 0) return true
+      await sleep(200)
+    }
+    return false
+  }
+
+  /** Wait (polling) until a PID is gone. */
+  async _waitForPidGone(pid, timeoutMs = 6000) {
+    if (!pid) return true
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (!this._isAlive(pid)) return true
+      await sleep(150)
+    }
+    return false
+  }
+
+  /**
+   * Stop the systemd/OpenRC service backing a daemon-mode SyPM process.
+   *
+   * IMPORTANT: `SyPM.kill()` only *disables* the daemon unit — it does
+   * NOT stop the running service. Because the generated unit uses
+   * `Restart=always`, systemd would immediately respawn a fresh node
+   * process the moment we kill the tracked PID. This is exactly the
+   * "persistent nodejs process" bug. We must therefore `systemctl stop`
+   * (or `rc-service stop`) BEFORE asking SyPM to kill anything.
+   */
+  _stopDaemonService(processId) {
+    if (!processId) return
+    try {
+      execSync(`sudo systemctl stop sypm-${processId}.service 2>/dev/null || true`)
+      execSync(`sudo systemctl reset-failed sypm-${processId}.service 2>/dev/null || true`)
+    } catch {}
+    try {
+      execSync(`sudo rc-service sypm-${processId} stop 2>/dev/null || true`)
+    } catch {}
+  }
+
+  /**
+   * Kill + drop every proxy entry from the SyPM registry.
+   *
+   * This is what guarantees "no more than one process": we always
+   * purge *all* rows carrying our process name, not just the one
+   * `_proc()` happens to return first. Without this, a stale `Stopped`
+   * row can shadow the live `Running` one and the UI lies about state.
+   */
+  _purgeRegistryEntries() {
+    let removed = 0
+    try {
+      const entries = SyPM.list().filter((x) => x.name === PROCESS_NAME)
+      for (const entry of entries) {
+        try {
+          // 1) Stop the init-system unit first (if daemon), otherwise
+          //    systemd/OpenRC will respawn it (Restart=always).
+          this._stopDaemonService(entry.id)
+          // 2) Kill the process tree via SyPM (also disables the unit).
+          SyPM.kill(entry.id)
+          // 3) Drop the registry row so it doesn't linger as "Stopped".
+          SyPM._removeFromRegistry(entry.id)
+          removed++
+        } catch {}
+      }
+    } catch {}
+    return removed
+  }
+
+  /** Kill any stray `node .../sypm_proxy_*.mjs` process left on the box. */
+  _killStrayProxyNodes() {
+    let killed = 0
+    try {
+      // -f matches the full command line: our temp script is named
+      //   `sypm_proxy_<timestamp>.mjs` inside os.tmpdir().
+      const out = execSync(`pgrep -af "sypm_proxy_" 2>/dev/null || true`, { encoding: 'utf-8' }).trim()
+      if (out) {
+        for (const line of out.split('\n')) {
+          const pid = parseInt(line.split(/\s+/)[0], 10)
+          if (Number.isFinite(pid) && pid > 1) {
+            try { process.kill(pid, 'SIGKILL'); killed++ } catch {}
+          }
+        }
+      }
+    } catch {}
+    return killed
+  }
+
+  /** Best-effort removal of leftover temp proxy scripts. */
+  _cleanupTempScripts() {
+    let removed = 0
+    try {
+      const dir = os.tmpdir()
+      for (const f of readdirSync(dir)) {
+        if (f.startsWith('sypm_proxy_') && f.endsWith('.mjs')) {
+          try { fs.unlinkSync(path.join(dir, f)); removed++ } catch {}
+        }
+      }
+    } catch {}
+    return removed
+  }
+
   // Cert cache — refreshed every render so newly-issued certs show up.
   _certs(id) {
     const cached = this.Storages.Get(id, 'px_certs_cache')
@@ -201,10 +358,11 @@ class Proxy extends SyAPP.Func() {
       this.Alert(id, `🔄 Certificates refreshed (${this._certs(id).length} found)`, { duration: 2000 })
     }
 
-    if (p.px_start)   { delete p.px_start;   await this._start(id) }
-    if (p.px_stop)    { delete p.px_stop;    this._stop(id) }
-    if (p.px_restart) { delete p.px_restart; this._restart(id) }
-    if (p.px_cleanup) { delete p.px_cleanup; try { SyPM.cleanup() } catch {} }
+    if (p.px_start)      { delete p.px_start;      await this._start(id) }
+    if (p.px_stop)       { delete p.px_stop;       await this._stop(id) }
+    if (p.px_restart)    { delete p.px_restart;    await this._restart(id) }
+    if (p.px_cleanup)    { delete p.px_cleanup;    try { SyPM.cleanup() } catch {} }
+    if (p.px_hard_reset) { delete p.px_hard_reset; await this._hardReset(id) }
 
     // Add a new blank rule
     if (p.px_add_rule) {
@@ -305,12 +463,58 @@ class Proxy extends SyAPP.Func() {
       })
     }
 
-    try {
-      const existing = this._proc()
-      if (existing) { SyPM.kill(existing.id); await new Promise(r => setTimeout(r, 1500)) }
-    } catch {}
+    // ------------------------------------------------------------------
+    // CLEAN TRANSITION — always fully tear down the previous process
+    // before starting a new one. This is what fixes the "toggling daemon
+    // in settings creates a second process without killing the first"
+    // bug: we now (a) stop the init-system unit so Restart=always cannot
+    // respawn it, (b) kill the process tree, (c) purge the registry row
+    // so no stale "Stopped" entry shadows the new "Running" one, (d)
+    // wait for the tracked PID to actually disappear, and (e) wait for
+    // the ports to actually be released before spawning.
+    // ------------------------------------------------------------------
+    const opts  = this._opts(id)
+    const ports = [opts.httpPort, opts.httpsPort]
 
-    const opts = this._opts(id)
+    const existing   = this._proc()
+    const existingPid = existing ? existing.pid : null
+
+    if (existing) {
+      // Stop the systemd/OpenRC unit first (if it was a daemon), so the
+      // init system does not respawn it while we are tearing things down.
+      this._stopDaemonService(existing.id)
+    }
+
+    // Kill + purge every registry entry carrying our name (usually just
+    // one; this also clears any legacy rows leaked by earlier runs).
+    this._purgeRegistryEntries()
+
+    // Orphans: any node process still pointing at a sypm_proxy_*.mjs.
+    this._killStrayProxyNodes()
+
+    // Orphans holding our ports.
+    this._killPortHolders(ports)
+
+    // Wait for the tracked PID to disappear (if it was ours).
+    if (existingPid) {
+      await this._waitForPidGone(existingPid, 5000)
+    }
+
+    // Wait for ports to actually be released.
+    let portsFreed = await this._waitForPortsFree(ports, 8000)
+    if (!portsFreed) {
+      this._killPortHolders(ports)
+      portsFreed = await this._waitForPortsFree(ports, 3000)
+    }
+    if (!portsFreed) {
+      this.Alert(id, `❌ Ports ${ports.join(', ')} still busy — aborting start`, { duration: 5000 })
+      return
+    }
+
+    // Small settle delay so the init system / kernel has fully
+    // processed the teardown before we ask for new listeners.
+    await sleep(250)
+
     const script = path.join(os.tmpdir(), `sypm_proxy_${Date.now()}.mjs`)
     writeFileSync(script, buildServer(resolved, opts), 'utf-8')
 
@@ -327,22 +531,125 @@ class Proxy extends SyAPP.Func() {
     }
   }
 
-  _stop(id) {
+  async _stop(id, silent = false) {
+    const p = this._proc()
+    if (!p) {
+      if (!silent) this.Alert(id, 'ℹ Not running', { duration: 2000 })
+      return true
+    }
+
     try {
-      const p = this._proc()
-      if (!p) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
-      SyPM.kill(p.id)
-      this.Alert(id, '🛑 Stopped', { duration: 2500 })
-    } catch (e) { this.Alert(id, `❌ ${e.message}`, { duration: 4000 }) }
+      // 1) Stop the init-system unit first (if daemon) so systemd/OpenRC
+      //    does not respawn the process.
+      this._stopDaemonService(p.id)
+
+      // 2) Kill + purge every registry entry with our name.
+      this._purgeRegistryEntries()
+
+      // 3) Sweep for stray processes holding our ports / temp scripts.
+      const opts  = this._opts(id)
+      const ports = [opts.httpPort, opts.httpsPort]
+      this._killStrayProxyNodes()
+      this._killPortHolders(ports)
+
+      // 4) Wait until the ports are actually free.
+      const freed = await this._waitForPortsFree(ports, 6000)
+
+      if (!silent) {
+        this.Alert(
+          id,
+          freed ? '🛑 Stopped & ports released' : '⚠ Stopped, but ports still busy',
+          { duration: 3000 }
+        )
+      }
+      return freed
+    } catch (e) {
+      if (!silent) this.Alert(id, `❌ ${e.message}`, { duration: 4000 })
+      return false
+    }
   }
 
-  _restart(id) {
+  async _restart(id) {
+    const p = this._proc()
+    if (!p) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
+
+    // Use our own stop → start pair instead of SyPM.restart(): SyPM.restart
+    // relies on a fixed 1 s setTimeout between kill and re-spawn, which is
+    // exactly the race that was producing "two processes at once". We wait
+    // for the ports / PIDs to actually settle before starting again.
+    this.Alert(id, '🔄 Restarting…', { duration: 2000 })
+    await this._stop(id, true)
+    await sleep(300)
+    await this._start(id)
+  }
+
+  // ------------------------------------------------------------------
+  // HARD RESET — "nuclear" stop of the entire Proxy interface.
+  //
+  // Why this exists: on some hosts, killing the tracked SyPM PID is not
+  // enough. The init system (Restart=always) can respawn a daemon unit,
+  // orphan `node .../sypm_proxy_*.mjs` processes can survive a normal
+  // kill, and a port can stay bound for a few seconds. This routine does
+  // ALL of the following, in order, and reports back:
+  //
+  //   1. stop the systemd/OpenRC unit (so it cannot respawn),
+  //   2. disable + remove the daemon unit entirely,
+  //   3. kill every proxy registry entry (SyPM.kill → process tree),
+  //   4. purge the proxy entries from the registry,
+  //   5. pkill every stray `sypm_proxy_*.mjs` process,
+  //   6. SIGKILL whoever still holds the HTTP/HTTPS ports,
+  //   7. wait for the ports to actually be released,
+  //   8. remove leftover temp proxy scripts,
+  //   9. run SyPM.cleanup() to drop any remaining dead registry rows.
+  // ------------------------------------------------------------------
+  async _hardReset(id) {
+    const opts  = this._opts(id)
+    const ports = [opts.httpPort, opts.httpsPort]
+    const report = []
+
+    // 1) Stop the init system unit for every proxy entry we know about.
     try {
-      const p = this._proc()
-      if (!p) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
-      SyPM.restart(p.id)
-      this.Alert(id, '🔄 Restarting...', { duration: 2500 })
-    } catch (e) { this.Alert(id, `❌ ${e.message}`, { duration: 4000 }) }
+      const entries = SyPM.list().filter((x) => x.name === PROCESS_NAME)
+      for (const e of entries) this._stopDaemonService(e.id)
+    } catch {}
+
+    // 2) Full daemon disable (removes the unit files from /etc).
+    try {
+      const entries = SyPM.list().filter((x) => x.name === PROCESS_NAME)
+      for (const e of entries) {
+        try { SyPM._disableDaemon(e.id) } catch {}
+      }
+    } catch {}
+
+    // 3) + 4) Kill + purge every proxy registry row.
+    const purged = this._purgeRegistryEntries()
+    if (purged) report.push(`${purged} registry entr${purged === 1 ? 'y' : 'ies'}`)
+
+    // 5) Stray node processes still pointing at our temp scripts.
+    const strayKilled = this._killStrayProxyNodes()
+    if (strayKilled) report.push(`${strayKilled} stray node proc${strayKilled === 1 ? '' : 's'}`)
+
+    // 6) Whoever is still holding the ports (orphans from previous runs).
+    const portKilled = this._killPortHolders(ports)
+    if (portKilled.length) report.push(`${portKilled.length} port holder${portKilled.length === 1 ? '' : 's'}`)
+
+    // 7) Wait for the ports to actually be released.
+    let freed = await this._waitForPortsFree(ports, 8000)
+    if (!freed) {
+      this._killPortHolders(ports)
+      freed = await this._waitForPortsFree(ports, 3000)
+    }
+    if (!freed) report.push('⚠ ports still busy')
+
+    // 8) Temp script sweep.
+    const tmp = this._cleanupTempScripts()
+    if (tmp) report.push(`${tmp} temp script${tmp === 1 ? '' : 's'}`)
+
+    // 9) Registry cleanup (dead rows that belong to ANY process).
+    try { SyPM.cleanup() } catch {}
+
+    const summary = report.length ? report.join(', ') : 'nothing to clean'
+    this.Alert(id, `💥 Hard reset complete — ${summary}`, { duration: 5000 })
   }
 
   // ------------------------------------------------------------------
@@ -369,6 +676,13 @@ class Proxy extends SyAPP.Func() {
       this.Text(id, ' ')
       this.Text(id, `Daemon: ${proc.daemon || 'No'}  •  Auto-restart: ${proc.autoRestart || 'No'}  •  Tries: ${proc.tries || 0}`)
     }
+
+    // Hard reset sits on its own row so it cannot be hit by accident.
+    this.Text(id, ' ')
+    this.Buttons(id, [
+      { name: '💥 Hard Reset (kill everything)', props: { px_hard_reset: 1 } }
+    ])
+    this.Text(id, '💥 Hard reset stops the daemon unit, kills every stray node process, releases the HTTP/HTTPS ports and cleans temp files.')
   }
 
   _renderRules(id) {
@@ -508,7 +822,15 @@ class Proxy extends SyAPP.Func() {
     this.Text(id, 'Daemon: installs a system service (auto-start on boot, needs sudo).')
     this.Text(id, 'Auto-restart: SyPM monitor respawns the process on crash.')
     this.Text(id, ' ')
-    this.Buttons(id, [{ name: '▶ Apply & Start', props: { px_start: 1 } }])
+    this.Buttons(id, [
+      { name: '▶ Apply & Start', props: { px_start: 1 } },
+      { name: '🛑 Stop',          props: { px_stop: 1 } }
+    ])
+    this.Text(id, ' ')
+    this.Buttons(id, [
+      { name: '💥 Hard Reset (kill everything)', props: { px_hard_reset: 1 } }
+    ])
+    this.Text(id, '💥 Hard reset stops the daemon unit, kills every stray node process, releases the HTTP/HTTPS ports and cleans temp files.')
   }
 }
 
