@@ -500,6 +500,67 @@ main
     }
 
     /**
+     * Queries the host init system for the runtime state of a daemon service.
+     *
+     * Returns both a running flag and, when the service is active, the actual
+     * MainPID reported by the init system. The PID matters because after a
+     * reboot the init system re-spawns the daemon with a brand-new PID while
+     * the registry still contains the pre-reboot PID. Without adopting the new
+     * PID, later list/monit/cleanup logic keeps seeing a dead PID and the live
+     * daemon appears as dead (or vanishes from the dashboard).
+     *
+     * @static
+     * @private
+     * @param {string} processId - Unique process identifier
+     * @returns {{running: boolean, pid: (number|null)}} Service runtime state
+     */
+    static _getDaemonServiceStatus(processId) {
+        const systemInfo = this._detectSystem();
+        try {
+            if (systemInfo.initSystem === 'systemd') {
+                const serviceName = `sypm-${processId}.service`;
+                let output = '';
+                try {
+                    output = execSync(
+                        `systemctl show ${serviceName} --property=ActiveState,MainPID 2>/dev/null`,
+                        { encoding: 'utf-8' }
+                    );
+                } catch (_) {
+                    // systemd not available / service unknown
+                    return { running: false, pid: null };
+                }
+                const activeState = (output.match(/ActiveState=(\S+)/) || [])[1] || '';
+                const mainPid = parseInt((output.match(/MainPID=(\d+)/) || [])[1] || '0', 10);
+                const running = activeState === 'active' || activeState === 'activating';
+                return { running, pid: (running && mainPid > 0) ? mainPid : null };
+            } else if (systemInfo.initSystem === 'openrc') {
+                const serviceName = `sypm-${processId}`;
+                let output = '';
+                try {
+                    output = execSync(`rc-service ${serviceName} status 2>/dev/null`, { encoding: 'utf-8' });
+                } catch (_) {
+                    return { running: false, pid: null };
+                }
+                const running = output.includes('started') || output.includes('running');
+                let pid = null;
+                if (running) {
+                    try {
+                        const pidFile = `/var/run/sypm-${processId}.pid`;
+                        if (fs.existsSync(pidFile)) {
+                            const parsed = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
+                            if (!isNaN(parsed) && parsed > 0) pid = parsed;
+                        }
+                    } catch (_) { /* ignore */ }
+                }
+                return { running, pid };
+            }
+        } catch (_) {
+            // Service not installed / init system unsupported
+        }
+        return { running: false, pid: null };
+    }
+
+    /**
      * Checks if a daemon service is currently running on the host init system.
      * Note: enabling a daemon (for auto-start on boot) does NOT start it, so we
      * must query the runtime state of the service, not just its enablement.
@@ -509,21 +570,7 @@ main
      * @returns {boolean} True if the init-system service is active/running
      */
     static _isDaemonServiceRunning(processId) {
-        const systemInfo = this._detectSystem();
-        try {
-            if (systemInfo.initSystem === 'systemd') {
-                const serviceName = `sypm-${processId}.service`;
-                const output = execSync(`systemctl is-active ${serviceName} 2>/dev/null`, { encoding: 'utf-8' }).trim();
-                return output === 'active';
-            } else if (systemInfo.initSystem === 'openrc') {
-                const serviceName = `sypm-${processId}`;
-                const output = execSync(`rc-service ${serviceName} status 2>/dev/null`, { encoding: 'utf-8' });
-                return output.includes('started') || output.includes('running');
-            }
-        } catch (_) {
-            // Service not installed / init system unsupported
-        }
-        return false;
+        return this._getDaemonServiceStatus(processId).running;
     }
 
     /**
@@ -565,7 +612,13 @@ main
     }
 
     /**
-     * Syncs daemon processes status with system services
+     * Syncs daemon processes status with system services.
+     *
+     * Besides flipping the status field, this also "adopts" the PID that the
+     * init system reports for the service. After a reboot the init system
+     * re-spawns the daemon under a different PID; the registry still holds the
+     * pre-reboot PID. Adopting the live PID keeps --list / --monit accurate and
+     * prevents cleanup() from pruning a daemon that is actually running.
      * @static
      * @private
      */
@@ -575,7 +628,21 @@ main
 
         for (const proc of registry) {
             if (proc.config?.daemon) {
-                const isRunning = this._isDaemonProcessAlive(proc);
+                const svc = this._getDaemonServiceStatus(proc.id);
+                const pidAlive = this._isPidAlive(proc.pid);
+                const monitorAlive = proc.monitorPid && proc.monitorPid !== proc.pid && this._isPidAlive(proc.monitorPid);
+                const isRunning = pidAlive || monitorAlive || svc.running;
+
+                // Adopt the init-system PID when it differs from what we have
+                // stored. This is the critical step after a reboot: the daemon
+                // is alive under a new PID, and without this the registry keeps
+                // pointing at the previous boot's PID.
+                if (svc.running && svc.pid && proc.pid !== svc.pid) {
+                    console.log(`✓ Adopted new PID ${svc.pid} for daemon process ${proc.name} (was ${proc.pid})`);
+                    proc.pid = svc.pid;
+                    proc.lastUpdate = new Date().toISOString();
+                    updated = true;
+                }
 
                 if (isRunning && proc.status !== 'running') {
                     proc.status = 'running';
