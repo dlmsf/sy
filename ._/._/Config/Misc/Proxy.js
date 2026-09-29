@@ -5,6 +5,7 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { writeFileSync, readdirSync, existsSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 
 const PROCESS_NAME = 'sypm_proxy_server'
 const LE_LIVE = '/etc/letsencrypt/live'
@@ -139,7 +140,68 @@ class Proxy extends SyAPP.Func() {
   _rules(id)       { return this.Storages.Get(id, 'px_rules') || [] }
   _opts(id)        { return this.Storages.Get(id, 'px_opts') || { httpPort: 80, httpsPort: 443, daemon: false, autoRestart: false } }
   _go(id, p)       { this.Storages.Set(id, 'px_page', p) }
-  _proc()          { try { return SyPM.list().find(x => x.name === PROCESS_NAME) || null } catch { return null } }
+  // Return EVERY process tracked by SyPM under our name. There must never
+  // be more than one, but if a previous transition left an orphan behind we
+  // want to see it (so we can clean it up) instead of hiding it.
+  _procs() {
+    try { return SyPM.list().filter(x => x.name === PROCESS_NAME) } catch { return [] }
+  }
+
+  _proc() {
+    const all = this._procs()
+    return all.find(p => p.status === 'Running' || p.status === 'Restarting') || all[0] || null
+  }
+
+  // SyPM.kill() disables a daemon unit but does NOT stop a running one.
+  // systemd keeps running services alive even after the unit file is
+  // removed, and it can respawn them. Explicitly stop the service here so
+  // no duplicate can come back to life mid-transition.
+  _stopDaemonServices() {
+    for (const p of this._procs()) {
+      if (p.daemon !== 'Yes') continue
+      try { execSync(`systemctl stop sypm-${p.id}.service 2>/dev/null || true`, { stdio: 'ignore' }) } catch {}
+      try { execSync(`rc-service sypm-${p.id} stop 2>/dev/null || true`,        { stdio: 'ignore' }) } catch {}
+    }
+  }
+
+  // Bring the tracked process count to ZERO. Returns the number of
+  // instances still reported as running at the end (0 == clean slate).
+  async _killAllProxy(timeoutMs = 6000) {
+    // 1. Stop daemon services first so nothing can respawn.
+    this._stopDaemonServices()
+
+    // 2. Kill every tracked instance (dead entries included – SyPM.kill
+    //    is safe on those too and clears their daemon unit if any).
+    for (const p of this._procs()) {
+      try { SyPM.kill(p.id) } catch {}
+    }
+
+    // 3. Second pass in case a service was still up during step 1.
+    this._stopDaemonServices()
+
+    // 4. Wait until the process tree has actually died.
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const alive = this._procs().filter(p => {
+        if (p.daemon === 'Yes') return p.status === 'Running' || p.status === 'Restarting'
+        try { return SyPM.isAlive(p.id) } catch { return false }
+      })
+      if (alive.length === 0) break
+      await new Promise(r => setTimeout(r, 200))
+    }
+
+    // 5. Prune dead entries out of the registry so we start from a clean
+    //    slate (no accumulating ghost rows after many Apply toggles).
+    try { SyPM.cleanup() } catch {}
+
+    // 6. Final sweep – anything that somehow survived gets one more kill.
+    for (const p of this._procs()) {
+      try { SyPM.kill(p.id) } catch {}
+    }
+    try { SyPM.cleanup() } catch {}
+
+    return this._procs().filter(p => p.status === 'Running' || p.status === 'Restarting').length
+  }
   _setRules(id, r) { this.Storages.Set(id, 'px_rules', r) }
   _setOpts(id, o)  { this.Storages.Set(id, 'px_opts', o) }
   _newId()         { return `r_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}` }
@@ -202,8 +264,8 @@ class Proxy extends SyAPP.Func() {
     }
 
     if (p.px_start)   { delete p.px_start;   await this._start(id) }
-    if (p.px_stop)    { delete p.px_stop;    this._stop(id) }
-    if (p.px_restart) { delete p.px_restart; this._restart(id) }
+    if (p.px_stop)    { delete p.px_stop;    await this._stop(id) }
+    if (p.px_restart) { delete p.px_restart; await this._restart(id) }
     if (p.px_cleanup) { delete p.px_cleanup; try { SyPM.cleanup() } catch {} }
 
     // Add a new blank rule
@@ -305,10 +367,19 @@ class Proxy extends SyAPP.Func() {
       })
     }
 
-    try {
-      const existing = this._proc()
-      if (existing) { SyPM.kill(existing.id); await new Promise(r => setTimeout(r, 1500)) }
-    } catch {}
+    // ------------------------------------------------------------------
+    // CLEAN TRANSITION
+    // There must NEVER be more than one proxy process. Kill EVERY tracked
+    // instance (including any orphans), stop every daemon unit, wait for
+    // the process tree to fully die and the registry to be pruned, then
+    // start the fresh one. If the old tree refuses to die we abort the
+    // start rather than risk spawning a duplicate.
+    // ------------------------------------------------------------------
+    const remaining = await this._killAllProxy()
+    if (remaining > 0) {
+      this.Alert(id, `⚠ Could not fully stop ${remaining} old process(es) — start aborted to avoid duplicates`, { duration: 5000 })
+      return
+    }
 
     const opts = this._opts(id)
     const script = path.join(os.tmpdir(), `sypm_proxy_${Date.now()}.mjs`)
@@ -321,27 +392,38 @@ class Proxy extends SyAPP.Func() {
         autoRestart: !!opts.autoRestart,
         restartTries: opts.autoRestart ? 999 : 0
       })
+
+      // Post-start sanity check: if anything else managed to slip into the
+      // registry during the start, prune every entry except the new one.
+      const after = this._procs()
+      if (after.length > 1) {
+        for (const p of after) {
+          if (p.id !== res.id) { try { SyPM.kill(p.id) } catch {} }
+        }
+        try { SyPM.cleanup() } catch {}
+      }
+
       this.Alert(id, `✅ Proxy started  PID ${res.pid}${opts.daemon ? '  [daemon]' : ''}${opts.autoRestart ? '  [auto-restart]' : ''}`, { duration: 3500 })
     } catch (e) {
       this.Alert(id, `❌ ${e.message}`, { duration: 5000 })
     }
   }
 
-  _stop(id) {
+  async _stop(id) {
     try {
-      const p = this._proc()
-      if (!p) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
-      SyPM.kill(p.id)
-      this.Alert(id, '🛑 Stopped', { duration: 2500 })
+      if (this._procs().length === 0) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
+      const remaining = await this._killAllProxy()
+      if (remaining === 0) this.Alert(id, '🛑 Stopped', { duration: 2500 })
+      else                 this.Alert(id, `⚠ ${remaining} process(es) still alive`, { duration: 4000 })
     } catch (e) { this.Alert(id, `❌ ${e.message}`, { duration: 4000 }) }
   }
 
-  _restart(id) {
+  async _restart(id) {
     try {
-      const p = this._proc()
-      if (!p) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
-      SyPM.restart(p.id)
-      this.Alert(id, '🔄 Restarting...', { duration: 2500 })
+      if (this._procs().length === 0) { this.Alert(id, 'ℹ Not running', { duration: 2000 }); return }
+      // _start() performs its own kill-everything-first transition, so a
+      // restart is simply "start again" — no risky deferred SyPM.restart().
+      await this._start(id)
     } catch (e) { this.Alert(id, `❌ ${e.message}`, { duration: 4000 }) }
   }
 
@@ -349,6 +431,7 @@ class Proxy extends SyAPP.Func() {
   // Pages
   // ------------------------------------------------------------------
   _renderMain(id) {
+    const procs = this._procs()
     const proc  = this._proc()
     const rules = this._rules(id)
     const certs = this._certs(id)
@@ -357,6 +440,12 @@ class Proxy extends SyAPP.Func() {
     this.Text(id, ' ')
     this.Text(id, running ? `🟢 ${proc.status}   PID ${proc.pid}` : '🔴 Proxy is not running')
     this.Text(id, `📋 ${rules.length} rule(s)   •   🔐 ${certs.length} certificate(s) found`)
+
+    // Warn loudly if the registry somehow contains more than one instance.
+    if (procs.length > 1) {
+      this.Text(id, `⚠ ${procs.length} proxy instances detected — click Restart or Stop to clean up`)
+    }
+
     this.Text(id, ' ')
 
     const btns = running
