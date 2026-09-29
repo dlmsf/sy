@@ -12,6 +12,28 @@ const LE_LIVE = '/etc/letsencrypt/live'
 const LE_ARCHIVE = '/etc/letsencrypt/archive'
 
 // ------------------------------------------------------------------
+// Persistent, GLOBAL storage for the Proxy module (never /tmp).
+//
+//   ~/.sypm/proxy/config.json   → ACTIVE config (daemon reads this on boot)
+//   ~/.sypm/proxy/saves/*.json  → NAMED snapshots (user-defined)
+//
+// Each named save contains rules + opts, and opts carries daemon and
+// autoRestart, so those settings travel with the save too.
+// ------------------------------------------------------------------
+const SYPM_HOME       = path.join(os.homedir(), '.sypm')
+const PROXY_DIR       = path.join(SYPM_HOME, 'proxy')
+const PROXY_SAVES_DIR = path.join(PROXY_DIR, 'saves')
+const PROXY_CONFIG    = path.join(PROXY_DIR, 'config.json')
+const PROXY_SERVER    = path.join(PROXY_DIR, 'proxy_server.mjs')
+
+try {
+  if (!existsSync(PROXY_DIR))       fs.mkdirSync(PROXY_DIR,       { recursive: true })
+  if (!existsSync(PROXY_SAVES_DIR)) fs.mkdirSync(PROXY_SAVES_DIR, { recursive: true })
+} catch (e) {
+  console.warn('[proxy] Failed to create config directories:', e.message)
+}
+
+// ------------------------------------------------------------------
 // Certificate discovery — mirrors the original behaviour, but now also
 // lets the UI list every certificate available on the machine so the
 // user can pick one per rule instead of relying on a hard-coded path.
@@ -69,14 +91,32 @@ function listCertificates() {
 // resolved at start time from the rule's `certDomain` (or the rule's
 // own domain as fallback), so rules can point at ANY cert on disk.
 // ------------------------------------------------------------------
-const buildServer = (rules, opts) => `
+// ------------------------------------------------------------------
+// Server script template — lives at a STABLE path
+// (~/.sypm/proxy/proxy_server.mjs) and reads its rules/opts from the
+// active config JSON at startup. Daemon mode points systemd at this
+// permanent file (not /tmp), so it survives reboots.
+// ------------------------------------------------------------------
+const buildServerSource = (configPath) => `
 import http from 'node:http'
 import https from 'node:https'
 import { readFileSync } from 'node:fs'
 import { createSecureContext } from 'node:tls'
 
-const rules = ${JSON.stringify(rules)}
-const opts  = ${JSON.stringify(opts)}
+const CONFIG_PATH = ${JSON.stringify(configPath)}
+
+function loadConfig() {
+  try {
+    return JSON.parse(readFileSync(CONFIG_PATH, 'utf-8'))
+  } catch (e) {
+    console.error('[proxy] Cannot read config ' + CONFIG_PATH + ': ' + e.message)
+    return { rules: [], opts: { httpPort: 80, httpsPort: 443 } }
+  }
+}
+
+const cfg   = loadConfig()
+const rules = (cfg.rules || []).filter(r => r.domain && r.target)
+const opts  = cfg.opts || {}
 
 const certs = {}
 for (const r of rules) {
@@ -112,6 +152,8 @@ function forward(req, res, rule, isHttps) {
 const hp = opts.httpPort  || 80
 const sp = opts.httpsPort || 443
 
+console.log('[proxy] Starting with ' + rules.length + ' rule(s) from ' + CONFIG_PATH)
+
 http.createServer((req, res) => {
   const rule = rules.find(r => r.domain === req.headers.host)
   if (rule && rule.useHttps === false) return forward(req, res, rule, false)
@@ -130,6 +172,17 @@ https.createServer({
   res.writeHead(404); res.end('No rule')
 }).listen(sp, '0.0.0.0', () => console.log('[proxy] HTTPS on ' + sp))
 `
+
+// Bootstrap the stable server script (idempotent — content never changes).
+try {
+  if (!existsSync(PROXY_DIR)) fs.mkdirSync(PROXY_DIR, { recursive: true })
+  const wanted = buildServerSource(PROXY_CONFIG)
+  if (!existsSync(PROXY_SERVER) || fs.readFileSync(PROXY_SERVER, 'utf-8') !== wanted) {
+    writeFileSync(PROXY_SERVER, wanted, 'utf-8')
+  }
+} catch (e) {
+  console.warn('[proxy] Failed to bootstrap server script:', e.message)
+}
 
 class Proxy extends SyAPP.Func() {
   constructor() {
@@ -202,9 +255,222 @@ class Proxy extends SyAPP.Func() {
 
     return this._procs().filter(p => p.status === 'Running' || p.status === 'Restarting').length
   }
-  _setRules(id, r) { this.Storages.Set(id, 'px_rules', r) }
-  _setOpts(id, o)  { this.Storages.Set(id, 'px_opts', o) }
+  _setRules(id, r) { this.Storages.Set(id, 'px_rules', r); this._persistConfig(id) }
+  _setOpts(id, o)  { this.Storages.Set(id, 'px_opts', o);  this._persistConfig(id) }
   _newId()         { return `r_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}` }
+
+  // ------------------------------------------------------------------
+  // Save-name sanitisation — keeps filenames portable and blocks
+  // directory traversal. Only [A-Za-z0-9._-] survive.
+  // ------------------------------------------------------------------
+  _safeName(name) {
+    return String(name || '')
+      .trim()
+      .replace(/[^a-zA-Z0-9._-]+/g, '_')
+      .replace(/^[._-]+/, '')
+      .replace(/[._-]+$/, '')
+      .slice(0, 64)
+  }
+
+  // ------------------------------------------------------------------
+  // Snapshot current rules + opts, resolving cert paths into the
+  // snapshot so it is self-contained. daemon and autoRestart ride
+  // inside opts, so they are part of the save.
+  // ------------------------------------------------------------------
+  _snapshot(id) {
+    const rules = this._rules(id)
+    const opts  = this._opts(id)
+    const certs = this._certs(id)
+
+    const resolved = rules.map(r => {
+      let certDomain = r.certDomain || ''
+      let cert = null
+
+      if (r.useHttps !== false && r.domain) {
+        if (!certDomain) {
+          cert = certs.find(c => c.domain === r.domain) || certs[0] || null
+          certDomain = cert ? cert.domain : ''
+        } else {
+          cert = certs.find(c => c.domain === certDomain) || null
+        }
+      }
+
+      return {
+        ...r,
+        certDomain,
+        certKey:  cert ? cert.key  : '',
+        certCert: cert ? cert.cert : ''
+      }
+    })
+
+    return { rules: resolved, opts }
+  }
+
+  // Active config — written on every change so the daemon always boots
+  // with the last-known-good ruleset.
+  _persistConfig(id) {
+    try {
+      const snap = this._snapshot(id)
+      const payload = { rules: snap.rules, opts: snap.opts, savedAt: new Date().toISOString() }
+      if (!existsSync(PROXY_DIR)) fs.mkdirSync(PROXY_DIR, { recursive: true })
+      writeFileSync(PROXY_CONFIG, JSON.stringify(payload, null, 2), 'utf-8')
+    } catch (e) {
+      console.warn('[proxy] Failed to persist active config:', e.message)
+    }
+  }
+
+  _loadConfigFromDisk() {
+    try {
+      if (!existsSync(PROXY_CONFIG)) return { rules: [], opts: null }
+      const parsed = JSON.parse(fs.readFileSync(PROXY_CONFIG, 'utf-8'))
+      return {
+        rules: Array.isArray(parsed.rules) ? parsed.rules : [],
+        opts:  parsed.opts || null
+      }
+    } catch (e) {
+      console.warn('[proxy] Failed to load active config:', e.message)
+      return { rules: [], opts: null }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // NAMED SAVES — one JSON file per user-defined snapshot under
+  // ~/.sypm/proxy/saves/<name>.json
+  // ------------------------------------------------------------------
+  _listSaves() {
+    try {
+      if (!existsSync(PROXY_SAVES_DIR)) return []
+      const files = readdirSync(PROXY_SAVES_DIR).filter(f => f.endsWith('.json'))
+      const out = []
+      for (const f of files) {
+        try {
+          const full = path.join(PROXY_SAVES_DIR, f)
+          const stat = fs.statSync(full)
+          const data = JSON.parse(fs.readFileSync(full, 'utf-8'))
+          const opts = data.opts || {}
+          out.push({
+            name:        f.replace(/\.json$/, ''),
+            mtime:       stat.mtimeMs,
+            rulesCount:  (data.rules || []).length,
+            daemon:      !!opts.daemon,
+            autoRestart: !!opts.autoRestart,
+            savedAt:     data.savedAt || new Date(stat.mtimeMs).toISOString()
+          })
+        } catch { /* skip broken file */ }
+      }
+      return out.sort((a, b) => b.mtime - a.mtime)
+    } catch { return [] }
+  }
+
+  _saveNamed(id, name) {
+    const clean = this._safeName(name)
+    if (!clean) return { ok: false, error: 'Empty or invalid save name' }
+
+    const snap = this._snapshot(id)
+    const payload = {
+      name: clean,
+      savedAt: new Date().toISOString(),
+      rules: snap.rules,
+      opts:  snap.opts
+    }
+
+    try {
+      if (!existsSync(PROXY_SAVES_DIR)) fs.mkdirSync(PROXY_SAVES_DIR, { recursive: true })
+      const file = path.join(PROXY_SAVES_DIR, `${clean}.json`)
+      const existed = existsSync(file)
+      writeFileSync(file, JSON.stringify(payload, null, 2), 'utf-8')
+      return { ok: true, clean, existed, rulesCount: snap.rules.length }
+    } catch (e) {
+      return { ok: false, error: e.message }
+    }
+  }
+
+  _loadNamed(id, name) {
+    const clean = this._safeName(name)
+    if (!clean) return { ok: false, error: 'Invalid name' }
+
+    const file = path.join(PROXY_SAVES_DIR, `${clean}.json`)
+    if (!existsSync(file)) return { ok: false, error: `Save "${clean}" not found` }
+
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf-8'))
+      const defaults = { httpPort: 80, httpsPort: 443, daemon: false, autoRestart: false }
+
+      this.Storages.Set(id, 'px_rules', Array.isArray(data.rules) ? data.rules : [])
+      this.Storages.Set(id, 'px_opts',  { ...defaults, ...(data.opts || {}) })
+
+      // Keep the daemon-readable active config in sync with what was loaded.
+      this._persistConfig(id)
+
+      return { ok: true, clean, rulesCount: (data.rules || []).length }
+    } catch (e) {
+      return { ok: false, error: e.message }
+    }
+  }
+
+  _deleteNamed(id, name) {
+    const clean = this._safeName(name)
+    if (!clean) return { ok: false, error: 'Invalid name' }
+
+    const file = path.join(PROXY_SAVES_DIR, `${clean}.json`)
+    try {
+      if (!existsSync(file)) return { ok: false, error: 'Not found' }
+      fs.unlinkSync(file)
+      return { ok: true, clean }
+    } catch (e) {
+      return { ok: false, error: e.message }
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Daemon hardening. SyPM's default systemd unit hard-codes
+  // /usr/bin/node (wrong under nvm/n/volta) and omits
+  // AmbientCapabilities, so binding to :80/:443 after a fresh boot
+  // fails. Patch the installed unit — scoped to Proxy only.
+  // ------------------------------------------------------------------
+  _fixDaemonService(procId) {
+    const systemInfo = (() => {
+      try { return SyPM._detectSystem() } catch { return { initSystem: 'unknown' } }
+    })()
+    if (systemInfo.initSystem !== 'systemd') return false
+
+    const localUnit  = path.join(SYPM_HOME, 'daemons', `sypm-${procId}.service`)
+    const systemUnit = `/etc/systemd/system/sypm-${procId}.service`
+    if (!existsSync(localUnit)) return false
+
+    try {
+      let content = fs.readFileSync(localUnit, 'utf-8')
+      const original = content
+
+      const nodeBin = process.execPath || '/usr/bin/node'
+      content = content.replace(/^ExecStart=\S+\s+/m, `ExecStart=${nodeBin} `)
+
+      if (!/AmbientCapabilities=/.test(content)) {
+        content = content.replace(
+          /\[Service\]\s*/,
+          `[Service]\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\n`
+        )
+      }
+
+      if (!/network-online\.target/.test(content)) {
+        content = content.replace(
+          /^After=network\.target\s*$/m,
+          'After=network-online.target\nWants=network-online.target'
+        )
+      }
+
+      if (content === original) return false
+
+      fs.writeFileSync(localUnit, content, 'utf-8')
+      try { execSync(`sudo cp "${localUnit}" "${systemUnit}"`, { stdio: 'ignore' }) } catch { return false }
+      try { execSync('sudo systemctl daemon-reload', { stdio: 'ignore' }) } catch {}
+      try { execSync(`sudo systemctl enable sypm-${procId}.service`, { stdio: 'ignore' }) } catch {}
+      return true
+    } catch (e) {
+      console.warn('[proxy] Failed to patch daemon service:', e.message)
+      return false
+    }
+  }
 
   // Cert cache — refreshed every render so newly-issued certs show up.
   _certs(id) {
@@ -228,8 +494,14 @@ class Proxy extends SyAPP.Func() {
     const id = props.session.UniqueID
     const cp = this.Builds.get(id)?.Session?.ActualProps || {}
     if(!this.Storages.Has(id,'parentfunc')){this.Storages.Set(id,'parentfunc',props.session.PreviousPath)}
-    if (!this.Storages.Has(id, 'px_rules')) this._setRules(id, [])
-    if (!this.Storages.Has(id, 'px_opts'))  this._setOpts(id, { httpPort: 80, httpsPort: 443, daemon: false, autoRestart: false })
+    // First render — hydrate rules/opts from the ACTIVE global config.
+    // Bypass _setRules/_setOpts to avoid re-saving what we just read.
+    if (!this.Storages.Has(id, 'px_rules') || !this.Storages.Has(id, 'px_opts')) {
+      const disk = this._loadConfigFromDisk()
+      const defaults = { httpPort: 80, httpsPort: 443, daemon: false, autoRestart: false }
+      this.Storages.Set(id, 'px_rules', Array.isArray(disk.rules) ? disk.rules : [])
+      this.Storages.Set(id, 'px_opts',  { ...defaults, ...(disk.opts || {}) })
+    }
 
     await this._events(id, cp)
 
@@ -328,6 +600,72 @@ class Proxy extends SyAPP.Func() {
       const o = this._opts(id); o.autoRestart = !o.autoRestart
       this._setOpts(id, o)
     }
+
+    // ================================================================
+    // NAMED SAVES — daemon + autoRestart ride inside opts, so they are
+    // captured by every save and restored on every load.
+    // px_selected_save = row picked in the list (target of actions)
+    // px_active_save   = save currently applied (marked ★ in the header)
+    // ================================================================
+
+    if (p.px_save_named) {
+      delete p.px_save_named
+      const nameInput = this.Storages.Get(id, 'field_px_save_name') || ''
+      const r = this._saveNamed(id, nameInput)
+      if (r.ok) {
+        this.Storages.Set(id, 'field_px_save_name', '')
+        this.Storages.Set(id, 'px_selected_save', r.clean)
+        this.Storages.Set(id, 'px_active_save',   r.clean)
+        this.Alert(id,
+          r.existed
+            ? `💾 Overwrote "${r.clean}" (${r.rulesCount} rule(s))`
+            : `💾 Saved as "${r.clean}" (${r.rulesCount} rule(s))`,
+          { duration: 2500 })
+      } else {
+        this.Alert(id, `❌ ${r.error}`, { duration: 3000 })
+      }
+    }
+
+    if (p.px_overwrite_named) {
+      const name = p.px_overwrite_named; delete p.px_overwrite_named
+      const r = this._saveNamed(id, name)
+      if (r.ok) {
+        this.Storages.Set(id, 'px_selected_save', r.clean)
+        this.Storages.Set(id, 'px_active_save',   r.clean)
+        this.Alert(id, `💾 Updated "${r.clean}" (${r.rulesCount} rule(s))`, { duration: 2500 })
+      } else {
+        this.Alert(id, `❌ ${r.error}`, { duration: 3000 })
+      }
+    }
+
+    if (p.px_select_save) {
+      const name = p.px_select_save; delete p.px_select_save
+      this.Storages.Set(id, 'px_selected_save', name)
+    }
+
+    if (p.px_load_named !== undefined) {
+      const name = p.px_load_named; delete p.px_load_named
+      const r = this._loadNamed(id, name)
+      if (r.ok) {
+        this.Storages.Set(id, 'px_selected_save', r.clean)
+        this.Storages.Set(id, 'px_active_save',   r.clean)
+        this.Alert(id, `📂 Loaded "${r.clean}" (${r.rulesCount} rule(s))`, { duration: 2500 })
+      } else {
+        this.Alert(id, `❌ ${r.error}`, { duration: 3000 })
+      }
+    }
+
+    if (p.px_delete_named !== undefined) {
+      const name = p.px_delete_named; delete p.px_delete_named
+      const r = this._deleteNamed(id, name)
+      if (r.ok) {
+        if (this.Storages.Get(id, 'px_selected_save') === r.clean) this.Storages.Delete(id, 'px_selected_save')
+        if (this.Storages.Get(id, 'px_active_save')   === r.clean) this.Storages.Delete(id, 'px_active_save')
+        this.Alert(id, `🗑 Deleted "${r.clean}"`, { duration: 2000 })
+      } else {
+        this.Alert(id, `❌ ${r.error}`, { duration: 3000 })
+      }
+    }
   }
 
   async _start(id) {
@@ -381,20 +719,34 @@ class Proxy extends SyAPP.Func() {
       return
     }
 
+    // Persist rules+opts (including daemon/autoRestart) to the ACTIVE
+    // config BEFORE launching so the daemon always reads the freshest
+    // ruleset on boot. Named saves are unaffected by this step.
+    this._persistConfig(id)
+
+    // Ensure the stable server script exists (idempotent bootstrap).
+    try {
+      const wanted = buildServerSource(PROXY_CONFIG)
+      if (!existsSync(PROXY_SERVER) || fs.readFileSync(PROXY_SERVER, 'utf-8') !== wanted) {
+        writeFileSync(PROXY_SERVER, wanted, 'utf-8')
+      }
+    } catch (e) {
+      this.Alert(id, `❌ Cannot write server script: ${e.message}`, { duration: 5000 })
+      return
+    }
+
     const opts = this._opts(id)
-    const script = path.join(os.tmpdir(), `sypm_proxy_${Date.now()}.mjs`)
-    writeFileSync(script, buildServer(resolved, opts), 'utf-8')
 
     try {
-      const res = SyPM.run(script, {
+      const res = SyPM.run(PROXY_SERVER, {
         name: PROCESS_NAME,
         daemon: !!opts.daemon,
         autoRestart: !!opts.autoRestart,
-        restartTries: opts.autoRestart ? 999 : 0
+        restartTries: opts.autoRestart ? 999 : 0,
+        workingDir: PROXY_DIR
       })
 
-      // Post-start sanity check: if anything else managed to slip into the
-      // registry during the start, prune every entry except the new one.
+      // Post-start sanity check: prune everything except the new entry.
       const after = this._procs()
       if (after.length > 1) {
         for (const p of after) {
@@ -403,7 +755,15 @@ class Proxy extends SyAPP.Func() {
         try { SyPM.cleanup() } catch {}
       }
 
-      this.Alert(id, `✅ Proxy started  PID ${res.pid}${opts.daemon ? '  [daemon]' : ''}${opts.autoRestart ? '  [auto-restart]' : ''}`, { duration: 3500 })
+      // Harden the freshly-installed systemd unit so it actually comes
+      // back up after a reboot (correct node path + port-bind capability).
+      let daemonNote = ''
+      if (opts.daemon) {
+        const fixed = this._fixDaemonService(res.id)
+        daemonNote = fixed ? '  [daemon: hardened]' : '  [daemon]'
+      }
+
+      this.Alert(id, `✅ Proxy started  PID ${res.pid}${daemonNote}${opts.autoRestart ? '  [auto-restart]' : ''}`, { duration: 3500 })
     } catch (e) {
       this.Alert(id, `❌ ${e.message}`, { duration: 5000 })
     }
@@ -568,36 +928,107 @@ class Proxy extends SyAPP.Func() {
     }
   }
 
-  _renderSettings(id) {
-    const o = this._opts(id)
+  async _renderSettings(id) {
+    const o     = this._opts(id)
     const certs = this._certs(id)
 
-    this.Text(id, ' ')
+    // === Network (compact) ===
     this.Text(id, '⚙ Settings')
-    this.Text(id, `🔐 ${certs.length} certificate(s) available`)
-    this.Text(id, ' ')
-
     this.Field(id, 'px_http_port', {
-      label: 'HTTP port',
+      label: 'HTTP',
       initialValue: String(o.httpPort || 80),
       onChange: (v) => { const oo = this._opts(id); oo.httpPort = parseInt(v, 10) || 80; this._setOpts(id, oo) }
     })
     this.Field(id, 'px_https_port', {
-      label: 'HTTPS port',
+      label: 'HTTPS',
       initialValue: String(o.httpsPort || 443),
       onChange: (v) => { const oo = this._opts(id); oo.httpsPort = parseInt(v, 10) || 443; this._setOpts(id, oo) }
     })
-    this.Text(id, ' ')
     this.Buttons(id, [
-      { name: `🛡 Daemon ${o.daemon ? '✓' : '✗'}`,              props: { px_toggle_daemon: 1 } },
-      { name: `🔄 Auto-restart ${o.autoRestart ? '✓' : '✗'}`,  props: { px_toggle_restart: 1 } },
-      { name: '🔄 Refresh certs',                               props: { px_refresh_certs: 1 } }
+      { name: `🛡 Daemon ${o.daemon ? '✓' : '✗'}`,             props: { px_toggle_daemon: 1 } },
+      { name: `🔄 Auto ${o.autoRestart ? '✓' : '✗'}`,          props: { px_toggle_restart: 1 } },
+      { name: `🔄 Certs (${certs.length})`,                     props: { px_refresh_certs: 1 } }
     ])
+
+    // === Save management (compact) ===
     this.Text(id, ' ')
-    this.Text(id, 'Daemon: installs a system service (auto-start on boot, needs sudo).')
-    this.Text(id, 'Auto-restart: SyPM monitor respawns the process on crash.')
+    await this._renderSaveManager(id)
+
     this.Text(id, ' ')
     this.Buttons(id, [{ name: '▶ Apply & Start', props: { px_start: 1 } }])
+  }
+
+  // ------------------------------------------------------------------
+  // Compact save manager. Whole block is ~4 visible rows:
+  //   1. header:  ★ <active save> · <rules> · 🛡🔄   (or "(unsaved)")
+  //   2. field:   Save as  [_______]
+  //   3. buttons: [💾 Save new]
+  //   4. actions: [📂 Load] [💾 Overwrite] [🗑 Delete]  ← only when selected
+  //   5. dropdown: [▼ 📚 Presets (n)]                   ← collapsed by default
+  // daemon + autoRestart are read straight from each save's opts and
+  // shown as 🛡/🔄 badges both in the header and in each preset row.
+  // ------------------------------------------------------------------
+  async _renderSaveManager(id) {
+    const saves        = this._listSaves()
+    const activeName   = this.Storages.Get(id, 'px_active_save')   || ''
+    const selectedName = this.Storages.Get(id, 'px_selected_save') || ''
+    const activeSave   = saves.find(s => s.name === activeName)
+    const selectedSave = saves.find(s => s.name === selectedName)
+    const o            = this._opts(id)
+
+    const fmt    = (ms)  => new Date(ms).toISOString().slice(5, 16).replace('T', ' ')
+    const badges = (d, r) => (`${d ? '🛡' : ''}${r ? '🔄' : ''}` || '—')
+
+    // Header line: active save (or "unsaved") + current daemon/restart
+    const curBadges = badges(o.daemon, o.autoRestart)
+    const header = activeSave
+      ? `★ ${activeSave.name}  ·  ${this._rules(id).length}r  ·  ${curBadges}`
+      : `(unsaved)  ·  ${this._rules(id).length}r  ·  ${curBadges}`
+    const selTag = (selectedSave && selectedSave.name !== activeName)
+      ? `    ● ${selectedSave.name}`
+      : ''
+
+    this.Text(id, `💾 Saves   ${header}${selTag}`)
+
+    // Save-as field + button
+    this.Field(id, 'px_save_name', {
+      label: 'Save as',
+      initialValue: '',
+      maxWidth: 32
+    })
+    this.Buttons(id, [{ name: '💾 Save new', props: { px_save_named: 1 } }])
+
+    // Contextual actions — only shown when a save is selected
+    if (selectedSave) {
+      this.Buttons(id, [
+        { name: '📂 Load',      props: { px_load_named:      selectedName } },
+        { name: '💾 Overwrite', props: { px_overwrite_named: selectedName } },
+        { name: '🗑 Delete',    props: { px_delete_named:    selectedName } }
+      ])
+    }
+
+    // Collapsed preset list — one row per save, click to select
+    await this.DropDown(id, 'px_saves_list', async () => {
+      if (saves.length === 0) {
+        this.Button(id, { name: '  (no saves yet)', props: {} })
+        return
+      }
+      for (const s of saves) {
+        const mark = s.name === selectedName ? '●' : '○'
+        const star = s.name === activeName   ? ' ★' : ''
+        this.Button(id, {
+          name: `${mark} ${s.name}${star}  ·  ${s.rulesCount}r  ·  ${badges(s.daemon, s.autoRestart)}  ·  ${fmt(s.mtime)}`,
+          props: { px_select_save: s.name }
+        })
+      }
+    }, {
+      up_buttontext:   `📚 Presets (${saves.length})`,
+      down_buttontext: 'Hide presets',
+      up_emoji:   '▶',
+      down_emoji: '▼'
+    })
+
+    this.Text(id, `📁 ${PROXY_DIR}`)
   }
 }
 
