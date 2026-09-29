@@ -1,6 +1,8 @@
 import Config from "./Config/Config.js";
 import SyAPP from "../SyAPP.js";
 import SyDB from "../SyDB.js";
+import SyPM from '../SyPM.js'
+import fs from 'fs'
 
 class SyInstances {
   static Model = SyDB.Model('SyInstances', {
@@ -9,7 +11,10 @@ class SyInstances {
     OwnerID: { required: false, type: 'string' },
     Type: { required: false },
     Running: { required: true, type: 'boolean', default: true },
-    Status: { required: true, type: 'string', default: 'Online' }
+    Status: { required: true, type: 'string', default: 'Online' },
+    ProcessId: { required: false, type: 'string', default: null },
+    ProcessType: { required: false, type: 'string', default: null },
+    ProcessSource: { required: false, type: 'string', default: null }
   });
 }
 
@@ -30,7 +35,8 @@ class Sy extends SyAPP.Func() {
             action: null,
             confirmDeleteId: null,
             targetInstanceId: null,
-            editTargetId: null
+            editTargetId: null,
+            processView: null
           };
         };
 
@@ -51,6 +57,67 @@ class Sy extends SyAPP.Func() {
           const newState = { ...current, ...updates };
           this.Storages.Set(uid, 'bulk_state', newState);
           return newState;
+        };
+
+        // ---------- PROCESS LINK HELPERS (SyPM) ----------
+        const getProcessInfo = (processId) => {
+          if (!processId) return null;
+          try {
+            const registry = SyPM._loadRegistry();
+            return registry.find(p => p.id === processId) || null;
+          } catch (e) {
+            return null;
+          }
+        };
+
+        const getProcessAlive = (processId) => {
+          if (!processId) return false;
+          try {
+            return SyPM.isAlive(processId);
+          } catch (e) {
+            return false;
+          }
+        };
+
+        const getProcessStatusLabel = (instance) => {
+          if (!instance || !instance.ProcessId) return '';
+          return getProcessAlive(instance.ProcessId) ? '  ONLINE' : '  OFFLINE';
+        };
+
+        const startProcessFromInstance = (instance) => {
+          if (!instance || !instance.ProcessSource) return null;
+          const type = instance.ProcessType || 'file';
+          const source = instance.ProcessSource;
+          const name = `sy-${instance._id}`;
+          try {
+            if (type === 'file') {
+              return SyPM.run(source, { name, autoRestart: true, restartTries: 5 });
+            }
+            if (type === 'code') {
+              return SyPM.run(source, { name, autoRestart: true, restartTries: 5 });
+            }
+            if (type === 'command') {
+              return SyPM.exec(source, { name, autoRestart: true, restartTries: 5 });
+            }
+            if (type === 'flow') {
+              const flowFile = path.join(os.tmpdir(), `sy_flow_${instance._id}_${Date.now()}.sh`);
+              fs.writeFileSync(flowFile, '#!/bin/bash\nset -e\n' + source, 'utf-8');
+              fs.chmodSync(flowFile, 0o755);
+              return SyPM.exec(`bash "${flowFile}"`, { name, autoRestart: true, restartTries: 5 });
+            }
+          } catch (e) {
+            return null;
+          }
+          return null;
+        };
+
+        const stopLinkedProcess = (instance) => {
+          if (!instance || !instance.ProcessId) return false;
+          const proc = getProcessInfo(instance.ProcessId);
+          if (proc && getProcessAlive(proc.id)) {
+            try { SyPM.kill(proc.id); return true; } catch (e) { return false; }
+          }
+          return false;
         };
 
         // ---------- HELPER: Get all descendants of an instance ----------
@@ -218,8 +285,12 @@ class Sy extends SyAPP.Func() {
           setManageState({ action: 'bulk_confirm', confirmDeleteId: null, targetInstanceId: props.target_instance || null, editTargetId: null });
         }
 
+        if (props.manage_action === 'process') {
+          setManageState({ action: null, confirmDeleteId: null, processView: 'menu' });
+        }
+
         if (props.manage_action === 'back') {
-          setManageState({ action: null, confirmDeleteId: null, targetInstanceId: null, editTargetId: null });
+          setManageState({ action: null, confirmDeleteId: null, targetInstanceId: null, editTargetId: null, processView: null });
           setBulkState({ selectedIds: [] });
         }
 
@@ -315,7 +386,8 @@ class Sy extends SyAPP.Func() {
           const children = instances.filter(i => i.OwnerID === instance._id);
           const key = `inst-${instance._id}`;
           const count = children.length ? ` (${children.length})` : '';
-          const prefix = isMain ? '🟢 ' : '    '.repeat(depth) + '└─ ';
+          const prefix = isMain ? '' : '    '.repeat(depth) + '└─ ';
+          const statusSuffix = getProcessStatusLabel(instance);
 
           // Capture state before DropDown for main close detection
           const stateBefore = this.Storages.Get(uid, `dropdown-${key}`);
@@ -351,8 +423,8 @@ class Sy extends SyAPP.Func() {
               await renderInstance(child, depth + 1, false);
             }
           }, {
-            up_buttontext: `${prefix}📁 ${instance.Name}${count}`,
-            down_buttontext: `${prefix}📂 ${instance.Name}${count}`,
+            up_buttontext: `${prefix}📁 ${instance.Name}${count}${statusSuffix}`,
+            down_buttontext: `${prefix}📂 ${instance.Name}${count}${statusSuffix}`,
             jumpTo: 0
           });
 
@@ -385,14 +457,155 @@ class Sy extends SyAPP.Func() {
 
         // ---------- RENDER MANAGE PAGE ----------
         await this.Page(uid, 'manage', async () => {
-          const manageState = getManageState();
-          const bulkState = getBulkState();
+          let manageState = getManageState();
+          let bulkState = getBulkState();
 
           // Determine target instance (use persistent state first, then prop)
-          const targetInstanceId = manageState.targetInstanceId || props.target_instance;
-          const targetInstance = targetInstanceId
+          let targetInstanceId = manageState.targetInstanceId || props.target_instance;
+          let targetInstance = targetInstanceId
             ? instances.find(i => i._id === targetInstanceId)
             : null;
+
+          // ---------- PROCESS ACTION HANDLERS ----------
+          if (props.process_action && targetInstance) {
+            const _pa = props.process_action;
+            const _proc = getProcessInfo(targetInstance.ProcessId);
+            const _procAlive = _proc ? getProcessAlive(_proc.id) : false;
+
+            if (_pa === 'back') {
+              setManageState({ processView: null });
+            } else if (_pa === 'link_file') {
+              setManageState({ processView: 'link_file' });
+            } else if (_pa === 'link_code') {
+              setManageState({ processView: 'link_code' });
+            } else if (_pa === 'link_command') {
+              setManageState({ processView: 'link_command' });
+            } else if (_pa === 'link_flow') {
+              setManageState({ processView: 'link_flow' });
+            } else if (_pa === 'view_logs') {
+              setManageState({ processView: 'logs' });
+            } else if (_pa === 'edit_source') {
+              const _t = targetInstance.ProcessType || 'file';
+              if (_t === 'file') setManageState({ processView: 'link_file' });
+              else if (_t === 'code') setManageState({ processView: 'link_code' });
+              else if (_t === 'command') setManageState({ processView: 'link_command' });
+              else if (_t === 'flow') setManageState({ processView: 'link_flow' });
+            } else if (_pa === 'unlink') {
+              stopLinkedProcess(targetInstance);
+              await SyInstances.Model.update(targetInstance._id, { ProcessId: null, ProcessType: null, ProcessSource: null });
+              instances = await SyInstances.Model.find();
+              targetInstance = instances.find(i => i._id === targetInstanceId);
+              setManageState({ processView: 'menu' });
+            } else if (_pa === 'stop') {
+              stopLinkedProcess(targetInstance);
+              await SyInstances.Model.update(targetInstance._id, { Running: false, Status: 'Offline' });
+              instances = await SyInstances.Model.find();
+              targetInstance = instances.find(i => i._id === targetInstanceId);
+            } else if (_pa === 'start') {
+              const _new = startProcessFromInstance(targetInstance);
+              if (_new) {
+                await SyInstances.Model.update(targetInstance._id, { ProcessId: _new.id, Running: true, Status: 'Online' });
+                instances = await SyInstances.Model.find();
+                targetInstance = instances.find(i => i._id === targetInstanceId);
+              } else {
+                this.Alert(uid, 'Failed to start process.', { duration: 3000 });
+              }
+            } else if (_pa === 'restart') {
+              if (_procAlive) {
+                try { SyPM.restart(_proc.id); } catch (e) {}
+              } else {
+                const _new = startProcessFromInstance(targetInstance);
+                if (_new) {
+                  await SyInstances.Model.update(targetInstance._id, { ProcessId: _new.id, Running: true, Status: 'Online' });
+                }
+              }
+              instances = await SyInstances.Model.find();
+              targetInstance = instances.find(i => i._id === targetInstanceId);
+            } else if (_pa === 'toggle_daemon') {
+              if (_proc) {
+                try {
+                  if (_proc.config && _proc.config.daemon) {
+                    SyPM.disableDaemon(_proc.id);
+                  } else {
+                    SyPM.enableDaemon(_proc.id);
+                  }
+                } catch (e) {
+                  this.Alert(uid, `Daemon toggle failed: ${e.message}`, { duration: 3000 });
+                }
+              }
+            } else if (_pa === 'commit_file') {
+              const _sel = this.FileManager.GetSelected(uid, `proc_file_${targetInstance._id}`);
+              if (_sel.length > 0) {
+                try {
+                  stopLinkedProcess(targetInstance);
+                  const _new = SyPM.run(_sel[0], { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: _new.id, ProcessType: 'file', ProcessSource: _sel[0], Running: true, Status: 'Online'
+                  });
+                  this.FileManager.ClearSelection(uid, `proc_file_${targetInstance._id}`);
+                  setManageState({ processView: 'menu' });
+                  instances = await SyInstances.Model.find();
+                  targetInstance = instances.find(i => i._id === targetInstanceId);
+                } catch (e) {
+                  this.Alert(uid, `Failed to start: ${e.message}`, { duration: 3000 });
+                }
+              }
+            } else if (_pa === 'commit_code') {
+              const _code = this.Storages.Get(uid, `texteditor_proc_code_${targetInstance._id}`) || '';
+              if (_code.trim()) {
+                try {
+                  stopLinkedProcess(targetInstance);
+                  const _new = SyPM.run(_code, { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: _new.id, ProcessType: 'code', ProcessSource: _code, Running: true, Status: 'Online'
+                  });
+                  setManageState({ processView: 'menu' });
+                  instances = await SyInstances.Model.find();
+                  targetInstance = instances.find(i => i._id === targetInstanceId);
+                } catch (e) {
+                  this.Alert(uid, `Failed to start: ${e.message}`, { duration: 3000 });
+                }
+              }
+            } else if (_pa === 'commit_command') {
+              const _cmd = this.Storages.Get(uid, `field_proc_cmd_${targetInstance._id}`) || '';
+              if (_cmd.trim()) {
+                try {
+                  stopLinkedProcess(targetInstance);
+                  const _new = SyPM.exec(_cmd, { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: _new.id, ProcessType: 'command', ProcessSource: _cmd, Running: true, Status: 'Online'
+                  });
+                  setManageState({ processView: 'menu' });
+                  instances = await SyInstances.Model.find();
+                  targetInstance = instances.find(i => i._id === targetInstanceId);
+                } catch (e) {
+                  this.Alert(uid, `Failed to start: ${e.message}`, { duration: 3000 });
+                }
+              }
+            } else if (_pa === 'commit_flow') {
+              const _flow = this.Storages.Get(uid, `texteditor_proc_flow_${targetInstance._id}`) || '';
+              if (_flow.trim()) {
+                try {
+                  stopLinkedProcess(targetInstance);
+                  const _flowFile = path.join(os.tmpdir(), `sy_flow_${targetInstance._id}_${Date.now()}.sh`);
+                  fs.writeFileSync(_flowFile, '#!/bin/bash\nset -e\n' + _flow, 'utf-8');
+                  fs.chmodSync(_flowFile, 0o755);
+                  const _new = SyPM.exec(`bash "${_flowFile}"`, { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: _new.id, ProcessType: 'flow', ProcessSource: _flow, Running: true, Status: 'Online'
+                  });
+                  setManageState({ processView: 'menu' });
+                  instances = await SyInstances.Model.find();
+                  targetInstance = instances.find(i => i._id === targetInstanceId);
+                } catch (e) {
+                  this.Alert(uid, `Failed to start flow: ${e.message}`, { duration: 3000 });
+                }
+              }
+            }
+
+            manageState = getManageState();
+            bulkState = getBulkState();
+          }
 
           // Get visible instances based on target or all mains
           let visible = [];
@@ -512,6 +725,118 @@ class Sy extends SyAPP.Func() {
               props: { manage_action: 'back', page: 'manage' }
             });
           }
+          // PROCESS MANAGER VIEW
+          else if (manageState.processView) {
+            const _proc = targetInstance ? getProcessInfo(targetInstance.ProcessId) : null;
+            const _procAlive = _proc ? getProcessAlive(_proc.id) : false;
+            const _daemonOn = _proc && _proc.config && _proc.config.daemon;
+            const _pv = manageState.processView;
+
+            this.Text(uid, '🔧 Process Manager');
+            if (targetInstance) this.Text(uid, `Instance: ${targetInstance.Name}`);
+            this.Text(uid, '─'.repeat(40));
+
+            if (_pv === 'menu') {
+              if (!targetInstance) {
+                this.Text(uid, 'No target instance.');
+              } else if (!targetInstance.ProcessId) {
+                this.Text(uid, 'No process linked. Choose a method:');
+                this.Button(uid, { name: '📄 From .js File', props: { process_action: 'link_file', page: 'manage', target_instance: targetInstance._id } });
+                this.Button(uid, { name: '📝 Write Code', props: { process_action: 'link_code', page: 'manage', target_instance: targetInstance._id } });
+                this.Button(uid, { name: '💻 Global Command', props: { process_action: 'link_command', page: 'manage', target_instance: targetInstance._id } });
+                this.Button(uid, { name: '🔗 Command Flow', props: { process_action: 'link_flow', page: 'manage', target_instance: targetInstance._id } });
+              } else {
+                const statusText = _procAlive
+                  ? this.TextColor.green('● ONLINE')
+                  : this.TextColor.red('○ OFFLINE');
+                this.Text(uid, `Status: ${statusText}`);
+                this.Text(uid, `Type:   ${targetInstance.ProcessType || 'unknown'}`);
+
+                if (_procAlive) {
+                  this.Buttons(uid, [
+                    { name: '⏹ Stop', props: { process_action: 'stop', page: 'manage', target_instance: targetInstance._id } },
+                    { name: '🔄 Restart', props: { process_action: 'restart', page: 'manage', target_instance: targetInstance._id } }
+                  ]);
+                } else {
+                  this.Buttons(uid, [
+                    { name: '▶ Start', props: { process_action: 'start', page: 'manage', target_instance: targetInstance._id } },
+                    { name: '🔄 Restart', props: { process_action: 'restart', page: 'manage', target_instance: targetInstance._id } }
+                  ]);
+                }
+
+                this.Buttons(uid, [
+                  { name: _daemonOn ? '🔧 Daemon: ON' : '🔧 Daemon: OFF', props: { process_action: 'toggle_daemon', page: 'manage', target_instance: targetInstance._id } },
+                  { name: '📜 Logs', props: { process_action: 'view_logs', page: 'manage', target_instance: targetInstance._id } }
+                ]);
+
+                this.Buttons(uid, [
+                  { name: '✏ Edit', props: { process_action: 'edit_source', page: 'manage', target_instance: targetInstance._id } },
+                  { name: '🔓 Unlink', props: { process_action: 'unlink', page: 'manage', target_instance: targetInstance._id } }
+                ]);
+              }
+            } else if (_pv === 'link_file') {
+              this.Text(uid, 'Select a .js file to run as a process:');
+              await this.File(uid, {
+                name: `proc_file_${targetInstance._id}`,
+                multiple: false,
+                filter: (itemPath, isDir) => isDir || itemPath.toLowerCase().endsWith('.js'),
+                startPath: os.homedir(),
+                displayName: '📁 Select .js File',
+                itemsPerPage: 8
+              });
+              const _sel = this.FileManager.GetSelected(uid, `proc_file_${targetInstance._id}`);
+              if (_sel.length > 0) {
+                this.Text(uid, `Selected: ${_sel[0]}`);
+                this.Button(uid, { name: '✅ Link & Start', props: { process_action: 'commit_file', page: 'manage', target_instance: targetInstance._id } });
+              }
+            } else if (_pv === 'link_code') {
+              this.Text(uid, 'Write Node.js code to run as a process:');
+              await this.TextEditor(uid, `proc_code_${targetInstance._id}`, {
+                label: 'Process Code',
+                title: `Code: ${targetInstance.Name}`,
+                initialValue: targetInstance.ProcessSource || '// Node.js code\nconsole.log("hello from process");\n'
+              });
+              this.Button(uid, { name: '✅ Save & Start', props: { process_action: 'commit_code', page: 'manage', target_instance: targetInstance._id } });
+            } else if (_pv === 'link_command') {
+              this.Text(uid, 'Enter a global command line:');
+              this.Field(uid, `proc_cmd_${targetInstance._id}`, {
+                label: 'Command',
+                initialValue: targetInstance.ProcessSource || '',
+                maxWidth: 60
+              });
+              this.Button(uid, { name: '✅ Save & Start', props: { process_action: 'commit_command', page: 'manage', target_instance: targetInstance._id } });
+            } else if (_pv === 'link_flow') {
+              this.Text(uid, 'Command flow — one command per line (runs sequentially):');
+              await this.TextEditor(uid, `proc_flow_${targetInstance._id}`, {
+                label: 'Command Flow',
+                title: `Flow: ${targetInstance.Name}`,
+                initialValue: targetInstance.ProcessSource || '#!/bin/bash\n# Example flow:\n# curl -o /tmp/script.sh https://example.com/script.sh\n# bash /tmp/script.sh\n'
+              });
+              this.Button(uid, { name: '✅ Save & Start', props: { process_action: 'commit_flow', page: 'manage', target_instance: targetInstance._id } });
+            } else if (_pv === 'logs') {
+              this.Text(uid, 'Log Output (last 60 lines):');
+              this.Text(uid, '─'.repeat(40));
+              if (_proc && _proc.log && fs.existsSync(_proc.log)) {
+                try {
+                  const _content = fs.readFileSync(_proc.log, 'utf-8');
+                  const _lines = _content.split('\n').slice(-60);
+                  for (const _line of _lines) {
+                    this.Text(uid, _line);
+                  }
+                } catch (e) {
+                  this.Text(uid, `Error reading log: ${e.message}`);
+                }
+              } else {
+                this.Text(uid, 'No log file available.');
+              }
+            }
+
+            this.Button(uid, ' ');
+            this.Button(uid, {
+              name: '↩ Back',
+              props: { process_action: 'back', page: 'manage', target_instance: targetInstance ? targetInstance._id : undefined }
+            });
+          }
           // DEFAULT: ACTION SELECTION
           else {
             this.Text(uid, 'Instance Actions:');
@@ -523,15 +848,19 @@ class Sy extends SyAPP.Func() {
 
             this.Buttons(uid, [
               {
-                name: '✏️ Rename This Instance',
+                name: '✏️ Rename',
                 props: { manage_action: 'edit', page: 'manage', target_instance: targetInstanceId }
               },
               {
-                name: '🗑️ Delete This Instance',
+                name: '🗑️ Delete',
                 props: { manage_action: 'delete', page: 'manage', target_instance: targetInstanceId }
               },
               {
-                name: '🔲 Bulk Manage',
+                name: '🔧 Process',
+                props: { manage_action: 'process', page: 'manage', target_instance: targetInstanceId }
+              },
+              {
+                name: '🔲 Bulk',
                 props: { manage_action: 'bulk', page: 'manage', target_instance: targetInstanceId }
               }
             ]);
