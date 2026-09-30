@@ -38,6 +38,21 @@ const DAEMON_DIR = path.join(GLOBAL_BASE_DIR, 'daemons');
  */
 const CLUSTER_LOG_DIR = path.join(GLOBAL_BASE_DIR, 'cluster_logs');
 
+/**
+ * Persistent directory for daemon entry-point artifacts.
+ *
+ * Daemon units must point at a path that survives reboots. When a process
+ * is started from inline code, a /tmp flow script, or a raw command line,
+ * the "source" handed to SyPM is either ephemeral (/tmp) or not a file at
+ * all. systemd/OpenRC would then boot into a missing file or a nonsensical
+ * ExecStart and the service would silently stay dead.
+ *
+ * Every daemon-managed process therefore gets a materialized, persistent
+ * entry point under this directory before the unit is written.
+ * @constant {string}
+ */
+const SCRIPTS_DIR = path.join(GLOBAL_BASE_DIR, 'scripts');
+
 // Ensure global directories exist
 if (!fs.existsSync(GLOBAL_BASE_DIR)) {
     fs.mkdirSync(GLOBAL_BASE_DIR, { recursive: true });
@@ -51,8 +66,28 @@ if (!fs.existsSync(DAEMON_DIR)) {
 if (!fs.existsSync(CLUSTER_LOG_DIR)) {
     fs.mkdirSync(CLUSTER_LOG_DIR, { recursive: true });
 }
+if (!fs.existsSync(SCRIPTS_DIR)) {
+    fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
+}
 if (!fs.existsSync(PROCESS_REGISTRY)) {
     fs.writeFileSync(PROCESS_REGISTRY, '[]', 'utf-8');
+}
+
+/**
+ * Returns true when a path is safe to reference from a boot-time unit,
+ * i.e. it will still exist after the machine reboots. Only /tmp (and
+ * macOS /var/folders tmp dirs) are considered unsafe.
+ * @param {string} p - Absolute path
+ * @returns {boolean} True when the path is persistent across reboots
+ */
+function isPersistentPath(p) {
+    if (!p || typeof p !== 'string') return false;
+    const tmp = os.tmpdir();
+    if (p.startsWith(tmp + path.sep) || p === tmp) return false;
+    if (p.startsWith('/tmp/') || p === '/tmp') return false;
+    if (p.startsWith('/var/tmp/') || p === '/var/tmp') return false;
+    if (p.startsWith('/var/folders/')) return false;
+    return true;
 }
 
 /**
@@ -591,14 +626,53 @@ main
     }
 
     /**
+     * Resolves the EFFECTIVE live PID for a process entry.
+     *
+     * For daemon-managed entries the stored `pid` frequently points at a
+     * dead wrapper (the pre-daemon shell, the pre-reboot PID, or the monitor
+     * that systemd replaced). The real worker is whichever of these is
+     * currently alive, in priority order:
+     *
+     *   1. The PID reported by the init system (systemd MainPID / OpenRC pidfile)
+     *   2. The tracked `pid`
+     *   3. The `monitorPid` (auto-restart wrapper)
+     *
+     * @static
+     * @private
+     * @param {Object} proc - Registry process entry
+     * @returns {number|null} A live PID, or null when nothing is alive
+     */
+    static _effectivePid(proc) {
+        if (!proc) return null;
+
+        if (proc.config?.daemon) {
+            // 1. Init-system PID is the authoritative one after a reboot
+            try {
+                const svc = this._getDaemonServiceStatus(proc.id);
+                if (svc.running && svc.pid && this._isPidAlive(svc.pid)) return svc.pid;
+            } catch (_) { /* ignore */ }
+
+            // 2. Tracked PID
+            if (this._isPidAlive(proc.pid)) return proc.pid;
+
+            // 3. Monitor PID
+            if (proc.monitorPid && this._isPidAlive(proc.monitorPid)) return proc.monitorPid;
+
+            return null;
+        }
+
+        // Non-daemon: same priority, minus the service lookup
+        if (this._isPidAlive(proc.pid)) return proc.pid;
+        if (proc.monitorPid && this._isPidAlive(proc.monitorPid)) return proc.monitorPid;
+        return null;
+    }
+
+    /**
      * Determines whether a daemon-managed process is alive.
      * A daemon process is considered alive when ANY of the following is true:
      *   - its tracked PID is alive
      *   - its monitor PID (auto-restart wrapper) is alive
      *   - the underlying init-system service is active
-     * This prevents the false "dead" reports that happened when the service
-     * was only enabled (for boot auto-start) but the spawned process was the
-     * one actually running.
      * @static
      * @private
      * @param {Object} proc - Registry process entry
@@ -609,6 +683,137 @@ main
         if (proc.monitorPid && proc.monitorPid !== proc.pid && this._isPidAlive(proc.monitorPid)) return true;
         if (this._isDaemonServiceRunning(proc.id)) return true;
         return false;
+    }
+
+    /**
+     * Finds a live daemon entry in the registry by name.
+     * Used for daemon idempotency: re-invoking run()/exec() with the same
+     * name and daemon:true must NOT create a second systemd unit.
+     * @static
+     * @private
+     * @param {string} name - Process name
+     * @returns {Object|null} Existing live daemon entry, or null
+     */
+    static _findLiveDaemonByName(name) {
+        if (!name) return null;
+        const registry = this._loadRegistry();
+        for (const proc of registry) {
+            if (proc.name === name && proc.config?.daemon) {
+                const svc = this._getDaemonServiceStatus(proc.id);
+                const pidAlive = this._isPidAlive(proc.pid);
+                const monitorAlive = proc.monitorPid && proc.monitorPid !== proc.pid && this._isPidAlive(proc.monitorPid);
+
+                if (svc.running || pidAlive || monitorAlive) {
+                    let changed = false;
+                    if (svc.running && svc.pid && proc.pid !== svc.pid) {
+                        proc.pid = svc.pid;
+                        proc.lastUpdate = new Date().toISOString();
+                        changed = true;
+                    }
+                    if (proc.status !== 'running') {
+                        proc.status = 'running';
+                        changed = true;
+                    }
+                    if (changed) this._saveRegistry(registry);
+                    return proc;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Materializes a persistent daemon entry-point for a process.
+     *
+     * The critical invariant: whatever path the daemon unit eventually
+     * references via ExecStart MUST survive a reboot. Sources that violate
+     * this (inline code → /tmp/*.mjs, /tmp flow scripts, raw command lines)
+     * are copied/wrapped into ~/.sypm/scripts/ and the unit points at the
+     * persistent artifact instead.
+     *
+     * Handles three shapes:
+     *   • node_script  → copy source (or use it if already persistent),
+     *                    ExecStart = node <path>
+     *   • global_command → write a bash wrapper, ExecStart = /bin/bash <path>
+     *
+     * @static
+     * @private
+     * @param {string} processId - Unique process identifier
+     * @param {Object} processInfo - Registry entry (has .path, .type, .config.command)
+     * @returns {{execStart: string, workDir: string}|null} Unit exec info, or null on failure
+     */
+    static _materializeDaemonArtifact(processId, processInfo) {
+        try {
+            if (!fs.existsSync(SCRIPTS_DIR)) {
+                fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
+            }
+
+            const nodeBin = process.execPath || '/usr/bin/node';
+            const procType = processInfo.type || 'node_script';
+
+            // ---------------- global_command ----------------
+            if (procType === 'global_command' || processInfo.isGlobalCommand) {
+                const rawCommand = processInfo.config?.command || processInfo.path || '';
+                if (!rawCommand) return null;
+
+                const scriptPath = path.join(SCRIPTS_DIR, `${processId}.sh`);
+                const workDir = processInfo.config?.workingDir && fs.existsSync(processInfo.config.workingDir)
+                    ? processInfo.config.workingDir
+                    : SCRIPTS_DIR;
+
+                const scriptBody = `#!/bin/bash
+# Auto-generated SyPM daemon wrapper for global command.
+# Persistent entry point — survives reboots. Do not edit by hand.
+set -e
+cd ${JSON.stringify(workDir)}
+exec ${rawCommand}
+`;
+                fs.writeFileSync(scriptPath, scriptBody, 'utf-8');
+                fs.chmodSync(scriptPath, 0o755);
+
+                return {
+                    execStart: `/bin/bash ${scriptPath}`,
+                    workDir
+                };
+            }
+
+            // ---------------- node_script ----------------
+            const sourcePath = processInfo.path;
+            if (!sourcePath) return null;
+
+            // If the source is already persistent, use it directly.
+            if (isPersistentPath(sourcePath) && fs.existsSync(sourcePath)) {
+                const workDir = processInfo.config?.workingDir && fs.existsSync(processInfo.config.workingDir)
+                    ? processInfo.config.workingDir
+                    : path.dirname(sourcePath);
+                return {
+                    execStart: `${nodeBin} ${sourcePath}`,
+                    workDir
+                };
+            }
+
+            // Otherwise copy the (possibly ephemeral) source into the
+            // persistent scripts directory. Preserve the extension so
+            // node treats ESM/CJS correctly.
+            if (!fs.existsSync(sourcePath)) return null;
+
+            const ext = path.extname(sourcePath) || '.mjs';
+            const persistentPath = path.join(SCRIPTS_DIR, `${processId}${ext}`);
+            fs.copyFileSync(sourcePath, persistentPath);
+            fs.chmodSync(persistentPath, 0o755);
+
+            const workDir = processInfo.config?.workingDir && fs.existsSync(processInfo.config.workingDir)
+                ? processInfo.config.workingDir
+                : SCRIPTS_DIR;
+
+            return {
+                execStart: `${nodeBin} ${persistentPath}`,
+                workDir
+            };
+        } catch (e) {
+            console.warn(`⚠ Failed to materialize daemon artifact for ${processId}: ${e.message}`);
+            return null;
+        }
     }
 
     /**
@@ -672,18 +877,28 @@ main
      * @param {string} logPath - Path to the log file
      * @returns {string} Path to the created service file
      */
-    static _createSystemdService(processId, processName, filePath, workingDir, logPath) {
+    static _createSystemdService(processId, processName, execStart, workingDir, logPath) {
+        // `execStart` is a fully-formed command line (node path + script, or
+        // /bin/bash + wrapper). It was produced by _materializeDaemonArtifact
+        // so it always points at a persistent path — never /tmp.
+        let resolvedWorkDir = workingDir;
+        if (!resolvedWorkDir || !fs.existsSync(resolvedWorkDir)) {
+            resolvedWorkDir = SCRIPTS_DIR;
+        }
+
         const serviceContent = `[Unit]
 Description=SyPM Managed Process: ${processName}
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=${os.userInfo().username}
-WorkingDirectory=${workingDir || path.dirname(filePath)}
-ExecStart=/usr/bin/node ${filePath}
+WorkingDirectory=${resolvedWorkDir}
+ExecStart=${execStart}
 Restart=always
 RestartSec=3
+KillMode=mixed
 StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 Environment=NODE_ENV=production
@@ -708,19 +923,29 @@ WantedBy=multi-user.target
      * @param {string} logPath - Path to the log file
      * @returns {string} Path to the created init script
      */
-    static _createOpenRCInitScript(processId, processName, filePath, workingDir, logPath) {
+    static _createOpenRCInitScript(processId, processName, execStart, workingDir, logPath) {
+        const firstSpace = execStart.indexOf(' ');
+        const interpreter = firstSpace === -1 ? execStart : execStart.slice(0, firstSpace);
+        const interpreterArgs = firstSpace === -1 ? '' : execStart.slice(firstSpace + 1);
+
+        let resolvedWorkDir = workingDir;
+        if (!resolvedWorkDir || !fs.existsSync(resolvedWorkDir)) {
+            resolvedWorkDir = SCRIPTS_DIR;
+        }
+
         const initScriptContent = `#!/sbin/openrc-run
 
 name="sypm-${processId}"
 description="SyPM Managed Process: ${processName}"
 pidfile="/var/run/sypm-${processId}.pid"
 
-command="/usr/bin/node"
-command_args="${filePath}"
+command="${interpreter}"
+command_args="${interpreterArgs}"
 command_background=true
 
 depend() {
     need net
+    after net-online
 }
 
 start() {
@@ -730,8 +955,8 @@ start() {
         --make-pidfile \\
         --background \\
         --user ${os.userInfo().username} \\
-        --chdir "${workingDir || path.dirname(filePath)}" \\
-        --exec /usr/bin/node -- ${filePath} >> ${logPath} 2>&1
+        --chdir "${resolvedWorkDir}" \\
+        --exec ${interpreter} -- ${interpreterArgs} >> ${logPath} 2>&1
     eend \$?
 }
 
@@ -764,13 +989,25 @@ stop() {
             return false;
         }
 
+        // Materialize a persistent entry point FIRST. The unit we are about
+        // to install will be started by systemd/OpenRC on every boot, long
+        // after the current process (and its /tmp files) are gone. If the
+        // source lives in /tmp — inline code, flow scripts — or is not a
+        // file at all (global command), the daemon would boot into a
+        // missing file or a nonsensical ExecStart and silently stay dead.
+        const artifact = this._materializeDaemonArtifact(processId, processInfo);
+        if (!artifact) {
+            console.log(`⚠️  Failed to materialize a persistent entry point for daemon ${processId}`);
+            return false;
+        }
+
         try {
             if (systemInfo.initSystem === 'systemd') {
                 const servicePath = this._createSystemdService(
                     processId,
                     processInfo.name,
-                    processInfo.path,
-                    processInfo.config.workingDir,
+                    artifact.execStart,
+                    artifact.workDir,
                     processInfo.log
                 );
 
@@ -779,6 +1016,17 @@ stop() {
                 execSync('sudo systemctl daemon-reload');
                 execSync(`sudo systemctl enable sypm-${processId}.service`);
 
+                // CRITICAL: `enable` only marks the unit for boot; it does NOT
+                // start it. Without an explicit start, the unit sits inactive
+                // and every subsequent status check reports "dead" — which is
+                // exactly the "starts with dead status" symptom.
+                try {
+                    execSync(`sudo systemctl start sypm-${processId}.service`);
+                    console.log(`✓ Systemd service started: sypm-${processId}.service`);
+                } catch (startErr) {
+                    console.log(`⚠️  Failed to start daemon service: ${startErr.message}`);
+                }
+
                 console.log(`✓ Systemd service created and enabled: sypm-${processId}.service`);
                 return true;
 
@@ -786,14 +1034,23 @@ stop() {
                 const initScriptPath = this._createOpenRCInitScript(
                     processId,
                     processInfo.name,
-                    processInfo.path,
-                    processInfo.config.workingDir,
+                    artifact.execStart,
+                    artifact.workDir,
                     processInfo.log
                 );
 
                 const systemInitPath = `/etc/init.d/sypm-${processId}`;
                 execSync(`sudo cp "${initScriptPath}" "${systemInitPath}"`);
                 execSync(`sudo rc-update add sypm-${processId} default`);
+
+                // Same reasoning as systemd: rc-update add only registers the
+                // service for the default runlevel; it must be started now.
+                try {
+                    execSync(`sudo rc-service sypm-${processId} start`);
+                    console.log(`✓ OpenRC service started: sypm-${processId}`);
+                } catch (startErr) {
+                    console.log(`⚠️  Failed to start daemon service: ${startErr.message}`);
+                }
 
                 console.log(`✓ OpenRC init script created and enabled: sypm-${processId}`);
                 return true;
@@ -939,6 +1196,18 @@ exit $EXIT_CODE
             throw new Error('Command cannot be empty');
         }
 
+        // Daemon idempotency: never create a second systemd/OpenRC unit for
+        // the same name. Without this, every boot that re-invokes exec()
+        // with daemon:true installs a duplicate service and the machine
+        // ends up running several copies of the same process.
+        if (config.daemon && config.name) {
+            const existing = this._findLiveDaemonByName(config.name);
+            if (existing) {
+                console.log(`✓ Daemon "${config.name}" already running — adopting existing entry (ID: ${existing.id}, PID: ${existing.pid})`);
+                return existing;
+            }
+        }
+
         const systemInfo = this._detectSystem();
         const id = this._generateId();
         const processName = config.name || `cmd_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
@@ -1053,7 +1322,29 @@ exit $EXIT_CODE
 
         if (config.daemon) {
             const daemonSuccess = this._enableDaemon(id, entry);
+
+            // When the init system owns the process, we must RELEASE the
+            // detached PTY/monitor process we just spawned. Two owners means
+            // the registry status flips between "running" (from our wrapper)
+            // and "dead" (from systemctl), and the detached copy would keep
+            // running independently of the unit — an orphan by construction.
             if (daemonSuccess) {
+                // Kill our own wrapper so only systemd's copy remains.
+                try {
+                    if (actualPid) {
+                        this._killProcessTree(actualPid);
+                    }
+                } catch (_) { /* ignore */ }
+
+                // Adopt the service's real MainPID into the registry.
+                const svc = this._getDaemonServiceStatus(id);
+                if (svc.running && svc.pid) {
+                    entry.pid = svc.pid;
+                    entry.monitorPid = null; // systemd is the supervisor now
+                    entry.lastUpdate = new Date().toISOString();
+                    this._saveRegistry(registry);
+                }
+
                 console.log(`✓ Daemon mode enabled for command: ${processName}`);
                 console.log(`✓ Process will auto-start on system reboot`);
             }
@@ -1268,6 +1559,19 @@ main
      * @throws {Error} If file not found or working directory is invalid
      */
     static run(filepathOrCode, config = {}) {
+        // Daemon idempotency: never create a second systemd/OpenRC unit for
+        // the same name. This is what prevents the "various sydb processes
+        // after reboot" symptom — the boot logic would otherwise install a
+        // fresh unit every time it re-ran, while the old one was already
+        // being started by the init system.
+        if (config.daemon && config.name) {
+            const existing = this._findLiveDaemonByName(config.name);
+            if (existing) {
+                console.log(`✓ Daemon "${config.name}" already running — adopting existing entry (ID: ${existing.id}, PID: ${existing.pid})`);
+                return existing;
+            }
+        }
+
         let resolvedPath;
         let isTempFile = false;
         let tempFilePath = null;
@@ -1438,7 +1742,31 @@ main
 
         if (config.daemon) {
             const daemonSuccess = this._enableDaemon(id, entry);
+
+            // When the init system owns the process, RELEASE our detached
+            // copy. Otherwise there are two owners: the wrapper we spawned
+            // and the unit systemd started, and the registry status will
+            // flip between "running" (wrapper alive) and "dead" (unit
+            // failed or MainPID not yet assigned). This is the direct cause
+            // of Sy-instance links starting with dead status.
             if (daemonSuccess) {
+                try {
+                    if (actualPid) {
+                        this._killProcessTree(actualPid);
+                    }
+                } catch (_) { /* ignore */ }
+
+                // Adopt the service's real MainPID into the registry, and
+                // clear monitorPid — systemd is the supervisor now, not our
+                // shell monitor.
+                const svc = this._getDaemonServiceStatus(id);
+                if (svc.running && svc.pid) {
+                    entry.pid = svc.pid;
+                    entry.monitorPid = null;
+                    entry.lastUpdate = new Date().toISOString();
+                    this._saveRegistry(registry);
+                }
+
                 console.log(`✓ Daemon mode enabled for process: ${processName}`);
                 console.log(`✓ Process will auto-start on system reboot`);
             }
@@ -1488,14 +1816,21 @@ main
 
                 let displayStatus = status.charAt(0).toUpperCase() + status.slice(1);
 
+                // Report the EFFECTIVE live PID so --monit can read real
+                // Memory/CPU. Without this, daemon rows show "Running" with
+                // N/A metrics because the registry still holds a dead wrapper
+                // PID while the real worker runs under the service's MainPID.
+                const effectivePid = this._effectivePid(proc);
+
                 processList.push({
                     status: displayStatus,
                     id: proc.id,
                     name: proc.name,
-                    pid: proc.pid,
+                    pid: effectivePid || proc.pid,
+                    storedPid: proc.pid,
+                    monitorPid: proc.monitorPid || 'N/A',
                     type: proc.type || 'node_script',
                     command: proc.config?.command || proc.path,
-                    monitorPid: proc.monitorPid || 'N/A',
                     tries: proc.config?.currentTries || 0,
                     autoRestart: proc.isAutoRestart ? 'Yes' : 'No',
                     daemon: proc.config?.daemon ? 'Yes' : 'No',
@@ -1535,14 +1870,20 @@ main
                 this._saveRegistry(registry);
             }
 
+            // Same effective-PID resolution as the daemon branch: report a
+            // live PID so --monit can read real Memory/CPU even when the
+            // stored PID was a short-lived wrapper.
+            const effectivePid = this._effectivePid(proc);
+
             processList.push({
                 status: displayStatus,
                 id: proc.id,
                 name: proc.name,
-                pid: proc.pid,
+                pid: effectivePid || proc.pid,
+                storedPid: proc.pid,
+                monitorPid: proc.monitorPid || 'N/A',
                 type: proc.type || 'node_script',
                 command: proc.config?.command || proc.path,
-                monitorPid: proc.monitorPid || 'N/A',
                 tries: proc.config?.currentTries || 0,
                 autoRestart: proc.isAutoRestart ? 'Yes' : 'No',
                 daemon: proc.config?.daemon ? 'Yes' : 'No',
@@ -2379,6 +2720,12 @@ main
             return `${Math.floor(diff / 86400)}d`;
         };
 
+        // Metrics are read against a PID, but for daemon-managed rows the
+        // value in the list is already the effective live PID (service
+        // MainPID). These helpers additionally fall back through
+        // storedPid/monitorPid when the primary lookup fails, so a row that
+        // is genuinely alive never shows "N/A" just because we probed the
+        // wrong PID once.
         const getMemoryUsage = (pid) => {
             if (!pid) return 'N/A';
             try {
@@ -2413,6 +2760,23 @@ main
                     }
                 }
             } catch (_) { /* process missing or no permission */ }
+            return 'N/A';
+        };
+
+        // Walk the candidate PIDs for a row (effective → stored → monitor)
+        // and return the first one that yields a real metric.
+        const resolveMetric = (row, reader) => {
+            const candidates = [];
+            if (row.pid) candidates.push(row.pid);
+            if (row.storedPid && row.storedPid !== row.pid) candidates.push(row.storedPid);
+            if (row.monitorPid && row.monitorPid !== 'N/A' &&
+                row.monitorPid !== row.pid && row.monitorPid !== row.storedPid) {
+                candidates.push(row.monitorPid);
+            }
+            for (const c of candidates) {
+                const v = reader(c);
+                if (v && v !== 'N/A') return v;
+            }
             return 'N/A';
         };
 
@@ -2458,13 +2822,14 @@ main
 
             // --- Column widths ---
             const colNum = 4;
-            const colName = Math.max(10, Math.min(30, Math.floor(width * 0.20)));
+            const colName = Math.max(10, Math.min(24, Math.floor(width * 0.17)));
             const colPid = 8;
             const colStatus = 11;
+            const colDaemon = 7;
             const colUptime = 7;
             const colMem = 9;
             const colCpu = 6;
-            const fixed = 2 + colNum + colName + colPid + colStatus + colUptime + colMem + colCpu + 7;
+            const fixed = 2 + colNum + colName + colPid + colStatus + colDaemon + colUptime + colMem + colCpu + 8;
             const colType = Math.max(6, width - fixed);
 
             const headerRow =
@@ -2473,6 +2838,7 @@ main
                 padVisible('Name', colName) + ' ' +
                 padVisible('PID', colPid) + ' ' +
                 padVisible('Status', colStatus) + ' ' +
+                padVisible('Daemon', colDaemon) + ' ' +
                 padVisible('Uptime', colUptime) + ' ' +
                 padVisible('Memory', colMem) + ' ' +
                 padVisible('CPU', colCpu) + ' ' +
@@ -2534,14 +2900,22 @@ main
                     }
 
                     const uptime = formatUptime(createdAtMap.get(p.id));
-                    const mem = getMemoryUsage(p.pid);
-                    const cpu = getCPUUsage(p.pid);
+                    const mem = resolveMetric(p, getMemoryUsage);
+                    const cpu = resolveMetric(p, getCPUUsage);
+
+                    // Daemon column: colour-code Yes/No so daemon-managed
+                    // processes are visually distinct from detached ones.
+                    const isDaemon = (p.daemon === 'Yes');
+                    const daemonStr = isDaemon
+                        ? `${ESC}[35mYes${ESC}[0m`
+                        : `${ESC}[90mNo${ESC}[0m`;
 
                     let row = `${marker} `;
                     row += padVisible(String(i + 1), colNum) + ' ';
                     row += padVisible(truncVisible(String(p.name || ''), colName), colName) + ' ';
                     row += padVisible(String(p.pid == null ? '' : p.pid), colPid) + ' ';
                     row += padVisible(statusStr, colStatus) + ' ';
+                    row += padVisible(daemonStr, colDaemon) + ' ';
                     row += padVisible(uptime, colUptime) + ' ';
                     row += padVisible(mem, colMem) + ' ';
                     row += padVisible(cpu, colCpu) + ' ';
