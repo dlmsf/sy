@@ -18,6 +18,193 @@ class SyInstances {
   });
 }
 
+// ================================================================
+// SyLink — ACID process-link manager
+// ================================================================
+// Every SyInstance-linked SyPM process is named "sy-<instance._id>".
+// That deterministic name is the ACID key: the process can always be
+// located and killed by name, regardless of what ProcessId says.
+//
+// Invariants enforced continuously:
+//   I1. No orphan process: every live "sy-<id>" process MUST have a
+//       matching SyInstance. Violations are killed immediately.
+//   I2. No dead reference: every instance.ProcessId MUST be live.
+//       Dead refs are cleared; live processes under the expected name
+//       are adopted (repairs drift after external restarts).
+//   I3. Kill before delete: any instance deletion kills its linked
+//       process(es) BEFORE the DB row is removed.
+//
+// Two enforcement layers:
+//   • reconcile() — full DB↔SyPM reconciliation (kills orphans,
+//                   clears dead refs, adopts live processes).
+//   • reaper()    — prunes dead entries from the SyPM registry
+//                   itself, so --list never shows zombie rows.
+// ================================================================
+class SyLink {
+  static PREFIX = 'sy-';
+
+  /** Deterministic SyPM process name for an instance. */
+  static nameFor(instance) {
+    if (!instance || instance._id === undefined || instance._id === null) return null;
+    return `${SyLink.PREFIX}${instance._id}`;
+  }
+
+  /** Instance id encoded in a sy-<id> process name, or null. */
+  static ownerOf(procName) {
+    if (typeof procName !== 'string' || !procName.startsWith(SyLink.PREFIX)) return null;
+    return procName.slice(SyLink.PREFIX.length);
+  }
+
+  /** Safe registry read — never throws. */
+  static _registry() {
+    try { return SyPM._loadRegistry() || []; } catch (_) { return []; }
+  }
+
+  /** Safe aliveness check — never throws. */
+  static alive(processId) {
+    if (!processId) return false;
+    try { return SyPM.isAlive(processId); } catch (_) { return false; }
+  }
+
+  /** Safe kill — never throws. */
+  static kill(processId) {
+    if (!processId) return false;
+    try { SyPM.kill(processId); return true; } catch (_) { return false; }
+  }
+
+  /**
+   * Kill every SyPM process linked to an instance, using BOTH the
+   * recorded ProcessId AND the deterministic name. Belt-and-braces:
+   * a stale ProcessId can never leave an orphan behind.
+   * @returns {number} number of process ids killed
+   */
+  static killForInstance(instance) {
+    if (!instance) return 0;
+    const killed = new Set();
+
+    // 1) Tracked ProcessId
+    if (instance.ProcessId && SyLink.alive(instance.ProcessId)) {
+      if (SyLink.kill(instance.ProcessId)) killed.add(instance.ProcessId);
+    }
+
+    // 2) Deterministic name (catches drift, duplicates, stale refs)
+    const expected = SyLink.nameFor(instance);
+    if (expected) {
+      for (const p of SyLink._registry()) {
+        if (p.name !== expected) continue;
+        if (SyLink.alive(p.id) && SyLink.kill(p.id)) killed.add(p.id);
+      }
+    }
+
+    return killed.size;
+  }
+
+  /**
+   * Kill every SyPM process whose sy-<id> owner is in `ids`.
+   * Used after deletion as a final backstop.
+   * @returns {number} number of process ids killed
+   */
+  static killForIds(ids) {
+    const wanted = new Set(Array.from(ids, String));
+    const killed = new Set();
+    for (const p of SyLink._registry()) {
+      const owner = SyLink.ownerOf(p.name);
+      if (owner === null || !wanted.has(owner)) continue;
+      if (SyLink.alive(p.id) && SyLink.kill(p.id)) killed.add(p.id);
+    }
+    return killed.size;
+  }
+
+  /**
+   * Prune dead entries from the SyPM registry itself.
+   * @returns {number} number of dead entries pruned
+   */
+  static reaper() {
+    let deadBefore = 0;
+    try {
+      const before = SyLink._registry();
+      deadBefore = before.filter(p => !SyLink.alive(p.id)).length;
+      if (deadBefore === 0) return 0;
+      SyPM.cleanup();
+    } catch (_) { /* ignore */ }
+    return deadBefore;
+  }
+
+  /**
+   * Full DB↔SyPM reconciliation. MUST be awaited.
+   * @param {Array} allInstances — current DB snapshot
+   * @returns {{killedOrphans:number, clearedRefs:number, adoptedRefs:number, repairedRefs:number, reaped:number}}
+   */
+  static async reconcile(allInstances) {
+    const stats = { killedOrphans: 0, clearedRefs: 0, adoptedRefs: 0, repairedRefs: 0, reaped: 0 };
+    const validIds = new Set(allInstances.map(i => String(i._id)));
+
+    const liveByName = new Map();
+    for (const p of SyLink._registry()) {
+      const owner = SyLink.ownerOf(p.name);
+      if (owner === null) continue;
+
+      // I1: orphan — owner instance no longer exists → kill now
+      if (!validIds.has(owner)) {
+        if (SyLink.alive(p.id) && SyLink.kill(p.id)) stats.killedOrphans++;
+        continue;
+      }
+
+      if (!liveByName.has(owner) && SyLink.alive(p.id)) {
+        liveByName.set(owner, p);
+      } else if (liveByName.has(owner)) {
+        // Duplicate name for the same owner → kill the extra
+        if (SyLink.alive(p.id) && SyLink.kill(p.id)) stats.killedOrphans++;
+      }
+    }
+
+    // I2: reconcile each instance's ProcessId
+    for (const inst of allInstances) {
+      const tracked = inst.ProcessId;
+      const trackedAlive = tracked ? SyLink.alive(tracked) : false;
+      const expected = liveByName.get(String(inst._id));
+
+      if (tracked && !trackedAlive) {
+        if (expected) {
+          try {
+            await SyInstances.Model.update(inst._id, {
+              ProcessId: expected.id, Running: true, Status: 'Online'
+            });
+            stats.adoptedRefs++;
+          } catch (_) { /* ignore */ }
+        } else {
+          try {
+            await SyInstances.Model.update(inst._id, {
+              ProcessId: null, Running: false, Status: 'Offline'
+            });
+            stats.clearedRefs++;
+          } catch (_) { /* ignore */ }
+        }
+        continue;
+      }
+
+      if (!tracked && expected) {
+        try {
+          await SyInstances.Model.update(inst._id, {
+            ProcessId: expected.id, Running: true, Status: 'Online'
+          });
+          stats.adoptedRefs++;
+        } catch (_) { /* ignore */ }
+      }
+
+      if (tracked && trackedAlive && expected && tracked !== expected.id) {
+        try {
+          await SyInstances.Model.update(inst._id, { ProcessId: expected.id });
+          stats.repairedRefs++;
+        } catch (_) { /* ignore */ }
+      }
+    }
+
+    stats.reaped = SyLink.reaper();
+    return stats;
+  }
+}
+
 class Sy extends SyAPP.Func() {
   constructor() {
     super(
@@ -36,7 +223,12 @@ class Sy extends SyAPP.Func() {
             confirmDeleteId: null,
             targetInstanceId: null,
             editTargetId: null,
-            processView: null
+            processView: null,
+            // Daemon is pre-selected BEFORE the process is started, so
+            // the very first spawn already goes through the init system
+            // when the user wants it. Reset to false whenever the user
+            // leaves the process view.
+            pendingDaemon: false
           };
         };
 
@@ -59,51 +251,47 @@ class Sy extends SyAPP.Func() {
           return newState;
         };
 
-        // ---------- PROCESS LINK HELPERS (SyPM) ----------
+        // ---------- PROCESS LINK (SyLink / SyPM) ----------
         const getProcessInfo = (processId) => {
           if (!processId) return null;
           try {
-            const registry = SyPM._loadRegistry();
-            return registry.find(p => p.id === processId) || null;
+            return SyLink._registry().find(p => p.id === processId) || null;
           } catch (e) {
             return null;
           }
         };
 
-        const getProcessAlive = (processId) => {
-          if (!processId) return false;
-          try {
-            return SyPM.isAlive(processId);
-          } catch (e) {
-            return false;
-          }
-        };
+        const getProcessAlive = (processId) => SyLink.alive(processId);
 
         const getProcessStatusLabel = (instance) => {
           if (!instance || !instance.ProcessId) return '';
           return getProcessAlive(instance.ProcessId) ? '  ONLINE' : '  OFFLINE';
         };
 
-        const startProcessFromInstance = (instance) => {
+        // Spawn a linked process. `options.daemon` selects whether the
+        // very first spawn goes through the init system (systemd /
+        // OpenRC) so the process is boot-persistent and managed by the
+        // service manager from the start — no detach-then-convert.
+        const startProcessFromInstance = (instance, options = {}) => {
           if (!instance || !instance.ProcessSource) return null;
           const type = instance.ProcessType || 'file';
           const source = instance.ProcessSource;
-          const name = `sy-${instance._id}`;
+          const name = SyLink.nameFor(instance);
+          const opts = {
+            name,
+            autoRestart: true,
+            restartTries: 5,
+            daemon: !!options.daemon
+          };
           try {
-            if (type === 'file') {
-              return SyPM.run(source, { name, autoRestart: true, restartTries: 5 });
-            }
-            if (type === 'code') {
-              return SyPM.run(source, { name, autoRestart: true, restartTries: 5 });
-            }
-            if (type === 'command') {
-              return SyPM.exec(source, { name, autoRestart: true, restartTries: 5 });
-            }
+            if (type === 'file')    return SyPM.run(source, opts);
+            if (type === 'code')    return SyPM.run(source, opts);
+            if (type === 'command') return SyPM.exec(source, opts);
             if (type === 'flow') {
               const flowFile = path.join(os.tmpdir(), `sy_flow_${instance._id}_${Date.now()}.sh`);
               fs.writeFileSync(flowFile, '#!/bin/bash\nset -e\n' + source, 'utf-8');
               fs.chmodSync(flowFile, 0o755);
-              return SyPM.exec(`bash "${flowFile}"`, { name, autoRestart: true, restartTries: 5 });
+              return SyPM.exec(`bash "${flowFile}"`, opts);
             }
           } catch (e) {
             return null;
@@ -111,14 +299,24 @@ class Sy extends SyAPP.Func() {
           return null;
         };
 
-        const stopLinkedProcess = (instance) => {
-          if (!instance || !instance.ProcessId) return false;
-          const proc = getProcessInfo(instance.ProcessId);
-          if (proc && getProcessAlive(proc.id)) {
-            try { SyPM.kill(proc.id); return true; } catch (e) { return false; }
+        const stopLinkedProcess = (instance) => SyLink.killForInstance(instance) > 0;
+
+        // ---------- CONTINUOUS ACID REAPER ----------
+        // Runs at most once per ACID_SWEEP_MS per session, on every
+        // render tick. Full DB↔SyPM reconciliation + registry pruning.
+        const ACID_SWEEP_MS = 1500;
+        const _lastSweep = Number(this.Storages.Get(uid, 'acid_last_sweep') || 0);
+        if (Date.now() - _lastSweep > ACID_SWEEP_MS) {
+          this.Storages.Set(uid, 'acid_last_sweep', Date.now());
+          try {
+            const stats = await SyLink.reconcile(instances);
+            if (stats.killedOrphans || stats.clearedRefs || stats.adoptedRefs || stats.repairedRefs) {
+              instances = await SyInstances.Model.find();
+            }
+          } catch (e) {
+            console.error('[SyLink reaper]', e && e.message);
           }
-          return false;
-        };
+        }
 
         // ---------- HELPER: Get all descendants of an instance ----------
         const getAllDescendants = (instanceId, allInstances) => {
@@ -136,16 +334,30 @@ class Sy extends SyAPP.Func() {
         };
 
         // ---------- HELPER: Delete instance and all descendants ----------
+        // ACID order: kill → grace → DB delete → final sweep.
         const deleteInstanceAndDescendants = async (instanceId, allInstances) => {
           const descendants = getAllDescendants(instanceId, allInstances);
+          const idsToDelete = [instanceId, ...descendants];
 
-          // Delete all descendants first (children, grandchildren, etc.)
+          let killedTotal = 0;
+          for (const id of idsToDelete) {
+            const inst = allInstances.find(i => String(i._id) === String(id));
+            if (inst) killedTotal += SyLink.killForInstance(inst);
+          }
+
+          if (killedTotal > 0) {
+            await new Promise(r => setTimeout(r, 250));
+          }
+
           for (const descId of descendants) {
             await SyInstances.Model.delete(descId);
           }
-
-          // Finally delete the instance itself
           await SyInstances.Model.delete(instanceId);
+
+          const leftover = SyLink.killForIds(idsToDelete);
+          if (killedTotal + leftover > 0) {
+            console.log(`[Sy ACID] Deleted instance ${instanceId}: killed ${killedTotal + leftover} linked process(es)`);
+          }
         };
 
         // ---------- SYNC TARGET INSTANCE ID WITH PROPS (for manage page) ----------
@@ -290,8 +502,25 @@ class Sy extends SyAPP.Func() {
         }
 
         if (props.manage_action === 'back') {
-          setManageState({ action: null, confirmDeleteId: null, targetInstanceId: null, editTargetId: null, processView: null });
+          setManageState({
+            action: null,
+            confirmDeleteId: null,
+            targetInstanceId: null,
+            editTargetId: null,
+            processView: null,
+            pendingDaemon: false
+          });
           setBulkState({ selectedIds: [] });
+        }
+
+        // Toggle the daemon flag in the *setup* views (before start).
+        // This is read by every commit_* handler so the very first
+        // spawn already goes through the init system when enabled.
+        // NOTE: this handler does NOT need targetInstance — it only
+        // flips a pending preference stored on manage_state.
+        if (props.process_toggle_pending_daemon) {
+          const cur = getManageState();
+          setManageState({ pendingDaemon: !cur.pendingDaemon });
         }
 
         // ---------- BULK SELECTION HANDLERS ----------
@@ -473,7 +702,7 @@ class Sy extends SyAPP.Func() {
             const _procAlive = _proc ? getProcessAlive(_proc.id) : false;
 
             if (_pa === 'back') {
-              setManageState({ processView: null });
+              setManageState({ processView: null, pendingDaemon: false });
             } else if (_pa === 'link_file') {
               setManageState({ processView: 'link_file' });
             } else if (_pa === 'link_code') {
@@ -495,26 +724,42 @@ class Sy extends SyAPP.Func() {
               await SyInstances.Model.update(targetInstance._id, { ProcessId: null, ProcessType: null, ProcessSource: null });
               instances = await SyInstances.Model.find();
               targetInstance = instances.find(i => i._id === targetInstanceId);
-              setManageState({ processView: 'menu' });
+              setManageState({ processView: 'menu', pendingDaemon: false });
             } else if (_pa === 'stop') {
               stopLinkedProcess(targetInstance);
               await SyInstances.Model.update(targetInstance._id, { Running: false, Status: 'Offline' });
               instances = await SyInstances.Model.find();
               targetInstance = instances.find(i => i._id === targetInstanceId);
             } else if (_pa === 'start') {
-              const _new = startProcessFromInstance(targetInstance);
+              // Honor the pre-selected daemon flag from the setup view.
+              const _wantDaemon = !!getManageState().pendingDaemon;
+              const _new = startProcessFromInstance(targetInstance, { daemon: _wantDaemon });
               if (_new) {
                 await SyInstances.Model.update(targetInstance._id, { ProcessId: _new.id, Running: true, Status: 'Online' });
                 instances = await SyInstances.Model.find();
                 targetInstance = instances.find(i => i._id === targetInstanceId);
+                setManageState({ pendingDaemon: false });
               } else {
                 this.Alert(uid, 'Failed to start process.', { duration: 3000 });
               }
             } else if (_pa === 'restart') {
+              // Preserve the daemon flag across restarts.
+              const _wantDaemon = !!(_proc && _proc.config && _proc.config.daemon);
               if (_procAlive) {
-                try { SyPM.restart(_proc.id); } catch (e) {}
+                stopLinkedProcess(targetInstance);
+                await new Promise(r => setTimeout(r, 300));
+                const _new = startProcessFromInstance(targetInstance, { daemon: _wantDaemon });
+                if (_new) {
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: _new.id, Running: true, Status: 'Online'
+                  });
+                } else {
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: null, Running: false, Status: 'Offline'
+                  });
+                }
               } else {
-                const _new = startProcessFromInstance(targetInstance);
+                const _new = startProcessFromInstance(targetInstance, { daemon: _wantDaemon });
                 if (_new) {
                   await SyInstances.Model.update(targetInstance._id, { ProcessId: _new.id, Running: true, Status: 'Online' });
                 }
@@ -522,28 +767,54 @@ class Sy extends SyAPP.Func() {
               instances = await SyInstances.Model.find();
               targetInstance = instances.find(i => i._id === targetInstanceId);
             } else if (_pa === 'toggle_daemon') {
-              if (_proc) {
-                try {
-                  if (_proc.config && _proc.config.daemon) {
-                    SyPM.disableDaemon(_proc.id);
-                  } else {
-                    SyPM.enableDaemon(_proc.id);
-                  }
-                } catch (e) {
-                  this.Alert(uid, `Daemon toggle failed: ${e.message}`, { duration: 3000 });
+              // Daemon conversion is NOT a flag flip. The running
+              // detached process must be fully killed and re-spawned
+              // through the init system, otherwise the old unmanaged
+              // tree keeps running and systemd/OpenRC has nothing to
+              // attach to. Full kill → grace → re-spawn with the new
+              // daemon flag. The same approach works in both directions
+              // (ON → OFF tears down the service and re-spawns detached).
+              const _wasDaemon = !!(_proc && _proc.config && _proc.config.daemon);
+              const _wantDaemon = !_wasDaemon;
+              try {
+                stopLinkedProcess(targetInstance);
+                await new Promise(r => setTimeout(r, 300));
+
+                const _new = startProcessFromInstance(targetInstance, { daemon: _wantDaemon });
+                if (_new) {
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: _new.id, Running: true, Status: 'Online'
+                  });
+                  this.Alert(uid,
+                    `Daemon ${_wantDaemon ? 'enabled' : 'disabled'} — process restarted.`,
+                    { duration: 3000 });
+                } else {
+                  await SyInstances.Model.update(targetInstance._id, {
+                    ProcessId: null, Running: false, Status: 'Offline'
+                  });
+                  this.Alert(uid, 'Daemon toggle: failed to restart process.', { duration: 3000 });
                 }
+              } catch (e) {
+                this.Alert(uid, `Daemon toggle failed: ${e.message}`, { duration: 3000 });
               }
+              instances = await SyInstances.Model.find();
+              targetInstance = instances.find(i => i._id === targetInstanceId);
             } else if (_pa === 'commit_file') {
               const _sel = this.FileManager.GetSelected(uid, `proc_file_${targetInstance._id}`);
               if (_sel.length > 0) {
+                const _wantDaemon = !!getManageState().pendingDaemon;
                 try {
                   stopLinkedProcess(targetInstance);
-                  const _new = SyPM.run(_sel[0], { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await new Promise(r => setTimeout(r, 200));
+                  const _new = SyPM.run(_sel[0], {
+                    name: SyLink.nameFor(targetInstance),
+                    autoRestart: true, restartTries: 5, daemon: _wantDaemon
+                  });
                   await SyInstances.Model.update(targetInstance._id, {
                     ProcessId: _new.id, ProcessType: 'file', ProcessSource: _sel[0], Running: true, Status: 'Online'
                   });
                   this.FileManager.ClearSelection(uid, `proc_file_${targetInstance._id}`);
-                  setManageState({ processView: 'menu' });
+                  setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
                 } catch (e) {
@@ -553,13 +824,18 @@ class Sy extends SyAPP.Func() {
             } else if (_pa === 'commit_code') {
               const _code = this.Storages.Get(uid, `texteditor_proc_code_${targetInstance._id}`) || '';
               if (_code.trim()) {
+                const _wantDaemon = !!getManageState().pendingDaemon;
                 try {
                   stopLinkedProcess(targetInstance);
-                  const _new = SyPM.run(_code, { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await new Promise(r => setTimeout(r, 200));
+                  const _new = SyPM.run(_code, {
+                    name: SyLink.nameFor(targetInstance),
+                    autoRestart: true, restartTries: 5, daemon: _wantDaemon
+                  });
                   await SyInstances.Model.update(targetInstance._id, {
                     ProcessId: _new.id, ProcessType: 'code', ProcessSource: _code, Running: true, Status: 'Online'
                   });
-                  setManageState({ processView: 'menu' });
+                  setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
                 } catch (e) {
@@ -569,13 +845,18 @@ class Sy extends SyAPP.Func() {
             } else if (_pa === 'commit_command') {
               const _cmd = this.Storages.Get(uid, `field_proc_cmd_${targetInstance._id}`) || '';
               if (_cmd.trim()) {
+                const _wantDaemon = !!getManageState().pendingDaemon;
                 try {
                   stopLinkedProcess(targetInstance);
-                  const _new = SyPM.exec(_cmd, { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  await new Promise(r => setTimeout(r, 200));
+                  const _new = SyPM.exec(_cmd, {
+                    name: SyLink.nameFor(targetInstance),
+                    autoRestart: true, restartTries: 5, daemon: _wantDaemon
+                  });
                   await SyInstances.Model.update(targetInstance._id, {
                     ProcessId: _new.id, ProcessType: 'command', ProcessSource: _cmd, Running: true, Status: 'Online'
                   });
-                  setManageState({ processView: 'menu' });
+                  setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
                 } catch (e) {
@@ -585,16 +866,21 @@ class Sy extends SyAPP.Func() {
             } else if (_pa === 'commit_flow') {
               const _flow = this.Storages.Get(uid, `texteditor_proc_flow_${targetInstance._id}`) || '';
               if (_flow.trim()) {
+                const _wantDaemon = !!getManageState().pendingDaemon;
                 try {
                   stopLinkedProcess(targetInstance);
+                  await new Promise(r => setTimeout(r, 200));
                   const _flowFile = path.join(os.tmpdir(), `sy_flow_${targetInstance._id}_${Date.now()}.sh`);
                   fs.writeFileSync(_flowFile, '#!/bin/bash\nset -e\n' + _flow, 'utf-8');
                   fs.chmodSync(_flowFile, 0o755);
-                  const _new = SyPM.exec(`bash "${_flowFile}"`, { name: `sy-${targetInstance._id}`, autoRestart: true, restartTries: 5 });
+                  const _new = SyPM.exec(`bash "${_flowFile}"`, {
+                    name: SyLink.nameFor(targetInstance),
+                    autoRestart: true, restartTries: 5, daemon: _wantDaemon
+                  });
                   await SyInstances.Model.update(targetInstance._id, {
                     ProcessId: _new.id, ProcessType: 'flow', ProcessSource: _flow, Running: true, Status: 'Online'
                   });
-                  setManageState({ processView: 'menu' });
+                  setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
                 } catch (e) {
@@ -784,6 +1070,12 @@ class Sy extends SyAPP.Func() {
                 displayName: '📁 Select .js File',
                 itemsPerPage: 8
               });
+              // Daemon pre-select toggle — applies to the FIRST spawn.
+              const _pd = !!getManageState().pendingDaemon;
+              this.Button(uid, {
+                name: _pd ? '🔧 Daemon on start: ON' : '🔧 Daemon on start: OFF',
+                props: { process_toggle_pending_daemon: true, page: 'manage', target_instance: targetInstance._id }
+              });
               const _sel = this.FileManager.GetSelected(uid, `proc_file_${targetInstance._id}`);
               if (_sel.length > 0) {
                 this.Text(uid, `Selected: ${_sel[0]}`);
@@ -796,6 +1088,12 @@ class Sy extends SyAPP.Func() {
                 title: `Code: ${targetInstance.Name}`,
                 initialValue: targetInstance.ProcessSource || '// Node.js code\nconsole.log("hello from process");\n'
               });
+              // Daemon pre-select toggle — applies to the FIRST spawn.
+              const _pd = !!getManageState().pendingDaemon;
+              this.Button(uid, {
+                name: _pd ? '🔧 Daemon on start: ON' : '🔧 Daemon on start: OFF',
+                props: { process_toggle_pending_daemon: true, page: 'manage', target_instance: targetInstance._id }
+              });
               this.Button(uid, { name: '✅ Save & Start', props: { process_action: 'commit_code', page: 'manage', target_instance: targetInstance._id } });
             } else if (_pv === 'link_command') {
               this.Text(uid, 'Enter a global command line:');
@@ -804,6 +1102,12 @@ class Sy extends SyAPP.Func() {
                 initialValue: targetInstance.ProcessSource || '',
                 maxWidth: 60
               });
+              // Daemon pre-select toggle — applies to the FIRST spawn.
+              const _pd = !!getManageState().pendingDaemon;
+              this.Button(uid, {
+                name: _pd ? '🔧 Daemon on start: ON' : '🔧 Daemon on start: OFF',
+                props: { process_toggle_pending_daemon: true, page: 'manage', target_instance: targetInstance._id }
+              });
               this.Button(uid, { name: '✅ Save & Start', props: { process_action: 'commit_command', page: 'manage', target_instance: targetInstance._id } });
             } else if (_pv === 'link_flow') {
               this.Text(uid, 'Command flow — one command per line (runs sequentially):');
@@ -811,6 +1115,12 @@ class Sy extends SyAPP.Func() {
                 label: 'Command Flow',
                 title: `Flow: ${targetInstance.Name}`,
                 initialValue: targetInstance.ProcessSource || '#!/bin/bash\n# Example flow:\n# curl -o /tmp/script.sh https://example.com/script.sh\n# bash /tmp/script.sh\n'
+              });
+              // Daemon pre-select toggle — applies to the FIRST spawn.
+              const _pd = !!getManageState().pendingDaemon;
+              this.Button(uid, {
+                name: _pd ? '🔧 Daemon on start: ON' : '🔧 Daemon on start: OFF',
+                props: { process_toggle_pending_daemon: true, page: 'manage', target_instance: targetInstance._id }
               });
               this.Button(uid, { name: '✅ Save & Start', props: { process_action: 'commit_flow', page: 'manage', target_instance: targetInstance._id } });
             } else if (_pv === 'logs') {
@@ -876,6 +1186,27 @@ class Sy extends SyAPP.Func() {
       },
       { linked: [Config],syappInit : async ({ mainFuncName, syapp, userConfig, sessions }) => {
         await SyDB.Connect(mainFuncName)
+
+        // ---------- ACID BOOT SWEEP ----------
+        // One-shot full reconciliation BEFORE the first screen renders.
+        // Guarantees no orphan process and no stale ProcessId can
+        // survive a restart, a crash, or a manual DB wipe. Also prunes
+        // dead entries from the SyPM registry so --list starts clean.
+        try {
+          const instances = await SyInstances.Model.find();
+          const stats = await SyLink.reconcile(instances);
+          const total = stats.killedOrphans + stats.clearedRefs
+                      + stats.adoptedRefs + stats.repairedRefs + stats.reaped;
+          if (total > 0) {
+            console.log(
+              `[Sy ACID boot] killedOrphans=${stats.killedOrphans} ` +
+              `clearedRefs=${stats.clearedRefs} adoptedRefs=${stats.adoptedRefs} ` +
+              `repairedRefs=${stats.repairedRefs} reaped=${stats.reaped}`
+            );
+          }
+        } catch (e) {
+          console.error('[Sy ACID boot] sweep failed:', e && e.message);
+        }
       } }
     );
   }
