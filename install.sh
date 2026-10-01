@@ -62,6 +62,17 @@ SHELL_SCRIPTS_SRC="./._/._/._/Qemu/qemu.sh ._/._/._/Util/lay.sh"    # ← Add yo
 SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 
 # =============================================================================
+# DEV-ONLY SHELL SCRIPT COMMAND MAPPING (installed only when --dev is passed)
+# =============================================================================
+# Same format as SHELL_SCRIPTS_SRC / SHELL_SCRIPTS_CMD above.
+# Position i in SHELL_SCRIPTS_SRC_DEV pairs with position i in
+# SHELL_SCRIPTS_CMD_DEV. Leave empty for no extra dev shell commands.
+# Remember to also add each dev shell command name to get_command_working_dir()
+# below (in the DEV-ONLY section) so it uses the right working directory.
+SHELL_SCRIPTS_SRC_DEV=""
+SHELL_SCRIPTS_CMD_DEV=""
+
+# =============================================================================
 # POST-INSTALL SCRIPTS CONFIGURATION
 # =============================================================================
 # Format: Each line specifies a script to execute after installation completes.
@@ -2377,6 +2388,12 @@ show_help() {
         done
     fi
     
+    if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+        for cmd in $SHELL_SCRIPTS_CMD_DEV; do
+            echo "  $cmd (dev shell script)"
+        done
+    fi
+    
     echo "  wsave"
     echo "  git-config"
     echo
@@ -2398,6 +2415,13 @@ show_help() {
         for cmd in $SHELL_SCRIPTS_CMD; do
             working_dir=$(get_command_working_dir "$cmd")
             echo "  $cmd: $working_dir (bash→ash fallback)"
+        done
+    fi
+    
+    if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+        for cmd in $SHELL_SCRIPTS_CMD_DEV; do
+            working_dir=$(get_command_working_dir "$cmd")
+            echo "  $cmd: $working_dir (dev shell script, bash→ash fallback)"
         done
     fi
     
@@ -2847,6 +2871,15 @@ remove_links() {
     # Remove shell script command links
     if [ -n "$SHELL_SCRIPTS_CMD" ]; then
         echo "$SHELL_SCRIPTS_CMD" | tr ' ' '\n' | while read cmd; do
+            [ -z "$cmd" ] && continue
+            dest_path="$BIN_DIR/$cmd"
+            [ -L "$dest_path" ] && rm -f "$dest_path"
+        done
+    fi
+    
+    # Remove dev-only shell script command links
+    if [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+        echo "$SHELL_SCRIPTS_CMD_DEV" | tr ' ' '\n' | while read cmd; do
             [ -z "$cmd" ] && continue
             dest_path="$BIN_DIR/$cmd"
             [ -L "$dest_path" ] && rm -f "$dest_path"
@@ -3489,19 +3522,31 @@ EOF
 
 create_shell_command_links() {
     install_dir="$1"
+    create_shell_command_links_from_lists "$install_dir" "$SHELL_SCRIPTS_SRC" "$SHELL_SCRIPTS_CMD"
+}
+
+# =============================================================================
+# Reusable helper: create shell script command wrappers for a given src/cmd
+# list pair. Shared by the main shell list and the dev-only (--dev) shell list
+# so both go through the exact same wiring and get_command_working_dir() lookup.
+# =============================================================================
+create_shell_command_links_from_lists() {
+    install_dir="$1"
+    src_list="$2"
+    cmd_list="$3"
     
     # Skip if no shell scripts configured
-    [ -z "$SHELL_SCRIPTS_SRC" ] && return 0
+    [ -z "$src_list" ] && return 0
     
     log_message "Creating shell script command wrappers with bash→ash fallback..."
     
     # Process each pair: source_file command_name
     src_idx=1
-    for src in $SHELL_SCRIPTS_SRC; do
+    for src in $src_list; do
         # Find matching command name by position
         cmd_idx=1
         command_name=""
-        for cmd in $SHELL_SCRIPTS_CMD; do
+        for cmd in $cmd_list; do
             [ "$cmd_idx" = "$src_idx" ] && command_name="$cmd" && break
             cmd_idx=$((cmd_idx + 1))
         done
@@ -3629,6 +3674,12 @@ create_command_links() {
     
     # Create shell script commands (bash→ash fallback)
     create_shell_command_links "$install_dir"
+    
+    # Create dev-only shell script commands (only when --dev was passed)
+    if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+        log_message "Installing dev-only shell script commands (--dev mode)..."
+        create_shell_command_links_from_lists "$install_dir" "$SHELL_SCRIPTS_SRC_DEV" "$SHELL_SCRIPTS_CMD_DEV"
+    fi
 }
 
 # =============================================================================
@@ -4083,6 +4134,11 @@ if [ -d "$INSTALL_DIR" ]; then
                 echo "  $cmd"
             done
         fi
+        if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+            for cmd in $SHELL_SCRIPTS_CMD_DEV; do
+                echo "  $cmd (dev)"
+            done
+        fi
         echo "  wsave"
         echo "  git-config"
         printf "\n"
@@ -4101,6 +4157,12 @@ if [ -d "$INSTALL_DIR" ]; then
             for cmd in $SHELL_SCRIPTS_CMD; do
                 working_dir=$(get_command_working_dir "$cmd")
                 echo "  $cmd: $working_dir (bash→ash fallback)"
+            done
+        fi
+        if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+            for cmd in $SHELL_SCRIPTS_CMD_DEV; do
+                working_dir=$(get_command_working_dir "$cmd")
+                echo "  $cmd: $working_dir (dev, bash→ash fallback)"
             done
         fi
         echo "  git-config: global"
@@ -4208,6 +4270,13 @@ if [ -n "$SHELL_SCRIPTS_CMD" ]; then
     done
 fi
 
+# Display dev-only shell script commands if --dev was passed
+if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+    for cmd in $SHELL_SCRIPTS_CMD_DEV; do
+        echo "  $cmd (dev)"
+    done
+fi
+
 echo "  wsave"
 echo "  git-config"
 
@@ -4231,6 +4300,14 @@ if [ -n "$SHELL_SCRIPTS_CMD" ]; then
     for cmd in $SHELL_SCRIPTS_CMD; do
         working_dir=$(get_command_working_dir "$cmd")
         echo "  $cmd: $working_dir (bash→ash fallback)"
+    done
+fi
+
+# Display dev-only shell command working directories if --dev was passed
+if [ "$DEV_MODE" = true ] && [ -n "$SHELL_SCRIPTS_CMD_DEV" ]; then
+    for cmd in $SHELL_SCRIPTS_CMD_DEV; do
+        working_dir=$(get_command_working_dir "$cmd")
+        echo "  $cmd: $working_dir (dev, bash→ash fallback)"
     done
 fi
 
