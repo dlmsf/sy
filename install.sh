@@ -25,8 +25,8 @@ MAIN_SOURCE_DIR="$REPO_DIR"                         # Root of your project files
 # NODE.JS COMMAND MAPPING (REQUIRED - define your commands)
 # =============================================================================
 # Using space-separated lists for ash compatibility (no associative arrays)
-NODE_ENTRY_POINTS_SRC="SyManager.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js ._/._/._/Qemu/Qemu.js ._/._/._/Util/CodeParser.js ._/._/._/Util/jsinfo.js ._/._/._/Util/Bundler.js ._/._/._/Util/PortClear.js ._/._/._/Util/Replacer.js ._/._/._/Util/GitView.js ._/._/._/Util/Struct.js ._/._/._/Util/shinstall.js ._/._/._/Util/CodeReplacer.js ._/._/._/Util/clipwait.js ._/._/._/Util/Proxy/core/MenuCLI/MenuCLI.js ._/._/._/Util/SingleInstall.js" 
-NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc labssh qemujs codeparser jsinfo bundler portclear replacer gitview struct shinstall codereplacer clipwait proxy singleinstall"
+NODE_ENTRY_POINTS_SRC="SyManager.js" 
+NODE_ENTRY_POINTS_CMD="sy"
 
 # =============================================================================
 # DEV-ONLY NODE.JS COMMAND MAPPING (installed only when --dev is passed)
@@ -36,8 +36,8 @@ NODE_ENTRY_POINTS_CMD="sy sypm sydb pkg pack arc labssh qemujs codeparser jsinfo
 # NODE_ENTRY_POINTS_CMD_DEV. Leave empty for no extra dev commands.
 # Remember to also add each dev command name to get_command_working_dir()
 # below (in the DEV-ONLY section) so it uses the right working directory.
-NODE_ENTRY_POINTS_SRC_DEV="._/SyAPP.js"
-NODE_ENTRY_POINTS_CMD_DEV="syapp"
+NODE_ENTRY_POINTS_SRC_DEV="._/SyAPP.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js ._/._/._/Qemu/Qemu.js ._/._/._/Util/CodeParser.js ._/._/._/Util/jsinfo.js ._/._/._/Util/Bundler.js ._/._/._/Util/PortClear.js ._/._/._/Util/Replacer.js ._/._/._/Util/GitView.js ._/._/._/Util/Struct.js ._/._/._/Util/shinstall.js ._/._/._/Util/CodeReplacer.js ._/._/._/Util/clipwait.js ._/._/._/Util/Proxy/core/MenuCLI/MenuCLI.js ._/._/._/Util/SingleInstall.js"
+NODE_ENTRY_POINTS_CMD_DEV="syapp sypm sydb pkg pack arc labssh qemujs codeparser jsinfo bundler portclear replacer gitview struct shinstall codereplacer clipwait proxy singleinstall"
 
 # =============================================================================
 # SHELL SCRIPT COMMAND MAPPING (OPTIONAL - for .sh files with bash→ash fallback)
@@ -58,8 +58,8 @@ NODE_ENTRY_POINTS_CMD_DEV="syapp"
 #   2. Add working directory in get_command_working_dir() below
 #   3. Run installer
 #
-SHELL_SCRIPTS_SRC="./._/._/._/Qemu/qemu.sh ._/._/._/Util/lay.sh"    # ← Add your .sh script paths here
-SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
+SHELL_SCRIPTS_SRC=""    # ← Add your .sh script paths here
+SHELL_SCRIPTS_CMD=""    # ← Add your command names here
 
 # =============================================================================
 # DEV-ONLY SHELL SCRIPT COMMAND MAPPING (installed only when --dev is passed)
@@ -69,8 +69,8 @@ SHELL_SCRIPTS_CMD="qemu lay"    # ← Add your command names here
 # SHELL_SCRIPTS_CMD_DEV. Leave empty for no extra dev shell commands.
 # Remember to also add each dev shell command name to get_command_working_dir()
 # below (in the DEV-ONLY section) so it uses the right working directory.
-SHELL_SCRIPTS_SRC_DEV=""
-SHELL_SCRIPTS_CMD_DEV=""
+SHELL_SCRIPTS_SRC_DEV="./._/._/._/Qemu/qemu.sh ._/._/._/Util/lay.sh"
+SHELL_SCRIPTS_CMD_DEV="qemu lay"
 
 # =============================================================================
 # POST-INSTALL SCRIPTS CONFIGURATION
