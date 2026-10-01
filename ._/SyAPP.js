@@ -16048,6 +16048,239 @@ function _sbParseFuncJS(source, filePath) {
   return state
 }
 
+// ============================================================
+// JSON / JSONL VIEWER — direct-boot loader
+// ============================================================
+// When the runner is invoked with a .json / .jsonl path, SyAPP boots a
+// dedicated JSONViewerFunc that skips the SelfBuilder entirely and
+// drops the user straight into this.JSON() with the file pre-loaded.
+//
+// NOTE ON SELF-CONTAINMENT:
+// Every helper used during loading (byte formatter, index walker) is
+// defined LOCALLY inside this block. Nothing here relies on module
+// symbols declared elsewhere (like buildSearchIndex), so the loader
+// cannot fail with "X is not defined" regardless of how the surrounding
+// file is reorganised. The viewer func itself reuses the shared
+// `_sbJvBuildIndex` walker, so no duplication of indexing logic is
+// needed inside the class.
+// ============================================================
+
+/**
+ * Human-readable byte size formatter.
+ * @private
+ */
+function _sbFormatBytes(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
+}
+
+/**
+ * Self-contained search-index walker. Mirrors the shape produced by the
+ * module-level buildSearchIndex() (used by this.JSON()), so the viewer
+ * can hand the result straight to the JSON browser without any
+ * dependency on that symbol being reachable at call time.
+ *
+ * Each entry: { type, path, key, value, fullValue }
+ * @private
+ */
+function _sbJvBuildIndex(data) {
+  const index = [];
+  const traverse = (obj, pathStr) => {
+    if (obj === null || obj === undefined) return;
+    if (Array.isArray(obj)) {
+      obj.forEach((item, i) => {
+        traverse(item, `${pathStr}[${i}]`);
+      });
+    } else if (typeof obj === 'object') {
+      for (const [k, v] of Object.entries(obj)) {
+        const fullPath = pathStr ? `${pathStr}.${k}` : k;
+        index.push({
+          type: 'key',
+          path: fullPath,
+          key: String(k).toLowerCase(),
+          value: typeof v === 'string' ? v.toLowerCase() : '',
+          fullValue: v
+        });
+        traverse(v, fullPath);
+      }
+    } else {
+      const strValue = String(obj).toLowerCase();
+      index.push({
+        type: 'value',
+        path: pathStr || 'root',
+        key: pathStr.split('.').pop()?.toLowerCase() || 'root',
+        value: strValue,
+        fullValue: obj
+      });
+    }
+  };
+  traverse(data, '');
+  return index;
+}
+
+/**
+ * Read a .json / .jsonl file from disk with a live progress bar, then
+ * parse it and build its search index. Everything is written to stderr
+ * so it never clashes with the terminal HUD output on stdout.
+ *
+ * Progress phases:
+ *   1. Reading  — chunked fs.createReadStream, byte-level progress bar.
+ *   2. Parsing  — JSON.parse or JSONL line-by-line parse.
+ *   3. Indexing — _sbJvBuildIndex() walk, entry count report.
+ *
+ * @param {string} filePath - Absolute path to the .json / .jsonl file.
+ * @returns {Promise<{ data: any, searchIndex: Array }>}
+ * @private
+ */
+async function _sbLoadJsonWithProgress(filePath) {
+  const fileName = path.basename(filePath);
+  const stat = fs.statSync(filePath);
+  const totalBytes = stat.size;
+  const totalStr = _sbFormatBytes(totalBytes);
+  const barLen = 30;
+  const useBar = !!process.stderr.isTTY;
+
+  const renderBar = (bytesRead, phase) => {
+    if (!useBar) return;
+    const pct = totalBytes > 0
+      ? Math.min(100, Math.floor((bytesRead / totalBytes) * 100))
+      : 100;
+    const filled = Math.floor((pct / 100) * barLen);
+    const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
+    const readStr = _sbFormatBytes(bytesRead);
+    process.stderr.write(
+      `\r⏳ ${phase} ${fileName} [${bar}] ${String(pct).padStart(3)}% (${readStr}/${totalStr})`
+    );
+  };
+
+  if (!useBar) {
+    process.stderr.write(`⏳ Loading ${fileName} (${totalStr})...\n`);
+  }
+
+  // ---------- Phase 1: read ----------
+  renderBar(0, 'Reading ');
+  const chunks = [];
+  let bytesRead = 0;
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+    stream.on('data', (chunk) => {
+      chunks.push(chunk);
+      bytesRead += chunk.length;
+      renderBar(bytesRead, 'Reading ');
+    });
+    stream.on('end', resolve);
+    stream.on('error', reject);
+  });
+  if (useBar) process.stderr.write('\n');
+
+  const content = Buffer.concat(chunks).toString('utf8');
+
+  // ---------- Phase 2: parse ----------
+  if (useBar) process.stderr.write(`\r⏳ Parsing ${fileName}...`);
+  else process.stderr.write(`⏳ Parsing ${fileName}...\n`);
+
+  let data;
+  const isJsonl = fileName.toLowerCase().endsWith('.jsonl');
+  if (isJsonl) {
+    data = content
+      .split(/\r?\n/)
+      .filter((l) => l.trim() !== '')
+      .map((l) => JSON.parse(l));
+  } else {
+    data = JSON.parse(content);
+  }
+
+  const topLevelCount = Array.isArray(data)
+    ? data.length
+    : (data && typeof data === 'object' ? Object.keys(data).length : 1);
+
+  if (useBar) {
+    process.stderr.write(
+      `\r✅ Parsed ${fileName} — ${topLevelCount.toLocaleString()} top-level item(s) (${totalStr})\n`
+    );
+  } else {
+    process.stderr.write(
+      `✅ Parsed — ${topLevelCount.toLocaleString()} top-level item(s) (${totalStr})\n`
+    );
+  }
+
+  // ---------- Phase 3: index ----------
+  if (useBar) process.stderr.write(`\r⏳ Building search index...`);
+  else process.stderr.write(`⏳ Building search index...\n`);
+
+  const searchIndex = _sbJvBuildIndex(data);
+
+  if (useBar) {
+    process.stderr.write(
+      `\r✅ Built search index — ${searchIndex.length.toLocaleString()} searchable entries\n`
+    );
+  } else {
+    process.stderr.write(
+      `✅ Built search index — ${searchIndex.length.toLocaleString()} searchable entries\n`
+    );
+  }
+
+  return { data, searchIndex };
+}
+
+/**
+ * Build a SyAPP_Func subclass that boots directly into this.JSON() with
+ * the given file pre-loaded. The file data and its search index are
+ * injected into per-session storage ONCE, on the first build pass, so
+ * subsequent refresh ticks and in-view navigation reuse the same
+ * in-memory dataset without re-reading the file.
+ *
+ * The storage keys match exactly what this.JSON() uses for its
+ * `default` instance, so the JSON browser skips its file-picker step
+ * and renders the data view immediately.
+ *
+ * @param {string} jsonPath - Absolute path to the source file.
+ * @param {any} preloadedData - Parsed contents of the file.
+ * @param {Array} preloadedIndex - Pre-built search index.
+ * @returns {typeof SyAPP_Func}
+ * @private
+ */
+function _sbMakeJSONViewerFunc(jsonPath, preloadedData, preloadedIndex) {
+  return class JSONViewerFunc extends SyAPP_Func {
+    constructor() {
+      super(
+        '__jsonviewer__',
+        async (props) => {
+          const id = props.session.UniqueID;
+          const instanceName = 'default';
+          const storageKey = `jsonBrowser_${instanceName}`;
+          const searchIndexKey = `${storageKey}_searchIndex`;
+
+          // Pre-populate the JSON browser storage ONCE per session.
+          // On every subsequent build pass (refresh ticks, navigation)
+          // the storage already has data !== null, so this.JSON()
+          // renders the data view directly.
+          let storage = this.Storages.Get(id, storageKey);
+          if (!storage || storage.data === null || storage.data === undefined) {
+            this.Storages.Set(id, storageKey, {
+              data: preloadedData,
+              path: [],
+              searchResults: null,
+              searchPath: [],
+              filePath: jsonPath,
+              searchQuery: '',
+              historyStack: []
+            });
+            this.Storages.Set(id, searchIndexKey, preloadedIndex);
+          }
+
+          // Jump straight into the JSON browser view — no file picker,
+          // no intermediate screen. The data view renders immediately.
+          await this.JSON(id, { name: instanceName });
+        },
+        { refreshMode: false }
+      );
+    }
+  };
+}
+
 function _installCtrlC(syapp) {
   syapp.HUD.on('ctrl+c', async () => {
     const builder = syapp.Funcs.get('__selfbuilder__')
@@ -16143,6 +16376,46 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       const syapp = new SyAPP(SelfBuilder);
       _installCtrlC(syapp);
       return;
+    }
+
+    // ------------------------------------------------------------------
+    // --- `node SyAPP.js <file>.json` / `node SyAPP.js <file>.jsonl` ---
+    // ------------------------------------------------------------------
+    // Boots a dedicated JSONViewerFunc that skips the SelfBuilder
+    // entirely and jumps straight into this.JSON() with the file
+    // pre-loaded — no file picker, no builder screen. A live progress
+    // indicator is printed to stderr while the file is read, parsed
+    // and indexed, so large JSON / JSONL datasets give visible
+    // feedback before the terminal HUD takes over.
+    //
+    // The loader is fully self-contained: every symbol it needs is
+    // defined in the same file, immediately above this branch, so
+    // there is no risk of "buildSearchIndex is not defined" from a
+    // module-reorganisation or a partially-applied patch.
+    // ------------------------------------------------------------------
+    {
+      const lower = String(arg1).toLowerCase();
+      if (lower.endsWith('.json') || lower.endsWith('.jsonl')) {
+        const jsonPath = path.isAbsolute(arg1)
+          ? arg1
+          : path.resolve(process.cwd(), arg1);
+
+        if (!fs.existsSync(jsonPath)) {
+          console.error(ColorText.brightRed(`❌ JSON file not found: ${arg1}`));
+          process.exit(1);
+        }
+
+        try {
+          const result = await _sbLoadJsonWithProgress(jsonPath);
+          const JSONViewerFunc = _sbMakeJSONViewerFunc(jsonPath, result.data, result.searchIndex);
+          const syapp = new SyAPP(JSONViewerFunc);
+          _installCtrlC(syapp);
+        } catch (err) {
+          console.error(ColorText.brightRed(`❌ Failed to load "${arg1}": ${err.message}`));
+          process.exit(1);
+        }
+        return;
+      }
     }
 
     // --- If arg1 is a save name (not a file path), load its state ---
