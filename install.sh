@@ -252,6 +252,7 @@ FORCE_UPDATE=false              # NEW: skip interactive menu and force update
 FORCE_REMOVE=false              # NEW: skip interactive menu and force remove
 FORCE_REMOVE_UPDATE=false       # NEW: force remove existing then install fresh
 DEV_MODE=false                  # NEW: install extra dev-only commands when --dev is passed
+ENV_MODE=false                  # NEW: open system-level env preset menu (--env)
 
 # NEW: List for files/directories manually included from actual filesystem (gitignored files)
 BUILD_INCLUDE_LIST="/tmp/build_include_$$.txt"
@@ -261,6 +262,201 @@ BUILD_INCLUDE_LIST_NAME="build_include_$$.txt"
 # External dependencies (uncomment and configure if needed)
 # PM2_TAR_GZ="$ARCHIVE_DIR/pm2.tar.gz"              # Uncomment if using pm2
 # PM2_EXTRACT_DIR="$INSTALL_DIR/vendor/pm2"         # Uncomment if using pm2
+
+# =============================================================================
+# ENVIRONMENT PRESETS SYSTEM (--env)
+# =============================================================================
+# System-level configuration providing global presets that influence every
+# install run. Stored OUTSIDE the install directory so presets survive
+# uninstall / update / reinstall cycles.
+#
+# HOW TO ADD A NEW PRESET (3 easy steps):
+#   1. Declare a default value below (e.g. MY_PRESET=false).
+#   2. Add a registry entry inside env_var_registry() in the form:
+#          MY_PRESET|default|type|Human readable description
+#      where type is "bool" (toggled in menu) or "string" (free text).
+#   3. Add an application rule inside apply_env_presets() that reacts to the
+#      variable and adjusts install-flow behavior.
+#   No other changes are required.
+#
+# Manage interactively with:  ./install.sh --env
+# =============================================================================
+
+ENV_CONFIG_DIR="/etc"
+ENV_CONFIG_FILE="/etc/${PROJECT_NAME}-installer.env"
+
+# ----- Preset defaults (overridden by saved config when present) -----
+FORCE_DEV=false
+
+# ----- Preset registry -------------------------------------------------------
+# Format (one entry per line): VAR_NAME|default|type|description
+# -----------------------------------------------------------------------------
+env_var_registry() {
+    cat <<'ENV_REGISTRY_EOF'
+FORCE_DEV|false|bool|Force every install to run in --dev mode by default
+ENV_REGISTRY_EOF
+}
+
+# ----- Load presets from the system config file (if present) -----
+load_env_config() {
+    [ -f "$ENV_CONFIG_FILE" ] || return 0
+    
+    env_registry_tmp="/tmp/env_registry_load_$$.txt"
+    env_var_registry > "$env_registry_tmp"
+    
+    while IFS='|' read -r var_name default_val var_type desc; do
+        [ -z "$var_name" ] && continue
+        line=$(grep "^${var_name}=" "$ENV_CONFIG_FILE" 2>/dev/null | tail -1)
+        [ -z "$line" ] && continue
+        value=$(echo "$line" | cut -d= -f2-)
+        eval "$var_name=\"\$value\""
+    done < "$env_registry_tmp"
+    
+    rm -f "$env_registry_tmp"
+    return 0
+}
+
+# ----- Save presets to the system config file -----
+save_env_config() {
+    env_registry_tmp="/tmp/env_registry_save_$$.txt"
+    env_var_registry > "$env_registry_tmp"
+    
+    tmp_file="${ENV_CONFIG_FILE}.tmp.$$"
+    
+    {
+        echo "# $PROJECT_NAME installer environment presets"
+        echo "# Generated: $(date)"
+        echo "# Managed by: ./install.sh --env"
+        echo "#"
+        while IFS='|' read -r var_name default_val var_type desc; do
+            [ -z "$var_name" ] && continue
+            eval "value=\$$var_name"
+            echo "${var_name}=${value}"
+        done < "$env_registry_tmp"
+    } > "$tmp_file"
+    
+    rm -f "$env_registry_tmp"
+    
+    if [ -w "$ENV_CONFIG_FILE" ] || [ -w "$ENV_CONFIG_DIR" ]; then
+        if mv "$tmp_file" "$ENV_CONFIG_FILE" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo mv "$tmp_file" "$ENV_CONFIG_FILE" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    rm -f "$tmp_file"
+    return 1
+}
+
+# ----- Interactive preset menu (opened by --env) -----
+show_env_menu() {
+    env_menu_map="/tmp/env_menu_map_$$.txt"
+    
+    while true; do
+        clear
+        echo "========================================="
+        echo "  $PROJECT_NAME Installer Environment Presets"
+        echo "========================================="
+        echo "Config file: $ENV_CONFIG_FILE"
+        echo ""
+        echo "These presets affect every install run at system level."
+        echo ""
+        
+        env_var_registry > "$env_menu_map"
+        
+        num=0
+        while IFS='|' read -r var_name default_val var_type desc; do
+            [ -z "$var_name" ] && continue
+            num=$((num + 1))
+            eval "current=\$$var_name"
+            printf "  %2s. %-12s = %-8s  %s\n" "$num" "$var_name" "$current" "$desc"
+        done < "$env_menu_map"
+        
+        echo ""
+        echo "  s. Save and exit"
+        echo "  r. Reload from disk (discard unsaved changes)"
+        echo "  q. Cancel (do not save)"
+        echo ""
+        printf "Choice: "
+        read env_choice
+        
+        case "$env_choice" in
+            s|S)
+                if save_env_config; then
+                    echo "Saved environment presets to: $ENV_CONFIG_FILE"
+                else
+                    echo "Error: could not save (permission denied?)"
+                fi
+                sleep 1
+                rm -f "$env_menu_map"
+                return 0
+                ;;
+            r|R)
+                load_env_config
+                ;;
+            q|Q)
+                rm -f "$env_menu_map"
+                return 0
+                ;;
+            *)
+                if echo "$env_choice" | grep -q '^[0-9]\+$'; then
+                    sel_line=$(sed -n "${env_choice}p" "$env_menu_map" 2>/dev/null)
+                    if [ -n "$sel_line" ]; then
+                        sel_var=$(echo "$sel_line" | cut -d'|' -f1)
+                        sel_type=$(echo "$sel_line" | cut -d'|' -f3)
+                        case "$sel_type" in
+                            bool)
+                                eval "cur=\$$sel_var"
+                                if [ "$cur" = "true" ]; then
+                                    eval "$sel_var=false"
+                                else
+                                    eval "$sel_var=true"
+                                fi
+                                ;;
+                            string)
+                                eval "cur=\$$sel_var"
+                                printf "Enter new value for %s [%s]: " "$sel_var" "$cur"
+                                read new_val
+                                [ -n "$new_val" ] && eval "$sel_var=\"\$new_val\""
+                                ;;
+                        esac
+                    fi
+                fi
+                ;;
+        esac
+    done
+}
+
+# ----- Apply presets to the install flow (modular dispatcher) -----
+apply_env_presets() {
+    # =====================================================================
+    # ENV PRESET APPLICATION DISPATCHER
+    # ---------------------------------------------------------------------
+    # Single point where presets are translated into install-flow behavior.
+    # Add a new rule below whenever a new preset is added to the registry.
+    # =====================================================================
+    
+    # ---- FORCE_DEV ----
+    # When true, every install runs in --dev mode (unless --dev was already
+    # passed explicitly on the command line, in which case nothing to do).
+    if [ "$FORCE_DEV" = "true" ]; then
+        if [ "$DEV_MODE" != "true" ]; then
+            DEV_MODE=true
+            log_message "Env preset FORCE_DEV=true -> enabling --dev mode for this install"
+        fi
+    fi
+    
+    # ---- Add future presets here ----
+}
+
+# =============================================================================
+# END OF ENVIRONMENT PRESETS SYSTEM
+# =============================================================================
 
 # =============================================================================
 # BUILD SAVE/LOAD FUNCTIONS - Pure bash, no external dependencies
@@ -2350,6 +2546,7 @@ show_help() {
     echo "  --remove, -r     Force remove existing installation without interactive menu"
     echo "  --reinstall, -ru Force remove existing then install fresh (remove + update)"
     echo "  --dev            Normal install + extra dev-only commands (see *_DEV lists)"
+    echo "  --env            Manage system-level installer environment presets"
     echo "  --build          Create a build from the last commit"
     echo "  --tar            Create a tar.gz archive (use with --build)"
     echo "  --config         Interactive file exclusion (use with --build)"
@@ -2369,6 +2566,11 @@ show_help() {
     echo "  $0 -u                         Force update (no interactive menu)"
     echo "  $0 -r                         Force remove (no interactive menu)"
     echo "  $0 -ru                        Force remove then reinstall fresh"
+    echo
+    echo "Environment preset examples:"
+    echo "  $0 --env                      Open the system-level presets menu"
+    echo "                                (toggle FORCE_DEV to always install with --dev)"
+    echo "  Config file: /etc/$PROJECT_NAME-installer.env"
     echo
     echo "Commands will be created for:"
     
@@ -4023,10 +4225,11 @@ for arg in "$@"; do
         --message) BUILD_MESSAGE_MODE=true ;;
         --version) BUILD_MODE=true; BUILD_VERSION="latest" ;;
         --dev) DEV_MODE=true ;;
+        --env) ENV_MODE=true ;;
     esac
     # Handle --build with optional save name
     # This catches: ./install.sh --build mysave  OR  ./install.sh --build --tar mysave
-    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "--dev" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-u" ] && [ "$arg" != "--remove" ] && [ "$arg" != "-r" ] && [ "$arg" != "--reinstall" ] && [ "$arg" != "-ru" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
+    if [ "$prev_arg" = "--build" ] && [ "$arg" != "--build" ] && [ "$arg" != "--tar" ] && [ "$arg" != "--config" ] && [ "$arg" != "--message" ] && [ "$arg" != "--version" ] && [ "$arg" != "--dev" ] && [ "$arg" != "--env" ] && [ "$arg" != "-log" ] && [ "$arg" != "--skip-debs" ] && [ "$arg" != "--local-dir" ] && [ "$arg" != "--no-preserve" ] && [ "$arg" != "--node" ] && [ "$arg" != "--nodejs" ] && [ "$arg" != "--update" ] && [ "$arg" != "-u" ] && [ "$arg" != "--remove" ] && [ "$arg" != "-r" ] && [ "$arg" != "--reinstall" ] && [ "$arg" != "-ru" ] && [ "$arg" != "-h" ] && [ "$arg" != "--help" ]; then
         BUILD_SAVE_NAME="$arg"
     fi
     # Handle --version with specific version number
@@ -4035,6 +4238,27 @@ for arg in "$@"; do
     fi
     prev_arg="$arg"
 done
+
+# =========================================================================
+# ENVIRONMENT PRESETS (--env)
+# =========================================================================
+# Load any saved system-level presets and apply them to the install flow.
+# The --env flag opens the interactive menu and exits without installing.
+# This is intentionally placed BEFORE the build/install logic so presets
+# (e.g. FORCE_DEV) can influence everything downstream.
+# =========================================================================
+
+load_env_config
+
+if [ "$ENV_MODE" = true ]; then
+    show_env_menu
+    exit 0
+fi
+
+# Modular dispatcher: translates loaded presets into install-flow behavior.
+# Add new preset application rules inside apply_env_presets() when new
+# variables are registered in env_var_registry().
+apply_env_presets
 
 # Handle build mode (exit early if only building)
 if [ "$BUILD_MODE" = true ]; then
