@@ -6839,12 +6839,25 @@ this.JSON = async (id, config = {}) => {
   const tokenSearchKey = `${storageKey}_tokenSearch`;
   const debugKey = `${storageKey}_debug`;
 
+  // NEW (array-of-objects support):
+  //   searchKeyKey   → which specific key searches are restricted to
+  //   showKeysKey    → list of keys to display in array item previews
+  //                    AND in search-result previews (display only —
+  //                    never affects saved output)
+  //   valueViewKey   → { key: string, filter: string|null } | null
+  const searchKeyKey = `${storageKey}_searchKey`;
+  const showKeysKey = `${storageKey}_showKeys`;
+  const valueViewKey = `${storageKey}_valueView`;
+
   // Search configuration with defaults
   let searchConfig = {
     mode: config.searchConfig?.mode || 'both',
     keyWeight: config.searchConfig?.keyWeight || 0.7,
     valueWeight: config.searchConfig?.valueWeight || 0.3,
-    minSimilarity: config.searchConfig?.minSimilarity || 0.3
+    minSimilarity: config.searchConfig?.minSimilarity || 0.3,
+    // NEW: when set, searches only match entries whose last path segment
+    // equals this key name (case-insensitive). null = search everywhere.
+    searchKey: config.searchConfig?.searchKey || null
   };
 
   // Load saved search config from storage if exists
@@ -6852,11 +6865,13 @@ this.JSON = async (id, config = {}) => {
   const savedKeyWeight = this.Storages.Get(id, searchKeyWeightKey);
   const savedValueWeight = this.Storages.Get(id, searchValueWeightKey);
   const savedMinSimilarity = this.Storages.Get(id, searchMinSimilarityKey);
+  const savedSearchKey = this.Storages.Get(id, searchKeyKey);
 
   if (savedMode) searchConfig.mode = savedMode;
   if (savedKeyWeight !== undefined && savedKeyWeight !== null) searchConfig.keyWeight = savedKeyWeight;
   if (savedValueWeight !== undefined && savedValueWeight !== null) searchConfig.valueWeight = savedValueWeight;
   if (savedMinSimilarity !== undefined && savedMinSimilarity !== null) searchConfig.minSimilarity = savedMinSimilarity;
+  if (savedSearchKey !== undefined && savedSearchKey !== null) searchConfig.searchKey = savedSearchKey || null;
 
   // Load save-only toggle state
   let saveOnly = this.Storages.Get(id, saveOnlyKey) || false;
@@ -6871,7 +6886,9 @@ this.JSON = async (id, config = {}) => {
       searchResults: null,
       searchPath: [],
       filePath: null,
-      searchQuery: ''
+      searchQuery: '',
+      // NEW: { key, filter } | null — value-view drilldown state.
+      valueView: null
     });
   }
 
@@ -6897,6 +6914,24 @@ this.JSON = async (id, config = {}) => {
   const recentLoadProp = `${storageKey}_loadRecent`;
   const returnProp = `${storageKey}_return`;
   const updateRecentTimeWindowProp = `${storageKey}_updateRecentTimeWindow`;
+
+  // NEW: array-of-objects support props.
+  //   setSearchKeyProp    → restrict search to one specific model key
+  //   clearSearchKeyProp  → remove the search-key restriction
+  //   toggleShowKeyProp   → toggle a key in/out of the preview filter
+  //   clearShowKeysProp   → wipe the preview filter
+  //   openValueViewProp   → open the value view for a specific key
+  //   setValueFilterProp  → apply/replace the value filter inside value view
+  //   clearValueFilterProp→ clear the value filter (keep value view open)
+  //   closeValueViewProp  → return to the regular array view
+  const setSearchKeyProp = `${storageKey}_setSearchKey`;
+  const clearSearchKeyProp = `${storageKey}_clearSearchKey`;
+  const toggleShowKeyProp = `${storageKey}_toggleShowKey`;
+  const clearShowKeysProp = `${storageKey}_clearShowKeys`;
+  const openValueViewProp = `${storageKey}_openValueView`;
+  const setValueFilterProp = `${storageKey}_setValueFilter`;
+  const clearValueFilterProp = `${storageKey}_clearValueFilter`;
+  const closeValueViewProp = `${storageKey}_closeValueView`;
 
   if (currentProps[backProp]) {
     if (storage.searchResults) {
@@ -7098,6 +7133,109 @@ this.JSON = async (id, config = {}) => {
     this.Storages.Set(id, debugKey, debugOutput);
     delete currentProps[toggleDebugProp];
   }
+
+  // ------------------------------------------------------------------
+  // NEW: array-of-objects support prop handlers
+  // ------------------------------------------------------------------
+
+  // Restrict searches to one specific key of the detected model.
+  if (currentProps[setSearchKeyProp] !== undefined) {
+    const k = currentProps[setSearchKeyProp];
+    searchConfig.searchKey = k || null;
+    this.Storages.Set(id, searchKeyKey, searchConfig.searchKey);
+    // Any change to the search key invalidates previous results.
+    this.Storages.Set(id, lastSearchQueryKey, '');
+    this.Pagination.Reset(id, `${storageKey}_searchResults`);
+    this.Pagination.Reset(id, `${storageKey}_searchNav`);
+    delete currentProps[setSearchKeyProp];
+  }
+
+  if (currentProps[clearSearchKeyProp]) {
+    searchConfig.searchKey = null;
+    this.Storages.Set(id, searchKeyKey, null);
+    this.Storages.Set(id, lastSearchQueryKey, '');
+    this.Pagination.Reset(id, `${storageKey}_searchResults`);
+    this.Pagination.Reset(id, `${storageKey}_searchNav`);
+    delete currentProps[clearSearchKeyProp];
+  }
+
+  // Toggle one key in/out of the preview "show only these keys" filter.
+  // DISPLAY-ONLY: never affects the data written by save-only mode.
+  if (currentProps[toggleShowKeyProp] !== undefined) {
+    const k = currentProps[toggleShowKeyProp];
+    let showKeysState = this.Storages.Get(id, showKeysKey);
+    if (!Array.isArray(showKeysState)) showKeysState = [];
+    const idx = showKeysState.indexOf(k);
+    if (idx >= 0) showKeysState.splice(idx, 1);
+    else showKeysState.push(k);
+    this.Storages.Set(id, showKeysKey, showKeysState);
+    delete currentProps[toggleShowKeyProp];
+  }
+
+  if (currentProps[clearShowKeysProp]) {
+    this.Storages.Set(id, showKeysKey, []);
+    delete currentProps[clearShowKeysProp];
+  }
+
+  // Open the value view for a specific key. Only triggered when the
+  // user explicitly clicks a "📊 key" button — never automatically.
+  if (currentProps[openValueViewProp] !== undefined) {
+    const k = currentProps[openValueViewProp];
+    if (k) {
+      storage.valueView = { key: k, filter: null };
+      this.Storages.Set(id, storageKey, storage);
+    }
+    delete currentProps[openValueViewProp];
+  }
+
+  // Apply a specific value filter inside the value view. Passing an
+  // empty string clears the filter (toggle-off behaviour).
+  if (currentProps[setValueFilterProp] !== undefined) {
+    const v = currentProps[setValueFilterProp];
+    if (!storage.valueView) storage.valueView = { key: null, filter: null };
+    storage.valueView.filter = (v === '' || v === null || v === undefined) ? null : v;
+    this.Storages.Set(id, storageKey, storage);
+    delete currentProps[setValueFilterProp];
+  }
+
+  if (currentProps[clearValueFilterProp]) {
+    if (storage.valueView) {
+      storage.valueView.filter = null;
+      this.Storages.Set(id, storageKey, storage);
+    }
+    delete currentProps[clearValueFilterProp];
+  }
+
+  if (currentProps[closeValueViewProp]) {
+    storage.valueView = null;
+    this.Storages.Set(id, storageKey, storage);
+    delete currentProps[closeValueViewProp];
+  }
+
+  // ------------------------------------------------------------------
+  // NEW: detect the model of the tree node the user is currently on.
+  //
+  // Computed from storage.path (the tree walk), NOT from the search
+  // results — the model needs to reflect the underlying array even
+  // while a search is active. This drives the config-panel key selectors
+  // AND the array view's "📊 key" value-view launchers.
+  //
+  // Cheap when the current node isn't an array (returns null at once).
+  // ------------------------------------------------------------------
+  let previewNode = storage.data;
+  for (const seg of storage.path) {
+    if (previewNode === null || previewNode === undefined) break;
+    previewNode = typeof seg === 'number' ? previewNode[seg] : previewNode?.[seg];
+  }
+  const detectedModel = Array.isArray(previewNode)
+    ? detectArrayModel(previewNode)
+    : null;
+
+  // Resolve the effective "show keys" list. Kept as the raw stored value
+  // so that navigating away and back preserves the user's selection.
+  // Used ONLY for the display layer — never for save-only output.
+  let showKeys = this.Storages.Get(id, showKeysKey);
+  if (!Array.isArray(showKeys)) showKeys = [];
   // ------------------------------------------------------------------
   // CRITICAL: Check for search change from field storage
   // ------------------------------------------------------------------
@@ -7118,7 +7256,13 @@ this.JSON = async (id, config = {}) => {
   
     if (storage.searchQuery && storage.searchQuery.trim()) {
       // Perform search with selected engine
-      const searchIndex = this.Storages.Get(id, searchIndexKey);
+      let searchIndex = this.Storages.Get(id, searchIndexKey);
+      // NEW: when a specific search key is set (via the config panel),
+      // restrict the index to entries whose last path segment matches it.
+      // This is what enables "search one specific key across all items".
+      if (searchConfig.searchKey) {
+        searchIndex = filterSearchIndexByKey(searchIndex, searchConfig.searchKey);
+      }
       if (tokenSearch) {
         storage.searchResults = tokenSearchJSON(
           storage.data, 
@@ -7133,6 +7277,13 @@ this.JSON = async (id, config = {}) => {
           searchConfig
         );
       }
+      // NEW: attach the FULL enclosing object to every result, so that
+      // save-only mode writes the complete object (all keys), and the
+      // UI can show whatever it wants without losing data.
+      storage.searchResults = enrichSearchResultsWithFullObjects(
+        storage.searchResults,
+        storage.data
+      );
       storage.searchPath = [];
       
       // Only reset pagination if the search query actually changed
@@ -7216,8 +7367,30 @@ this.JSON = async (id, config = {}) => {
         const outputFileName = `${originalBase}_search_${timestamp}.json`;
         const outputPath = path.join(originalDir, outputFileName);
 
-        // Write search results to file
-        fs.writeFileSync(outputPath, JSON.stringify(storage.searchResults, null, 2), 'utf8');
+        // ------------------------------------------------------------------
+        // NEW: build the OUTPUT payload from the FULL objects attached to
+        // each search result. The show-keys filter is a DISPLAY-ONLY
+        // concern, so every saved entry must contain the ENTIRE original
+        // object (all keys) — never a slimmed copy.
+        //
+        //   • For object matches (e.g. "users[3].email"): the parent
+        //     object ("users[3]") is written — every key preserved.
+        //   • For array matches (e.g. "users[3].tags"): the array itself
+        //     is written — every element preserved.
+        //   • For flat matches on a whole array of objects (path "root"
+        //     or "users"), the whole array is written.
+        //
+        // Fallback: when `_fullObject` is not present (defensive), the
+        // result's own `value` is used so nothing is silently lost.
+        // ------------------------------------------------------------------
+        const savedPayload = (storage.searchResults || []).map(r => {
+          if (!r || typeof r !== 'object') return r;
+          const full = (r._fullObject !== undefined) ? r._fullObject : r.value;
+          return full;
+        });
+
+        // Write search results to file — FULL objects, every key intact.
+        fs.writeFileSync(outputPath, JSON.stringify(savedPayload, null, 2), 'utf8');
 
         // Clear search state completely
         storage.searchResults = null;
@@ -7230,7 +7403,7 @@ this.JSON = async (id, config = {}) => {
         this.Storages.Set(id, storageKey, storage);
 
         // Alert user
-        this.Alert(id, `💾 Saved search results to: ${path.basename(outputPath)}`, { duration: 4000 });
+        this.Alert(id, `💾 Saved ${savedPayload.length} full object(s) to: ${path.basename(outputPath)}`, { duration: 4000 });
       } else {
         // No file loaded, should not happen
         this.Alert(id, '❌ Cannot save search: no JSON file loaded', { duration: 3000 });
@@ -7321,6 +7494,80 @@ this.JSON = async (id, config = {}) => {
         props: { [setSearchModeProp]: 'both' }
       }
     ]);
+
+    // ------------------------------------------------------------------
+    // NEW: Search Key selector — only shown when the current tree node
+    // is an array of objects and a model could be detected. Clicking a
+    // key restricts ALL searches to that specific key across the entire
+    // dataset; clicking again (or ✖ Any) clears the restriction.
+    // ------------------------------------------------------------------
+    if (detectedModel && detectedModel.keys.length > 0) {
+      this.Text(id, ' ');
+      this.Text(id,
+        `${this.TextColor.brightCyan('🔍 Search Key:')} ` +
+        (searchConfig.searchKey
+          ? this.TextColor.green(`"${searchConfig.searchKey}"`)
+          : this.TextColor.dim('(any key)'))
+      );
+
+      const searchKeyButtons = detectedModel.keys.slice(0, 8).map(k => {
+        const active = searchConfig.searchKey === k.key;
+        return {
+          name: active
+            ? this.TextColor.bgGreen(this.TextColor.black(` ✓ ${k.key} `))
+            : `🔑 ${k.key}`,
+          props: { [setSearchKeyProp]: active ? '' : k.key }
+        };
+      });
+
+      if (searchConfig.searchKey) {
+        searchKeyButtons.push({
+          name: this.TextColor.brightRed('✖ Any'),
+          props: { [clearSearchKeyProp]: true }
+        });
+      }
+
+      this.Buttons(id, searchKeyButtons);
+    }
+
+    // ------------------------------------------------------------------
+    // NEW: Show-Keys filter — only shown when the current tree node is
+    // an array of objects. Toggling a key hides/shows it in the array
+    // item previews, in search result instances (normal & saved), and
+    // inside the value view.
+    //
+    // DISPLAY-ONLY: this filter is NEVER applied to the data written by
+    // save-only mode — the saved file always contains every key of each
+    // matched object.
+    // ------------------------------------------------------------------
+    if (detectedModel && detectedModel.keys.length > 0) {
+      this.Text(id, ' ');
+      this.Text(id,
+        `${this.TextColor.brightCyan('👁 Show Keys:')} ` +
+        (showKeys.length > 0
+          ? this.TextColor.dim(`(${showKeys.length} selected — display only)`)
+          : this.TextColor.dim('(all keys shown)'))
+      );
+
+      const showKeyButtons = detectedModel.keys.slice(0, 8).map(k => {
+        const active = showKeys.includes(k.key);
+        return {
+          name: active
+            ? this.TextColor.green(`✓ ${k.key}`)
+            : this.TextColor.dim(`○ ${k.key}`),
+          props: { [toggleShowKeyProp]: k.key }
+        };
+      });
+
+      if (showKeys.length > 0) {
+        showKeyButtons.push({
+          name: this.TextColor.brightRed('✖ Clear'),
+          props: { [clearShowKeysProp]: true }
+        });
+      }
+
+      this.Buttons(id, showKeyButtons);
+    }
     
     this.Text(id, ' ');
     
@@ -7542,6 +7789,81 @@ this.JSON = async (id, config = {}) => {
     return abbreviateText(value, maxLength);
   };
 
+  // NEW: preview for array items that shows key:value pairs inline,
+  // optionally restricted to a set of "show keys" chosen by the user
+  // in the config panel. Used whenever the current node is an array of
+  // objects, so items show their actual content instead of "Object(N)".
+  const getItemPreviewForArray = (item, maxLength = maxTextLength, showKeysList = []) => {
+    if (item === null) return 'null';
+    if (typeof item !== 'object') return abbreviateText(item, maxLength);
+    if (Array.isArray(item)) return `Array(${item.length})`;
+
+    let keys = Object.keys(item);
+    const allKeys = keys.slice();
+    if (Array.isArray(showKeysList) && showKeysList.length > 0) {
+      const filterSet = new Set(showKeysList);
+      keys = keys.filter(k => filterSet.has(k));
+      if (keys.length === 0) {
+        return `{${allKeys.length} keys} ` + ColorText.dim('(filtered out)');
+      }
+    }
+
+    const parts = [];
+    const budget = Math.max(8, maxLength - 4);
+    for (const k of keys) {
+      const v = item[k];
+      let vs;
+      if (v === null) vs = 'null';
+      else if (Array.isArray(v)) vs = `[${v.length}]`;
+      else if (typeof v === 'object') vs = '{…}';
+      else vs = String(v);
+      const piece = `${k}:${vs}`;
+      if (parts.length > 0 && (parts.join(', ').length + piece.length + 2) > budget) {
+        parts.push('…');
+        break;
+      }
+      parts.push(piece);
+    }
+    return '{' + parts.join(', ') + '}';
+  };
+
+  // NEW: preview for a search-result entry.
+  //
+  // A search result's `.value` field can be any JSON shape. This helper
+  // produces a compact one-line display that respects the show-keys
+  // filter for DISPLAY ONLY:
+  //
+  //   • When showKeys is empty → the FULL value (using the existing
+  //     getValuePreview rules, so nothing changes for existing users).
+  //   • When showKeys is non-empty → a slimmed view exposing only the
+  //     selected keys (via slimSearchResultValue), stringified compactly
+  //     and truncated to maxLength.
+  //
+  // IMPORTANT: this helper is ONLY used for what the user SEES. The
+  // actual data written by save-only mode always uses the full
+  // `_fullObject`, so no keys are ever lost on disk.
+  const getSearchResultPreview = (value, maxLength = maxTextLength, showKeysList = []) => {
+    if (!Array.isArray(showKeysList) || showKeysList.length === 0) {
+      return getValuePreview(value, maxLength);
+    }
+
+    const slimmed = slimSearchResultValue(value, showKeysList);
+    if (slimmed === null || slimmed === undefined) return String(slimmed);
+
+    if (typeof slimmed !== 'object') {
+      return abbreviateText(slimmed, maxLength);
+    }
+
+    let str;
+    try { str = JSON.stringify(slimmed); }
+    catch (_) { str = String(slimmed); }
+
+    if (str === '{}' || str === '[]') {
+      return ColorText.dim('(filtered out)');
+    }
+    return abbreviateText(str, maxLength);
+  };
+
   const formatFileSize = (bytes) => {
     if (bytes < 1024) return bytes + ' B';
     else if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -7638,8 +7960,20 @@ this.JSON = async (id, config = {}) => {
               matchInfo = ` 🔀K:${item.keySimilarity ? Math.round(item.keySimilarity * 100) + '%' : '0%'} V:${item.valueSimilarity ? Math.round(item.valueSimilarity * 100) + '%' : '0%'}`;
             }
 
+            // NEW: reflect the show-keys filter on EVERY result instance
+            // for DISPLAY ONLY. When showKeys is non-empty, the preview is
+            // computed from a slimmed copy of the FULL object attached to
+            // this result (`_fullObject`), so every key the user selected
+            // is shown consistently. The underlying saved data is
+            // unaffected — save-only always writes `_fullObject` whole.
+            const previewSource = (item._fullObject !== undefined) ? item._fullObject : item.value;
+            const slimmedPreview = getSearchResultPreview(previewSource, maxTextLength, showKeys);
+            const valuePart = (Array.isArray(showKeys) && showKeys.length > 0 && previewSource !== undefined)
+              ? ` ${this.TextColor.dim('→')} ${this.TextColor.brightWhite(slimmedPreview)}`
+              : '';
+
             this.Button(id, {
-              name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${matchInfo}${similarity}`,
+              name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${matchInfo}${similarity}${valuePart}`,
               props: { [`${storageKey}_navigate`]: itemData.globalIndex }
             });
           }
@@ -7707,27 +8041,168 @@ this.JSON = async (id, config = {}) => {
 
   } else if (Array.isArray(currentNode)) {
     // Array display
-    this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
+    const isSearchResultList = displaySearchResults && storage.searchPath.length === 0;
+    const arrayModel = isSearchResultList ? null : detectArrayModel(currentNode);
 
-    if (currentNode.length === 0) {
-      this.Text(id, `${this.TextColor.dim('(empty array)')}`);
-    } else {
-      await this.Pagination.Button(
-        id, 
-        `${storageKey}_array`, 
-        currentNode, 
+    // ------------------------------------------------------------------
+    // NEW: VALUE-VIEW MODE — only entered by clicking a "📊 key" button
+    // below. Shows every distinct value of that key with item counts,
+    // lets the user filter to one specific value, and (when filtered)
+    // lists the matching items so they can drill into a specific one.
+    // ------------------------------------------------------------------
+    if (!isSearchResultList && storage.valueView && storage.valueView.key) {
+      const vvKey = storage.valueView.key;
+      const vvFilter = storage.valueView.filter;
+
+      this.Text(id,
+        `${this.TextColor.brightCyan('📊')} ` +
+        this.TextColor.bold(`Values of key "${vvKey}"`)
+      );
+      this.Text(id, this.TextColor.dim(`  (from ${currentNode.length} items)`));
+
+      const aggregatedValues = aggregateKeyValues(currentNode, vvKey);
+
+      if (vvFilter !== null && vvFilter !== undefined) {
+        const matchingCount =
+          aggregatedValues.find(v => v.value === String(vvFilter))?.count || 0;
+        this.Text(id,
+          `  ${this.TextColor.brightGreen('✓ Filter:')} ` +
+          this.TextColor.bold(String(vvFilter)) + ' ' +
+          this.TextColor.dim(`(${matchingCount} item${matchingCount === 1 ? '' : 's'})`)
+        );
+      }
+
+      this.Text(id, ' ');
+
+      if (aggregatedValues.length === 0) {
+        this.Text(id, this.TextColor.dim('  (no values found for this key)'));
+      } else {
+        const valueItems = aggregatedValues.map(v => ({
+          value: v.value,
+          count: v.count,
+          isActive: vvFilter !== null && vvFilter !== undefined && String(vvFilter) === v.value
+        }));
+
+        await this.Pagination.Button(
+          id,
+          `${storageKey}_valueView`,
+          valueItems,
+          {
+            ...createPaginationConfig(`${storageKey}_valueView`, valueItems.length),
+            renderItem: (itemData) => {
+              const { value, count, isActive } = itemData.item;
+              const shown = abbreviateText(value, Math.floor(maxTextLength * 0.7));
+              const name = isActive
+                ? this.TextColor.bgGreen(this.TextColor.black(` ▶ ${shown} `)) +
+                  ' ' + this.TextColor.dim(`×${count}`)
+                : this.TextColor.cyan(shown) + ' ' + this.TextColor.dim(`×${count}`);
+              this.Button(id, {
+                name,
+                props: { [setValueFilterProp]: isActive ? '' : value }
+              });
+            }
+          }
+        );
+      }
+
+      this.Text(id, ' ');
+      const vvActions = [
         {
-          ...createPaginationConfig(`${storageKey}_array`, currentNode.length),
-          renderItem: (itemData) => {
-            const item = itemData.item;
-            const display = getValuePreview(item, maxTextLength);
-            this.Button(id, {
-              name: `${this.TextColor.green(`#${itemData.globalIndex}`)} ${display}`,
-              props: { [`${storageKey}_navigate`]: itemData.globalIndex }
-            });
+          name: this.TextColor.orange('← Back to array'),
+          props: { [closeValueViewProp]: true }
+        }
+      ];
+      if (vvFilter !== null && vvFilter !== undefined) {
+        vvActions.push({
+          name: this.TextColor.brightRed('✖ Clear filter'),
+          props: { [clearValueFilterProp]: true }
+        });
+      }
+      this.Buttons(id, vvActions);
+
+      // When a filter is active, list the matching items so the user can
+      // drill into a specific one. The preview respects the show-keys
+      // filter, so every listed instance reflects the user's selection.
+      if (vvFilter !== null && vvFilter !== undefined) {
+        const matching = [];
+        for (let i = 0; i < currentNode.length; i++) {
+          const item = currentNode[i];
+          if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+          if (!(vvKey in item)) continue;
+          const raw = item[vvKey];
+          const strV = (typeof raw === 'object' && raw !== null)
+            ? JSON.stringify(raw)
+            : String(raw);
+          if (strV === String(vvFilter)) {
+            matching.push({ item, globalIndex: i });
           }
         }
-      );
+
+        this.Text(id, ' ');
+        this.Text(id, `${this.TextColor.bold(`Matching items (${matching.length}):`)}`);
+        await this.Pagination.Button(
+          id,
+          `${storageKey}_valueViewItems`,
+          matching,
+          {
+            ...createPaginationConfig(`${storageKey}_valueViewItems`, matching.length),
+            renderItem: (itemData) => {
+              const { item, globalIndex } = itemData.item;
+              const display = getItemPreviewForArray(item, maxTextLength, showKeys);
+              this.Button(id, {
+                name: `${this.TextColor.green(`#${globalIndex}`)} ${display}`,
+                props: { [`${storageKey}_navigate`]: globalIndex }
+              });
+            }
+          }
+        );
+      }
+
+    } else {
+      // Regular array view
+      this.Text(id, `${this.TextColor.yellow('📚')} Array (${currentNode.length} items)`);
+
+      // ------------------------------------------------------------------
+      // NEW: model info + value-view launcher buttons. Only shown when
+      // the array contains at least one object and a model was detected.
+      // Clicking a "📊 key" button is what "loads" the value view for
+      // that key — nothing happens unless the user clicks one.
+      // ------------------------------------------------------------------
+      if (arrayModel && arrayModel.keys.length > 0) {
+        this.Text(id, this.TextColor.dim(
+          `  model: ${arrayModel.keys.length} key(s) across ` +
+          `${arrayModel.objectCount} object(s)`
+        ));
+
+        const keyLauncherButtons = arrayModel.keys.slice(0, 8).map(k => ({
+          name: `📊 ${k.key} ${this.TextColor.dim(`(${k.count})`)}`,
+          props: { [openValueViewProp]: k.key }
+        }));
+        if (keyLauncherButtons.length > 0) {
+          this.Buttons(id, keyLauncherButtons);
+        }
+      }
+
+      if (currentNode.length === 0) {
+        this.Text(id, `${this.TextColor.dim('(empty array)')}`);
+      } else {
+        await this.Pagination.Button(
+          id, 
+          `${storageKey}_array`, 
+          currentNode, 
+          {
+            ...createPaginationConfig(`${storageKey}_array`, currentNode.length),
+            renderItem: (itemData) => {
+              const item = itemData.item;
+              const display = getItemPreviewForArray(item, maxTextLength, showKeys);
+              this.Button(id, {
+                name: `${this.TextColor.green(`#${itemData.globalIndex}`)} ${display}`,
+                props: { [`${storageKey}_navigate`]: itemData.globalIndex }
+              });
+            }
+          }
+        );
+      }
     }
 
   } else if (currentNode !== null && typeof currentNode === 'object') {
@@ -7889,6 +8364,200 @@ function buildSearchIndex(data) {
   
   traverse(data);
   return index;
+}
+
+// ----------------------------------------------------------------------
+// Array-of-objects model detection.
+//
+// Walks an array and collects the union of every key present in its
+// object items, plus per-key coverage (how many items actually have it).
+// Used by this.JSON() to expose a model of the current array, let the
+// user search a single specific key, and drive the value-view drilldown.
+//
+// Returns null when the array contains no objects at all.
+// ----------------------------------------------------------------------
+function detectArrayModel(arr) {
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+
+  const keyCounts = new Map();
+  let objectCount = 0;
+
+  for (const item of arr) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+    objectCount++;
+    const seen = new Set();
+    for (const k of Object.keys(item)) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+      keyCounts.set(k, (keyCounts.get(k) || 0) + 1);
+    }
+  }
+
+  if (objectCount === 0) return null;
+
+  const keys = Array.from(keyCounts.entries())
+    .map(([key, count]) => ({
+      key,
+      count,
+      coverage: objectCount > 0 ? count / objectCount : 0
+    }))
+    .sort((a, b) => {
+      if (b.coverage !== a.coverage) return b.coverage - a.coverage;
+      return a.key.localeCompare(b.key);
+    });
+
+  return { keys, objectCount, totalItems: arr.length };
+}
+
+// ----------------------------------------------------------------------
+// Aggregate distinct values of one key across all objects of an array.
+// Values are stringified for grouping so primitives and simple objects
+// can be mixed safely. Sorted by frequency (most common first).
+// ----------------------------------------------------------------------
+function aggregateKeyValues(arr, key) {
+  if (!Array.isArray(arr) || !key) return [];
+  const counts = new Map();
+
+  for (const item of arr) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+    if (!(key in item)) continue;
+    const v = item[key];
+    let strV;
+    if (typeof v === 'object' && v !== null) {
+      try { strV = JSON.stringify(v); } catch (_) { strV = String(v); }
+    } else {
+      strV = String(v);
+    }
+    counts.set(strV, (counts.get(strV) || 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value)));
+}
+
+// ----------------------------------------------------------------------
+// Restrict a search index so only entries whose LAST segment matches the
+// given key name remain (case-insensitive). Falsy key = no-op.
+// ----------------------------------------------------------------------
+function filterSearchIndexByKey(searchIndex, key) {
+  if (!key || !Array.isArray(searchIndex)) return searchIndex || [];
+  const lower = String(key).toLowerCase();
+  return searchIndex.filter(entry => entry && entry.key === lower);
+}
+
+// ----------------------------------------------------------------------
+// NEW: Build a "slim" preview object for a search-result value when a
+// show-keys filter is active. Used ONLY for display in the UI.
+//
+//   • plain object        → return an object with ONLY the selected keys
+//                           (recursively, so nested objects are slimmed
+//                           too — matching the array-view previews);
+//   • array of objects    → map each element through the same filter;
+//   • primitive / null    → returned as-is (nothing to slim);
+//   • empty showKeys      → the ORIGINAL value, untouched.
+//
+// This is what guarantees "all instances contain the object with the
+// selected keys if have selected keys to hide/show" in the UI.
+// It is NEVER applied to the data written to disk by save-only mode.
+// ----------------------------------------------------------------------
+function slimSearchResultValue(value, showKeys) {
+  if (!Array.isArray(showKeys) || showKeys.length === 0) return value;
+
+  const showSet = new Set(showKeys);
+
+  const slim = (v) => {
+    if (v === null || v === undefined) return v;
+    if (Array.isArray(v)) return v.map(slim);
+    if (typeof v !== 'object') return v;
+
+    const out = {};
+    for (const k of Object.keys(v)) {
+      if (showSet.has(k)) {
+        out[k] = slim(v[k]);
+      }
+    }
+    return out;
+  };
+
+  return slim(value);
+}
+
+// ----------------------------------------------------------------------
+// NEW: Enrich search results so each entry carries the FULL original
+// object (or array) it belongs to — never a slimmed copy.
+//
+// A search result only carries the matched path + the matched value.
+// For save-only mode (and for "drill into match" navigation) we want the
+// whole enclosing object for that match, exactly as it exists in the
+// source dataset — with EVERY key, not just the matched ones.
+//
+// Strategy: use the path (e.g. "users[3].email" or "users[3]") to walk
+// the source data and grab the deepest OBJECT or ARRAY that CONTAINS the
+// match. That full object is stored on `_fullObject`. The search-result
+// `value` field itself is left untouched, so the display layer keeps
+// working exactly as it does today.
+//
+// Called AFTER the search engine (weighted or token) has produced its
+// results — never during the search itself — so this has zero impact on
+// search behaviour, ranking, or limits.
+// ----------------------------------------------------------------------
+function enrichSearchResultsWithFullObjects(results, sourceData) {
+  if (!Array.isArray(results) || results.length === 0) return results;
+  if (sourceData === null || sourceData === undefined) return results;
+
+  // Resolve a bracket/dot path string ("a.b[2].c") into a value walk.
+  // Returns `{ value, parent }` where `parent` is the nearest enclosing
+  // object/array, or null if the path cannot be resolved.
+  const resolvePathWithParent = (pathStr) => {
+    if (!pathStr || pathStr === 'root') return { value: sourceData, parent: sourceData };
+
+    const segments = [];
+    const re = /([^.[\]]+)|\[(\d+)\]/g;
+    let m;
+    while ((m = re.exec(pathStr)) !== null) {
+      if (m[1] !== undefined) segments.push(m[1]);
+      else segments.push(parseInt(m[2], 10));
+    }
+
+    let node = sourceData;
+    let parent = null;
+    for (let i = 0; i < segments.length; i++) {
+      if (node === null || node === undefined) return { value: undefined, parent: null };
+      const seg = segments[i];
+      // Remember the parent before descending (only for object/array parents)
+      if (node !== null && typeof node === 'object') parent = node;
+      node = typeof seg === 'number' ? node[seg] : node[seg];
+    }
+    return { value: node, parent: parent !== null ? parent : node };
+  };
+
+  // Determine which full object to expose for a given result entry.
+  //
+  //   • If the matched value is itself an object/array → use it.
+  //   • If the parent (nearest enclosing object/array) is available →
+  //     use that. This is what makes a match on "users[3].email" expose
+  //     the entire "users[3]" object including every other key.
+  //   • Fallback → the value itself.
+  const pickFullObject = (pathStr, valueFallback) => {
+    const { value, parent } = resolvePathWithParent(pathStr);
+    if (value !== null && typeof value === 'object') return value;
+    if (parent !== null && parent !== undefined && typeof parent === 'object') return parent;
+    return valueFallback;
+  };
+
+  for (const r of results) {
+    if (!r || typeof r !== 'object') continue;
+    try {
+      const full = pickFullObject(r.path, r.value);
+      // Non-enumerable-friendly plain property; JSON-serialised normally.
+      r._fullObject = full;
+    } catch (_) {
+      r._fullObject = r.value;
+    }
+  }
+
+  return results;
 }
 
 // ----------------------------------------------------------------------
@@ -16275,7 +16944,7 @@ function _sbMakeJSONViewerFunc(jsonPath, preloadedData, preloadedIndex) {
           // no intermediate screen. The data view renders immediately.
           await this.JSON(id, { name: instanceName });
         },
-        { refreshMode: false }
+        { refreshMode: true }
       );
     }
   };
