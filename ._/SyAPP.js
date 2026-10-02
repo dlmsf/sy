@@ -6932,6 +6932,7 @@ this.JSON = async (id, config = {}) => {
   const setValueFilterProp = `${storageKey}_setValueFilter`;
   const clearValueFilterProp = `${storageKey}_clearValueFilter`;
   const closeValueViewProp = `${storageKey}_closeValueView`;
+  const openSearchResultProp = `${storageKey}_openSearchResult`;
 
   if (currentProps[backProp]) {
     if (storage.searchResults) {
@@ -7212,6 +7213,19 @@ this.JSON = async (id, config = {}) => {
     delete currentProps[closeValueViewProp];
   }
 
+  // Clicking a search result now enters the underlying FULL object
+  // (`_fullObject`) rather than the raw result metadata. A marker
+  // object is pushed as the FIRST searchPath segment so the walk logic
+  // can unwrap it; deeper navigation (keys, array indices) keeps
+  // pushing regular segments on top.
+  if (currentProps[openSearchResultProp] !== undefined) {
+    const idx = currentProps[openSearchResultProp];
+    if (storage.searchResults && storage.searchResults[idx] !== undefined) {
+      storage.searchPath = [{ __searchResult: idx }];
+    }
+    delete currentProps[openSearchResultProp];
+  }
+
   // ------------------------------------------------------------------
   // NEW: detect the model of the tree node the user is currently on.
   //
@@ -7284,10 +7298,13 @@ this.JSON = async (id, config = {}) => {
         storage.searchResults,
         storage.data
       );
-      storage.searchPath = [];
       
-      // Only reset pagination if the search query actually changed
+      // Only reset navigation and pagination when the search query
+      // actually changed. Preserving searchPath across refreshes is
+      // what lets the user stay inside a search result's object while
+      // the HUD auto-refreshes.
       if (searchQueryChanged) {
+        storage.searchPath = [];
         this.Pagination.Reset(id, `${storageKey}_searchResults`);
         this.Pagination.Reset(id, `${storageKey}_searchNav`);
         this.Storages.Set(id, lastSearchQueryKey, storage.searchQuery);
@@ -7510,7 +7527,9 @@ this.JSON = async (id, config = {}) => {
           : this.TextColor.dim('(any key)'))
       );
 
-      const searchKeyButtons = detectedModel.keys.slice(0, 8).map(k => {
+      // NOTE: no slice() — every key of the detected model is exposed
+      // so no key is ever silently cut from the config panel.
+      const searchKeyButtons = detectedModel.keys.map(k => {
         const active = searchConfig.searchKey === k.key;
         return {
           name: active
@@ -7549,7 +7568,9 @@ this.JSON = async (id, config = {}) => {
           : this.TextColor.dim('(all keys shown)'))
       );
 
-      const showKeyButtons = detectedModel.keys.slice(0, 8).map(k => {
+      // NOTE: no slice() — every key of the detected model is exposed
+      // so no key is ever silently cut from the "Show Keys" filter.
+      const showKeyButtons = detectedModel.keys.map(k => {
         const active = showKeys.includes(k.key);
         return {
           name: active
@@ -7741,7 +7762,17 @@ this.JSON = async (id, config = {}) => {
     if (storage.searchPath.length > 0) {
       currentNode = storage.searchResults;
       for (const seg of storage.searchPath) {
-        if (typeof seg === 'number') {
+        if (seg && typeof seg === 'object' && seg.__searchResult !== undefined) {
+          // Marker: unwrap the full object of the referenced search
+          // result so clicking a result lands on the actual data
+          // object instead of the metadata wrapper.
+          const result = storage.searchResults[seg.__searchResult];
+          if (result) {
+            currentNode = result._fullObject !== undefined ? result._fullObject : result.value;
+          } else {
+            currentNode = null;
+          }
+        } else if (typeof seg === 'number') {
           currentNode = currentNode[seg];
         } else {
           currentNode = currentNode?.[seg];
@@ -7974,7 +8005,7 @@ this.JSON = async (id, config = {}) => {
 
             this.Button(id, {
               name: `${this.TextColor.brightBlue(`#${itemData.globalIndex + 1}`)} ${item.type === 'key' ? '🔑' : '📝'} ${abbreviateText(item.path, maxTextLength)}${matchInfo}${similarity}${valuePart}`,
-              props: { [`${storageKey}_navigate`]: itemData.globalIndex }
+              props: { [openSearchResultProp]: itemData.globalIndex }
             });
           }
         }
@@ -8007,11 +8038,18 @@ this.JSON = async (id, config = {}) => {
         );
       }
     } else if (currentNode !== null && typeof currentNode === 'object') {
-      const keys = Object.keys(currentNode);
+      const allKeys = Object.keys(currentNode);
+      // Apply the show-keys filter (display only) so entering an
+      // object inside a search result honours the user's key selection.
+      let keys = allKeys;
+      if (Array.isArray(showKeys) && showKeys.length > 0) {
+        const filterSet = new Set(showKeys);
+        keys = allKeys.filter(k => filterSet.has(k));
+      }
       this.Text(id, `${this.TextColor.magenta('🔑')} Object (${keys.length} keys)`);
 
       if (keys.length === 0) {
-        this.Text(id, `${this.TextColor.dim('(empty object)')}`);
+        this.Text(id, `${this.TextColor.dim(allKeys.length > 0 ? '(all keys hidden by filter)' : '(empty object)')}`);
       } else {
         const keyItems = keys.map(key => ({ key, value: currentNode[key] }));
 
@@ -8174,8 +8212,11 @@ this.JSON = async (id, config = {}) => {
           `${arrayModel.objectCount} object(s)`
         ));
 
-        const keyLauncherButtons = arrayModel.keys.slice(0, 8).map(k => ({
-          name: `📊 ${k.key} ${this.TextColor.dim(`(${k.count})`)}`,
+        // NOTE: no slice() — every key of the detected model is exposed
+        // so no key is ever silently cut from the array-view launchers.
+        // The `(count)` suffix was also removed per the request.
+        const keyLauncherButtons = arrayModel.keys.map(k => ({
+          name: `📊 ${k.key}`,
           props: { [openValueViewProp]: k.key }
         }));
         if (keyLauncherButtons.length > 0) {
@@ -8207,11 +8248,19 @@ this.JSON = async (id, config = {}) => {
 
   } else if (currentNode !== null && typeof currentNode === 'object') {
     // Object display
-    const keys = Object.keys(currentNode);
+    const allKeys = Object.keys(currentNode);
+    // Apply the show-keys filter (display only) so entering an object
+    // honours the user's key selection, whether the object came from
+    // the tree, the array view, or a search result.
+    let keys = allKeys;
+    if (Array.isArray(showKeys) && showKeys.length > 0) {
+      const filterSet = new Set(showKeys);
+      keys = allKeys.filter(k => filterSet.has(k));
+    }
     this.Text(id, `${this.TextColor.magenta('🔑')} Object (${keys.length} keys)`);
 
     if (keys.length === 0) {
-      this.Text(id, `${this.TextColor.dim('(empty object)')}`);
+      this.Text(id, `${this.TextColor.dim(allKeys.length > 0 ? '(all keys hidden by filter)' : '(empty object)')}`);
     } else {
       const keyItems = keys.map(key => ({ key, value: currentNode[key] }));
 
@@ -16951,9 +17000,51 @@ function _sbMakeJSONViewerFunc(jsonPath, preloadedData, preloadedIndex) {
 }
 
 function _installCtrlC(syapp) {
+  // ------------------------------------------------------------------
+  // Terminal state cleanup on exit.
+  //
+  // When the process is terminated while the HUD has mouse tracking
+  // enabled, the terminal keeps emitting SGR mouse sequences (e.g.
+  // "51;56;25M") into the shell, which caused the "spam of strange
+  // characters" after Ctrl+C on a JSON / JSONL direct load.
+  //
+  // We explicitly disable every mouse mode, restore the cursor, drop
+  // raw mode and detach stdin listeners BEFORE calling process.exit.
+  // ------------------------------------------------------------------
+  const cleanupTerminal = () => {
+    try {
+      if (syapp && syapp.HUD) {
+        try { syapp.HUD.cleanupMenuState && syapp.HUD.cleanupMenuState(); } catch (_) {}
+        try { syapp.HUD.cleanupAll && syapp.HUD.cleanupAll(); } catch (_) {}
+        try { syapp.HUD.cleanupMouseSupport && syapp.HUD.cleanupMouseSupport(); } catch (_) {}
+        try { syapp.HUD.resetTerminalModes && syapp.HUD.resetTerminalModes(); } catch (_) {}
+      }
+    } catch (_) {}
+
+    // Belt-and-braces: write the raw reset sequences directly, so even
+    // if the HUD helpers throw we always disable mouse tracking and
+    // restore the cursor.
+    try {
+      stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h');
+    } catch (_) {}
+
+    try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+    try { stdin.removeAllListeners('data'); } catch (_) {}
+    try { stdin.removeAllListeners('keypress'); } catch (_) {}
+  };
+
+  // OS-level SIGINT (e.g. Ctrl+C pressed outside raw-mode menus).
+  process.on('SIGINT', () => {
+    cleanupTerminal();
+    process.exit(0);
+  });
+
   syapp.HUD.on('ctrl+c', async () => {
     const builder = syapp.Funcs.get('__selfbuilder__')
-    if (!builder) { process.exit(0) }
+    if (!builder) {
+      cleanupTerminal();
+      process.exit(0)
+    }
     try {
       const name = await syapp.HUD.ask('\nSave as: ')
       const trimmed = String(name || '').trim()
@@ -16963,6 +17054,7 @@ function _installCtrlC(syapp) {
         console.log(ColorText.brightGreen(`💾 Saved "${trimmed}" → ${_getSaveFile(trimmed)}`))
       }
     } catch (_) { }
+    cleanupTerminal();
     process.exit(0)
   })
 }
