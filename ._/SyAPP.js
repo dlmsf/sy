@@ -9561,12 +9561,15 @@ function levenshteinDistance(str1, str2) {
               });
             }
     
-            // Page indicator
+            // Page indicator — clickable to enter "go to page" mode.
+            // Visual design is unchanged: it still renders as a single
+            // compact button showing "X / Y", sitting between Prev and
+            // Next exactly as before.
             const indicatorText = custom.pageIndicatorText || 
                                  `${storage.actual_page} / ${totalPages}`;
             navButtons.push({
               name: indicatorText,
-              props: {}
+              props: { [`pagination_goto_${name}`]: true }
             });
     
             if (storage.actual_page < totalPages) {
@@ -9578,6 +9581,69 @@ function levenshteinDistance(str1, str2) {
     
             if (navButtons.length > 0) {
               this.Buttons(id, navButtons);
+            }
+    
+            // --------------------------------------------------------
+            // INLINE "GO TO PAGE" FIELD (opened by the page indicator)
+            // --------------------------------------------------------
+            // Clicking the page indicator switches the pagination into
+            // "goto" mode, which renders a compact this.Field() right
+            // below the navigation row. The user types a page number
+            // and presses Enter to jump straight to that page.
+            //
+            //   • Enter with a valid page number → jump to that page.
+            //   • Enter with an empty value      → cancel and return
+            //                                       to the normal view.
+            //   • Escape (handled by HUD)        → field stays open;
+            //                                      pressing Enter then
+            //                                      cancels it.
+            //
+            // The pagination buttons themselves are NOT modified, so
+            // the compact layout of the navigation row is preserved.
+            // --------------------------------------------------------
+            const gotoModeKey = `pagination_goto_mode_${name}`;
+            const gotoFieldName = `pagination_goto_field_${name}`;
+    
+            // Click handler: entering goto mode seeds an empty field
+            // so the user can type a fresh page number from scratch.
+            // Empty + Enter is the natural "cancel" path.
+            if (currentProps[`pagination_goto_${name}`]) {
+              delete currentProps[`pagination_goto_${name}`];
+              if (totalPages > 1) {
+                this.Storages.Set(id, gotoModeKey, true);
+                this.Storages.Set(id, `field_${gotoFieldName}`, '');
+              }
+            }
+    
+            // Only render the field when it is actually meaningful
+            // (more than one page) and goto mode is currently active.
+            if (totalPages > 1 && this.Storages.Get(id, gotoModeKey) === true) {
+              this.Field(id, gotoFieldName, {
+                label: 'Go to page',
+                initialValue: '',
+                maxWidth: 6,
+                onChange: (value) => {
+                  // Always leave goto mode so the field disappears on
+                  // the next render pass.
+                  this.Storages.Set(id, gotoModeKey, false);
+    
+                  const trimmed = String(value == null ? '' : value).trim();
+    
+                  // Enter with empty value → cancel and return.
+                  if (trimmed === '') return;
+    
+                  const target = parseInt(trimmed, 10);
+                  if (!isNaN(target) && target >= 1 && target <= totalPages) {
+                    const currentStorage = this.Storages.Get(id, name);
+                    if (currentStorage) {
+                      currentStorage.actual_page = target;
+                      currentStorage.total_pages = totalPages;
+                      this.Storages.Set(id, name, currentStorage);
+                    }
+                  }
+                  // Invalid input → silently cancel; current page kept.
+                }
+              });
             }
           }
         }
