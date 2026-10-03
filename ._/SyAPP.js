@@ -675,70 +675,29 @@ Examples:
 }
 
 
+/**
+ * Split an array into fixed-size pages.
+ *
+ * NOTE: this used to silently DROP items whose key set was not a subset
+ * of the FIRST item's key set (the "object_model" heuristic). That made
+ * mixed-schema arrays — very common in real JSON — lose almost every
+ * element, which is exactly the "only 1 instance shows up" symptom.
+ *
+ * The current implementation includes EVERY item, in original order, so
+ * every element of the source array is guaranteed to be reachable.
+ */
 const BuildPagination = (fullarray = [], items_per_page = 5) => {
-  let pagination = [{
-       page : 1,
-       list : []
-   }]
-   pagination.splice(0,1)
-   
-   let object_model = {}
-   let count = 0
-   let type = typeof fullarray[0]
-   
-
-   fullarray.forEach((t,index) => {
-       if (count == 0) {
-           if(index == 0){
-               type = typeof t
-               if(typeof t == 'object'){
-                   object_model = t
-               }
-           }
-           if(typeof t == type){
-               if(typeof t == 'object'){
-                  let fullinclude = true
-                  Object.keys(t).forEach(k => {
-                      if(!Object.keys(object_model).includes(k)){
-                          fullinclude = false
-                      }
-                  })
-                   if(fullinclude){
-                       pagination.push({ page: pagination.length + 1, list: [] })
-                   pagination[pagination.length - 1].list.push(t)
-                   count += 1
-                   }
-               } else {
-                  pagination.push({ page: pagination.length + 1, list: [] })
-                   pagination[pagination.length - 1].list.push(t)
-                   count += 1
-               }
-               
-           }
-           
-       } else {
-           if(typeof t == type){
-               if(typeof t == 'object'){
-                  let fullinclude = true
-                  Object.keys(t).forEach(k => {
-                      if(!Object.keys(object_model).includes(k)){
-                          fullinclude = false
-                      }
-                  })
-                   if(fullinclude){
-                   pagination[pagination.length - 1].list.push(t)
-                   count += 1
-                   }
-               } else {
-                   pagination[pagination.length - 1].list.push(t)
-                   count += 1
-               }
-           }
-       }
-       
-       if (count == items_per_page) { count = 0 }
-   })
-return pagination
+  const arr = Array.isArray(fullarray) ? fullarray : [];
+  const perPage = Math.max(1, items_per_page | 0) || 1;
+  const total = arr.length;
+  const pages = [];
+  for (let start = 0; start < total; start += perPage) {
+    pages.push({
+      page: pages.length + 1,
+      list: arr.slice(start, Math.min(start + perPage, total))
+    });
+  }
+  return pages;
 }
 
 class ColorText {
@@ -4261,6 +4220,213 @@ class HTTPModelValidator {
   }
 }
 
+// ============================================================
+// STREAMING JSON / JSONL LOADER
+// ============================================================
+//
+// Node.js caps the maximum length of a single JS string at roughly
+// 512 MB ("Cannot create a string longer than 0x1fffffe8 characters").
+// Naively reading a multi-hundred-MB JSON file with `readFileSync(path,
+// 'utf8')` therefore crashes for large datasets.
+//
+// These helpers load JSON / JSONL files WITHOUT ever materialising the
+// entire file as one string:
+//
+//   • JSONL files are streamed line-by-line.
+//   • JSON files whose top-level structure is an array are streamed
+//     element-by-element using a depth/string-aware tokenizer.
+//   • Files under ~400 MB keep using the fast readFileSync path, so
+//     nothing changes for typical datasets.
+//
+// Memory usage is bounded by the size of the LARGEST top-level item
+// (or line, for JSONL), never by the size of the whole file.
+// ============================================================
+
+/**
+ * Stream the top-level items of a JSON array file. Yields each complete
+ * element's raw source text (still encoded as JSON). Handles nested
+ * objects/arrays, string escapes and whitespace correctly.
+ * @private
+ */
+async function* _syappStreamJsonArrayItems(filePath, chunkSize = 256 * 1024) {
+  const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: chunkSize });
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let arrayStarted = false;
+  let itemBuf = '';
+  let itemHasContent = false;
+  let itemComplete = false;
+
+  for await (const chunk of stream) {
+    for (let i = 0; i < chunk.length; i++) {
+      const c = chunk[i];
+
+      if (!arrayStarted) {
+        if (c === '[') { arrayStarted = true; continue; }
+        if (/\s/.test(c)) continue;
+        throw new Error('Not a top-level JSON array');
+      }
+
+      if (inString) {
+        itemBuf += c;
+        if (escape) escape = false;
+        else if (c === '\\') escape = true;
+        else if (c === '"') inString = false;
+        continue;
+      }
+
+      if (itemComplete) {
+        if (/\s/.test(c)) continue;
+        if (c === ',') {
+          itemComplete = false;
+          yield itemBuf;
+          itemBuf = '';
+          itemHasContent = false;
+          continue;
+        }
+        if (c === ']') {
+          yield itemBuf;
+          return;
+        }
+        throw new Error('Unexpected character after JSON array item: ' + JSON.stringify(c));
+      }
+
+      if (c === '"') {
+        inString = true;
+        itemBuf += c;
+        itemHasContent = true;
+        continue;
+      }
+      if (c === '[' || c === '{') {
+        depth++;
+        itemBuf += c;
+        itemHasContent = true;
+        continue;
+      }
+      if (c === ']' || c === '}') {
+        if (depth === 0) {
+          if (c === ']') {
+            if (itemHasContent) yield itemBuf;
+            return;
+          }
+          throw new Error('Unexpected "}" at top level');
+        }
+        depth--;
+        itemBuf += c;
+        if (depth === 0) itemComplete = true;
+        continue;
+      }
+      if (c === ',' && depth === 0) {
+        if (itemHasContent) {
+          yield itemBuf;
+          itemBuf = '';
+          itemHasContent = false;
+        }
+        continue;
+      }
+      if (/\s/.test(c) && depth === 0 && !itemHasContent) {
+        continue;
+      }
+      itemBuf += c;
+      itemHasContent = true;
+    }
+  }
+  if (itemHasContent) yield itemBuf;
+}
+
+/**
+ * Parse a JSON or JSONL file without ever building a single string
+ * larger than the largest top-level item (or line, for JSONL).
+ *
+ * @param {string} filePath - Absolute path to the .json / .jsonl file.
+ * @param {Function} [onProgress] - (bytesRead, totalBytes) callback.
+ * @returns {Promise<any>} Parsed data.
+ * @private
+ */
+async function _syappLoadJsonFile(filePath, onProgress) {
+  const stat = fs.statSync(filePath);
+  const totalBytes = stat.size;
+  const lower = filePath.toLowerCase();
+  const isJsonl = lower.endsWith('.jsonl');
+
+  // Files under ~400 MB are read in one shot — the fast, well-tested
+  // path, well below Node's ~512MB hard cap.
+  const SAFE_STRING_LIMIT = 400 * 1024 * 1024;
+  if (totalBytes < SAFE_STRING_LIMIT) {
+    const content = fs.readFileSync(filePath, 'utf8');
+    if (typeof onProgress === 'function') onProgress(totalBytes, totalBytes);
+    if (isJsonl) {
+      return content
+        .split(/\r?\n/)
+        .filter((line) => line.trim() !== '')
+        .map((line) => JSON.parse(line));
+    }
+    return JSON.parse(content);
+  }
+
+  // Large JSONL: stream line by line.
+  if (isJsonl) {
+    const data = [];
+    let bytesRead = 0;
+    const stream = fs.createReadStream(filePath, { encoding: 'utf8', highWaterMark: 256 * 1024 });
+    let carry = '';
+    for await (const chunk of stream) {
+      bytesRead += Buffer.byteLength(chunk, 'utf8');
+      if (typeof onProgress === 'function') onProgress(bytesRead, totalBytes);
+      const combined = carry + chunk;
+      let start = 0;
+      let idx;
+      while ((idx = combined.indexOf('\n', start)) !== -1) {
+        let line = combined.slice(start, idx);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line.trim() !== '') data.push(JSON.parse(line));
+        start = idx + 1;
+      }
+      carry = combined.slice(start);
+    }
+    if (carry.trim() !== '') data.push(JSON.parse(carry));
+    if (typeof onProgress === 'function') onProgress(totalBytes, totalBytes);
+    return data;
+  }
+
+  // Large JSON: only top-level arrays can be streamed by the tokenizer.
+  // Object-rooted giant JSON genuinely needs a full string; fall back
+  // to readFileSync (which will throw the standard string-limit error
+  // for files above the cap — a real Node limitation).
+  const fd = fs.openSync(filePath, 'r');
+  let firstNonWs = '';
+  try {
+    const buf = Buffer.alloc(1024);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    for (let i = 0; i < n; i++) {
+      const ch = String.fromCharCode(buf[i]);
+      if (ch !== ' ' && ch !== '\t' && ch !== '\n' && ch !== '\r') {
+        firstNonWs = ch;
+        break;
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  if (firstNonWs !== '[') {
+    const content = fs.readFileSync(filePath, 'utf8');
+    if (typeof onProgress === 'function') onProgress(totalBytes, totalBytes);
+    return JSON.parse(content);
+  }
+
+  const data = [];
+  let bytesRead = 0;
+  for await (const itemStr of _syappStreamJsonArrayItems(filePath)) {
+    data.push(JSON.parse(itemStr));
+    bytesRead += itemStr.length;
+    if (typeof onProgress === 'function') onProgress(bytesRead, totalBytes);
+  }
+  if (typeof onProgress === 'function') onProgress(totalBytes, totalBytes);
+  return data;
+}
+
 // --------------------------- SyAPP_Func Class ---------------------------
 
 /**
@@ -6987,8 +7153,7 @@ this.JSON = async (id, config = {}) => {
       storage.historyStack.push(storage.filePath);
     }
     try {
-      const content = fs.readFileSync(newPath, 'utf8');
-      const data = parseJsonOrJsonl(newPath, content);
+      const data = await _syappLoadJsonFile(newPath);
       storage.data = data;
       storage.filePath = newPath;
       storage.path = [];
@@ -6996,6 +7161,7 @@ this.JSON = async (id, config = {}) => {
       storage.searchPath = [];
       storage.searchQuery = '';
       this.Storages.Delete(id, searchFieldName);
+      this.Storages.Delete(id, `field_${searchFieldName}`);
       this.Storages.Set(id, lastSearchQueryKey, '');
       const searchIndex = buildSearchIndex(data);
       this.Storages.Set(id, searchIndexKey, searchIndex);
@@ -7009,10 +7175,19 @@ this.JSON = async (id, config = {}) => {
   if (currentProps[returnProp]) {
     delete currentProps[returnProp];
     if (storage.historyStack && storage.historyStack.length > 0) {
-      const prevPath = storage.historyStack.pop();
+      const entry = storage.historyStack.pop();
+      const prevPath = (entry && typeof entry === 'object') ? entry.path : entry;
       try {
-        const content = fs.readFileSync(prevPath, 'utf8');
-        const data = parseJsonOrJsonl(prevPath, content);
+        let data, searchIndex;
+        if (entry && typeof entry === 'object' && entry.data !== undefined) {
+          // Cached data available — return instantly. This is what
+          // avoids a second full reload of a huge JSON file.
+          data = entry.data;
+          searchIndex = entry.searchIndex || buildSearchIndex(data);
+        } else {
+          data = await _syappLoadJsonFile(prevPath);
+          searchIndex = buildSearchIndex(data);
+        }
         storage.data = data;
         storage.filePath = prevPath;
         storage.path = [];
@@ -7020,8 +7195,8 @@ this.JSON = async (id, config = {}) => {
         storage.searchPath = [];
         storage.searchQuery = '';
         this.Storages.Delete(id, searchFieldName);
+        this.Storages.Delete(id, `field_${searchFieldName}`);
         this.Storages.Set(id, lastSearchQueryKey, '');
-        const searchIndex = buildSearchIndex(data);
         this.Storages.Set(id, searchIndexKey, searchIndex);
         this.Storages.Set(id, storageKey, storage);
         this.Alert(id, `↩️ Returned to: ${path.basename(prevPath)}`, { duration: 2000 });
@@ -7331,8 +7506,7 @@ this.JSON = async (id, config = {}) => {
     if (selected.length > 0) {
       const filePath = selected[0];
       try {
-        const content = fs.readFileSync(filePath, 'utf8');
-        const data = parseJsonOrJsonl(filePath, content);
+        const data = await _syappLoadJsonFile(filePath);
         storage.data = data;
         storage.filePath = filePath;
         storage.path = [];
@@ -7341,6 +7515,7 @@ this.JSON = async (id, config = {}) => {
         storage.searchQuery = '';
         storage.historyStack = [];
         this.Storages.Delete(id, searchFieldName);
+        this.Storages.Delete(id, `field_${searchFieldName}`);
         this.Storages.Set(id, lastSearchQueryKey, '');
 
         const searchIndex = buildSearchIndex(data);
@@ -7824,6 +7999,11 @@ this.JSON = async (id, config = {}) => {
   // optionally restricted to a set of "show keys" chosen by the user
   // in the config panel. Used whenever the current node is an array of
   // objects, so items show their actual content instead of "Object(N)".
+  //
+  // IMPORTANT: each value is truncated to a very short preview
+  // (VALUE_CAP characters) so that a single huge value — e.g. a long
+  // string sitting in the first key — can never blow up the whole
+  // preview line. The key name itself is kept intact.
   const getItemPreviewForArray = (item, maxLength = maxTextLength, showKeysList = []) => {
     if (item === null) return 'null';
     if (typeof item !== 'object') return abbreviateText(item, maxLength);
@@ -7839,6 +8019,7 @@ this.JSON = async (id, config = {}) => {
       }
     }
 
+    const VALUE_CAP = 10;
     const parts = [];
     const budget = Math.max(8, maxLength - 4);
     for (const k of keys) {
@@ -7847,7 +8028,10 @@ this.JSON = async (id, config = {}) => {
       if (v === null) vs = 'null';
       else if (Array.isArray(v)) vs = `[${v.length}]`;
       else if (typeof v === 'object') vs = '{…}';
-      else vs = String(v);
+      else {
+        vs = String(v);
+        if (vs.length > VALUE_CAP) vs = vs.slice(0, VALUE_CAP) + '…';
+      }
       const piece = `${k}:${vs}`;
       if (parts.length > 0 && (parts.join(', ').length + piece.length + 2) > budget) {
         parts.push('…');
@@ -8061,8 +8245,19 @@ this.JSON = async (id, config = {}) => {
             ...createPaginationConfig(`${storageKey}_searchNav`, keyItems.length),
             renderItem: (itemData) => {
               const { key, value } = itemData.item;
-              const keyDisplay = abbreviateText(key, Math.floor(maxTextLength / 2));
-              const valuePreview = getValuePreview(value, Math.floor(maxTextLength / 2));
+              // FULL key (never truncated) + a short content preview,
+              // capped at 10 chars for string values so a huge value in
+              // the first key cannot blow up the line.
+              const keyDisplay = String(key);
+              let valuePreview;
+              if (Array.isArray(value)) {
+                valuePreview = `Array(${value.length})`;
+              } else if (value !== null && typeof value === 'object') {
+                valuePreview = `Object(${Object.keys(value).length} keys)`;
+              } else {
+                const s = String(value);
+                valuePreview = s.length > 10 ? s.slice(0, 10) + '…' : s;
+              }
 
               this.Button(id, {
                 name: `${this.TextColor.cyan(keyDisplay)}: ${this.TextColor.dim(valuePreview)}`,
@@ -8272,12 +8467,22 @@ this.JSON = async (id, config = {}) => {
           ...createPaginationConfig(`${storageKey}_object`, keyItems.length),
           renderItem: (itemData) => {
             const { key, value } = itemData.item;
-            const keyDisplay = abbreviateText(key, Math.floor(maxTextLength / 2));
-            const valuePreview = getValuePreview(value, Math.floor(maxTextLength / 2));
+            // FULL key (never truncated) + a short content preview,
+            // capped at 10 chars for string values.
+            const keyDisplay = String(key);
+            let valuePreview;
+            if (Array.isArray(value)) {
+              valuePreview = `Array(${value.length})`;
+            } else if (value !== null && typeof value === 'object') {
+              valuePreview = `Object(${Object.keys(value).length} keys)`;
+            } else {
+              const s = String(value);
+              valuePreview = s.length > 10 ? s.slice(0, 10) + '…' : s;
+            }
 
             let buttonName = `${this.TextColor.cyan(keyDisplay)}: ${this.TextColor.dim(valuePreview)}`;
 
-            if (typeof value === 'string' && value.length > maxTextLength) {
+            if (typeof value === 'string' && value.length > 10) {
               buttonName += ` ${this.TextColor.brightYellow('📖')}`;
             }
 
@@ -16860,7 +17065,7 @@ async function _sbLoadJsonWithProgress(filePath) {
   const barLen = 30;
   const useBar = !!process.stderr.isTTY;
 
-  const renderBar = (bytesRead, phase) => {
+  const renderBar = (bytesRead) => {
     if (!useBar) return;
     const pct = totalBytes > 0
       ? Math.min(100, Math.floor((bytesRead / totalBytes) * 100))
@@ -16869,76 +17074,40 @@ async function _sbLoadJsonWithProgress(filePath) {
     const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
     const readStr = _sbFormatBytes(bytesRead);
     process.stderr.write(
-      `\r⏳ ${phase} ${fileName} [${bar}] ${String(pct).padStart(3)}% (${readStr}/${totalStr})`
+      `\r⏳ Reading ${fileName} [${bar}] ${String(pct).padStart(3)}% (${readStr}/${totalStr})`
     );
   };
 
   if (!useBar) {
     process.stderr.write(`⏳ Loading ${fileName} (${totalStr})...\n`);
-  }
-
-  // ---------- Phase 1: read ----------
-  renderBar(0, 'Reading ');
-  const chunks = [];
-  let bytesRead = 0;
-  await new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
-    stream.on('data', (chunk) => {
-      chunks.push(chunk);
-      bytesRead += chunk.length;
-      renderBar(bytesRead, 'Reading ');
-    });
-    stream.on('end', resolve);
-    stream.on('error', reject);
-  });
-  if (useBar) process.stderr.write('\n');
-
-  const content = Buffer.concat(chunks).toString('utf8');
-
-  // ---------- Phase 2: parse ----------
-  if (useBar) process.stderr.write(`\r⏳ Parsing ${fileName}...`);
-  else process.stderr.write(`⏳ Parsing ${fileName}...\n`);
-
-  let data;
-  const isJsonl = fileName.toLowerCase().endsWith('.jsonl');
-  if (isJsonl) {
-    data = content
-      .split(/\r?\n/)
-      .filter((l) => l.trim() !== '')
-      .map((l) => JSON.parse(l));
   } else {
-    data = JSON.parse(content);
+    renderBar(0);
   }
+
+  // ---------- Read + parse (streaming-aware) ----------
+  let data;
+  try {
+    data = await _syappLoadJsonFile(filePath, (bytesRead) => renderBar(bytesRead));
+  } catch (err) {
+    if (useBar) process.stderr.write('\n');
+    throw err;
+  }
+  if (useBar) process.stderr.write('\n');
 
   const topLevelCount = Array.isArray(data)
     ? data.length
     : (data && typeof data === 'object' ? Object.keys(data).length : 1);
 
-  if (useBar) {
-    process.stderr.write(
-      `\r✅ Parsed ${fileName} — ${topLevelCount.toLocaleString()} top-level item(s) (${totalStr})\n`
-    );
-  } else {
-    process.stderr.write(
-      `✅ Parsed — ${topLevelCount.toLocaleString()} top-level item(s) (${totalStr})\n`
-    );
-  }
+  process.stderr.write(
+    `✅ Parsed ${fileName} — ${topLevelCount.toLocaleString()} top-level item(s) (${totalStr})\n`
+  );
 
-  // ---------- Phase 3: index ----------
-  if (useBar) process.stderr.write(`\r⏳ Building search index...`);
-  else process.stderr.write(`⏳ Building search index...\n`);
-
+  // ---------- Build search index ----------
+  process.stderr.write(`⏳ Building search index...\n`);
   const searchIndex = _sbJvBuildIndex(data);
-
-  if (useBar) {
-    process.stderr.write(
-      `\r✅ Built search index — ${searchIndex.length.toLocaleString()} searchable entries\n`
-    );
-  } else {
-    process.stderr.write(
-      `✅ Built search index — ${searchIndex.length.toLocaleString()} searchable entries\n`
-    );
-  }
+  process.stderr.write(
+    `✅ Built search index — ${searchIndex.length.toLocaleString()} searchable entries\n`
+  );
 
   return { data, searchIndex };
 }
