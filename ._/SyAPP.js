@@ -1918,6 +1918,10 @@ if (configuration.remember) {
       // the user was already scrolled mid-list).
       let scrollOffset = this._lastScrollOffset || 0;
       let maxVisibleLines = 1;
+      // Total rows actually available for the scrollable area (computed by
+      // computeViewport below). Used so textview items, which occupy more
+      // than one row, never overflow the terminal height.
+      let availableRowsForScrollable = 1;
 
       // ------------------------------------------------------------------
       // PER-LINE HORIZONTAL SCROLL STATE
@@ -2009,7 +2013,6 @@ if (configuration.remember) {
         if (question) {
           headerLines = question.split('\n').length + 1;
         }
-        // Reserve space for pinned-top and pinned-bottom areas + separators
         const topSeparatorRows = hasPinnedTopArea ? 1 : 0;
         const topRows = hasPinnedTopArea
           ? (pinnedTopCount + topSeparatorRows + pinnedTopTitleLines.length)
@@ -2018,10 +2021,26 @@ if (configuration.remember) {
         const bottomRows = hasPinnedArea
           ? (pinnedCount + bottomSeparatorRows + pinnedTitleLines.length)
           : 0;
-        maxVisibleLines = Math.max(
+
+        availableRowsForScrollable = Math.max(
           1,
           terminalHeight - headerLines - topRows - bottomRows - 2
         );
+
+        // Count how many scrollable items fit into availableRowsForScrollable,
+        // treating textview items as taking `lines` visual rows each.
+        let itemCount = 0;
+        let rowsUsed = 0;
+        for (const lineArr of scrollableOptions) {
+          const h = (Array.isArray(lineArr) && lineArr.length === 1 &&
+                     lineArr[0] && lineArr[0].type === 'textview')
+            ? Math.max(2, lineArr[0].lines || 4)
+            : 1;
+          if (rowsUsed + h > availableRowsForScrollable) break;
+          rowsUsed += h;
+          itemCount++;
+        }
+        maxVisibleLines = Math.max(1, itemCount);
       };
 
       // ------------------------------------------------------------------
@@ -2347,6 +2366,89 @@ if (configuration.remember) {
         return parts.join('');
       };
 
+      // ------------------------------------------------------------------
+      // TEXT VIEW (this.TextButton) RENDERING
+      // ------------------------------------------------------------------
+      // Renders a `textview` item as a fixed-height framed box.
+      // States: idle (dim) / focused (yellow) / active (green).
+      // While ACTIVE the bottom border shows a contextual hint with the
+      // E-to-edit shortcut (only when editable).
+      const renderTextViewLines = (item, isFocused, lineIdx) => {
+        const termWidth = Math.max(20, stdout.columns || 80);
+        const totalLines = Math.max(2, item.lines || 4);
+        const contentLines = totalLines - 2;
+        const innerWidth = Math.max(4, termWidth - 4);
+        const value = String(item.value || '');
+        const scroll = item.scroll || 0;
+        const active = !!item.active;
+        const editable = !!item.editable;
+
+        const wrapped = [];
+        const rawLines = value.split('\n');
+        for (const rawLine of rawLines) {
+          if (rawLine.length === 0) { wrapped.push(''); continue; }
+          for (let i = 0; i < rawLine.length; i += innerWidth) {
+            wrapped.push(rawLine.slice(i, i + innerWidth));
+          }
+        }
+        if (wrapped.length === 0) wrapped.push('');
+
+        const totalWrapped = wrapped.length;
+        const maxScroll = Math.max(0, totalWrapped - contentLines);
+        const s = Math.max(0, Math.min(scroll, maxScroll));
+
+        const styleLine = (l) => {
+          if (active) return ColorText.brightGreen(l);
+          if (isFocused) return ColorText.brightYellow(l);
+          return ColorText.dim(l);
+        };
+
+        const out = [];
+
+        const label = item.label || '';
+        const labelPart = label ? ` ${label} ` : '';
+        const topFill = Math.max(0, termWidth - 2 - labelPart.length);
+        out.push(('┌' + labelPart + '─'.repeat(topFill) + '┐').slice(0, termWidth));
+
+        for (let i = 0; i < contentLines; i++) {
+          const idx = s + i;
+          let text = (idx < totalWrapped) ? wrapped[idx] : '';
+          if (text.length > innerWidth) text = text.slice(0, innerWidth);
+          text = text.padEnd(innerWidth, ' ');
+
+          let leftMarker = '│';
+          if (i === 0 && s > 0) leftMarker = '↑';
+          if (i === contentLines - 1 && (s + contentLines) < totalWrapped) leftMarker = '↓';
+          if (i === 0 && isFocused && !active) leftMarker = '▶';
+
+          let line = leftMarker + ' ' + text + ' │';
+          if (line.length > termWidth) line = line.slice(0, termWidth);
+          else if (line.length < termWidth) line = line + ' '.repeat(termWidth - line.length);
+          out.push(line);
+        }
+
+        let counter = '';
+        if (maxScroll > 0) {
+          counter = ` ${s + 1}-${Math.min(s + contentLines, totalWrapped)}/${totalWrapped} `;
+        }
+        if (isFocused && !active) {
+          const hint = ' Enter: activate ';
+          const avail = Math.max(0, termWidth - 2 - counter.length - hint.length);
+          counter = counter + '─'.repeat(avail) + hint;
+        }
+        if (active) {
+          const hint = editable
+            ? ' ↑↓: scroll  E: edit  Enter: exit '
+            : ' ↑↓: scroll  Enter: exit ';
+          const avail = Math.max(0, termWidth - 2 - counter.length - hint.length);
+          counter = counter + '─'.repeat(avail) + hint;
+        }
+        const botFill = Math.max(0, termWidth - 2 - counter.length);
+        out.push(('└' + '─'.repeat(botFill) + counter + '┘').slice(0, termWidth));
+
+        return out.map(styleLine);
+      };
+
       const renderMenu = () => {
         computeViewport();
 
@@ -2414,14 +2516,37 @@ if (configuration.remember) {
 
         const firstItemRow = currentRow;
 
+        let rowsUsedInLoop = 0;
+        let lastRenderedRel = startRel - 1;
+
         for (let rel = startRel; rel < endRel; rel++) {
           const lineIndex = scrollableStartIndex + rel;
-          const lineString = renderOptionLine(normalizedOptions[lineIndex], lineIndex, line, column);
-          console.log(lineString);
-          currentRow += 1;
+          const lineOptions = normalizedOptions[lineIndex];
+          const isTextView = Array.isArray(lineOptions) && lineOptions.length === 1 &&
+                             lineOptions[0] && lineOptions[0].type === 'textview';
+
+          if (isTextView) {
+            const tv = lineOptions[0];
+            const height = Math.max(2, tv.lines || 4);
+            if (rowsUsedInLoop + height > availableRowsForScrollable) break;
+            const tvLines = renderTextViewLines(tv, lineIndex === line, lineIndex);
+            for (const ln of tvLines) {
+              console.log(ln);
+              currentRow += 1;
+            }
+            rowsUsedInLoop += height;
+            lastRenderedRel = rel;
+          } else {
+            if (rowsUsedInLoop + 1 > availableRowsForScrollable) break;
+            const lineString = renderOptionLine(lineOptions, lineIndex, line, column);
+            console.log(lineString);
+            currentRow += 1;
+            rowsUsedInLoop += 1;
+            lastRenderedRel = rel;
+          }
         }
 
-        const remaining = scrollableCount - endRel;
+        const remaining = scrollableCount - (lastRenderedRel + 1);
         const hasDownIndicator = remaining > 0;
         if (hasDownIndicator) {
           console.log(ColorText.dim(`${remaining} more below`));
@@ -2470,6 +2595,19 @@ if (configuration.remember) {
       };
 
       const setFocus = (newLine, newColumn) => {
+        // Defensive: if focus moves away from an active textview, drop
+        // it back to FOCUSED so the next visit starts cleanly.
+        const prevOption = normalizedOptions[line] && normalizedOptions[line][column];
+        const nextOption = normalizedOptions[newLine] && normalizedOptions[newLine][newColumn];
+        if (prevOption && prevOption.type === 'textview' && prevOption !== nextOption) {
+          if (prevOption.active) {
+            prevOption.active = false;
+            if (typeof prevOption.persistActive === 'function') {
+              prevOption.persistActive();
+            }
+          }
+        }
+
         line = newLine;
         column = newColumn;
 
@@ -2499,6 +2637,21 @@ if (configuration.remember) {
         if (selectedOption && selectedOption.type === 'field') {
           this.startFieldEditing(selectedOption, line, column, renderMenu);
           setFocus(line, column);
+          renderMenu();
+          return;
+        }
+
+        // -------- TextButton / Textview handling --------
+        // FOCUSED → Enter/click ACTIVATES the box.
+        // ACTIVE  → Enter/click DEACTIVATES the box.
+        // Editing is handled by the E-key shortcut in handleKeyPress.
+        if (selectedOption && selectedOption.type === 'textview') {
+          const wasFocused = (normalizedOptions[line] &&
+                              normalizedOptions[line][column] === selectedOption);
+          if (!wasFocused) setFocus(line, column);
+
+          selectedOption.onToggle();
+          this.isClickInProgress = false;
           renderMenu();
           return;
         }
@@ -2599,6 +2752,16 @@ if (configuration.remember) {
               }
             }
 
+            // -------- TextButton ↑ (locked while active) --------
+            {
+              const tvUp = normalizedOptions[line] && normalizedOptions[line][column];
+              if (tvUp && tvUp.type === 'textview' && tvUp.active) {
+                tvUp.onScroll(-1);
+                renderMenu();
+                break;
+              }
+            }
+
             if (line > 0) line--;
             if (column >= normalizedOptions[line].length) column = normalizedOptions[line].length - 1;
             setFocus(line, column);
@@ -2633,6 +2796,16 @@ if (configuration.remember) {
                 }
               } else {
                 lastDownPressTime = now;
+              }
+            }
+
+            // -------- TextButton ↓ (locked while active) --------
+            {
+              const tvDown = normalizedOptions[line] && normalizedOptions[line][column];
+              if (tvDown && tvDown.type === 'textview' && tvDown.active) {
+                tvDown.onScroll(1);
+                renderMenu();
+                break;
               }
             }
 
@@ -3683,14 +3856,31 @@ setFocus(newLine, newColumn);
         maxVisible = scrollableCount;
       }
 
-      const relRow = terminalY - firstItemRow + scrollOffset;
+      const visualRow = terminalY - firstItemRow;
+      if (visualRow < 0) return -1;
 
-      if (relRow < 0) return -1;
-      if (relRow < scrollOffset) return -1;
-      if (relRow >= scrollOffset + maxVisible) return -1;
-      if (relRow >= scrollableCount) return -1;
+      // Walk items accumulating visual heights. TextView items occupy
+      // `lines` rows each, so the old 1-row-per-item mapping would
+      // return the wrong item when a textview sits above the click.
+      let acc = 0;
+      let targetRel = -1;
+      for (let i = scrollOffset; i < scrollableCount; i++) {
+        const lineArr = normalizedOptions[scrollableStartIndex + i];
+        if (!lineArr) break;
+        const h = (Array.isArray(lineArr) && lineArr.length === 1 &&
+                   lineArr[0] && lineArr[0].type === 'textview')
+          ? Math.max(2, lineArr[0].lines || 4)
+          : 1;
+        if (visualRow < acc + h) {
+          targetRel = i;
+          break;
+        }
+        acc += h;
+      }
 
-      row = scrollableStartIndex + relRow;
+      if (targetRel === -1) return -1;
+
+      row = scrollableStartIndex + targetRel;
     }
 
     if (row < 0 || row >= normalizedOptions.length) return -1;
@@ -10252,6 +10442,228 @@ function levenshteinDistance(str1, str2) {
         }
     };
 
+    // --------------------------- TextButton Method ---------------------------
+
+    /**
+     * Create a compact, scrollable text viewer (TextButton).
+     *
+     * ─── THREE VISUAL STATES ──────────────────────────────────────────
+     *   1. IDLE      — not focused. Frame drawn in DIM GREY.
+     *   2. FOCUSED   — current item selected via ↑ / ↓ or hovered with
+     *                  the mouse. Frame drawn in BRIGHT YELLOW.
+     *                  ↑ / ↓ STILL navigate past the box.
+     *   3. ACTIVE    — user pressed Enter / clicked while FOCUSED.
+     *                  Frame drawn in BRIGHT GREEN. LOCKED:
+     *                    • ↑ / ↓       scroll the text (swallowed at edges)
+     *                    • Enter       exits back to FOCUSED
+     *                    • Escape      exits back to FOCUSED
+     *                    • E (letter)  opens the editor (editable only)
+     *
+     * ─── EDITOR LAUNCH (the reliable path) ────────────────────────────
+     *   The E key handler in the HUD calls a bound `openEditor` method
+     *   that TextButton stores directly on the item object. That method:
+     *     1. Runs on the next macrotask (setImmediate), so the HUD's
+     *        keypress handler has fully returned and the terminal is
+     *        guaranteed to be idle.
+     *     2. Calls this._openTextEditor() to run the full-screen editor.
+     *     3. Persists the new value and triggers a Func rebuild so the
+     *        box shows the freshly edited content.
+     *
+     *   This bypasses the event system, LoadScreen re-entry and trigger
+     *   props entirely. It is the same code path that this.TextEditor()
+     *   ultimately uses (_openTextEditor), just invoked from a different
+     *   place — after the menu has been torn down, never during it.
+     *
+     * Optional config:
+     *   lines        {number}   Visual rows to occupy (min 2, default 4).
+     *   label        {string}   Label shown in the top border.
+     *   initialValue {string}   Initial text (re-seeds when changed).
+     *   editable     {boolean}  Enable the E-to-edit shortcut.
+     *   onChange     {Function} Invoked with the new text after an edit.
+     *   title        {string}   Editor title (defaults to label || name).
+     *   pinned       {boolean}  Pin to the pinned-bottom area.
+     *   pinnedTop    {boolean}  Pin to the pinned-top area.
+     *
+     * @param {string} id - User/build ID
+     * @param {string} name - Unique name (used as the storage key)
+     * @param {Object} [config] - Configuration
+     */
+    this.TextButton = (id, name, config = {}) => {
+        if (!this.Builds.has(id)) {
+            if (this.Log) console.log(`this.TextButton() Error - userBuild not found | BuildID: ${id}`);
+            return;
+        }
+
+        const __build = this.Builds.get(id);
+
+        // Inherit the current pinned container context.
+        let pinned = config.pinned;
+        let pinnedTop = config.pinnedTop;
+        if (pinned === undefined && pinnedTop === undefined) {
+            if (__build._pinContext === 'top') pinnedTop = true;
+            else if (__build._pinContext === 'bottom') pinned = true;
+        }
+
+        const storageKey = `textbutton_${name}`;
+        const scrollKey  = `textbutton_scroll_${name}`;
+        const seedKey    = `textbutton_seed_${name}`;
+        const activeKey  = `textbutton_active_${name}`;
+
+        // ------------------------------------------------------------------
+        // initialValue seeding
+        // ------------------------------------------------------------------
+        const hasInitial = Object.prototype.hasOwnProperty.call(config, 'initialValue');
+        const desiredInitial = hasInitial ? String(config.initialValue == null ? '' : config.initialValue) : null;
+        const lastSeed = this.Storages.Get(id, seedKey);
+        let value = this.Storages.Get(id, storageKey);
+
+        if (value === undefined) {
+            value = desiredInitial !== null ? desiredInitial : '';
+            this.Storages.Set(id, storageKey, value);
+            this.Storages.Set(id, seedKey, value);
+        } else if (desiredInitial !== null && lastSeed !== desiredInitial) {
+            value = desiredInitial;
+            this.Storages.Set(id, storageKey, value);
+            this.Storages.Set(id, seedKey, desiredInitial);
+            this.Storages.Set(id, scrollKey, 0);
+        }
+
+        let scroll = this.Storages.Get(id, scrollKey);
+        if (typeof scroll !== 'number' || !isFinite(scroll)) {
+            scroll = 0;
+            this.Storages.Set(id, scrollKey, scroll);
+        }
+
+        const lines = Math.max(2, Math.min(50, parseInt(config.lines, 10) || 4));
+        const editable = !!config.editable;
+        const activeStored = this.Storages.Get(id, activeKey) === true;
+
+        // Capture references the openEditor method needs. `self` is the
+        // SyAPP_Func instance (SelfBuilder, main Func, etc.) so we can
+        // reach _openTextEditor, Storages, _syappInstance, Name, etc.
+        const self = this;
+
+        const tvItem = {
+            type: 'textview',
+            name: name,
+            label: config.label || '',
+            lines: lines,
+            editable: editable,
+            value: value,
+            scroll: scroll,
+            storageKey: storageKey,
+            scrollKey: scrollKey,
+            activeKey: activeKey,
+            active: activeStored,
+            pinned: pinned || false,
+            pinnedTop: pinnedTop || false,
+            metadata: {
+                props: {},
+                path: this.Name,
+                resetSelection: false
+            },
+
+            // -------- ↑ / ↓ scroll --------
+            onScroll: (delta) => {
+                const curScroll = self.Storages.Get(id, scrollKey) || 0;
+                const v = self.Storages.Get(id, storageKey) || '';
+                const w = Math.max(10, (stdout.columns || 80) - 4);
+                const wrapped = [];
+                const rawLines = String(v).split('\n');
+                for (const rawLine of rawLines) {
+                    if (rawLine.length === 0) { wrapped.push(''); continue; }
+                    for (let i = 0; i < rawLine.length; i += w) {
+                        wrapped.push(rawLine.slice(i, i + w));
+                    }
+                }
+                if (wrapped.length === 0) wrapped.push('');
+                const contentLines = Math.max(1, lines - 2);
+                const maxS = Math.max(0, wrapped.length - contentLines);
+                const newScroll = Math.max(0, Math.min(maxS, curScroll + delta));
+                if (newScroll === curScroll) return false;
+                self.Storages.Set(id, scrollKey, newScroll);
+                tvItem.scroll = newScroll;
+                return true;
+            },
+
+            persistActive: () => {
+                self.Storages.Set(id, activeKey, !!tvItem.active);
+            },
+
+            onToggle: () => {
+                if (tvItem.active) {
+                    tvItem.active = false;
+                    tvItem.persistActive();
+                    return 'deactivated';
+                }
+                tvItem.active = true;
+                tvItem.persistActive();
+                return 'activated';
+            },
+
+            // -------- Editor launcher --------
+            // Called by the HUD's E-key handler (via setImmediate). Runs
+            // the editor, persists the result, then triggers a Func
+            // rebuild so the box shows the fresh content.
+            openEditor: async () => {
+                try {
+                    // Belt-and-braces: make sure the HUD released every
+                    // terminal mode. This should already be done by the
+                    // caller, but if anything is left over we clear it
+                    // here so the editor always starts clean.
+                    if (self._syappInstance && self._syappInstance.HUD) {
+                        try { self._syappInstance.HUD.resetTerminalModes(); } catch (_) {}
+                        try { self._syappInstance.HUD.cleanupMouseSupport(); } catch (_) {}
+                    }
+                    try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+
+                    // Run the full-screen editor.
+                    const newValue = await self._openTextEditor(id, {
+                        title: config.title || config.label || name,
+                        initialContent: self.Storages.Get(id, storageKey) || ''
+                    });
+
+                    if (newValue !== null && newValue !== undefined) {
+                        self.Storages.Set(id, storageKey, newValue);
+                        self.Storages.Set(id, seedKey, newValue);
+                        self.Storages.Set(id, scrollKey, 0);
+                        self.Storages.Set(id, activeKey, false);
+                        if (typeof config.onChange === 'function') {
+                            try { config.onChange(newValue); } catch (e) { if (self.Log) console.error(e); }
+                        }
+                    } else {
+                        self.Storages.Set(id, activeKey, false);
+                    }
+
+                    // Trigger a rebuild of the current function so the
+                    // box renders the new content immediately.
+                    if (self._syappInstance) {
+                        const session = self._syappInstance.Sessions.get(self._syappInstance.MainSessionID);
+                        if (session) {
+                            // Ensure nothing is holding the lock.
+                            session.InAction = false;
+                            const liveProps = { ...(session.ActualProps || {}) };
+                            self._syappInstance.LoadScreen(self.Name, {
+                                props: liveProps
+                            }).catch(() => {});
+                        }
+                    }
+                } catch (err) {
+                    if (self.Log) console.error('TextButton editor error:', err);
+                    // Try to recover the terminal if something went wrong.
+                    try { stdout.write('\x1b[?1049l\x1b[?25h'); } catch (_) {}
+                    try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+                }
+            }
+        };
+
+        if (__build._cellItems) {
+            __build._cellItems.push(tvItem);
+        } else {
+            __build.Buttons.push(tvItem);
+        }
+    };
+
     // --------------------------- TextEditor Method ---------------------------
 
     /**
@@ -14348,6 +14760,17 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.TextEditor(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'textbutton': {
+          const cfg = {}
+          if (it.label) cfg.label = it.label
+          if (it.initialValue) cfg.initialValue = it.initialValue
+          if (it.lines && it.lines !== 4) cfg.lines = it.lines
+          if (it.editable) cfg.editable = true
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
+          L.push(`${indent}this.TextButton(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'page': {
           const pageCfg = {}
           if (it.pinButton) pageCfg.pinButton = true
@@ -14540,6 +14963,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Buttons: 'buttonsGroup',
   Field: 'field',
   TextEditor: 'texteditor',
+  TextButton: 'textbutton',
   Page: 'page',
   PinnedTop: 'pinnedTop',
   PinnedBottom: 'pinnedBottom',
@@ -14589,6 +15013,19 @@ function _sbMakeItemForMethod(methodName, id) {
       return { ...base, name: 'field_' + id, label: 'Label', initialValue: '' }
     case 'texteditor':
       return { ...base, name: 'editor_' + id, label: 'Text Editor', initialValue: '' }
+    case 'textbutton':
+      // Compact scrollable text viewer. Defaults to a 4-row read-only box
+      // with an editable toggle so the user can opt in to the editor flow.
+      return {
+        ...base,
+        name: 'textbtn_' + id,
+        label: 'Text',
+        initialValue: '',
+        lines: 4,
+        editable: false,
+        pinned: false,
+        pinnedTop: false
+      }
     case 'page':
       return {
         ...base,
@@ -15833,6 +16270,19 @@ class SelfBuilder extends SyAPP_Func {
             pinnedTop: it.pinnedTop
           })
           break
+        case 'textbutton':
+          // Renders the real TextButton in both edit and view modes so
+          // the built-in focus/activate/locked-scroll/E-to-edit flow
+          // works exactly like a hand-written this.TextButton() call.
+          this.TextButton(id, it.name, {
+            label: it.label,
+            initialValue: it.initialValue,
+            lines: it.lines || 4,
+            editable: !!it.editable,
+            pinned: it.pinned,
+            pinnedTop: it.pinnedTop
+          })
+          break
         case 'page':
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
@@ -16210,6 +16660,16 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('label', 'Label', 'string')
         mkProp('initialValue', 'Initial', 'string')
         mkProp('buttonText', 'Button Text', 'string')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
+        break
+
+      case 'textbutton':
+        mkProp('name', 'Name', 'string')
+        mkProp('label', 'Label', 'string')
+        mkProp('initialValue', 'Initial', 'string')
+        mkProp('lines', 'Rows', 'number')
+        mkToggle('editable', 'Editable')
         mkToggle('pinned', 'Pinned Btm')
         mkToggle('pinnedTop', 'Pinned Top')
         break
@@ -16799,6 +17259,22 @@ function _sbCallToItem(call, sessionVar) {
         name,
         label: typeof cfg.label === 'string' ? cfg.label : '',
         initialValue: typeof cfg.initialValue === 'string' ? cfg.initialValue : '',
+        pinned: !!cfg.pinned,
+        pinnedTop: !!cfg.pinnedTop
+      }
+    }
+    case 'TextButton': {
+      const name = _sbParseValue(rest[0])
+      if (typeof name !== 'string') return null
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {}
+      if (cfg === null) return null
+      return {
+        type: 'textbutton',
+        name,
+        label: typeof cfg.label === 'string' ? cfg.label : '',
+        initialValue: typeof cfg.initialValue === 'string' ? cfg.initialValue : '',
+        lines: typeof cfg.lines === 'number' ? cfg.lines : 4,
+        editable: !!cfg.editable,
         pinned: !!cfg.pinned,
         pinnedTop: !!cfg.pinnedTop
       }
