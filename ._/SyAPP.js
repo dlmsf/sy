@@ -2889,6 +2889,59 @@ if (configuration.remember) {
               process.exit();
             }
             break;
+
+          case 'e':
+            // "E" opens the built-in text editor for the currently
+            // ACTIVE + EDITABLE textview (this.TextButton with
+            // { editable: true }).
+            //
+            // The editor is deliberately NOT invoked inline. Instead
+            // we (1) flip the box back to FOCUSED, (2) tear down the
+            // menu (removes keypress/mouse listeners, disables raw
+            // mode, resets mouse tracking), (3) resolve the pending
+            // menu promise so the promise chain unwinds cleanly, and
+            // (4) schedule openEditor() on the next macrotask via
+            // setImmediate.
+            //
+            // That deferral is what guarantees the editor always gets
+            // a completely idle terminal: the keypress handler has
+            // returned, no mouse sequences are in flight, and stdin
+            // has no leftover listeners competing for raw bytes.
+            //
+            // Only plain "e" triggers this — ctrl+e, shift+e and
+            // alt/meta+e are left for future shortcuts.
+            if (!key.ctrl && !key.shift && !key.meta) {
+              const tvEdit = normalizedOptions[line] && normalizedOptions[line][column];
+              if (tvEdit &&
+                  tvEdit.type === 'textview' &&
+                  tvEdit.active &&
+                  tvEdit.editable &&
+                  typeof tvEdit.openEditor === 'function') {
+                // Flip the box back to FOCUSED so the next render
+                // (triggered by the editor's post-save LoadScreen)
+                // starts from a clean, un-highlighted state.
+                tvEdit.active = false;
+                if (typeof tvEdit.persistActive === 'function') {
+                  tvEdit.persistActive();
+                }
+
+                // Tear down the menu.
+                this.cleanupMenuState();
+
+                // Resolve the pending menu promise. Nothing in the
+                // LoadScreen flow actually awaits this promise (the
+                // menu is fire-and-forget), so this is purely
+                // bookkeeping to keep the promise chain clean.
+                resolve(tvEdit);
+
+                // Defer the editor to the next macrotask.
+                setImmediate(() => {
+                  try { tvEdit.openEditor(); } catch (_) {}
+                });
+                return;
+              }
+            }
+            break;
         }
       };
 
@@ -10625,7 +10678,27 @@ function levenshteinDistance(str1, str2) {
 
                     if (newValue !== null && newValue !== undefined) {
                         self.Storages.Set(id, storageKey, newValue);
-                        self.Storages.Set(id, seedKey, newValue);
+                        // IMPORTANT: seedKey is intentionally NOT
+                        // touched here.
+                        //
+                        // seedKey stores the ORIGINAL config.initialValue
+                        // snapshot taken when the TextButton was first
+                        // created. TextButton uses it to detect when the
+                        // user changes the initialValue in the source
+                        // code (in which case the box should reset to
+                        // the new initial).
+                        //
+                        // If we overwrote seedKey with the user's edit,
+                        // the very next build pass would see
+                        // `desiredInitial !== lastSeed` (because
+                        // config.initialValue is still the old default)
+                        // and immediately clobber the user's edit with
+                        // the stale initialValue.
+                        //
+                        // Leaving seedKey untouched is what makes
+                        // "edit → save → see the new text in the box"
+                        // work reliably, while still allowing a genuine
+                        // config change to reset the value.
                         self.Storages.Set(id, scrollKey, 0);
                         self.Storages.Set(id, activeKey, false);
                         if (typeof config.onChange === 'function') {
