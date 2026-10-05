@@ -8511,8 +8511,24 @@ this.JSON = async (id, config = {}) => {
         );
       }
     } else {
+      // Primitive value inside a search result — same TextButton treatment
+      // as the main tree view. A separate stable storage name is used so
+      // the search-result value box never collides with the tree one.
       const valueStr = String(currentNode);
-      this.Text(id, `${this.TextColor.brightGreen('💎')} Value: ${this.TextColor.bold(valueStr)}`);
+
+      this.Text(id, `${this.TextColor.brightGreen('💎')} Value:`);
+
+      const valueLines = valueStr.length > 400 ? 12
+                        : valueStr.length > 200 ? 8
+                        : valueStr.length > 80  ? 6
+                        : 4;
+
+      this.TextButton(id, `${storageKey}_search_value_view`, {
+        label: 'Value',
+        initialValue: valueStr,
+        lines: valueLines,
+        editable: false
+      });
     }
 
   } else if (Array.isArray(currentNode)) {
@@ -8739,24 +8755,30 @@ this.JSON = async (id, config = {}) => {
     }
 
   } else {
-    // Primitive display
+    // Primitive display — the key's value is rendered through
+    // this.TextButton() instead of this.Text(), so the user gets the
+    // same scrollable / activatable box used for every other value.
+    //
+    // The box uses a STABLE storage name per JSON browser instance:
+    // navigating to a different key produces a different `initialValue`,
+    // which causes TextButton to automatically re-seed its content (and
+    // reset its scroll position) — so the box always reflects whichever
+    // key the user is currently looking at.
     const valueStr = typeof currentNode === 'string' ? currentNode : String(currentNode);
-    const isLong = valueStr.length > maxTextLength;
 
     this.Text(id, `${this.TextColor.brightGreen('💎')} Value:`);
 
-    if (isLong) {
-      this.Text(id, abbreviateText(valueStr, maxTextLength));
-      this.Text(id, ' ');
-      this.Text(id, `${this.TextColor.brightYellow('📖 Full Content:')}`);
+    const valueLines = valueStr.length > 400 ? 12
+                      : valueStr.length > 200 ? 8
+                      : valueStr.length > 80  ? 6
+                      : 4;
 
-      const wrapWidth = 70;
-      for (let i = 0; i < valueStr.length; i += wrapWidth) {
-        this.Text(id, valueStr.substring(i, i + wrapWidth));
-      }
-    } else {
-      this.Text(id, this.TextColor.bold(valueStr));
-    }
+    this.TextButton(id, `${storageKey}_value_view`, {
+      label: 'Value',
+      initialValue: valueStr,
+      lines: valueLines,
+      editable: false
+    });
   }
 
   // ------------------------------------------------------------------
