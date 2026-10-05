@@ -2,7 +2,7 @@ import readline from 'readline';
 import { stdin, stdout } from 'process';
 import EventEmitter from 'events';
 import { readFileSync, existsSync } from 'fs';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -4668,6 +4668,348 @@ async function _syappLoadJsonFile(filePath, onProgress) {
   }
   if (typeof onProgress === 'function') onProgress(totalBytes, totalBytes);
   return data;
+}
+
+// ============================================================
+// JS PARSER + RUNNER used by this.JavaScript()
+// ============================================================
+
+// ---- tokenizer ----
+// `clean` has strings/comments blanked; `depthStart` is the brace depth
+// entering the line, used to walk class bodies reliably.
+function _jsTok(code) {
+  const raw = String(code || '').split('\n'), out = [];
+  let depth = 0, inB = false, inT = false;
+  for (let i = 0; i < raw.length; i++) {
+    const orig = raw[i], dStart = depth;
+    let c = '', j = 0, inS = null, inL = false;
+    while (j < orig.length) {
+      const ch = orig[j], nx = orig[j + 1];
+      if (inB) { if (ch === '*' && nx === '/') { inB = false; c += '  '; j += 2; } else { c += ' '; j++; } continue; }
+      if (inL) { c += ' '; j++; continue; }
+      if (inT) { if (ch === '\\') { c += '  '; j += 2; continue; } if (ch === '`') { inT = false; c += ' '; j++; continue; } c += ' '; j++; continue; }
+      if (inS) { if (ch === '\\') { c += '  '; j += 2; continue; } if (ch === inS) inS = null; c += ' '; j++; continue; }
+      if (ch === '/' && nx === '/') { inL = true; c += '  '; j += 2; continue; }
+      if (ch === '/' && nx === '*') { inB = true; c += '  '; j += 2; continue; }
+      if (ch === '"' || ch === "'") { inS = ch; c += ' '; j++; continue; }
+      if (ch === '`') { inT = true; c += ' '; j++; continue; }
+      if (ch === '{') depth++; else if (ch === '}') depth = Math.max(0, depth - 1);
+      c += ch; j++;
+    }
+    out.push({ num: i + 1, original: orig, clean: c, depthStart: dStart });
+  }
+  return out;
+}
+
+function _jsParams(t) {
+  const s = t.indexOf('('); if (s < 0) return [];
+  let d = 0, e = -1;
+  for (let i = s; i < t.length; i++) {
+    if (t[i] === '(') d++;
+    else if (t[i] === ')') { d--; if (!d) { e = i; break; } }
+  }
+  if (e < 0) return [];
+  const inner = t.slice(s + 1, e); if (!inner.trim()) return [];
+  const parts = []; let buf = '', dd = 0;
+  for (const ch of inner) {
+    if ('([{'.includes(ch)) dd++;
+    else if (')]}'.includes(ch)) dd--;
+    if (ch === ',' && !dd) { parts.push(buf); buf = ''; continue; }
+    buf += ch;
+  }
+  if (buf.trim()) parts.push(buf);
+  return parts.map(p => {
+    p = String(p).trim(); if (!p) return null;
+    const eq = p.indexOf('=');
+    const h = (eq < 0 ? p : p.slice(0, eq)).split(':')[0].trim().split(/\s+/).pop();
+    return h || null;
+  }).filter(Boolean);
+}
+
+function _jsBlockEnd(lines, idx) {
+  let d = 0, started = false;
+  for (let i = idx; i < lines.length; i++) {
+    for (const ch of lines[i].clean) {
+      if (ch === '{') { d++; started = true; }
+      else if (ch === '}') { d--; if (started && d === 0) return i; }
+    }
+  }
+  return lines.length - 1;
+}
+
+function _jsStmtEnd(lines, idx) {
+  let d = 0;
+  for (let i = idx; i < lines.length; i++) {
+    for (const ch of lines[i].clean) {
+      if ('([{'.includes(ch)) d++;
+      else if (')]}'.includes(ch)) d = Math.max(0, d - 1);
+      else if (ch === ';' && !d) return i;
+    }
+    if (i > idx && !d) {
+      const n = lines[i + 1];
+      if (n) {
+        const nc = n.clean.trim();
+        if (nc && !/^[.)\]},]|&&|\|\||=>|\+|-|\*|\/|:/.test(nc)) return i;
+      }
+    }
+  }
+  return lines.length - 1;
+}
+
+function _jsClassBody(lines, si, ei, name, ext) {
+  const bd = lines[si].depthStart + 1;
+  const info = { name, extends: ext || null, methods: [], fields: [], constructorArgs: [], lineStart: lines[si].num, lineEnd: lines[ei].num, startIdx: si, endIdx: ei };
+  let i = si + 1;
+  while (i < ei) {
+    const r = lines[i];
+    if (r.depthStart !== bd) { i++; continue; }
+    let rest = r.clean.trim();
+    if (!rest || /^[})\]]/.test(rest)) { i++; continue; }
+    const m = { isStatic: false, isAsync: false };
+    let g = 0, mc;
+    while ((mc = rest.match(/^(static|async|get|set|public|private|protected|readonly|abstract|override)\s+/)) && g++ < 8) {
+      if (mc[1] === 'static') m.isStatic = true;
+      else if (mc[1] === 'async') m.isAsync = true;
+      rest = rest.slice(mc[0].length);
+    }
+    if (/^constructor\s*\(/.test(rest)) { const e = _jsBlockEnd(lines, i); info.constructorArgs = _jsParams(rest); i = e + 1; continue; }
+    const mm = rest.match(/^([A-Za-z_$#][\w$]*|\[[^\]]*\])\s*\??\s*\(/);
+    if (mm) { const e = _jsBlockEnd(lines, i); info.methods.push({ name: mm[1], params: _jsParams(rest), isStatic: m.isStatic, isAsync: m.isAsync, lineStart: r.num, startIdx: i, endIdx: e }); i = e + 1; continue; }
+    const fm = rest.match(/^([A-Za-z_$#][\w$]*)\s*(?:=|;|:)/);
+    if (fm) { const e = _jsStmtEnd(lines, i); info.fields.push({ name: fm[1], isStatic: m.isStatic, lineStart: r.num, startIdx: i, endIdx: e }); i = e + 1; continue; }
+    i++;
+  }
+  return info;
+}
+
+function _jsParse(code) {
+  const r = { classes: [], functions: [], variables: [], imports: [] };
+  const lines = _jsTok(code);
+  let i = 0;
+  while (i < lines.length) {
+    const rec = lines[i], c = rec.clean.trim();
+    if (!c || rec.depthStart !== 0) { i++; continue; }
+    let m;
+    if ((m = c.match(/^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)\s*(?:extends\s+([A-Za-z_$.]+))?/))) {
+      const e = _jsBlockEnd(lines, i);
+      r.classes.push(_jsClassBody(lines, i, e, m[1], m[2]));
+      i = e + 1; continue;
+    }
+    if ((m = c.match(/^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(/))) {
+      const e = _jsBlockEnd(lines, i);
+      r.functions.push({ name: m[1], params: _jsParams(c), isAsync: /\basync\b/.test(c), lineStart: rec.num, startIdx: i, endIdx: e });
+      i = e + 1; continue;
+    }
+    if ((m = c.match(/^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/))) {
+      const e = _jsStmtEnd(lines, i);
+      const full = lines.slice(i, e + 1).map(l => l.clean).join(' ');
+      if (/=>/.test(full) || /\bfunction\b/.test(full)) {
+        r.functions.push({ name: m[1], params: _jsParams(full), isAsync: /=\s*async\b/.test(full), lineStart: rec.num, startIdx: i, endIdx: e });
+      } else {
+        r.variables.push({ name: m[1], lineStart: rec.num, startIdx: i, endIdx: e });
+      }
+      i = e + 1; continue;
+    }
+    if (/^import\b/.test(c) && !/^import\s*\(/.test(c)) {
+      const e = _jsStmtEnd(lines, i);
+      r.imports.push({ statement: rec.original.trim(), lineStart: rec.num, startIdx: i, endIdx: e });
+      i = e + 1; continue;
+    }
+    i++;
+  }
+  return r;
+}
+
+function _jsShape(src) {
+  try { return _jsParse(String(src || '')); }
+  catch (_) { return { classes: [], functions: [], variables: [], imports: [] }; }
+}
+
+function _jsCoerce(v) {
+  if (v == null || typeof v !== 'string') return v;
+  const t = v.trim();
+  if (t === '') return '';
+  if (t === 'true') return true;
+  if (t === 'false') return false;
+  if (t === 'null') return null;
+  if (t === 'undefined') return undefined;
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  if (/^[\[{"]/.test(t)) try { return JSON.parse(t); } catch (_) {}
+  return v;
+}
+
+function _jsFit(name, max) {
+  name = String(name || '');
+  if (name.length <= max) return name;
+  return name.slice(0, Math.max(1, max - 6)) + '…' + name.slice(-4);
+}
+
+// ============================================================
+// RECENTS STORAGE — JSON files under os.tmpdir()
+// ============================================================
+// Every inline code written through the widget's editor is saved
+// here. Pinned entries survive pruning; unpinned ones are trimmed to
+// the newest `maxUnpinned` (default 20).
+
+const _JS_CODES_DIR = path.join(os.tmpdir(), 'syapp_js_codes');
+
+function _jsEnsureDir() {
+  try { if (!fs.existsSync(_JS_CODES_DIR)) fs.mkdirSync(_JS_CODES_DIR, { recursive: true }); } catch (_) {}
+}
+
+function _jsList() {
+  _jsEnsureDir();
+  try {
+    return fs.readdirSync(_JS_CODES_DIR)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        try {
+          const full = path.join(_JS_CODES_DIR, f);
+          const j = JSON.parse(fs.readFileSync(full, 'utf8'));
+          return {
+            file: f,
+            name: String(j.name || 'untitled'),
+            code: String(j.code || ''),
+            pinned: !!j.pinned,
+            createdAt: j.createdAt || 0,
+            updatedAt: j.updatedAt || 0,
+            mtime: fs.statSync(full).mtimeMs
+          };
+        } catch (_) { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => (Number(b.pinned) - Number(a.pinned)) || ((b.mtime || 0) - (a.mtime || 0)));
+  } catch (_) { return []; }
+}
+
+function _jsSave(entry) {
+  _jsEnsureDir();
+  const file = entry.file || `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}.json`;
+  const payload = {
+    name: String(entry.name || 'untitled'),
+    code: String(entry.code || ''),
+    pinned: !!entry.pinned,
+    createdAt: entry.createdAt || Date.now(),
+    updatedAt: Date.now()
+  };
+  try { fs.writeFileSync(path.join(_JS_CODES_DIR, file), JSON.stringify(payload, null, 2)); } catch (_) {}
+  return { file, ...payload };
+}
+
+function _jsLoad(file) {
+  try {
+    const p = path.join(_JS_CODES_DIR, file);
+    if (!fs.existsSync(p)) return null;
+    const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return {
+      file,
+      name: String(j.name || 'untitled'),
+      code: String(j.code || ''),
+      pinned: !!j.pinned,
+      createdAt: j.createdAt,
+      updatedAt: j.updatedAt
+    };
+  } catch (_) { return null; }
+}
+
+function _jsDel(file) {
+  try { fs.unlinkSync(path.join(_JS_CODES_DIR, file)); return true; } catch (_) { return false; }
+}
+
+function _jsPrune(maxUnpinned = 20) {
+  const unpinned = _jsList().filter(c => !c.pinned);
+  let n = 0;
+  for (let i = maxUnpinned; i < unpinned.length; i++) if (_jsDel(unpinned[i].file)) n++;
+  return n;
+}
+
+function _jsAutoName(code) {
+  const line = String(code || '').split('\n').find(l => l.trim() && !/^\s*(\/\/|\/\*|\*)/.test(l));
+  return line ? line.trim().slice(0, 40) : 'untitled';
+}
+
+// ============================================================
+// JS EXECUTION — fresh `node` subprocess per call
+// ============================================================
+
+const _JS_RUNNER = [
+  "const url=require('url'),file=process.argv[1],cls=process.argv[2],meth=process.argv[3],b64=process.argv[4];",
+  "function snap(v,d,s){d=d||0;s=s||new WeakSet();if(d>8)return'[max-depth]';if(v==null)return null;const t=typeof v;",
+  "if(t==='bigint'||t==='symbol')return v.toString();if(t==='function')return'[Function: '+(v.name||'anonymous')+']';",
+  "if(t!=='object')return v;if(s.has(v))return'[circular]';s.add(v);",
+  "if(Array.isArray(v))return v.map(x=>snap(x,d+1,s));",
+  "if(v instanceof Date)return{'__Date':v.toISOString()};",
+  "if(v instanceof RegExp)return{'__RegExp':String(v)};",
+  "if(v instanceof Error)return{'__Error':v.message,name:v.name};",
+  "if(v instanceof Map)return{'__Map':Array.from(v.entries()).map(([k,x])=>[snap(k,d+1,s),snap(x,d+1,s)])};",
+  "if(v instanceof Set)return{'__Set':Array.from(v.values()).map(x=>snap(x,d+1,s))};",
+  "const o={};for(const k of Object.keys(v))try{o[k]=snap(v[k],d+1,s)}catch(_){o[k]='[unserializable]'}return o}",
+  "(async()=>{try{",
+  "const m=await import(url.pathToFileURL(file).href+'?t='+Date.now());",
+  "const cs=[];if(m.default!==undefined)cs.push(m.default);for(const k of Object.keys(m))if(k!=='default')cs.push(m[k]);",
+  "let C=null;for(const c of cs)if(typeof c==='function'&&c.name===cls){C=c;break}",
+  "if(!C)throw new Error('Class \"'+cls+'\" not found in exported module');",
+  "let a={};try{a=JSON.parse(Buffer.from(b64,'base64').toString('utf8')||'{}')}catch(_){}",
+  "const ca=Array.isArray(a.constructor)?a.constructor:[],ma=Array.isArray(a.method)?a.method:[],pp=a.props&&typeof a.props==='object'?a.props:{};",
+  "const inst=new C(...ca);for(const k of Object.keys(pp))try{inst[k]=pp[k]}catch(_){}",
+  "if(meth==='__constructOnly'){process.stdout.write(JSON.stringify({ok:true,instance:snap(inst)})+'\\n');return}",
+  "if(typeof inst[meth]!=='function')throw new Error('Method not found: '+meth);",
+  "let r=inst[meth](...ma);if(r&&typeof r.then==='function')r=await r;",
+  "process.stdout.write(JSON.stringify({ok:true,result:snap(r),instance:snap(inst)})+'\\n')",
+  "}catch(e){process.stdout.write(JSON.stringify({ok:false,error:e&&e.message?e.message:String(e),stack:e&&e.stack?e.stack:null})+'\\n')}})();"
+].join("\n");
+
+function _jsRunNode(scriptPath, args = [], options = {}) {
+  return new Promise((resolve) => {
+    const timeout = options.timeout || 30000;
+    let done = false;
+    const fin = (r) => { if (!done) { done = true; resolve(r); } };
+    let child;
+    try {
+      child = spawn('node', [scriptPath, ...args], { cwd: options.cwd || process.cwd(), env: { ...process.env, ...(options.env || {}) } });
+    } catch (e) { return fin({ ok: false, error: e.message, code: -1 }); }
+    let so = '', se = '';
+    if (child.stdout) child.stdout.on('data', d => { so += d.toString(); if (so.length > 5e6) so = so.slice(-5e6); });
+    if (child.stderr) child.stderr.on('data', d => { se += d.toString(); if (se.length > 5e6) se = se.slice(-5e6); });
+    child.on('close', (code, signal) => fin({ ok: code === 0, code, signal, stdout: so, stderr: se }));
+    child.on('error', (err) => fin({ ok: false, error: err.message, code: -1, stdout: so, stderr: se }));
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} fin({ ok: false, error: `Timed out after ${timeout}ms`, code: -1, stdout: so, stderr: se }); }, timeout);
+    child.on('close', () => clearTimeout(t));
+  });
+}
+
+async function _jsRunInline(code, options = {}) {
+  const tmp = path.join(os.tmpdir(), `syapp_js_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.js`);
+  fs.writeFileSync(tmp, String(code || ''), 'utf8');
+  try { return await _jsRunNode(tmp, options.args || [], options); }
+  finally { try { fs.unlinkSync(tmp); } catch (_) {} }
+}
+
+function _jsRunClass(filePath, cls, meth, args = {}, options = {}) {
+  return new Promise((resolve) => {
+    const timeout = options.timeout || 30000;
+    let done = false;
+    const fin = (r) => { if (!done) { done = true; resolve(r); } };
+    const b64 = Buffer.from(JSON.stringify(args || {}), 'utf8').toString('base64');
+    let child;
+    try {
+      child = spawn('node', ['-e', _JS_RUNNER, filePath, cls, meth, b64], { cwd: options.cwd || path.dirname(filePath) || process.cwd(), env: { ...process.env } });
+    } catch (e) { return fin({ ok: false, error: e.message }); }
+    let so = '', se = '';
+    if (child.stdout) child.stdout.on('data', d => { so += d.toString(); });
+    if (child.stderr) child.stderr.on('data', d => { se += d.toString(); });
+    child.on('close', () => {
+      try {
+        const trimmed = so.trim(), p = trimmed ? JSON.parse(trimmed) : null;
+        if (!p) return fin({ ok: false, error: 'Empty result', stderr: se });
+        if (p.ok) return fin({ ok: true, result: p.result, instance: p.instance, stderr: se });
+        return fin({ ok: false, error: p.error || 'Unknown error', stack: p.stack, stderr: se });
+      } catch (e) { fin({ ok: false, error: 'Could not parse runner output: ' + e.message, raw: so, stderr: se }); }
+    });
+    child.on('error', (err) => fin({ ok: false, error: err.message }));
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} fin({ ok: false, error: `Timed out after ${timeout}ms`, stderr: se }); }, timeout);
+    child.on('close', () => clearTimeout(t));
+  });
 }
 
 // --------------------------- SyAPP_Func Class ---------------------------
@@ -12763,6 +13105,558 @@ function levenshteinDistance(str1, str2) {
       }
     };
 
+    // --------------------------- JavaScript Runner / Explorer ---------------------------
+
+    /**
+     * Minimalist JS runner/explorer.
+     *
+     * Visual contract:
+     *   • Collapsed: exactly ONE dropdown button.
+     *   • Expanded, no source: `📁 file` (nested picker) + `✎ code`
+     *     (this.TextEditor). Recents show up if any exist.
+     *   • Expanded, source present: `▶ execute` first, then `✎ edit`,
+     *     `🕘 recents`, `↺ reset`, then the ƒ/◈ lists that open the
+     *     class/instance playground.
+     *   • Recents view: `📄 load`, `📌 pin`, `✎ rename`, `🗑 del` per entry.
+     *
+     * Persistence:
+     *   Every inline code written through the editor is auto-saved to
+     *   `<os.tmpdir()>/syapp_js_codes/*.json`. Pinned entries are never
+     *   pruned; unpinned ones are trimmed to the newest 20.
+     *
+     * @param {string} id
+     * @param {string} [codeOrPath='']  file path OR inline JS source
+     * @param {Object} [config]
+     * @param {string} [config.name='js']
+     * @param {Function} [config.filter]
+     * @param {string} [config.startPath]
+     * @param {number} [config.timeout=30000]
+     * @param {boolean} [config.classOnly=false]
+     * @returns {Promise<void>}
+     */
+    this.JavaScript = async (id, codeOrPath = '', config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.JavaScript() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const cfg = { name: 'js', filter: null, startPath: undefined, timeout: 30000, classOnly: false, ...config };
+      const sk = `javascript_${cfg.name}`;
+      const fp = `${sk}_f`;
+      const fpn = `${sk}_picker`;
+      const edk = `texteditor_${fp}_code`;
+      const fFilter = cfg.filter || ((p, isDir) => isDir || /\.(js|mjs|cjs)$/i.test(p));
+
+      const fresh = () => ({
+        source: 'none', filePath: null, code: '', parsed: null,
+        selectedClass: null, selectedMethod: null,
+        ctorArgs: {}, methodArgs: {}, propsJson: '{}',
+        instance: null, result: null, runResult: null,
+        view: null, editing: false, currentCodeFile: null
+      });
+
+      if (!this.Storages.Has(id, sk)) {
+        const init = fresh();
+        if (typeof codeOrPath === 'string' && codeOrPath) {
+          const asPath = /\.(js|mjs|cjs)$/i.test(codeOrPath) || (codeOrPath.length < 1024 && fs.existsSync(codeOrPath));
+          if (asPath) {
+            init.source = 'file';
+            init.filePath = path.isAbsolute(codeOrPath) ? codeOrPath : path.resolve(process.cwd(), codeOrPath);
+            try { init.code = fs.readFileSync(init.filePath, 'utf8'); init.parsed = _jsParse(init.code); } catch (_) {}
+          } else {
+            init.source = 'code'; init.code = codeOrPath; init.parsed = _jsParse(codeOrPath);
+            const e = _jsSave({ name: _jsAutoName(codeOrPath), code: codeOrPath });
+            init.currentCodeFile = e.file;
+          }
+        }
+        this.Storages.Set(id, sk, init);
+      }
+
+      const st = this.Storages.Get(id, sk);
+      const P  = this.Builds.get(id).Session.ActualProps || {};
+      const curPage = P.page || '';
+      const passProps = curPage ? { page: curPage } : {};
+
+      // Rendering aliases.
+      const L  = (name, props) => this.Button(id, props ? { name, props } : { name });
+      const B  = (list)        => this.Buttons(id, list);
+      const F  = (name, c)     => this.Field(id, name, c);
+      const TB = (name, c)     => this.TextButton(id, name, c);
+
+      const freshView = () => {
+        st.selectedClass = null; st.selectedMethod = null;
+        st.ctorArgs = {}; st.methodArgs = {};
+        st.instance = null; st.result = null; st.runResult = null;
+      };
+
+      const buildArgs = (cls, method) => {
+        const ca = (cls.constructorArgs || []).map((_, i) => _jsCoerce(st.ctorArgs[i]));
+        const ma = method ? (method.params || []).map((_, i) => _jsCoerce(st.methodArgs[i])) : [];
+        let props = {};
+        try { props = JSON.parse(st.propsJson || '{}'); } catch (_) {}
+        return { constructor: ca, method: ma, props };
+      };
+
+      const findClass  = (n) => (st.parsed?.classes   || []).find(c => c.name === n);
+      const findMethod = (c, n) => (c?.methods || []).find(m => m.name === n);
+
+      // Autosaves current st.code (creating a new file only on first
+      // save) and prunes unpinned entries beyond 20.
+      const saveCurrent = (name) => {
+        if (!st.code || !st.code.trim()) return null;
+        const prev = st.currentCodeFile ? _jsLoad(st.currentCodeFile) : null;
+        const e = _jsSave({
+          file: st.currentCodeFile,
+          name: name || (prev ? prev.name : _jsAutoName(st.code)),
+          code: st.code,
+          pinned: prev ? prev.pinned : false,
+          createdAt: prev ? prev.createdAt : Date.now()
+        });
+        st.currentCodeFile = e.file;
+        _jsPrune(20);
+        return e;
+      };
+
+      // ---------------------------------------------------------------
+      // PROP HANDLERS
+      // ---------------------------------------------------------------
+
+      if (P.__js_run) {
+        delete P.__js_run;
+        st.runResult = null; st.result = null;
+        if (st.source === 'file' && st.filePath)
+          st.runResult = { ...(await _jsRunNode(st.filePath, [], { timeout: cfg.timeout })), mode: 'file' };
+        else if (st.source === 'code' && st.code.trim())
+          st.runResult = { ...(await _jsRunInline(st.code, { timeout: cfg.timeout })), mode: 'inline' };
+      }
+
+      if (P.__js_runFn !== undefined) {
+        const fnName = P.__js_runFn;
+        delete P.__js_runFn;
+        st.runResult = null;
+        if (st.source === 'file' && st.filePath && fnName) {
+          const wrapper = [
+            `import { pathToFileURL } from 'url';`,
+            `(async()=>{try{`,
+            `const m=await import(pathToFileURL(${JSON.stringify(st.filePath)}).href+'?t='+Date.now());`,
+            `const fn=m[${JSON.stringify(fnName)}]||(m.default&&m.default[${JSON.stringify(fnName)}]);`,
+            `if(typeof fn!=='function')throw new Error('Function not found: '+${JSON.stringify(fnName)});`,
+            `const r=await fn();`,
+            `process.stdout.write(JSON.stringify({ok:true,result:r===undefined?null:r}))`,
+            `}catch(e){process.stdout.write(JSON.stringify({ok:false,error:e.message}))}})();`
+          ].join('\n');
+          const tmp = path.join(os.tmpdir(), `syapp_fn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`);
+          fs.writeFileSync(tmp, wrapper, 'utf8');
+          try {
+            const r = await _jsRunNode(tmp, [], { timeout: cfg.timeout });
+            let parsed = null;
+            try { parsed = JSON.parse((r.stdout || '').trim() || 'null'); } catch (_) {}
+            st.runResult = parsed ? {
+              ok: !!parsed.ok,
+              stdout: parsed.ok ? JSON.stringify(parsed.result, null, 2) : '',
+              stderr: parsed.ok ? '' : String(parsed.error || ''),
+              code: parsed.ok ? 0 : 1,
+              mode: 'ƒ ' + fnName
+            } : { ...r, mode: 'ƒ ' + fnName };
+          } finally { try { fs.unlinkSync(tmp); } catch (_) {} }
+        }
+      }
+
+      if (P.__js_reset) {
+        delete P.__js_reset;
+        const keep = st.currentCodeFile; // recents entry survives reset
+        Object.assign(st, fresh());
+        st.currentCodeFile = keep;
+        this.Storages.Delete(id, edk);
+        this.FileManager.ClearSelection(id, fpn);
+      }
+
+      if (P.__js_edit) {
+        delete P.__js_edit;
+        this.Storages.Set(id, edk, st.code || '');
+        st.editing = true;
+      }
+
+      if (P.__js_view !== undefined) {
+        st.view = P.__js_view || null;
+        delete P.__js_view;
+      }
+
+      if (P.__js_loadRecent) {
+        const e = _jsLoad(P.__js_loadRecent);
+        delete P.__js_loadRecent;
+        if (e) {
+          st.source = 'code';
+          st.code = e.code;
+          st.parsed = _jsParse(e.code);
+          st.currentCodeFile = e.file;
+          st.view = null;
+          freshView();
+          this.Storages.Set(id, edk, e.code);
+        }
+      }
+
+      if (P.__js_pinRecent) {
+        const e = _jsLoad(P.__js_pinRecent);
+        delete P.__js_pinRecent;
+        if (e) { e.pinned = !e.pinned; _jsSave(e); }
+      }
+
+      if (P.__js_delRecent) {
+        _jsDel(P.__js_delRecent);
+        delete P.__js_delRecent;
+      }
+
+      if (P.__js_renameRecent) {
+        const file = P.__js_renameRecent;
+        delete P.__js_renameRecent;
+        const e = _jsLoad(file);
+        if (e) {
+          this.WaitInput(id, {
+            path: this.Name,
+            props: { ...passProps, __js_renameWait: `${cfg.name}::${file}` },
+            question: `Rename "${e.name}" → `
+          });
+          return;
+        }
+      }
+
+      // WaitInput response for a pending rename. The marker prop is
+      // namespaced per widget, so two JavaScript instances never
+      // collide. SelfBuilder only consumes `inputValue` when ITS OWN
+      // pending flags are set — see _processActions.
+      if (P.__js_renameWait && P.inputValue !== undefined) {
+        const marker = String(P.__js_renameWait);
+        const file = marker.split('::')[1];
+        const newName = String(P.inputValue || '').trim();
+        delete P.__js_renameWait;
+        delete P.inputValue;
+        if (file && newName) {
+          const e = _jsLoad(file);
+          if (e) { e.name = newName; _jsSave(e); }
+        }
+      }
+
+      if (P.__js_enterClass !== undefined) {
+        const v = P.__js_enterClass; delete P.__js_enterClass;
+        st.selectedClass = v || null; st.selectedMethod = null;
+        st.ctorArgs = {}; st.methodArgs = {};
+        st.result = null; st.instance = null;
+      }
+
+      if (P.__js_enterMethod !== undefined) {
+        const v = P.__js_enterMethod; delete P.__js_enterMethod;
+        st.selectedMethod = v || null; st.methodArgs = {}; st.result = null;
+      }
+
+      if (P.__js_back) {
+        delete P.__js_back;
+        if (st.selectedMethod !== null) { st.selectedMethod = null; st.methodArgs = {}; }
+        else if (st.selectedClass !== null) { freshView(); }
+      }
+
+      if (P.__js_instantiate) {
+        delete P.__js_instantiate;
+        const cls = st.source === 'file' && st.filePath && st.selectedClass ? findClass(st.selectedClass) : null;
+        if (cls) {
+          const r = await _jsRunClass(st.filePath, st.selectedClass, '__constructOnly', buildArgs(cls, null), { timeout: cfg.timeout });
+          st.result = r.ok
+            ? { ok: true, value: 'instance ready', instance: r.instance }
+            : { ok: false, error: r.error, stack: r.stack };
+          if (r.ok) st.instance = r.instance;
+        }
+      }
+
+      if (P.__js_execute) {
+        delete P.__js_execute;
+        const cls    = st.source === 'file' && st.filePath && st.selectedClass ? findClass(st.selectedClass) : null;
+        const method = cls && st.selectedMethod ? findMethod(cls, st.selectedMethod) : null;
+        if (cls && method) {
+          const r = await _jsRunClass(st.filePath, st.selectedClass, st.selectedMethod, buildArgs(cls, method), { timeout: cfg.timeout });
+          st.result = r.ok
+            ? { ok: true, value: r.result, instance: r.instance }
+            : { ok: false, error: r.error, stack: r.stack };
+          if (r.ok) st.instance = r.instance;
+        }
+      }
+
+      if (P.__js_clearResult)   { delete P.__js_clearResult;   st.result = null; st.runResult = null; }
+      if (P.__js_resetInstance) { delete P.__js_resetInstance; st.instance = null; st.result = null; }
+
+      // ---------------------------------------------------------------
+      // AUTO-LOAD from the nested file picker.
+      // ---------------------------------------------------------------
+      if (st.source === 'none') {
+        const picked = this.FileManager.GetSelected(id, fpn);
+        if (picked.length > 0) {
+          this.FileManager.ClearSelection(id, fpn);
+          try {
+            st.filePath = picked[0];
+            st.code = fs.readFileSync(picked[0], 'utf8');
+            st.parsed = _jsParse(st.code);
+            st.source = 'file';
+            st.currentCodeFile = null;
+            freshView();
+            this.Alert(id, `✅ ${path.basename(picked[0])}`, { duration: 1500 });
+          } catch (e) {
+            this.Alert(id, `❌ ${e.message}`, { duration: 4000 });
+          }
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // RE-OPEN THE EDITOR (from ✎ edit or from the initial ✎ code button)
+      // ---------------------------------------------------------------
+      if (st.editing) {
+        P[`__textEditor_${fp}_code`] = true;
+        const prev = st.code || '';
+        const code = await this.TextEditor(id, `${fp}_code`, {
+          label: '',
+          buttonText: '✎ code',
+          initialValue: prev,
+          title: 'JavaScript'
+        });
+        st.editing = false;
+        if (typeof code === 'string' && code.trim() && code !== prev) {
+          st.code = code;
+          st.parsed = _jsParse(code);
+          st.source = 'code';
+          st.filePath = null;
+          saveCurrent();
+          freshView();
+        }
+      }
+
+      // ---------------------------------------------------------------
+      // ONE DROPDOWN — everything happens inside it.
+      // ---------------------------------------------------------------
+      const ddLabel = st.source === 'none'
+        ? '⌨ javascript'
+        : st.source === 'file'
+          ? `📄 ${_jsFit(path.basename(st.filePath || 'js'), 40)}`
+          : `⌨ ${_jsFit(st.currentCodeFile ? (_jsLoad(st.currentCodeFile)?.name || 'inline') : 'inline', 30)}`;
+
+      await this.DropDown(id, `${sk}_dd`, async () => {
+
+        // ================ RECENTS VIEW ================
+        if (st.view === 'recents') {
+          L(ColorText.orange('◀ back'), { __js_view: '' });
+          const list = _jsList();
+          if (list.length === 0) {
+            L(ColorText.dim('(no saved codes)'));
+          } else {
+            for (const c of list) {
+              B([
+                { name: `📄 ${_jsFit(c.name, 26)}`, props: { __js_loadRecent: c.file } },
+                { name: c.pinned ? '📌' : '☆', props: { __js_pinRecent: c.file } },
+                { name: '✎', props: { __js_renameRecent: c.file } },
+                { name: '🗑', props: { __js_delRecent: c.file } }
+              ]);
+            }
+          }
+          return;
+        }
+
+        // ================ NO SOURCE YET ================
+        if (st.source === 'none') {
+          await this.File(id, {
+            name: fpn,
+            multiple: false,
+            filter: fFilter,
+            startPath: cfg.startPath || process.cwd(),
+            displayName: '📁 file'
+          });
+
+          const code = await this.TextEditor(id, `${fp}_code`, {
+            label: '',
+            buttonText: '✎ code',
+            initialValue: '',
+            title: 'JavaScript'
+          });
+          if (code && code.trim()) {
+            st.source = 'code';
+            st.code = code;
+            st.parsed = _jsParse(code);
+            st.filePath = null;
+            st.currentCodeFile = null;
+            saveCurrent();
+            freshView();
+          }
+
+          const n = _jsList().length;
+          if (n > 0) L(ColorText.dim(`🕘 recents (${n})`), { __js_view: 'recents' });
+
+          if (st.source === 'none') return;
+        }
+
+        // ================ ROOT VIEW ================
+        if (!st.selectedClass) {
+          L(ColorText.bgGreen(ColorText.black(' ▶ execute ')), { __js_run: 1 });
+
+          const recents = _jsList().length;
+          const rowActions = [];
+          if (st.source === 'code' && st.code && st.code.trim())
+            rowActions.push({ name: ColorText.cyan('✎ edit'), props: { __js_edit: 1 } });
+          if (recents > 0)
+            rowActions.push({ name: ColorText.dim(`🕘 (${recents})`), props: { __js_view: 'recents' } });
+          if (st.runResult || st.instance || st.result)
+            rowActions.push({ name: ColorText.red('↺ reset'), props: { __js_reset: 1 } });
+          if (rowActions.length > 0) B(rowActions);
+
+          const fns = st.parsed?.functions || [];
+          if (!cfg.classOnly && fns.length > 0) {
+            L(' ');
+            L(ColorText.dim(`ƒ functions (${fns.length})`));
+            B(fns.map(fn => ({
+              name: `▶ ${fn.name}${(fn.params || []).length ? '(' + fn.params.join(', ') + ')' : ''}`,
+              props: { __js_runFn: fn.name }
+            })));
+          }
+
+          const cls = st.parsed?.classes || [];
+          if (cls.length > 0) {
+            L(' ');
+            L(ColorText.dim(`◈ classes (${cls.length})`));
+            B(cls.map(c => ({
+              name: `◈ ${c.name}` +
+                (c.extends ? ColorText.dim(' : ' + c.extends) : '') +
+                ColorText.dim(` (${c.methods.length})`),
+              props: { __js_enterClass: c.name }
+            })));
+          }
+
+          if (cfg.classOnly ? cls.length === 0 : (fns.length === 0 && cls.length === 0)) {
+            L(ColorText.dim('(nothing parsed — ▶ execute still runs the source)'));
+          }
+
+          if (st.runResult) {
+            L(' ');
+            L(`${st.runResult.ok ? ColorText.green('✓') : ColorText.red('✗')} ` +
+              ColorText.dim(`exit ${st.runResult.code ?? '?'} · ${st.runResult.mode}`));
+            const out = [
+              st.runResult.stdout || '',
+              st.runResult.stderr ? '\n[stderr]\n' + st.runResult.stderr : '',
+              st.runResult.error ? '\n[error] ' + st.runResult.error : ''
+            ].filter(Boolean).join('');
+            if (out) TB(`${sk}_run_result`, {
+              label: 'out',
+              initialValue: out,
+              lines: Math.min(14, Math.max(4, out.split('\n').length)),
+              editable: false
+            });
+            L(ColorText.dim('✕ clear'), { __js_clearResult: 1 });
+          }
+        }
+
+        // ================ CLASS VIEW ================
+        else if (!st.selectedMethod) {
+          const cls = findClass(st.selectedClass);
+          L(ColorText.dim('◈ ') + ColorText.brightMagenta(ColorText.bold(st.selectedClass)) +
+            (cls?.extends ? ColorText.dim(' : ' + cls.extends) : ''));
+
+          if (!cls) { L(ColorText.orange('◀ back'), { __js_back: 1 }); return; }
+
+          (cls.constructorArgs || []).forEach((name, i) => F(`${fp}_ctor_${i}`, {
+            label: name,
+            initialValue: st.ctorArgs[i] !== undefined ? String(st.ctorArgs[i]) : '',
+            maxWidth: 30,
+            onChange: (v) => { st.ctorArgs[i] = v; }
+          }));
+
+          F(`${fp}_props`, {
+            label: 'props',
+            initialValue: st.propsJson || '{}',
+            maxWidth: 40,
+            onChange: (v) => { st.propsJson = v; }
+          });
+
+          B([
+            { name: ColorText.bgGreen(ColorText.black(' 🧪 create ')), props: { __js_instantiate: 1 } },
+            { name: ColorText.orange('◀ back'), props: { __js_back: 1 } }
+          ]);
+
+          if (st.result) {
+            L(' ');
+            L(st.result.ok
+              ? ColorText.green('✓ ' + (typeof st.result.value === 'string' ? st.result.value : 'ready'))
+              : ColorText.red('✗ ' + (st.result.error || 'error')));
+          }
+
+          if (st.instance) {
+            const s = JSON.stringify(st.instance, null, 2);
+            TB(`${sk}_instance_view`, {
+              label: 'instance',
+              initialValue: s,
+              lines: Math.min(14, Math.max(4, s.split('\n').length)),
+              editable: false
+            });
+            if (cls.methods.length > 0) {
+              L(' ');
+              L(ColorText.dim(`methods (${cls.methods.length})`));
+              B(cls.methods.map(m => ({
+                name: `${m.isAsync ? '⏳' : m.isStatic ? '·' : '▶'} ${m.name}` +
+                  ((m.params || []).length ? `(${m.params.join(', ')})` : ''),
+                props: { __js_enterMethod: m.name }
+              })));
+            }
+            L(ColorText.dim('↺ discard'), { __js_resetInstance: 1 });
+          }
+        }
+
+        // ================ METHOD VIEW ================
+        else {
+          const cls = findClass(st.selectedClass);
+          const method = cls ? findMethod(cls, st.selectedMethod) : null;
+
+          L(ColorText.dim(`${st.selectedClass} › `) + ColorText.brightCyan(ColorText.bold(st.selectedMethod)));
+
+          if (!method) { L(ColorText.orange('◀ back'), { __js_back: 1 }); return; }
+
+          (method.params || []).forEach((name, i) => F(`${fp}_method_${i}`, {
+            label: name,
+            initialValue: st.methodArgs[i] !== undefined ? String(st.methodArgs[i]) : '',
+            maxWidth: 30,
+            onChange: (v) => { st.methodArgs[i] = v; }
+          }));
+
+          B([
+            { name: ColorText.bgGreen(ColorText.black(' ▶ exec ')), props: { __js_execute: 1 } },
+            { name: ColorText.orange('◀ back'), props: { __js_back: 1 } }
+          ]);
+
+          if (st.result) {
+            L(' ');
+            if (st.result.ok) {
+              let s;
+              try { s = JSON.stringify(st.result.value, null, 2); }
+              catch (_) { s = String(st.result.value); }
+              if (s === undefined) s = '(undefined)';
+              TB(`${sk}_method_result`, {
+                label: 'result',
+                initialValue: s,
+                lines: Math.min(16, Math.max(4, s.split('\n').length + 1)),
+                editable: false
+              });
+            } else {
+              L(ColorText.red('✗ ' + (st.result.error || 'error')));
+              if (st.result.stack) TB(`${sk}_method_stack`, {
+                label: 'stack',
+                initialValue: String(st.result.stack),
+                lines: 6,
+                editable: false
+              });
+            }
+            L(ColorText.dim('✕ clear'), { __js_clearResult: 1 });
+          }
+        }
+      }, {
+        up_buttontext: ddLabel,
+        down_buttontext: ddLabel,
+        up_emoji: '▶',
+        down_emoji: '▼'
+      });
+    };
+
     // --------------------------- Build Method ---------------------------
 
     this.Build = async (props = { session: new Session }) => {
@@ -14994,6 +15888,18 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'javascript': {
+          const cfg = {}
+          if (it.config) {
+            if (it.config.name) cfg.name = it.config.name
+            if (it.config.classOnly) cfg.classOnly = true
+            if (it.config.timeout && it.config.timeout !== 30000) cfg.timeout = it.config.timeout
+            if (it.config.startPath) cfg.startPath = it.config.startPath
+          }
+          const cfgArg = Object.keys(cfg).length > 0 ? `, ${JSON.stringify(cfg)}` : ''
+          L.push(`${indent}await this.JavaScript(id, ${JSON.stringify(it.codeOrPath || '')}${cfgArg})`)
+          break
+        }
         case 'route': {
           const m = it.method || 'Get'
           L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
@@ -15070,6 +15976,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   SetPage: 'setpage',
   File: 'file',
   JSON: 'json',
+  JavaScript: 'javascript',
   Args: 'args',
   Cells: 'cells',
   Grid: 'grid',
@@ -15188,6 +16095,15 @@ function _sbMakeItemForMethod(methodName, id) {
         cells: [{ items: [] }],
         maxCellRatio: 0.2,
         gap: 2
+      }
+    case 'javascript':
+      // Minimalist JS widget. Starts with no source; the whole widget
+      // is a single dropdown and the file picker + inline editor live
+      // inside it. Inline codes are auto-saved under os.tmpdir().
+      return {
+        ...base,
+        codeOrPath: '',
+        config: { name: 'js_' + id, classOnly: false, timeout: 30000 }
       }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
@@ -15500,7 +16416,11 @@ class SelfBuilder extends SyAPP_Func {
     const passProps = curPage ? { page: curPage } : {}
 
     // ---- WaitInput resolution ----
-    if (p.inputValue !== undefined) {
+    // Consume `inputValue` ONLY when this SelfBuilder instance itself
+    // initiated the WaitInput. Nested widgets (e.g. the JavaScript
+    // item's "rename recent" prompt) may also use WaitInput and
+    // resolve their own value downstream in their own prop handlers.
+    if (p.inputValue !== undefined && (this._pendingEdit || this._pendingAction)) {
       if (this._pendingEdit) {
         const it = this._findItem(this._pendingEdit.itemId)
         if (it) {
@@ -15613,6 +16533,13 @@ class SelfBuilder extends SyAPP_Func {
         this._pendingAction = null
       }
       delete p.inputValue
+      return
+    }
+
+    // If `inputValue` is still present here, it belongs to a nested
+    // widget — leave it untouched so the widget's own prop handler
+    // can consume it.
+    if (p.inputValue !== undefined) {
       return
     }
 
@@ -16530,6 +17457,14 @@ class SelfBuilder extends SyAPP_Func {
             })
           }
           break
+        case 'javascript':
+          // The widget drives itself purely through props on
+          // ActualProps (same model as this.File / this.JSON), so its
+          // internal buttons keep working in EDIT and VIEW modes alike.
+          // In EDIT mode, the ○/◉ dot prefix still opens the pinned
+          // editor for tweaking `codeOrPath` and the config.
+          await this.JavaScript(id, it.codeOrPath || '', it.config || {})
+          break
         case 'route':
           this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
           break
@@ -16868,6 +17803,27 @@ class SelfBuilder extends SyAPP_Func {
         mkToggle('form', 'Form Fallback')
         break
 
+      case 'javascript': {
+        // `codeOrPath` = file path (".js/.mjs/.cjs"), inline source, or
+        // empty (widget shows its picker + editor inside the dropdown).
+        mkProp('codeOrPath', 'Code / Path', 'string')
+        mkProp('config', 'Config (JSON)', 'json')
+
+        const src = it.codeOrPath && !/\.(js|mjs|cjs)$/i.test(it.codeOrPath) ? it.codeOrPath : '';
+        if (src) {
+          const sh = _jsShape(src);
+          propButtons.push({
+            name: ColorText.dim(
+              `   shape: ${sh.classes.length} class(es), ` +
+              `${sh.functions.length} function(s), ` +
+              `${sh.variables.length} variable(s)`
+            ),
+            props: {},
+            pinned: true
+          });
+        }
+        break
+      }
       case 'route':
         mkProp('path', 'Path', 'string')
         mkProp('handler', 'Handler', 'string')
