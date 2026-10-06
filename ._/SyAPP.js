@@ -2449,6 +2449,89 @@ if (configuration.remember) {
         return out.map(styleLine);
       };
 
+      // ------------------------------------------------------------------
+      // EMBED VIEW (this.Emb) RENDERING
+      // ------------------------------------------------------------------
+      const renderEmbedViewLines = (item, isFocused, lineIdx) => {
+        const termWidth = Math.max(20, stdout.columns || 80);
+        const totalLines = Math.max(4, item.lines || 10);
+        const contentLines = totalLines - 2;
+        const innerWidth = Math.max(4, termWidth - 4);
+        const value = String(item.viewText || '');
+        const scroll = item.scroll || 0;
+        const active = !!item.active;
+        const navigable = !!item.navigable;
+        const editable = !!item.editable;
+        const errored = !!item.viewError;
+
+        const wrapped = [];
+        const rawLines = value.split('\n');
+        for (const rawLine of rawLines) {
+          if (rawLine.length === 0) { wrapped.push(''); continue; }
+          for (let i = 0; i < rawLine.length; i += innerWidth) {
+            wrapped.push(rawLine.slice(i, i + innerWidth));
+          }
+        }
+        if (wrapped.length === 0) wrapped.push('');
+
+        const totalWrapped = wrapped.length;
+        const maxScroll = Math.max(0, totalWrapped - contentLines);
+        const s = Math.max(0, Math.min(scroll, maxScroll));
+
+        const styleLine = (l) => {
+          if (errored) return ColorText.brightRed(l);
+          if (active) return ColorText.brightGreen(l);
+          if (isFocused) return ColorText.brightCyan(l);
+          return ColorText.dim(l);
+        };
+
+        const out = [];
+
+        const label = item.label || '';
+        const labelPart = label ? ` ${label} ` : '';
+        const topFill = Math.max(0, termWidth - 2 - labelPart.length);
+        out.push(('┌' + labelPart + '─'.repeat(topFill) + '┐').slice(0, termWidth));
+
+        for (let i = 0; i < contentLines; i++) {
+          const idx = s + i;
+          let text = (idx < totalWrapped) ? wrapped[idx] : '';
+          if (text.length > innerWidth) text = text.slice(0, innerWidth);
+          text = text.padEnd(innerWidth, ' ');
+
+          let leftMarker = '│';
+          if (i === 0 && s > 0) leftMarker = '↑';
+          if (i === contentLines - 1 && (s + contentLines) < totalWrapped) leftMarker = '↓';
+          if (i === 0 && isFocused && !active) leftMarker = '▣';
+
+          let line = leftMarker + ' ' + text + ' │';
+          if (line.length > termWidth) line = line.slice(0, termWidth);
+          else if (line.length < termWidth) line = line + ' '.repeat(termWidth - line.length);
+          out.push(line);
+        }
+
+        let counter = '';
+        if (maxScroll > 0) {
+          counter = ` ${s + 1}-${Math.min(s + contentLines, totalWrapped)}/${totalWrapped} `;
+        }
+
+        let hint = '';
+        if (isFocused && !active) {
+          hint = ' Enter: activate ';
+        } else if (active) {
+          const parts = [];
+          if (navigable) parts.push('Enter: go to func');
+          if (editable)  parts.push('E: edit');
+          parts.push('↑↓: scroll');
+          parts.push('Enter: exit');
+          hint = ' ' + parts.join('  ') + ' ';
+        }
+
+        const midFill = Math.max(0, termWidth - 2 - counter.length - hint.length);
+        out.push(('└' + '─'.repeat(midFill) + counter + hint + '┘').slice(0, termWidth));
+
+        return out.map(styleLine);
+      };
+
       const renderMenu = () => {
         computeViewport();
 
@@ -2522,15 +2605,18 @@ if (configuration.remember) {
         for (let rel = startRel; rel < endRel; rel++) {
           const lineIndex = scrollableStartIndex + rel;
           const lineOptions = normalizedOptions[lineIndex];
-          const isTextView = Array.isArray(lineOptions) && lineOptions.length === 1 &&
-                             lineOptions[0] && lineOptions[0].type === 'textview';
+          const firstItem = (Array.isArray(lineOptions) && lineOptions.length === 1) ? lineOptions[0] : null;
+          const isTextView = firstItem && firstItem.type === 'textview';
+          const isEmbedView = firstItem && firstItem.type === 'embedview';
 
-          if (isTextView) {
-            const tv = lineOptions[0];
-            const height = Math.max(2, tv.lines || 4);
+          if (isTextView || isEmbedView) {
+            const box = firstItem;
+            const height = Math.max(2, box.lines || 4);
             if (rowsUsedInLoop + height > availableRowsForScrollable) break;
-            const tvLines = renderTextViewLines(tv, lineIndex === line, lineIndex);
-            for (const ln of tvLines) {
+            const boxLines = isTextView
+              ? renderTextViewLines(box, lineIndex === line, lineIndex)
+              : renderEmbedViewLines(box, lineIndex === line, lineIndex);
+            for (const ln of boxLines) {
               console.log(ln);
               currentRow += 1;
             }
@@ -2595,11 +2681,14 @@ if (configuration.remember) {
       };
 
       const setFocus = (newLine, newColumn) => {
-        // Defensive: if focus moves away from an active textview, drop
-        // it back to FOCUSED so the next visit starts cleanly.
+        // Defensive: if focus moves away from an active box (textview
+        // OR embedview), drop it back to FOCUSED so the next visit
+        // starts cleanly.
         const prevOption = normalizedOptions[line] && normalizedOptions[line][column];
         const nextOption = normalizedOptions[newLine] && normalizedOptions[newLine][newColumn];
-        if (prevOption && prevOption.type === 'textview' && prevOption !== nextOption) {
+        if (prevOption &&
+            (prevOption.type === 'textview' || prevOption.type === 'embedview') &&
+            prevOption !== nextOption) {
           if (prevOption.active) {
             prevOption.active = false;
             if (typeof prevOption.persistActive === 'function') {
@@ -2651,6 +2740,60 @@ if (configuration.remember) {
           if (!wasFocused) setFocus(line, column);
 
           selectedOption.onToggle();
+          this.isClickInProgress = false;
+          renderMenu();
+          return;
+        }
+
+        // -------- EmbedView (this.Emb) handling --------
+        if (selectedOption && selectedOption.type === 'embedview') {
+          const wasFocused = (normalizedOptions[line] &&
+                              normalizedOptions[line][column] === selectedOption);
+          if (!wasFocused) setFocus(line, column);
+
+          if (selectedOption.active) {
+            if (selectedOption.navigable && selectedOption.childFuncName) {
+              this.lastSelectedIndex = this.getLinearIndexFromCoordinates(normalizedOptions, line, column);
+
+              const selectionEventData = {
+                index: this.lastSelectedIndex,
+                line,
+                column,
+                selected: this.getOptionDataForEvent(selectedOption),
+                question,
+                source: selectionSource,
+                metadata: {
+                  path: selectedOption.childFuncName,
+                  props: {},
+                  resetSelection: true,
+                  jumpTo: false
+                },
+                customData: {
+                  __embeddedNav: true,
+                  originalName: selectedOption.originalName
+                }
+              };
+
+              this.emitEvent(this.eventTypes.MENU_SELECTION, selectionEventData);
+
+              this.cleanupMenuState();
+              this.isClickInProgress = false;
+              resolve(selectedOption.name || selectedOption);
+              return;
+            }
+            selectedOption.active = false;
+            if (typeof selectedOption.persistActive === 'function') {
+              selectedOption.persistActive();
+            }
+            this.isClickInProgress = false;
+            renderMenu();
+            return;
+          }
+
+          selectedOption.active = true;
+          if (typeof selectedOption.persistActive === 'function') {
+            selectedOption.persistActive();
+          }
           this.isClickInProgress = false;
           renderMenu();
           return;
@@ -2912,6 +3055,24 @@ if (configuration.remember) {
             // alt/meta+e are left for future shortcuts.
             if (!key.ctrl && !key.shift && !key.meta) {
               const tvEdit = normalizedOptions[line] && normalizedOptions[line][column];
+
+              if (tvEdit &&
+                  tvEdit.type === 'embedview' &&
+                  tvEdit.active &&
+                  tvEdit.editable &&
+                  typeof tvEdit.openEditor === 'function') {
+                tvEdit.active = false;
+                if (typeof tvEdit.persistActive === 'function') {
+                  tvEdit.persistActive();
+                }
+                this.cleanupMenuState();
+                resolve(tvEdit);
+                setImmediate(() => {
+                  try { tvEdit.openEditor(); } catch (_) {}
+                });
+                return;
+              }
+
               if (tvEdit &&
                   tvEdit.type === 'textview' &&
                   tvEdit.active &&
@@ -3920,10 +4081,9 @@ setFocus(newLine, newColumn);
       for (let i = scrollOffset; i < scrollableCount; i++) {
         const lineArr = normalizedOptions[scrollableStartIndex + i];
         if (!lineArr) break;
-        const h = (Array.isArray(lineArr) && lineArr.length === 1 &&
-                   lineArr[0] && lineArr[0].type === 'textview')
-          ? Math.max(2, lineArr[0].lines || 4)
-          : 1;
+        const firstIt = (Array.isArray(lineArr) && lineArr.length === 1) ? lineArr[0] : null;
+        const isBox = firstIt && (firstIt.type === 'textview' || firstIt.type === 'embedview');
+        const h = isBox ? Math.max(2, firstIt.lines || 4) : 1;
         if (visualRow < acc + h) {
           targetRel = i;
           break;
@@ -11101,6 +11261,713 @@ function levenshteinDistance(str1, str2) {
         }
     };
 
+    // --------------------------- Emb Method ---------------------------
+
+    /**
+     * Embed another SyAPP_Func (class or .js file) inside the current
+     * build. Two visual modes:
+     *
+     *   1. BOX MODE (default)   — live framed box (TextButton-style).
+     *   2. COMPACT MODE         — single plain button (compact: true).
+     *
+     * Editable mode
+     * ─────────────
+     * With `editable: true`, pressing E on an ACTIVE box opens the
+     * SelfBuilder to edit the embed's source. If no source exists yet,
+     * a brand-new .js file is created on the spot from a template.
+     *
+     * Because navigating INTO the SelfBuilder would otherwise leave the
+     * user stranded (the SelfBuilder has no built-in return), Emb
+     * injects a `__returnTo` marker into the SelfBuilder's session
+     * props. The SelfBuilder reads that marker, snapshots its OWN
+     * current State on the way in, and renders a persistent "← Return"
+     * pinned button that restores that snapshot and navigates back to
+     * the ORIGINATING func with its original props.
+     *
+     * This works whether the origin is the SelfBuilder itself (in which
+     * case the SelfBuilder's own draft is restored) or any other parent
+     * func.
+     */
+    this.Emb = async (id, funcOrPath, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Emb() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+
+      const parentSyapp = this._syappInstance;
+      if (!parentSyapp || !parentSyapp.Funcs) {
+        if (this.Log) console.log(`this.Emb() Error - SyAPP instance not attached | BuildID: ${id}`);
+        return;
+      }
+
+      const __build = this.Builds.get(id);
+      const cfg = {
+        name: undefined,
+        label: undefined,
+        lines: 10,
+        navigable: true,
+        editable: false,
+        description: '',
+        pinned: undefined,
+        pinnedTop: undefined,
+        defaultReturn: true,
+        defaultReturnLabel: undefined,
+        compact: false,
+        buttonText: undefined,
+        ...config
+      };
+
+      const curSessionProps = this.Builds.get(id)?.Session?.ActualProps || {};
+      let effectiveSource = funcOrPath;
+      const provisionalKey = cfg.name
+        ? `${this.Name}__emb__${String(cfg.name).replace(/[^A-Za-z0-9_]/g, '_')}`
+        : null;
+      if (provisionalKey) {
+        const override = curSessionProps[`__embSource__${provisionalKey}`];
+        if (typeof override === 'string' && override.trim() !== '') {
+          effectiveSource = override;
+        }
+      }
+
+      const hasSource = !(effectiveSource === undefined || effectiveSource === null ||
+                          (typeof effectiveSource === 'string' && effectiveSource.trim() === ''));
+
+      if (!hasSource && !cfg.editable) {
+        this.Alert(id, 'Emb: no source configured (enable editable to draft one)', { duration: 4000 });
+        return;
+      }
+
+      let sourceKey = 'unknown';
+      if (typeof effectiveSource === 'string' && effectiveSource.trim() !== '') {
+        try { sourceKey = `file_${path.resolve(effectiveSource).replace(/[^A-Za-z0-9_]/g, '_')}`; }
+        catch (_) { sourceKey = 'file_unknown'; }
+      } else if (typeof effectiveSource === 'function') {
+        sourceKey = `class_${effectiveSource.name || 'Anon'}`;
+      } else if (effectiveSource && typeof effectiveSource === 'object') {
+        sourceKey = `inst_${effectiveSource.Name || 'Anon'}`;
+      } else {
+        sourceKey = 'draft';
+      }
+      const uniqueKey = cfg.name
+        ? `${this.Name}__emb__${String(cfg.name).replace(/[^A-Za-z0-9_]/g, '_')}`
+        : `${this.Name}__emb__${sourceKey}`;
+
+      if (!parentSyapp._embedSandboxes) parentSyapp._embedSandboxes = new Map();
+
+      let sandbox = parentSyapp._embedSandboxes.get(uniqueKey);
+
+      if (sandbox && sandbox.isDraft && hasSource) {
+        try { parentSyapp.Funcs.delete(sandbox.funcName); } catch (_) {}
+        parentSyapp._embedSandboxes.delete(uniqueKey);
+        sandbox = null;
+      }
+
+      if (!sandbox) {
+        if (hasSource) {
+          try { sandbox = await this._spawnEmbSandbox(effectiveSource, uniqueKey, parentSyapp); }
+          catch (err) {
+            if (this.Log) console.error('this.Emb() spawn error:', err);
+            this.Alert(id, `Emb error: ${err.message}`, { duration: 5000 });
+            return;
+          }
+        } else {
+          sandbox = await this._spawnEmbDraftSandbox(uniqueKey, parentSyapp, cfg.label);
+        }
+        if (!sandbox) {
+          this.Alert(id, 'Emb: could not create sandbox', { duration: 5000 });
+          return;
+        }
+        parentSyapp._embedSandboxes.set(uniqueKey, sandbox);
+      }
+
+      const rawParentProps = (this.Builds.get(id)?.Session?.ActualProps) || {};
+      const parentPropsSnapshot = {};
+      for (const k of Object.keys(rawParentProps)) {
+        if (k === 'session' || k === 'mainfunc') continue;
+        if (k.startsWith('__embSource__')) continue;
+        parentPropsSnapshot[k] = rawParentProps[k];
+      }
+      parentPropsSnapshot.page = '';
+      sandbox.parentProps = parentPropsSnapshot;
+      sandbox.parentFuncName = this.Name;
+      sandbox.parentSessionId = id;
+      sandbox.defaultReturn = cfg.defaultReturn !== false;
+      sandbox.defaultReturnLabel = cfg.defaultReturnLabel;
+      sandbox.embUniqueKey = uniqueKey;
+
+      const resolvedLabel = cfg.label
+        || sandbox.originalName
+        || (sandbox.isDraft ? 'Draft' : 'Embedded');
+
+      // ------------------------------------------------------------------
+      // COMPACT MODE — single plain button.
+      // ------------------------------------------------------------------
+      if (cfg.compact) {
+        const btnName = cfg.buttonText || `▣ ${resolvedLabel}`;
+        const cfgPinned = cfg.pinned === true;
+        const cfgPinnedTop = cfg.pinnedTop === true;
+
+        const compactButton = {
+          name: btnName,
+          metadata: {
+            props: {},
+            path: sandbox.funcName,
+            resetSelection: true,
+            jumpTo: false,
+            pinned: cfgPinned,
+            pinnedTop: cfgPinnedTop
+          },
+          action: () => {}
+        };
+
+        if (__build._cellItems) {
+          __build._cellItems.push(compactButton);
+        } else {
+          __build.Buttons.push(compactButton);
+        }
+        return;
+      }
+
+      // ------------------------------------------------------------------
+      // BOX MODE.
+      // ------------------------------------------------------------------
+      if (!sandbox.initDone) {
+        try { await sandbox.initPromise; } catch (_) { /* logged inside */ }
+        sandbox.initDone = true;
+      }
+
+      let childRender;
+      try { childRender = await this._renderEmbSandbox(sandbox); }
+      catch (err) {
+        if (this.Log) console.error('this.Emb() child render error:', err);
+        childRender = { error: `Child render error: ${err.message}`, hud_obj: { title: '', options: [] } };
+      }
+
+      const activeKey = `embedview_active_${uniqueKey}`;
+      const scrollKey = `embedview_scroll_${uniqueKey}`;
+      const activeStored = this.Storages.Get(id, activeKey) === true;
+      let storedScroll = this.Storages.Get(id, scrollKey);
+      if (typeof storedScroll !== 'number' || !isFinite(storedScroll)) storedScroll = 0;
+
+      const childView = this._formatEmbSandboxView(childRender);
+      const self = this;
+
+      const evItem = {
+        type: 'embedview',
+        name: uniqueKey,
+        label: resolvedLabel,
+        lines: Math.max(4, Math.min(80, parseInt(cfg.lines, 10) || 10)),
+        navigable: !!cfg.navigable,
+        editable: !!cfg.editable,
+        isDraft: !!sandbox.isDraft,
+        childFuncName: sandbox.funcName,
+        childSessionId: sandbox.sessionId,
+        originalName: sandbox.originalName,
+        sourcePath: sandbox.sourcePath,
+        viewText: childView.text,
+        viewError: childView.error || null,
+        scroll: storedScroll,
+        activeKey,
+        scrollKey,
+        active: activeStored,
+        pinned: cfg.pinned || false,
+        pinnedTop: cfg.pinnedTop || false,
+        metadata: { props: {}, path: this.Name, resetSelection: false },
+        persistActive: () => { self.Storages.Set(id, activeKey, !!evItem.active); },
+        persistScroll: () => { self.Storages.Set(id, scrollKey, evItem.scroll || 0); },
+        onToggle: () => {
+          if (evItem.active) { evItem.active = false; evItem.persistActive(); return 'deactivated'; }
+          evItem.active = true; evItem.persistActive(); return 'activated';
+        },
+        onScroll: (delta) => {
+          const w = Math.max(10, (stdout.columns || 80) - 4);
+          const lines = String(evItem.viewText || '').split('\n');
+          const wrapped = [];
+          for (const rl of lines) {
+            if (!rl.length) { wrapped.push(''); continue; }
+            for (let i = 0; i < rl.length; i += w) wrapped.push(rl.slice(i, i + w));
+          }
+          if (wrapped.length === 0) wrapped.push('');
+          const bodyRows = Math.max(1, (evItem.lines || 10) - 2);
+          const maxS = Math.max(0, wrapped.length - bodyRows);
+          const newS = Math.max(0, Math.min(maxS, (evItem.scroll || 0) + delta));
+          if (newS === evItem.scroll) return false;
+          evItem.scroll = newS;
+          evItem.persistScroll();
+          return true;
+        },
+        openEditor: () => {
+          // ------------------------------------------------------------------
+          // Editable shortcut. Two paths:
+          //   1. SelfBuilder is registered → navigate there with the
+          //      source loaded (or a fresh editor if no source exists)
+          //      AND inject a `__returnTo` marker so the SelfBuilder can
+          //      render a "← Return" button back to this parent func.
+          //   2. No SelfBuilder → fall back to the internal text editor
+          //      and write the result to disk.
+          // ------------------------------------------------------------------
+          const builder = parentSyapp.Funcs.get('__selfbuilder__');
+
+          const originPath = self.Name;
+          const originProps = { ...(self.Builds.get(id)?.Session?.ActualProps || {}) };
+          delete originProps.session;
+          delete originProps.mainfunc;
+          originProps.page = '';
+
+          // ------------------------------------------------------------------
+          // Case A: no source yet → create a new one.
+          // ------------------------------------------------------------------
+          if (!sandbox.sourcePath || !fs.existsSync(sandbox.sourcePath)) {
+            const defaultPath = path.resolve(
+              process.cwd(),
+              `${(cfg.name || sandbox.originalName || 'embed')}_${Date.now().toString(36)}.js`
+            );
+
+            if (builder) {
+              try {
+                parentSyapp.LoadScreen('__selfbuilder__', {
+                  props: {
+                    __editFile: defaultPath,
+                    __returnTo: {
+                      path: originPath,
+                      props: originProps
+                    },
+                    page: ''
+                  },
+                  resetSelection: true
+                }).catch(() => {});
+                self.Alert(id, `💡 New file: ${defaultPath}`, { duration: 4000 });
+              } catch (e) {
+                self.Alert(id, `Edit error: ${e.message}`, { duration: 3000 });
+              }
+              return;
+            }
+
+            // Fallback: inline editor + implicit default path.
+            (async () => {
+              try {
+                const chosen = defaultPath;
+                const template = _sbMakeEmbDraftTemplate(sandbox.originalName || cfg.name || 'embed');
+                const edited = await self._openTextEditor(id, {
+                  title: `New: ${path.basename(chosen)}`,
+                  initialContent: template
+                });
+                if (edited === null || edited === undefined) return;
+
+                fs.writeFileSync(chosen, edited, 'utf8');
+                self.Alert(id, `💾 Saved: ${chosen}`, { duration: 3000 });
+
+                try {
+                  const live = parentSyapp.Sessions.get(parentSyapp.MainSessionID);
+                  if (live) {
+                    if (!live.ActualProps) live.ActualProps = {};
+                    live.ActualProps[`__embSource__${uniqueKey}`] = chosen;
+                  }
+                } catch (_) {}
+
+                try {
+                  parentSyapp.LoadScreen(self.Name, {
+                    props: { ...(self.Builds.get(id)?.Session?.ActualProps || {}) },
+                    resetSelection: false
+                  }).catch(() => {});
+                } catch (_) {}
+              } catch (e) {
+                self.Alert(id, `Edit error: ${e.message}`, { duration: 4000 });
+              }
+            })();
+            return;
+          }
+
+          // ------------------------------------------------------------------
+          // Case B: source exists → prefer SelfBuilder.
+          // ------------------------------------------------------------------
+          if (builder) {
+            try {
+              parentSyapp.LoadScreen('__selfbuilder__', {
+                props: {
+                  __editFile: sandbox.sourcePath,
+                  __returnTo: {
+                    path: originPath,
+                    props: originProps
+                  },
+                  page: ''
+                },
+                resetSelection: true
+              }).catch(() => {});
+            } catch (e) {
+              self.Alert(id, `Edit error: ${e.message}`, { duration: 3000 });
+            }
+            return;
+          }
+
+          // ------------------------------------------------------------------
+          // Case C: no SelfBuilder — inline editor over the file, then
+          // hot-reload the sandbox.
+          // ------------------------------------------------------------------
+          (async () => {
+            try {
+              const current = fs.readFileSync(sandbox.sourcePath, 'utf8');
+              const edited = await self._openTextEditor(id, {
+                title: `Edit ${path.basename(sandbox.sourcePath)}`,
+                initialContent: current
+              });
+              if (edited === null || edited === undefined || edited === current) return;
+
+              fs.writeFileSync(sandbox.sourcePath, edited, 'utf8');
+              self.Alert(id, `💾 Saved: ${path.basename(sandbox.sourcePath)}`, { duration: 2500 });
+
+              try {
+                const fileUrl = url.pathToFileURL(sandbox.sourcePath).href;
+                const imported = await import(fileUrl + `?t=${Date.now()}`);
+                const candidates = [];
+                if (imported && imported.default !== undefined) candidates.push(imported.default);
+                for (const k of Object.keys(imported || {})) {
+                  if (k !== 'default') candidates.push(imported[k]);
+                }
+                for (const c of candidates) {
+                  if (typeof c !== 'function') continue;
+                  try {
+                    const probe = new c();
+                    if (probe && typeof probe.Build === 'function' &&
+                        probe.Storages && typeof probe.Storages.Get === 'function') {
+                      const newInst = new c();
+                      try {
+                        Object.defineProperty(newInst, 'Name', {
+                          value: sandbox.funcName,
+                          writable: false,
+                          configurable: true
+                        });
+                      } catch (_) {}
+                      newInst._syappInstance = parentSyapp;
+                      newInst._isEmbedded = true;
+                      newInst._embedSandboxKey = uniqueKey;
+                      parentSyapp.Funcs.set(sandbox.funcName, newInst);
+                      sandbox.func = newInst;
+                      sandbox.entered = false;
+                      sandbox.isDraft = false;
+                      break;
+                    }
+                  } catch (_) { /* try next */ }
+                }
+              } catch (_) { /* ignore reload errors */ }
+            } catch (e) {
+              self.Alert(id, `Edit error: ${e.message}`, { duration: 4000 });
+            }
+          })();
+        }
+      };
+
+      if (__build._cellItems) {
+        __build._cellItems.push(evItem);
+      } else {
+        __build.Buttons.push(evItem);
+      }
+    };
+
+    this._spawnEmbDraftSandbox = async (uniqueKey, parentSyapp, draftLabel) => {
+      const originalName = draftLabel || 'Draft';
+      const funcName = `__emb__${uniqueKey.replace(/[^A-Za-z0-9_]/g, '_')}__${originalName}`;
+
+      const placeholder = new SyAPP_Func(
+        funcName,
+        async (props) => {
+          const uid = props.session.UniqueID;
+          this.Text(uid, '📝');
+          this.Text(uid, `Draft embed: ${originalName}`);
+          this.Text(uid, '');
+          this.Text(uid, 'No source configured yet.');
+          this.Text(uid, 'Press E on the box to create the code.');
+          this.Text(uid, '');
+          this.Button(uid, {
+            name: '← Return',
+            path: parentSyapp.MainFunc.Name,
+            props: { page: '' }
+          });
+        },
+        { refreshMode: false }
+      );
+
+      try {
+        Object.defineProperty(placeholder, 'Name', {
+          value: funcName,
+          writable: false,
+          configurable: true
+        });
+      } catch (_) {}
+
+      placeholder.OriginalEmbeddedName = originalName;
+      placeholder._isEmbedded = true;
+      placeholder._embeddedParent = this.Name;
+      placeholder._syappInstance = parentSyapp;
+      placeholder._embedSandboxKey = uniqueKey;
+
+      if (!parentSyapp.Funcs.has(funcName)) {
+        parentSyapp.Funcs.set(funcName, placeholder);
+      }
+
+      const sandboxSessionId = `${parentSyapp.MainSessionID}__emb__${uniqueKey.replace(/[^A-Za-z0-9_]/g, '_')}`;
+      if (!parentSyapp.Sessions.has(sandboxSessionId)) {
+        parentSyapp.Sessions.set(sandboxSessionId, new Session({
+          uniqueid: sandboxSessionId,
+          machine_id: parentSyapp.Sessions.get(parentSyapp.MainSessionID)?.MachineID || getMachineID(),
+          process_id: process.pid
+        }));
+      }
+      const sandboxSession = parentSyapp.Sessions.get(sandboxSessionId);
+
+      return {
+        func: placeholder,
+        funcName,
+        session: sandboxSession,
+        sessionId: sandboxSessionId,
+        sourcePath: null,
+        originalName,
+        initPromise: Promise.resolve(),
+        initDone: true,
+        entered: false,
+        isDraft: true,
+        parentProps: {},
+        parentFuncName: null
+      };
+    };
+
+    this._spawnEmbSandbox = async (funcOrPath, uniqueKey, parentSyapp) => {
+      let FuncClass = null;
+      let sourcePath = null;
+
+      if (typeof funcOrPath === 'function') {
+        FuncClass = funcOrPath;
+      } else if (funcOrPath && typeof funcOrPath === 'object' &&
+                 typeof funcOrPath.Build === 'function' &&
+                 typeof funcOrPath.Name === 'string') {
+        FuncClass = funcOrPath.constructor;
+      } else if (typeof funcOrPath === 'string' && funcOrPath.trim()) {
+        const abs = path.isAbsolute(funcOrPath)
+          ? funcOrPath
+          : path.resolve(process.cwd(), funcOrPath);
+        if (!fs.existsSync(abs)) throw new Error(`File not found: ${abs}`);
+        sourcePath = abs;
+        const fileUrl = url.pathToFileURL(abs).href;
+        const imported = await import(fileUrl);
+        const candidates = [];
+        if (imported && imported.default !== undefined) candidates.push(imported.default);
+        for (const k of Object.keys(imported || {})) {
+          if (k !== 'default') candidates.push(imported[k]);
+        }
+        for (const c of candidates) {
+          if (typeof c !== 'function') continue;
+          try {
+            const probe = new c();
+            if (probe && typeof probe.Build === 'function' &&
+                probe.Storages && typeof probe.Storages.Get === 'function') {
+              FuncClass = c;
+              break;
+            }
+          } catch (_) { /* try next */ }
+        }
+      }
+
+      if (!FuncClass) throw new Error('No SyAPP_Func class found in source');
+
+      const func = new FuncClass();
+      const originalName = func.Name || 'embedded';
+      const funcName = `__emb__${uniqueKey.replace(/[^A-Za-z0-9_]/g, '_')}__${originalName}`;
+
+      try {
+        Object.defineProperty(func, 'Name', {
+          value: funcName,
+          writable: false,
+          configurable: true
+        });
+      } catch (_) { /* ignored */ }
+
+      func.OriginalEmbeddedName = originalName;
+      func._isEmbedded = true;
+      func._embeddedParent = this.Name;
+      func._syappInstance = parentSyapp;
+      func._embedSandboxKey = uniqueKey;
+
+      if (!parentSyapp.Funcs.has(funcName)) {
+        parentSyapp.Funcs.set(funcName, func);
+
+        try {
+          const linked = func.Linked || [];
+          for (const linkedCls of linked) {
+            if (typeof linkedCls !== 'function') continue;
+            const linkedProbe = new linkedCls();
+            const baseLinkedName = linkedProbe.Name || 'linked';
+            const linkedName = parentSyapp.Funcs.has(baseLinkedName)
+              ? `${baseLinkedName}__${funcName.replace(/[^A-Za-z0-9_]/g, '_')}`
+              : baseLinkedName;
+            try {
+              Object.defineProperty(linkedProbe, 'Name', {
+                value: linkedName,
+                writable: false,
+                configurable: true
+              });
+            } catch (_) {}
+            linkedProbe._syappInstance = parentSyapp;
+            linkedProbe._isEmbedded = true;
+            parentSyapp.Funcs.set(linkedName, linkedProbe);
+          }
+        } catch (_) { /* non-fatal */ }
+      }
+
+      const sandboxSessionId = `${parentSyapp.MainSessionID}__emb__${uniqueKey.replace(/[^A-Za-z0-9_]/g, '_')}`;
+      if (!parentSyapp.Sessions.has(sandboxSessionId)) {
+        parentSyapp.Sessions.set(sandboxSessionId, new Session({
+          uniqueid: sandboxSessionId,
+          machine_id: parentSyapp.Sessions.get(parentSyapp.MainSessionID)?.MachineID || getMachineID(),
+          process_id: process.pid
+        }));
+      }
+      const sandboxSession = parentSyapp.Sessions.get(sandboxSessionId);
+
+      const initPromise = (async () => {
+        try {
+          const initFn = func.SyAPPInit;
+          if (typeof initFn !== 'function') return;
+          if (func.SyAPPInitOnce && func._syappInitExecuted) return;
+
+          const initContext = {
+            syapp: parentSyapp,
+            mainFuncName: funcName,
+            mainFuncOriginalName: originalName,
+            serverConfig: parentSyapp.serverConfig,
+            config: parentSyapp.serverConfig,
+            userConfig: parentSyapp._userConfig,
+            funcs: parentSyapp.Funcs,
+            sessions: parentSyapp.Sessions,
+            mainSessionId: sandboxSessionId,
+            logMaster: LogMaster,
+            colorText: ColorText,
+            configManager: ConfigManager
+          };
+
+          const result = initFn(initContext);
+          if (result instanceof Promise) await result;
+          if (func.SyAPPInitOnce) func._syappInitExecuted = true;
+        } catch (err) {
+          console.error(`Emb init error in ${funcName}:`, err);
+          throw err;
+        }
+      })();
+
+      return {
+        func,
+        funcName,
+        session: sandboxSession,
+        sessionId: sandboxSessionId,
+        sourcePath,
+        originalName,
+        initPromise,
+        initDone: false,
+        entered: false,
+        isDraft: false,
+        parentProps: {},
+        parentFuncName: null
+      };
+    };
+
+    this._renderEmbSandbox = async (sandbox) => {
+      const { func, funcName, session } = sandbox;
+
+      if (session.InAction) return null;
+
+      session.InAction = true;
+      try {
+        const curProps = session.ActualProps || {};
+        const nextProps = {};
+
+        if (curProps.page) nextProps.page = curProps.page;
+
+        if (!sandbox.entered) {
+          sandbox.entered = true;
+        } else {
+          nextProps._isRefresh = true;
+        }
+
+        nextProps.mainfunc = funcName;
+        nextProps.session = session;
+
+        const previousPath = session.ActualPath;
+        if (previousPath && previousPath !== funcName) {
+          session.PreviousPath = previousPath;
+        }
+        session.ActualPath = funcName;
+        session.PreviousProps = session.ActualProps;
+        session.ActualProps = nextProps;
+
+        let result;
+        try {
+          result = await func.Build(nextProps);
+        } finally {
+          session.ActualPath = '';
+          session.ActualProps = {};
+        }
+
+        return result || {
+          hud_obj: { title: '', options: [] },
+          wait_input: false,
+          input_obj: {},
+          routes: {}
+        };
+      } finally {
+        session.InAction = false;
+      }
+    };
+
+    this._formatEmbSandboxView = (childRender) => {
+      if (!childRender) return { text: '(loading…)', error: null };
+      if (childRender.error) return { text: `⚠ ${childRender.error}`, error: childRender.error };
+
+      const hud = childRender.hud_obj || {};
+      const lines = [];
+
+      if (hud.pinnedTopTitle) {
+        for (const l of String(hud.pinnedTopTitle).split('\n')) lines.push(l);
+        lines.push('');
+      }
+
+      if (hud.title) {
+        for (const l of String(hud.title).split('\n')) lines.push(l);
+      }
+
+      const options = Array.isArray(hud.options) ? hud.options : [];
+      for (const opt of options) {
+        if (!opt) continue;
+        if (opt.type === 'options' && Array.isArray(opt.value)) {
+          const names = opt.value
+            .map(sub => (sub && typeof sub.name === 'string') ? sub.name : '')
+            .filter(Boolean);
+          if (names.length > 0) lines.push('  ' + names.join('   '));
+        } else if (opt.type === 'field') {
+          const label = opt.label || '';
+          const val = opt.value || '';
+          lines.push(label ? `${label}: ░${val}░` : `░${val}░`);
+        } else if (opt.type === 'textview' || opt.type === 'embedview') {
+          const lbl = opt.label ? `[${opt.label}]` : `[${opt.type}]`;
+          const body = opt.value || opt.viewText || '';
+          lines.push(`  ${lbl} (${String(body).split('\n').length} line(s))`);
+        } else if (typeof opt.name === 'string') {
+          lines.push('  ' + opt.name);
+        }
+      }
+
+      if (childRender.wait_input && childRender.input_obj) {
+        lines.push('');
+        lines.push(`⏳ ${childRender.input_obj.question || 'Input:'}`);
+      }
+
+      if (hud.pinnedTitle) {
+        lines.push('');
+        for (const l of String(hud.pinnedTitle).split('\n')) lines.push(l);
+      }
+
+      if (lines.length === 0) lines.push('(empty)');
+      return { text: lines.join('\n'), error: null };
+    };
+
     // --------------------------- TextEditor Method ---------------------------
 
     /**
@@ -14582,24 +15449,23 @@ this.HUD = new TerminalHUD({
         // Hard gate: never refresh before the SyAPP init has finished.
         await this._syappInitReady;
 
-        // Find all sessions currently on this function
-        for (const [sessionId, session] of this.Sessions) {
-          if (session.ActualPath === funcName) {
-            if (session.ActualProps?.page) {
-              this.LoadScreen(funcName, {
-                props: {
-                  page: session.ActualProps.page,
-                  _isRefresh: true
-                }
-              });
-            } else {
-              this.LoadScreen(funcName, {
-                props: {
-                  _isRefresh: true
-                }
-              });
+        // Only the MAIN session drives the visible screen.
+        const session = this.Sessions.get(this.MainSessionID);
+        if (!session) return;
+        if (session.ActualPath !== funcName) return;
+        if (session.ActualProps?.page) {
+          this.LoadScreen(funcName, {
+            props: {
+              page: session.ActualProps.page,
+              _isRefresh: true
             }
-          }
+          });
+        } else {
+          this.LoadScreen(funcName, {
+            props: {
+              _isRefresh: true
+            }
+          });
         }
       }, this._refreshInterval);
       
@@ -14646,34 +15512,27 @@ this.HUD = new TerminalHUD({
         // Hard gate: never refresh before the SyAPP init has finished.
         await this._syappInitReady;
 
-        let sessions = [...this.Sessions.keys()]
-
-        sessions.forEach(k => {
-          const session = this.Sessions.get(k);
-          const currentFuncName = session.ActualPath;
-
-          // Skip sessions that have not been loaded yet (init still
-          // gating the very first screen).
-          if (!currentFuncName) return;
-
-          // Check if the current function allows refresh
-          if (this._shouldRefreshFunction(currentFuncName)) {
-            if (session.ActualProps?.page) {
-              this.LoadScreen(currentFuncName, {
-                props: {
-                  page: session.ActualProps.page,
-                  _isRefresh: true
-                }
-              })
-            } else {
-              this.LoadScreen(currentFuncName, {
-                props: {
-                  _isRefresh: true
-                }
-              })
-            }
+        // Only the MAIN session drives the visible screen.
+        const session = this.Sessions.get(this.MainSessionID);
+        if (!session) return;
+        const currentFuncName = session.ActualPath;
+        if (!currentFuncName) return;
+        if (this._shouldRefreshFunction(currentFuncName)) {
+          if (session.ActualProps?.page) {
+            this.LoadScreen(currentFuncName, {
+              props: {
+                page: session.ActualProps.page,
+                _isRefresh: true
+              }
+            })
+          } else {
+            this.LoadScreen(currentFuncName, {
+              props: {
+                _isRefresh: true
+              }
+            })
           }
-        })
+        }
       }, this._refreshInterval);
     } else {
       // Global refresh is disabled, but we'll start per-function refreshers
@@ -14909,6 +15768,85 @@ this.HUD = new TerminalHUD({
         try {
           const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
 
+          // ============================================================
+          // DEFAULT RETURN INJECTION
+          // ============================================================
+          try {
+            const targetFunc = this.Funcs.get(targetFuncName);
+            const sandboxKey = targetFunc && targetFunc._embedSandboxKey;
+            const sandbox = sandboxKey && this._embedSandboxes
+              ? this._embedSandboxes.get(sandboxKey)
+              : null;
+
+            if (sandbox && sandbox.defaultReturn !== false && return_obj && return_obj.hud_obj) {
+              const opts = Array.isArray(return_obj.hud_obj.options) ? return_obj.hud_obj.options : [];
+
+              const RETURN_RE = /\b(return|back)\b|←|↩|⏎/i;
+              let hasOwnReturn = false;
+              const scanOption = (o) => {
+                if (!o) return;
+                if (typeof o === 'string') { if (RETURN_RE.test(o)) hasOwnReturn = true; return; }
+                if (typeof o.name === 'string' && RETURN_RE.test(o.name)) hasOwnReturn = true;
+                if (o.type === 'options' && Array.isArray(o.value)) {
+                  for (const s of o.value) scanOption(s);
+                }
+              };
+              for (const o of opts) scanOption(o);
+
+              if (!hasOwnReturn) {
+                const parentPath = sandbox.parentFuncName || this.MainFunc.Name;
+                const label = sandbox.defaultReturnLabel
+                  || `← Back to ${parentPath}`;
+
+                const syappRef = this;
+
+                const injectedButton = {
+                  name: label,
+                  metadata: {
+                    props: { page: '' },
+                    path: parentPath,
+                    resetSelection: true,
+                    jumpTo: false,
+                    pinned: false,
+                    pinnedTop: false
+                  },
+                  eventData: { __embReturn: true },
+                  action: () => {
+                    const doNavigate = () => {
+                      try {
+                        const live = syappRef.Sessions.get(syappRef.MainSessionID);
+                        if (live) live.ActualProps = { page: '' };
+                      } catch (_) {}
+                      try {
+                        syappRef.LoadScreen(parentPath, {
+                          props: { page: '' },
+                          resetSelection: true
+                        }).catch(() => {});
+                      } catch (_) {}
+                    };
+
+                    const session = syappRef.Sessions.get(syappRef.MainSessionID);
+                    if (session && session.InAction) {
+                      const tick = () => {
+                        if (!session.InAction) { doNavigate(); return; }
+                        setTimeout(tick, 20);
+                      };
+                      setTimeout(tick, 20);
+                    } else {
+                      doNavigate();
+                    }
+                  }
+                };
+
+                return_obj.hud_obj.options = [injectedButton, ...opts];
+              }
+            }
+          } catch (injErr) {
+            if (this.serverConfig && this.serverConfig.enableHTTP) {
+              console.error('Default return injection error:', injErr);
+            }
+          }
+
           if (config.props) {
             if (config.props.session) {
               if (config.props.session.ActualPath && config.props.session.PreviousPath) {
@@ -15015,25 +15953,33 @@ this.HUD = new TerminalHUD({
     };
 
     this.HUD.on(this.HUD.eventTypes.MENU_SELECTION, (e) => {
+      // EMBED RETURN BYPASS — see SyAPP_Func.Emb().
+      const isEmbReturn = !!(e.customData && e.customData.__embReturn);
+      if (isEmbReturn) {
+        return;
+      }
+
       const currentSession = this.Sessions.get(this.MainSessionID);
       const currentProps = currentSession.ActualProps || {};
       const currentPage = currentProps.page || '';
 
-      const newProps = e.metadata.props || {};
+      const newProps = (e.metadata && e.metadata.props) || {};
 
       if (!('page' in newProps) && currentPage) {
         newProps.page = currentPage;
       }
 
-      this.LoadScreen(e.metadata.path, {
-        jumpTo: e.metadata.jumpTo || false,
-        resetSelection: e.metadata.resetSelection || false,
+      const targetPath = (e.metadata && e.metadata.path) || this.MainFunc.Name;
+
+      this.LoadScreen(targetPath, {
+        jumpTo: (e.metadata && e.metadata.jumpTo) || false,
+        resetSelection: (e.metadata && e.metadata.resetSelection) || false,
         props: newProps
       }).catch(er => {
         this.LoadScreen('error', {
           props: {
             error_message: er,
-            error_func: e.metadata.path,
+            error_func: targetPath,
             mainfunc: this.MainFunc.Name
           }
         });
@@ -15605,6 +16551,31 @@ this.HUD = new TerminalHUD({
 export default SyAPP
 
 // ============================================================
+// EMB DRAFT TEMPLATE
+// ============================================================
+function _sbMakeEmbDraftTemplate(funcName) {
+  const safe = String(funcName || 'embed').replace(/[^A-Za-z0-9_$]/g, '') || 'embed';
+  const cls = safe.charAt(0).toUpperCase() + safe.slice(1);
+  return [
+    `import SyAPP from './SyAPP.js'`,
+    ``,
+    `export default class ${cls} extends SyAPP.Func() {`,
+    `  constructor() {`,
+    `    super(`,
+    `      ${JSON.stringify(safe)},`,
+    `      async (props) => {`,
+    `        const id = props.session.UniqueID`,
+    `        this.Text(id, 'Hello from ${safe}')`,
+    `        this.Button(id, { name: 'Click me', props: { page: '' } })`,
+    `      }`,
+    `    )`,
+    `  }`,
+    `}`,
+    ``
+  ].join('\n');
+}
+
+// ============================================================
 // SELF BUILDER — persistent state + interactive editor
 // ============================================================
 const SYAPP_HOME = path.join(os.homedir(), '.syapp')
@@ -15758,6 +16729,24 @@ function _genFuncJS(state, syappRelPath) {
           if (it.pinned) cfg.pinned = true
           if (it.pinnedTop) cfg.pinnedTop = true
           L.push(`${indent}this.TextButton(id, ${JSON.stringify(it.name)}, ${JSON.stringify(cfg)})`)
+          break
+        }
+        case 'emb': {
+          const cfg = {}
+          if (it.name) cfg.name = it.name
+          if (it.label) cfg.label = it.label
+          if (it.lines && it.lines !== 10) cfg.lines = it.lines
+          if (it.navigable === false) cfg.navigable = false
+          if (it.editable) cfg.editable = true
+          if (it.defaultReturn === false) cfg.defaultReturn = false
+          if (it.defaultReturnLabel) cfg.defaultReturnLabel = it.defaultReturnLabel
+          if (it.description) cfg.description = it.description
+          if (it.pinned) cfg.pinned = true
+          if (it.pinnedTop) cfg.pinnedTop = true
+          if (it.compact) cfg.compact = true
+          if (it.buttonText) cfg.buttonText = it.buttonText
+          const cfgStr = Object.keys(cfg).length > 0 ? `, ${JSON.stringify(cfg)}` : ''
+          L.push(`${indent}await this.Emb(id, ${it.source || "''"}${cfgStr})`)
           break
         }
         case 'page': {
@@ -15965,6 +16954,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Field: 'field',
   TextEditor: 'texteditor',
   TextButton: 'textbutton',
+  Emb: 'emb',
   Page: 'page',
   PinnedTop: 'pinnedTop',
   PinnedBottom: 'pinnedBottom',
@@ -16027,6 +17017,29 @@ function _sbMakeItemForMethod(methodName, id) {
         editable: false,
         pinned: false,
         pinnedTop: false
+      }
+    case 'emb':
+      // Embedded func box. Two visual modes:
+      //   • BOX MODE (default)     — live framed box.
+      //   • COMPACT MODE (compact) — single plain button.
+      //
+      // When `editable: true`, the box is editable even WITHOUT a
+      // configured source. A `__returnTo` marker (with a self-builder
+      // state snapshot) is injected so the user can always come back.
+      return {
+        ...base,
+        source: '',
+        label: '',
+        lines: 10,
+        navigable: true,
+        editable: false,
+        defaultReturn: true,
+        defaultReturnLabel: '',
+        description: '',
+        pinned: false,
+        pinnedTop: false,
+        compact: false,
+        buttonText: ''
       }
     case 'page':
       return {
@@ -16801,9 +17814,144 @@ class SelfBuilder extends SyAPP_Func {
   // ----------------------------------------------------------
   async _renderSelf(props) {
     const id = props.session.UniqueID
+
+    // ------------------------------------------------------------------
+    // External edit request — used by `this.Emb()` when the embed's
+    // "editable" flag is on and the user presses "E" on an active box.
+    //
+    // The SelfBuilder is entered with:
+    //   • props.__editFile   — path to load / create
+    //   • props.__returnTo   — { path, props } describing where to go
+    //                          back to when the user is done editing
+    //
+    // CRITICAL: the CURRENT self-builder State is SNAPSHOTTED on the way
+    // in, so that if the __returnTo target is the SelfBuilder itself
+    // (returning to the parent self build), the snapshot can be restored
+    // exactly — instead of showing an empty screen.
+    //
+    // Both the snapshot and the return target are stored in the
+    // SelfBuilder's own storage so they survive the state overwrite and
+    // any refresh ticks.
+    // ------------------------------------------------------------------
+    if (props.__editFile && typeof props.__editFile === 'string') {
+      const targetPath = props.__editFile
+      delete props.__editFile
+
+      // Snapshot our own state BEFORE the load overwrites it.
+      const selfSnapshot = _sbSafeState(this.State) || null
+
+      // Persist the return target + self snapshot.
+      const returnTo = props.__returnTo
+      delete props.__returnTo
+      if (returnTo && typeof returnTo === 'object' && typeof returnTo.path === 'string') {
+        this.Storages.Set(id, '__sb_returnTo', {
+          path: returnTo.path,
+          props: (returnTo.props && typeof returnTo.props === 'object') ? returnTo.props : {},
+          selfSnapshot: selfSnapshot
+        })
+      }
+
+      try {
+        if (fs.existsSync(targetPath)) {
+          const src = fs.readFileSync(targetPath, 'utf8')
+          const parsed = _sbParseFuncJS(src, targetPath)
+          if (parsed) {
+            this.State = parsed
+            this.EditItemId = null
+            this.ExportTarget = targetPath
+            this.Storages.Set(id, 'sb_new_open', false)
+            this.Storages.Set(id, 'sb_methods_open', false)
+            this.Alert(id, `📂 Loaded for edit: ${path.basename(targetPath)}`, { duration: 2500 })
+          }
+        } else {
+          const baseName = path.basename(targetPath).replace(/\.(js|mjs|cjs)$/i, '')
+          const clsName = (baseName || 'Embed').replace(/[^A-Za-z0-9_$]/g, '') || 'Embed'
+          const funcName = (clsName.charAt(0).toLowerCase() + clsName.slice(1)) || 'embed'
+          this.State = {
+            name: funcName,
+            funcName: clsName,
+            code: '',
+            items: [],
+            hiddenMethods: []
+          }
+          this.EditItemId = null
+          this.ExportTarget = targetPath
+          this.Storages.Set(id, 'sb_new_open', false)
+          this.Storages.Set(id, 'sb_methods_open', false)
+          this.Alert(id, `🆕 New file: ${targetPath}`, { duration: 4000 })
+        }
+      } catch (e) {
+        this.Alert(id, `❌ Edit load error: ${e.message}`, { duration: 4000 })
+      }
+    }
+
     const S = this.State
     const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
     const curPage = curProps.page || ''
+
+    // ------------------------------------------------------------------
+    // READ THE PERSISTED RETURN TARGET
+    //
+    // If a `__sb_returnTo` marker exists in storage, render a
+    // persistent "← Return" button in the pinned-top area. Clicking it
+    // clears the marker and navigates back to the origin func with the
+    // origin props.
+    //
+    // If the origin IS the SelfBuilder itself, the SNAPSHOT taken on
+    // the way in is restored into `this.State` BEFORE navigating, so
+    // the user lands on their original draft instead of an empty
+    // editor.
+    // ------------------------------------------------------------------
+    let returnTo = null
+    try { returnTo = this.Storages.Get(id, '__sb_returnTo') || null } catch (_) { returnTo = null }
+
+    if (returnTo && typeof returnTo === 'object' && typeof returnTo.path === 'string') {
+      const retLabel = `← Return to ${returnTo.path}`
+      this.Button(id, {
+        name: ColorText.orange(retLabel),
+        pinnedTop: true,
+        props: {
+          __sbDoReturn: 1
+        },
+        action: () => {
+          // ------------------------------------------------------------------
+          // Restore the pre-edit self state IF the origin is us.
+          //
+          // This is the crucial piece: when the user pressed E on a box
+          // that lived inside the SelfBuilder itself, the origin path
+          // IS '__selfbuilder__'. In that case we must restore the exact
+          // state that existed before the __editFile load overwrote it —
+          // otherwise the user would land on an empty editor.
+          // ------------------------------------------------------------------
+          try {
+            const syappRef = this._syappInstance
+            const originPath = returnTo.path
+
+            if (returnTo.selfSnapshot && typeof returnTo.selfSnapshot === 'object') {
+              // Restore regardless of origin: if the origin is another
+              // func, this restore is harmless (its own State is what
+              // gets used); if the origin is us, this restores our draft.
+              try { this.State = JSON.parse(JSON.stringify(returnTo.selfSnapshot)) } catch (_) {}
+              this.EditItemId = null
+            }
+
+            // Clear the marker BEFORE navigating so a refresh mid-flight
+            // cannot re-inject it.
+            try { this.Storages.Delete(id, '__sb_returnTo') } catch (_) {}
+
+            if (!syappRef) return
+            const live = syappRef.Sessions.get(syappRef.MainSessionID)
+            if (live) {
+              live.ActualProps = { ...(returnTo.props || {}), page: '' }
+            }
+            syappRef.LoadScreen(originPath, {
+              props: { ...(returnTo.props || {}), page: '' },
+              resetSelection: true
+            }).catch(() => {})
+          } catch (_) {}
+        }
+      })
+    }
 
     this._processActions(id, props)
     if (this.Builds.get(id)?.WaitInput) return
@@ -17305,6 +18453,36 @@ class SelfBuilder extends SyAPP_Func {
             pinnedTop: it.pinnedTop
           })
           break
+        case 'emb':
+          if (this.Editing) {
+            const srcTag = it.source
+              ? ` ${ColorText.dim('[' + _fit(String(it.source), 24) + ']')}`
+              : ColorText.dim(' [no source]')
+            const modeTag = it.compact ? ColorText.dim(' [compact]') : ''
+            const editTag = it.editable ? ColorText.dim(' [editable]') : ''
+            const shownLabel = it.label || '(auto name)'
+            this.Button(id, {
+              name: `${ColorText.brightCyan('▣')} ${_fit(shownLabel, 20)}${srcTag}${modeTag}${editTag}`,
+              props: {}
+            })
+          } else {
+            const embCfg = {
+              name: it.name,
+              label: it.label || undefined,
+              lines: it.lines || 10,
+              navigable: it.navigable !== false,
+              editable: !!it.editable,
+              defaultReturn: it.defaultReturn !== false,
+              defaultReturnLabel: it.defaultReturnLabel || undefined,
+              description: it.description || '',
+              pinned: it.pinned,
+              pinnedTop: it.pinnedTop,
+              compact: !!it.compact,
+              buttonText: it.buttonText || undefined
+            }
+            await this.Emb(id, it.source || '', embCfg)
+          }
+          break
         case 'page':
           if (this.Editing) {
             const hasItems = Array.isArray(it.items) && it.items.length > 0
@@ -17700,6 +18878,22 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('initialValue', 'Initial', 'string')
         mkProp('lines', 'Rows', 'number')
         mkToggle('editable', 'Editable')
+        mkToggle('pinned', 'Pinned Btm')
+        mkToggle('pinnedTop', 'Pinned Top')
+        break
+
+      case 'emb':
+        mkProp('name', 'Name', 'string')
+        mkProp('source', 'Source (js file path)', 'string')
+        mkProp('label', 'Label (empty = auto)', 'string')
+        mkProp('buttonText', 'Button text (compact)', 'string')
+        mkProp('lines', 'Rows (box mode)', 'number')
+        mkProp('description', 'Description', 'string')
+        mkProp('defaultReturnLabel', 'Return label (empty=auto)', 'string')
+        mkToggle('navigable', 'Navigable')
+        mkToggle('editable', 'Editable')
+        mkToggle('defaultReturn', 'Default Return')
+        mkToggle('compact', 'Compact (single button)')
         mkToggle('pinned', 'Pinned Btm')
         mkToggle('pinnedTop', 'Pinned Top')
         break
