@@ -2681,18 +2681,24 @@ if (configuration.remember) {
       };
 
       const setFocus = (newLine, newColumn) => {
-        // Defensive: if focus moves away from an active box (textview
-        // OR embedview), drop it back to FOCUSED so the next visit
-        // starts cleanly.
-        const prevOption = normalizedOptions[line] && normalizedOptions[line][column];
+        // Clear ACTIVE on every textview/embedview NOT focused next.
+        // Arrow keys pre-mutate line/column BEFORE setFocus, so a
+        // "previous slot" read resolved to the NEW item and left the
+        // previously-activated box stuck green forever. Iterating the
+        // whole list is the reliable fix and trivially cheap.
         const nextOption = normalizedOptions[newLine] && normalizedOptions[newLine][newColumn];
-        if (prevOption &&
-            (prevOption.type === 'textview' || prevOption.type === 'embedview') &&
-            prevOption !== nextOption) {
-          if (prevOption.active) {
-            prevOption.active = false;
-            if (typeof prevOption.persistActive === 'function') {
-              prevOption.persistActive();
+        for (let li = 0; li < normalizedOptions.length; li++) {
+          const lineArr = normalizedOptions[li];
+          for (let ci = 0; ci < lineArr.length; ci++) {
+            const opt = lineArr[ci];
+            if (!opt) continue;
+            if (opt.type !== 'textview' && opt.type !== 'embedview') continue;
+            if (opt === nextOption) continue;
+            if (opt.active) {
+              opt.active = false;
+              if (typeof opt.persistActive === 'function') {
+                opt.persistActive();
+              }
             }
           }
         }
@@ -10614,6 +10620,12 @@ function levenshteinDistance(str1, str2) {
         action: (finalConfig.action) ? finalConfig.action : () => { },
       };
 
+      // Propagate `eventData` so callers can opt out of SyAPP's
+      // automatic MENU_SELECTION navigation. The Emb Return button
+      // uses `__embReturn: true` to become the sole navigator for its
+      // click.
+      if (finalConfig.eventData) button_obj.eventData = finalConfig.eventData;
+
       if (this.Builds.get(id).dropdown_color) {
         button_obj.name = this.TextColor.rgb(
           button_obj.name,
@@ -11354,6 +11366,21 @@ function levenshteinDistance(str1, str2) {
 
       if (!parentSyapp._embedSandboxes) parentSyapp._embedSandboxes = new Map();
 
+      // ============================================================
+      // REVISION-AWARE SANDBOX LIFECYCLE
+      // ============================================================
+      // SyAPP._embRevision is bumped whenever the user returns from a
+      // nested edit or exports. A sandbox whose __revision differs is
+      // stale and MUST be respawned — otherwise the parent keeps
+      // rendering the pre-edit instance.
+      //
+      // This is what makes the emb box reflect the draft immediately
+      // after Return, without waiting for a disk write.
+      // ============================================================
+      const draftKeyLocal = `__sb_emb_draft_${uniqueKey.replace(/[^A-Za-z0-9]/g, '_')}`;
+      const draftState = this.Storages.Get(id, draftKeyLocal);
+      const liveRevision = parentSyapp._embRevision || 0;
+
       let sandbox = parentSyapp._embedSandboxes.get(uniqueKey);
 
       if (sandbox && sandbox.isDraft && hasSource) {
@@ -11362,21 +11389,29 @@ function levenshteinDistance(str1, str2) {
         sandbox = null;
       }
 
+      // Stale revision → respawn with the current draft baked in.
+      if (sandbox && sandbox.__revision !== liveRevision) {
+        try { parentSyapp.Funcs.delete(sandbox.funcName); } catch (_) {}
+        parentSyapp._embedSandboxes.delete(uniqueKey);
+        sandbox = null;
+      }
+
       if (!sandbox) {
         if (hasSource) {
-          try { sandbox = await this._spawnEmbSandbox(effectiveSource, uniqueKey, parentSyapp); }
+          try { sandbox = await this._spawnEmbSandbox(effectiveSource, uniqueKey, parentSyapp, draftState); }
           catch (err) {
             if (this.Log) console.error('this.Emb() spawn error:', err);
             this.Alert(id, `Emb error: ${err.message}`, { duration: 5000 });
             return;
           }
         } else {
-          sandbox = await this._spawnEmbDraftSandbox(uniqueKey, parentSyapp, cfg.label);
+          sandbox = await this._spawnEmbDraftSandbox(uniqueKey, parentSyapp, cfg.label, draftState);
         }
         if (!sandbox) {
           this.Alert(id, 'Emb: could not create sandbox', { duration: 5000 });
           return;
         }
+        sandbox.__revision = liveRevision;
         parentSyapp._embedSandboxes.set(uniqueKey, sandbox);
       }
 
@@ -11394,6 +11429,45 @@ function levenshteinDistance(str1, str2) {
       sandbox.defaultReturn = cfg.defaultReturn !== false;
       sandbox.defaultReturnLabel = cfg.defaultReturnLabel;
       sandbox.embUniqueKey = uniqueKey;
+
+      // ============================================================
+      // EMB TREE REGISTRY
+      // ============================================================
+      // Every emb that renders through this.Emb() registers itself
+      // here. This is the source of truth for the 📦 Export Tree view
+      // and for the "root-all" export mode.
+      //
+      // draftKey is derived from uniqueKey (stable across E-presses),
+      // NOT from the source path — so a brand-new emb whose path
+      // changes on every edit still finds its RAM draft.
+      // ============================================================
+      const draftKey = `__sb_emb_draft_${uniqueKey.replace(/[^A-Za-z0-9]/g, '_')}`;
+      sandbox.draftKey = draftKey;
+
+      if (!parentSyapp._embTree) parentSyapp._embTree = new Map();
+      if (typeof parentSyapp._embRevision !== 'number') parentSyapp._embRevision = 0;
+      if (typeof parentSyapp._embRootAll !== 'boolean') parentSyapp._embRootAll = false;
+      {
+        const existing = parentSyapp._embTree.get(uniqueKey);
+        if (existing) {
+          existing.parentFuncName = this.Name;
+          existing.childFuncName  = sandbox.funcName;
+          existing.originalName   = sandbox.originalName;
+          existing.sourcePath     = sandbox.sourcePath;
+          existing.draftKey       = draftKey;
+        } else {
+          parentSyapp._embTree.set(uniqueKey, {
+            uniqueKey,
+            parentFuncName: this.Name,
+            childFuncName:  sandbox.funcName,
+            originalName:   sandbox.originalName,
+            sourcePath:     sandbox.sourcePath,
+            draftKey,
+            save:           true,
+            registeredAt:   Date.now()
+          });
+        }
+      }
 
       const resolvedLabel = cfg.label
         || sandbox.originalName
@@ -11498,158 +11572,108 @@ function levenshteinDistance(str1, str2) {
         },
         openEditor: () => {
           // ------------------------------------------------------------------
-          // Editable shortcut. Two paths:
-          //   1. SelfBuilder is registered → navigate there with the
-          //      source loaded (or a fresh editor if no source exists)
-          //      AND inject a `__returnTo` marker so the SelfBuilder can
-          //      render a "← Return" button back to this parent func.
-          //   2. No SelfBuilder → fall back to the internal text editor
-          //      and write the result to disk.
+          // Editable shortcut. Called by the HUD via setImmediate().
+          //
+          // The RAM draft key is derived from uniqueKey (stable across
+          // E-presses), so a brand-new emb whose source path changes
+          // on every edit still finds and restores its draft.
           // ------------------------------------------------------------------
           const builder = parentSyapp.Funcs.get('__selfbuilder__');
 
-          const originPath = self.Name;
-          const originProps = { ...(self.Builds.get(id)?.Session?.ActualProps || {}) };
-          delete originProps.session;
-          delete originProps.mainfunc;
+          // Parent's live props so Return can restore the exact view.
+          const liveSession = parentSyapp.Sessions.get(parentSyapp.MainSessionID);
+          const liveProps = (liveSession && liveSession.ActualProps) || {};
+          const originProps = {};
+          for (const k of Object.keys(liveProps)) {
+            if (k === 'session' || k === 'mainfunc') continue;
+            if (k.startsWith('__embSource__')) continue;
+            if (k.startsWith('__sb_')) continue;
+            if (k.startsWith('__edit')) continue;
+            if (k === '__view') continue;
+            originProps[k] = liveProps[k];
+          }
           originProps.page = '';
 
-          // ------------------------------------------------------------------
-          // Case A: no source yet → create a new one.
-          // ------------------------------------------------------------------
-          if (!sandbox.sourcePath || !fs.existsSync(sandbox.sourcePath)) {
-            const defaultPath = path.resolve(
+          let targetPath = sandbox.sourcePath;
+          if (!targetPath) {
+            targetPath = path.resolve(
               process.cwd(),
               `${(cfg.name || sandbox.originalName || 'embed')}_${Date.now().toString(36)}.js`
             );
-
-            if (builder) {
-              try {
-                parentSyapp.LoadScreen('__selfbuilder__', {
-                  props: {
-                    __editFile: defaultPath,
-                    __returnTo: {
-                      path: originPath,
-                      props: originProps
-                    },
-                    page: ''
-                  },
-                  resetSelection: true
-                }).catch(() => {});
-                self.Alert(id, `💡 New file: ${defaultPath}`, { duration: 4000 });
-              } catch (e) {
-                self.Alert(id, `Edit error: ${e.message}`, { duration: 3000 });
-              }
-              return;
-            }
-
-            // Fallback: inline editor + implicit default path.
-            (async () => {
-              try {
-                const chosen = defaultPath;
-                const template = _sbMakeEmbDraftTemplate(sandbox.originalName || cfg.name || 'embed');
-                const edited = await self._openTextEditor(id, {
-                  title: `New: ${path.basename(chosen)}`,
-                  initialContent: template
-                });
-                if (edited === null || edited === undefined) return;
-
-                fs.writeFileSync(chosen, edited, 'utf8');
-                self.Alert(id, `💾 Saved: ${chosen}`, { duration: 3000 });
-
-                try {
-                  const live = parentSyapp.Sessions.get(parentSyapp.MainSessionID);
-                  if (live) {
-                    if (!live.ActualProps) live.ActualProps = {};
-                    live.ActualProps[`__embSource__${uniqueKey}`] = chosen;
-                  }
-                } catch (_) {}
-
-                try {
-                  parentSyapp.LoadScreen(self.Name, {
-                    props: { ...(self.Builds.get(id)?.Session?.ActualProps || {}) },
-                    resetSelection: false
-                  }).catch(() => {});
-                } catch (_) {}
-              } catch (e) {
-                self.Alert(id, `Edit error: ${e.message}`, { duration: 4000 });
-              }
-            })();
-            return;
           }
 
-          // ------------------------------------------------------------------
-          // Case B: source exists → prefer SelfBuilder.
-          // ------------------------------------------------------------------
+          const draftKey = sandbox.draftKey
+            || `__sb_emb_draft_${uniqueKey.replace(/[^A-Za-z0-9]/g, '_')}`;
+
           if (builder) {
             try {
               parentSyapp.LoadScreen('__selfbuilder__', {
                 props: {
-                  __editFile: sandbox.sourcePath,
+                  __editFile: targetPath,
+                  __editDraftKey: draftKey,
+                  __embUniqueKey: uniqueKey,
                   __returnTo: {
-                    path: originPath,
-                    props: originProps
+                    path: self.Name,
+                    props: originProps,
+                    targetPath: targetPath,
+                    draftKey: draftKey,
+                    embUniqueKey: uniqueKey
                   },
                   page: ''
                 },
                 resetSelection: true
               }).catch(() => {});
+              self.Alert(id, `📂 Editing: ${path.basename(targetPath)}`, { duration: 2500 });
             } catch (e) {
               self.Alert(id, `Edit error: ${e.message}`, { duration: 3000 });
             }
             return;
           }
 
-          // ------------------------------------------------------------------
-          // Case C: no SelfBuilder — inline editor over the file, then
-          // hot-reload the sandbox.
-          // ------------------------------------------------------------------
+          // ---------- No SelfBuilder: inline text editor ----------
           (async () => {
             try {
-              const current = fs.readFileSync(sandbox.sourcePath, 'utf8');
-              const edited = await self._openTextEditor(id, {
-                title: `Edit ${path.basename(sandbox.sourcePath)}`,
-                initialContent: current
-              });
-              if (edited === null || edited === undefined || edited === current) return;
+              const exists = fs.existsSync(targetPath);
+              const initial = exists
+                ? fs.readFileSync(targetPath, 'utf8')
+                : _sbMakeEmbDraftTemplate(sandbox.originalName || cfg.name || 'embed');
 
-              fs.writeFileSync(sandbox.sourcePath, edited, 'utf8');
-              self.Alert(id, `💾 Saved: ${path.basename(sandbox.sourcePath)}`, { duration: 2500 });
+              const edited = await self._openTextEditor(id, {
+                title: exists
+                  ? `Edit ${path.basename(targetPath)}`
+                  : `New: ${path.basename(targetPath)}`,
+                initialContent: initial
+              });
+              if (edited === null || edited === undefined) return;
+              if (exists && edited === initial) return;
+
+              fs.writeFileSync(targetPath, edited, 'utf8');
+              self.Alert(id, `💾 Saved: ${path.basename(targetPath)}`, { duration: 2500 });
+
+              if (parentSyapp._embedSandboxes) {
+                for (const [key, sb] of Array.from(parentSyapp._embedSandboxes.entries())) {
+                  if (sb && sb.sourcePath === targetPath) {
+                    try { parentSyapp.Funcs.delete(sb.funcName); } catch (_) {}
+                    parentSyapp._embedSandboxes.delete(key);
+                  }
+                }
+              }
+              parentSyapp._embRevision = (parentSyapp._embRevision || 0) + 1;
 
               try {
-                const fileUrl = url.pathToFileURL(sandbox.sourcePath).href;
-                const imported = await import(fileUrl + `?t=${Date.now()}`);
-                const candidates = [];
-                if (imported && imported.default !== undefined) candidates.push(imported.default);
-                for (const k of Object.keys(imported || {})) {
-                  if (k !== 'default') candidates.push(imported[k]);
+                const live = parentSyapp.Sessions.get(parentSyapp.MainSessionID);
+                if (live) {
+                  if (!live.ActualProps) live.ActualProps = {};
+                  live.ActualProps[`__embSource__${uniqueKey}`] = targetPath;
                 }
-                for (const c of candidates) {
-                  if (typeof c !== 'function') continue;
-                  try {
-                    const probe = new c();
-                    if (probe && typeof probe.Build === 'function' &&
-                        probe.Storages && typeof probe.Storages.Get === 'function') {
-                      const newInst = new c();
-                      try {
-                        Object.defineProperty(newInst, 'Name', {
-                          value: sandbox.funcName,
-                          writable: false,
-                          configurable: true
-                        });
-                      } catch (_) {}
-                      newInst._syappInstance = parentSyapp;
-                      newInst._isEmbedded = true;
-                      newInst._embedSandboxKey = uniqueKey;
-                      parentSyapp.Funcs.set(sandbox.funcName, newInst);
-                      sandbox.func = newInst;
-                      sandbox.entered = false;
-                      sandbox.isDraft = false;
-                      break;
-                    }
-                  } catch (_) { /* try next */ }
-                }
-              } catch (_) { /* ignore reload errors */ }
+              } catch (_) {}
+
+              try {
+                parentSyapp.LoadScreen(self.Name, {
+                  props: { ...liveProps },
+                  resetSelection: false
+                }).catch(() => {});
+              } catch (_) {}
             } catch (e) {
               self.Alert(id, `Edit error: ${e.message}`, { duration: 4000 });
             }
@@ -11664,26 +11688,45 @@ function levenshteinDistance(str1, str2) {
       }
     };
 
-    this._spawnEmbDraftSandbox = async (uniqueKey, parentSyapp, draftLabel) => {
+    this._spawnEmbDraftSandbox = async (uniqueKey, parentSyapp, draftLabel, draftState) => {
       const originalName = draftLabel || 'Draft';
       const funcName = `__emb__${uniqueKey.replace(/[^A-Za-z0-9_]/g, '_')}__${originalName}`;
 
+      // The placeholder is created with a `build` closure that
+      // renders the RAM draft (when present) or a "no source yet"
+      // hint. Crucially, the draft renderer writes through the
+      // PLACEHOLDER itself (`placeholder.Text(...)`, etc.) — not
+      // through the parent — so the entries land in
+      // `placeholder.Builds[sessionId]`, which is the entry
+      // `SyAPP_Func.prototype.Build` created for this render.
+      //
+      // `placeholder` is referenced inside `placeholderBuild` before
+      // its `const` declaration only textually; the closure runs
+      // after the const is initialised, so this is safe.
+      const placeholderBuild = async (props) => {
+        const uid = props.session.UniqueID;
+
+        if (draftState && Array.isArray(draftState.items) && draftState.items.length > 0) {
+          await _embRenderDraftItems(placeholder, uid, props, draftState.items);
+          return;
+        }
+
+        placeholder.Text(uid, '📝');
+        placeholder.Text(uid, `Draft embed: ${originalName}`);
+        placeholder.Text(uid, '');
+        placeholder.Text(uid, 'No source configured yet.');
+        placeholder.Text(uid, 'Press E on the box to create the code.');
+        placeholder.Text(uid, '');
+        placeholder.Button(uid, {
+          name: '← Return',
+          path: parentSyapp.MainFunc.Name,
+          props: { page: '' }
+        });
+      };
+
       const placeholder = new SyAPP_Func(
         funcName,
-        async (props) => {
-          const uid = props.session.UniqueID;
-          this.Text(uid, '📝');
-          this.Text(uid, `Draft embed: ${originalName}`);
-          this.Text(uid, '');
-          this.Text(uid, 'No source configured yet.');
-          this.Text(uid, 'Press E on the box to create the code.');
-          this.Text(uid, '');
-          this.Button(uid, {
-            name: '← Return',
-            path: parentSyapp.MainFunc.Name,
-            props: { page: '' }
-          });
-        },
+        placeholderBuild,
         { refreshMode: false }
       );
 
@@ -11748,7 +11791,8 @@ function levenshteinDistance(str1, str2) {
         if (!fs.existsSync(abs)) throw new Error(`File not found: ${abs}`);
         sourcePath = abs;
         const fileUrl = url.pathToFileURL(abs).href;
-        const imported = await import(fileUrl);
+        // Cache-busting query so a re-export is picked up on re-import.
+        const imported = await import(fileUrl + `?t=${Date.now()}`);
         const candidates = [];
         if (imported && imported.default !== undefined) candidates.push(imported.default);
         for (const k of Object.keys(imported || {})) {
@@ -16551,6 +16595,169 @@ this.HUD = new TerminalHUD({
 export default SyAPP
 
 // ============================================================
+// SHARED DRAFT RENDERER
+// ============================================================
+// Renders a SelfBuilder-shaped draft State (the object stored by the
+// nested editor) through an arbitrary SyAPP_Func instance.
+//
+// CRITICAL CONTRACT: `host` MUST be the SyAPP_Func instance whose
+// `Builds` map already contains an entry for `uid`. In practice this
+// means:
+//   • _spawnEmbDraftSandbox passes the placeholder func itself, while
+//     SyAPP_Func.prototype.Build's scaffolding (set up by the base
+//     class) has already created placeholder.Builds[uid].
+//   • _spawnEmbSandbox overrides func.Build with a wrapper that
+//     mirrors the base scaffolding and passes `func` as host.
+//
+// Passing the parent func (`this` in the enclosing scope) was the
+// original bug: host.Text(uid, ...) looked up parent.Builds[uid],
+// found nothing, and silently dropped the call — leaving the emb box
+// empty in view mode.
+// ============================================================
+async function _embRenderDraftItems(host, uid, props, items) {
+  const AsyncF = Object.getPrototypeOf(async function () { }).constructor;
+
+  const emitItems = async (list) => {
+    for (const it of (list || [])) {
+      try { await emitOne(it); } catch (_) { /* keep going */ }
+    }
+  };
+
+  const emitOne = async (it) => {
+    if (!it || typeof it !== 'object') return;
+    switch (it.type) {
+      case 'text':
+        host.Text(uid, it.value || '');
+        break;
+      case 'spacer':
+        host.Text(uid, '');
+        break;
+      case 'button': {
+        const cfg = {
+          name: it.name || '',
+          props: { ...(it.props || {}) },
+          path: it.path,
+          resetSelection: it.resetSelection,
+          jumpTo: it.jumpTo,
+          pinned: it.pinned,
+          pinnedTop: it.pinnedTop
+        };
+        if (it.sourceMethod === 'SideButton' || it.buttons) {
+          host.SideButton(uid, cfg);
+        } else {
+          host.Button(uid, cfg);
+        }
+        break;
+      }
+      case 'buttonsGroup': {
+        const configs = (it.items || [])
+          .filter(c => c && c.type === 'button')
+          .map(c => ({
+            name: c.name || '',
+            props: { ...(c.props || {}) },
+            path: c.path,
+            resetSelection: c.resetSelection,
+            jumpTo: c.jumpTo,
+            pinned: c.pinned,
+            pinnedTop: c.pinnedTop
+          }));
+        if (configs.length > 0) host.Buttons(uid, configs);
+        break;
+      }
+      case 'field':
+        host.Field(uid, it.name, {
+          label: it.label || '',
+          initialValue: it.initialValue || '',
+          pinned: it.pinned,
+          pinnedTop: it.pinnedTop
+        });
+        break;
+      case 'textbutton':
+        host.TextButton(uid, it.name, {
+          label: it.label,
+          initialValue: it.initialValue,
+          lines: it.lines || 4,
+          editable: !!it.editable,
+          pinned: it.pinned,
+          pinnedTop: it.pinnedTop
+        });
+        break;
+      case 'texteditor':
+        await host.TextEditor(uid, it.name, {
+          label: it.label,
+          initialValue: it.initialValue,
+          buttonText: it.buttonText,
+          pinned: it.pinned,
+          pinnedTop: it.pinnedTop
+        });
+        break;
+      case 'page':
+        await host.Page(uid, it.name, async () => {
+          await emitItems(it.items || []);
+        }, it.pinButton ? { pinButton: true, pinPosition: it.pinPosition } : undefined);
+        break;
+      case 'dropdown':
+        await host.DropDown(uid, it.name, async () => {
+          await emitItems(it.items || []);
+        }, {
+          up_buttontext: it.up_buttontext || 'Show more',
+          down_buttontext: it.down_buttontext || 'Hide'
+        });
+        break;
+      case 'pinnedTop':
+        await host.PinnedTop(uid, async () => {
+          await emitItems(it.items || []);
+        }, it.separator ? { separator: it.separator } : undefined);
+        break;
+      case 'pinnedBottom':
+        await host.PinnedBottom(uid, async () => {
+          await emitItems(it.items || []);
+        }, it.separator ? { separator: it.separator } : undefined);
+        break;
+      case 'codeblock':
+        // Draft preview renders the block body unconditionally.
+        // Conditions are only evaluated in the exported code.
+        await emitItems(it.items || []);
+        break;
+      case 'alert':
+        host.Alert(uid, it.text || '', { duration: Number(it.duration) || 3000 });
+        break;
+      case 'emb': {
+        // Nested emb — spawns a child sandbox through host.Emb(),
+        // registering a proper tree node (parentFuncName = host.Name).
+        const embCfg = {
+          name: it.name,
+          label: it.label || undefined,
+          lines: it.lines || 10,
+          navigable: it.navigable !== false,
+          editable: !!it.editable,
+          defaultReturn: it.defaultReturn !== false,
+          defaultReturnLabel: it.defaultReturnLabel || undefined,
+          description: it.description || '',
+          pinned: it.pinned,
+          pinnedTop: it.pinnedTop,
+          compact: !!it.compact,
+          buttonText: it.buttonText || undefined
+        };
+        await host.Emb(uid, it.source || '', embCfg);
+        break;
+      }
+      case 'code':
+        try {
+          const fn = new AsyncF('id', 'props', it.value || '');
+          await fn.call(host, uid, props);
+        } catch (_) {}
+        break;
+      default:
+        // Unknown item type — skipped in preview.
+        break;
+    }
+  };
+
+  await emitItems(items);
+}
+
+// ============================================================
 // EMB DRAFT TEMPLATE
 // ============================================================
 function _sbMakeEmbDraftTemplate(funcName) {
@@ -17267,6 +17474,28 @@ class SelfBuilder extends SyAPP_Func {
     this._pendingEdit = null
     this._pendingAction = null
     this._idSeq = 0
+
+    // Nested-edit mode bookkeeping.
+    this._nestedDraftKey = null
+    this._nestedEmbUniqueKey = null
+  }
+
+  // ----------------------------------------------------------
+  // NESTED DRAFT PERSISTENCE
+  // ----------------------------------------------------------
+  // The draft of a nested emb edit is written into the caller's
+  // storage on EVERY render while in nested mode. Even if the
+  // process is killed abruptly, or Return never fires, the draft is
+  // already safe and will be restored on the next E-press on the
+  // same emb box.
+  _saveNestedDraft(id) {
+    if (!this._nestedDraftKey) return;
+    try {
+      const safe = _sbSafeState(this.State);
+      if (safe && typeof safe === 'object' && Array.isArray(safe.items)) {
+        this.Storages.Set(id, this._nestedDraftKey, JSON.parse(JSON.stringify(safe)));
+      }
+    } catch (_) {}
   }
 
   _nid() { return `it_${Date.now().toString(36)}_${++this._idSeq}` }
@@ -17781,6 +18010,73 @@ class SelfBuilder extends SyAPP_Func {
       if (it) it[prop] = !it[prop]
     }
 
+    // ----------------------------------------------------------------
+    // EMB TREE / ROOT-ALL ACTIONS
+    // ----------------------------------------------------------------
+
+    // Global toggle: root-all on export.
+    if (p.__toggleRootAll) {
+      const syapp = this._syappInstance
+      if (syapp) syapp._embRootAll = !syapp._embRootAll
+    }
+
+    // Per-node: toggle inclusion in 📤 Export Selected.
+    if (p.__toggleEmbSave) {
+      const key = p.__toggleEmbSave
+      const tree = this._syappInstance && this._syappInstance._embTree
+      if (tree && tree.has(key)) {
+        const node = tree.get(key)
+        node.save = !node.save
+      }
+    }
+
+    if (p.__bulkSelectAll) {
+      const tree = this._syappInstance && this._syappInstance._embTree
+      if (tree) for (const n of tree.values()) n.save = true
+    }
+    if (p.__bulkClearAll) {
+      const tree = this._syappInstance && this._syappInstance._embTree
+      if (tree) for (const n of tree.values()) n.save = false
+    }
+
+    // Bulk export: write each selected node's RAM draft to its own
+    // .js file, then bump the revision so the parent re-imports.
+    if (p.__bulkExportTree) {
+      const tree = this._syappInstance && this._syappInstance._embTree
+      if (tree) {
+        let exported = 0
+        let skipped = 0
+        for (const node of tree.values()) {
+          if (!node.save) continue
+          const srcPath = node.sourcePath
+          if (!srcPath) { skipped++; continue }
+
+          const dk = node.draftKey
+            || `__sb_emb_draft_${node.uniqueKey.replace(/[^A-Za-z0-9]/g, '_')}`
+          const draft = this.Storages.Get(id, dk)
+          if (!draft || !Array.isArray(draft.items) || draft.items.length === 0) {
+            skipped++
+            continue
+          }
+
+          try {
+            const dir = path.dirname(srcPath)
+            let rel = path.relative(dir, url.fileURLToPath(import.meta.url))
+            if (!rel.startsWith('.')) rel = './' + rel
+            const js = _genFuncJS(draft, rel)
+            fs.writeFileSync(srcPath, js)
+            exported++
+          } catch (_) {
+            skipped++
+          }
+        }
+        if (this._syappInstance) {
+          this._syappInstance._embRevision = (this._syappInstance._embRevision || 0) + 1
+        }
+        this.Alert(id, `📤 Exported ${exported} emb file(s) — ${skipped} skipped`, { duration: 4000 })
+      }
+    }
+
     // Cycle a page's pin position (bottom ↔ top). Used by the page
     // editor's "Pin Position" button.
     if (p.__cyclePinPosition) {
@@ -17805,7 +18101,64 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__setAppName) { this._pendingAction = 'appName'; this.WaitInput(id, { question: 'App name: ', path: this.Name, props: passProps }); return }
     if (p.__save) { this._pendingAction = 'save'; this.WaitInput(id, { question: 'Save as: ', path: this.Name, props: passProps }); return }
     if (p.__load) { this._pendingAction = 'load'; this.WaitInput(id, { question: 'Load name: ', path: this.Name, props: passProps }); return }
-    if (p.__export) { this._pendingAction = 'export'; this.WaitInput(id, { question: 'Export file: ', path: this.Name, props: passProps }); return }
+    if (p.__export) {
+      // ------------------------------------------------------------------
+      // Export writes the parent file. When _embRootAll is ON, every
+      // registered emb's RAM draft is ALSO inlined into the same file
+      // as a nested class, and the parent's this.Emb(id, "path") calls
+      // are rewritten to pass the local class instead. The result is a
+      // single self-contained .js with the whole tree rooted in it.
+      //
+      // When _embRootAll is OFF, only the parent is written; embs stay
+      // referenced by their own file paths.
+      // ------------------------------------------------------------------
+      const rootAll = !!(this._syappInstance && this._syappInstance._embRootAll)
+
+      // No ExportTarget yet (root-level export from the SelfBuilder):
+      // fall through to the name prompt, remembering rootAll for the
+      // completion handler.
+      if (!this.ExportTarget) {
+        this._pendingAction = 'export'
+        this._pendingExportRootAll = rootAll
+        this.WaitInput(id, { question: 'Export file: ', path: this.Name, props: passProps })
+        return
+      }
+
+      // Target exists — write it now.
+      try {
+        const target = this.ExportTarget
+        const dir = path.dirname(target)
+        let rel = path.relative(dir, url.fileURLToPath(import.meta.url))
+        if (!rel.startsWith('.')) rel = './' + rel
+
+        let js = _genFuncJS(S, rel)
+
+        if (rootAll) {
+          js = _embInlineRootedExport(js, S, rel, id, this.Storages, this._syappInstance)
+        }
+
+        fs.writeFileSync(target, js)
+
+        // Keep the RAM draft in sync with what we just wrote.
+        if (this._nestedDraftKey) {
+          try {
+            const safe = _sbSafeState(S)
+            if (safe && typeof safe === 'object' && Array.isArray(safe.items)) {
+              this.Storages.Set(id, this._nestedDraftKey, JSON.parse(JSON.stringify(safe)))
+            }
+          } catch (_) {}
+        }
+
+        if (this._syappInstance) {
+          this._syappInstance._embRevision = (this._syappInstance._embRevision || 0) + 1
+        }
+
+        this.Alert(id, `📤 Exported: ${target}${rootAll ? ' (root-all)' : ''}`, { duration: 3500 })
+      } catch (e) {
+        this.Alert(id, `❌ ${e.message}`, { duration: 4000 })
+      }
+      return
+    }
     if (p.__exit) { process.exit(0) }
   }
 
@@ -17837,22 +18190,51 @@ class SelfBuilder extends SyAPP_Func {
       const targetPath = props.__editFile
       delete props.__editFile
 
-      // Snapshot our own state BEFORE the load overwrites it.
+      // Stable RAM draft key (from the caller). Kept on the instance
+      // so every render can re-save without re-plumbing through props.
+      const draftKeyFromProps = props.__editDraftKey
+      delete props.__editDraftKey
+      const embUniqueKey = props.__embUniqueKey || null
+      delete props.__embUniqueKey
+
+      const draftKey = (typeof draftKeyFromProps === 'string' && draftKeyFromProps)
+        || `__sb_nested_state_${targetPath.replace(/[^A-Za-z0-9]/g, '_')}`
+      this._nestedDraftKey = draftKey
+      this._nestedEmbUniqueKey = embUniqueKey
+
       const selfSnapshot = _sbSafeState(this.State) || null
 
-      // Persist the return target + self snapshot.
       const returnTo = props.__returnTo
       delete props.__returnTo
+
       if (returnTo && typeof returnTo === 'object' && typeof returnTo.path === 'string') {
         this.Storages.Set(id, '__sb_returnTo', {
           path: returnTo.path,
           props: (returnTo.props && typeof returnTo.props === 'object') ? returnTo.props : {},
-          selfSnapshot: selfSnapshot
+          selfSnapshot: selfSnapshot,
+          prevExportTarget: this.ExportTarget,
+          targetPath: typeof returnTo.targetPath === 'string' ? returnTo.targetPath : targetPath,
+          draftKey: draftKey,
+          embUniqueKey: embUniqueKey
         })
       }
 
       try {
-        if (fs.existsSync(targetPath)) {
+        // Priority 1: in-session RAM draft (stable key).
+        const cached = this.Storages.Get(id, draftKey)
+
+        if (cached && typeof cached === 'object' && Array.isArray(cached.items)) {
+          if (!Array.isArray(cached.hiddenMethods)) cached.hiddenMethods = []
+          if (typeof cached.pinnedTopSeparator !== 'string') cached.pinnedTopSeparator = 'line'
+          if (typeof cached.pinnedBottomSeparator !== 'string') cached.pinnedBottomSeparator = 'line'
+          this.State = cached
+          this.EditItemId = null
+          this.ExportTarget = targetPath
+          this.Storages.Set(id, 'sb_new_open', false)
+          this.Storages.Set(id, 'sb_methods_open', false)
+          this.Alert(id, `♻ Restored session edit: ${path.basename(targetPath)}`, { duration: 2500 })
+        } else if (fs.existsSync(targetPath)) {
+          // Priority 2: parse the file on disk.
           const src = fs.readFileSync(targetPath, 'utf8')
           const parsed = _sbParseFuncJS(src, targetPath)
           if (parsed) {
@@ -17864,6 +18246,7 @@ class SelfBuilder extends SyAPP_Func {
             this.Alert(id, `📂 Loaded for edit: ${path.basename(targetPath)}`, { duration: 2500 })
           }
         } else {
+          // Priority 3: brand-new file → blank draft.
           const baseName = path.basename(targetPath).replace(/\.(js|mjs|cjs)$/i, '')
           const clsName = (baseName || 'Embed').replace(/[^A-Za-z0-9_$]/g, '') || 'Embed'
           const funcName = (clsName.charAt(0).toLowerCase() + clsName.slice(1)) || 'embed'
@@ -17883,6 +18266,8 @@ class SelfBuilder extends SyAPP_Func {
       } catch (e) {
         this.Alert(id, `❌ Edit load error: ${e.message}`, { duration: 4000 })
       }
+
+      this._saveNestedDraft(id)
     }
 
     const S = this.State
@@ -17910,51 +18295,86 @@ class SelfBuilder extends SyAPP_Func {
       this.Button(id, {
         name: ColorText.orange(retLabel),
         pinnedTop: true,
-        props: {
-          __sbDoReturn: 1
-        },
+        // Bypass SyAPP's automatic MENU_SELECTION navigation so the
+        // action below is the SOLE navigator for this click. Without
+        // the bypass, the auto-nav listener fires LoadScreen inside
+        // emitEvent — before cleanupMenuState — and the target menu
+        // is clobbered when the current menu tears down.
+        eventData: { __embReturn: true },
         action: () => {
           // ------------------------------------------------------------------
-          // Restore the pre-edit self state IF the origin is us.
-          //
-          // This is the crucial piece: when the user pressed E on a box
-          // that lived inside the SelfBuilder itself, the origin path
-          // IS '__selfbuilder__'. In that case we must restore the exact
-          // state that existed before the __editFile load overwrote it —
-          // otherwise the user would land on an empty editor.
+          //  1. Persist current draft into RAM.
+          //  2. Bump SyAPP._embRevision so the parent's cached sandbox
+          //     for this emb is treated as stale and respawned with
+          //     the fresh draft baked in.
+          //  3. Restore the parent's pre-edit snapshot.
+          //  4. Restore prior ExportTarget.
+          //  5. Clear nested-mode flags + marker.
+          //  6. Schedule the actual navigation on the next macrotask.
           // ------------------------------------------------------------------
           try {
             const syappRef = this._syappInstance
-            const originPath = returnTo.path
 
+            // (1) RAM save
+            this._saveNestedDraft(id)
+
+            // (2) invalidate cached sandbox for this emb
+            if (syappRef) {
+              syappRef._embRevision = (syappRef._embRevision || 0) + 1
+            }
+
+            // (3) restore parent's pre-edit snapshot
             if (returnTo.selfSnapshot && typeof returnTo.selfSnapshot === 'object') {
-              // Restore regardless of origin: if the origin is another
-              // func, this restore is harmless (its own State is what
-              // gets used); if the origin is us, this restores our draft.
               try { this.State = JSON.parse(JSON.stringify(returnTo.selfSnapshot)) } catch (_) {}
               this.EditItemId = null
             }
 
-            // Clear the marker BEFORE navigating so a refresh mid-flight
-            // cannot re-inject it.
+            // (4) restore prior ExportTarget
+            if (returnTo.prevExportTarget !== undefined) {
+              this.ExportTarget = returnTo.prevExportTarget
+            }
+
+            // (5) clear nested-mode flags + marker
+            this._nestedDraftKey = null
+            this._nestedEmbUniqueKey = null
             try { this.Storages.Delete(id, '__sb_returnTo') } catch (_) {}
 
-            if (!syappRef) return
-            const live = syappRef.Sessions.get(syappRef.MainSessionID)
-            if (live) {
-              live.ActualProps = { ...(returnTo.props || {}), page: '' }
+            // (6) schedule the actual navigation
+            const originPath = returnTo.path
+            const originProps = returnTo.props || {}
+            if (syappRef) {
+              setImmediate(() => {
+                try {
+                  const live = syappRef.Sessions.get(syappRef.MainSessionID)
+                  if (live) {
+                    live.ActualProps = { ...originProps, page: '' }
+                  }
+                  syappRef.LoadScreen(originPath, {
+                    props: { ...originProps, page: '' },
+                    resetSelection: true
+                  }).catch(() => {})
+                } catch (_) {}
+              })
             }
-            syappRef.LoadScreen(originPath, {
-              props: { ...(returnTo.props || {}), page: '' },
-              resetSelection: true
-            }).catch(() => {})
           } catch (_) {}
         }
       })
     }
 
     this._processActions(id, props)
+
+    // Persist the draft to RAM on EVERY render while in nested mode.
+    // Even if Return never fires (crash, abrupt close), the draft is
+    // already safe and will be found on the next E-press on this box.
+    this._saveNestedDraft(id)
+
     if (this.Builds.get(id)?.WaitInput) return
+
+    // -------- Emb tree view (⚙ Config → 📦 Export Tree) --------
+    if (props.__view === 'embTree') {
+      this._renderEmbTreePage(id, props)
+      return
+    }
 
     const W = _termCols()
     const container = this._resolveContainer(curPage)
@@ -18106,6 +18526,167 @@ class SelfBuilder extends SyAPP_Func {
     return ' ' + _fit(body, W - 2)
   }
 
+  // ----------------------------------------------------------
+  // EMB TREE VIEW
+  // ----------------------------------------------------------
+  // Renders every emb registered in this._syappInstance._embTree.
+  //
+  // One row per node with a single toggle: ☐/☑ "save" — included in
+  // 📤 Export Selected (writes each selected emb to its own .js file).
+  //
+  // The toolbar's 🌳 Root toggle switches the OTHER export mode: when
+  // ON, the next 📤 Export writes ONE self-contained file with every
+  // registered emb inlined.
+  // ----------------------------------------------------------
+  _renderEmbTreePage(id, props) {
+    const syapp = this._syappInstance
+    const tree = (syapp && syapp._embTree) ? syapp._embTree : new Map()
+    const nodes = Array.from(tree.values())
+
+    this.Text(id, ' ' + ColorText.bold(ColorText.brightCyan('📦 Emb Tree')))
+    this.Text(id, ' ' + ColorText.dim(`root: ${this.Name}  |  ${nodes.length} node(s) registered`))
+    this.Text(id, ' ' + _hr('─'))
+
+    if (nodes.length === 0) {
+      this.Text(id, ' ' + ColorText.dim('(no emb nodes yet — press E on any active editable emb box to register one)'))
+    } else {
+      const byParent = new Map()
+      for (const n of nodes) {
+        const p = n.parentFuncName || '(orphan)'
+        if (!byParent.has(p)) byParent.set(p, [])
+        byParent.get(p).push(n)
+      }
+
+      const rendered = new Set()
+      const renderNode = (node, depth) => {
+        if (rendered.has(node.uniqueKey)) return
+        rendered.add(node.uniqueKey)
+
+        const indent = '   '.repeat(depth)
+        const mark = node.save ? ColorText.green('☑') : ColorText.dim('☐')
+        const name = ColorText.bold(node.originalName || node.uniqueKey)
+        const src = node.sourcePath
+          ? path.basename(node.sourcePath)
+          : ColorText.dim('(draft — no file yet)')
+        const label = `${indent}${mark} ${name}  ${ColorText.dim('[' + src + ']')}`
+
+        this.Button(id, {
+          name: label,
+          props: { __toggleEmbSave: node.uniqueKey }
+        })
+
+        const kids = byParent.get(node.childFuncName) || []
+        for (const k of kids) renderNode(k, depth + 1)
+      }
+
+      const selfName = this.Name
+      const rootKids = byParent.get(selfName) || byParent.get('__selfbuilder__') || []
+      for (const r of rootKids) renderNode(r, 0)
+      for (const n of nodes) if (!rendered.has(n.uniqueKey)) renderNode(n, 0)
+    }
+
+    this.Text(id, ' ' + _hr('─'))
+
+    const rootAll = !!(syapp && syapp._embRootAll)
+    const selected = nodes.filter(n => n.save).length
+    this.Text(id, ' ' + ColorText.dim(`${selected} of ${nodes.length} node(s) selected for file export`))
+
+    // Global root-all toggle also lives here as a big, visible button.
+    this.Button(id, {
+      name: rootAll
+        ? ColorText.bgMagenta(ColorText.brightWhite(' 🌳 Root all on export: ON '))
+        : ColorText.dim('🌳 Root all on export: OFF (click to enable)'),
+      props: { __toggleRootAll: 1 }
+    })
+
+    this.Buttons(id, [
+      { name: ColorText.bgGreen(ColorText.black(' 📤 Export Selected (own files) ')), props: { __bulkExportTree: 1 } },
+      { name: ColorText.green('✓ Select All'), props: { __bulkSelectAll: 1 } },
+      { name: ColorText.red('✗ Clear All'), props: { __bulkClearAll: 1 } },
+      { name: ColorText.orange('← Back'), props: { __view: '' } }
+    ])
+  }
+
+  // ----------------------------------------------------------
+  // ROOTED EXPORT HELPER
+  // ----------------------------------------------------------
+  // Takes a parent-file body (from _genFuncJS) and returns a new
+  // body with every registered emb inlined as a local class above
+  // the parent's export default, and every `this.Emb(id, "path")`
+  // call rewritten to pass the local class identifier instead of
+  // the file path.
+  //
+  // The result is one self-contained .js: running `node <it>`
+  // boots the whole tree with no external emb files.
+  // ----------------------------------------------------------
+  _embInlineRootedExport(js, S, rel, id, storageHost, syapp) {
+    const tree = syapp && syapp._embTree
+    if (!tree || tree.size === 0) return js
+
+    const inlineBlocks = []
+    const sourceToLocalName = new Map()
+
+    for (const node of tree.values()) {
+      // Prefer the RAM draft; fall back to the on-disk file.
+      const dk = node.draftKey
+        || `__sb_emb_draft_${node.uniqueKey.replace(/[^A-Za-z0-9]/g, '_')}`
+      const draft = storageHost.Get(id, dk)
+
+      let source = null
+      if (draft && Array.isArray(draft.items) && draft.items.length > 0) {
+        source = _genFuncJS(draft, rel)
+      } else if (node.sourcePath && fs.existsSync(node.sourcePath)) {
+        try { source = fs.readFileSync(node.sourcePath, 'utf8') } catch (_) {}
+      }
+      if (!source) continue
+
+      const srcName = (node.originalName || 'Emb').replace(/[^A-Za-z0-9_$]/g, '') || 'Emb'
+      const localName = `__EmbRoot_${srcName}_${node.uniqueKey.slice(-6).replace(/[^A-Za-z0-9_$]/g, '')}`
+
+      let body = source
+        // Drop the `import SyAPP from ...` line — the parent already
+        // has one, and a duplicate import of the same binding would
+        // be a syntax error.
+        .replace(/^\s*import\s+SyAPP\s+from\s+['"][^'"]+['"]\s*;?\s*$/m, '')
+        // Rename the exported class so it doesn't clash with the
+        // parent's class (or with other inlined embs).
+        .replace(/export\s+default\s+class\s+[A-Za-z_$][\w$]*/, `class ${localName}`)
+        .replace(/^\s*export\s+class\s+[A-Za-z_$][\w$]*/m, `class ${localName}`)
+
+      inlineBlocks.push({ localName, body })
+
+      if (node.sourcePath) sourceToLocalName.set(node.sourcePath, localName)
+    }
+
+    // Rewrite `this.Emb(id, "path")` → `this.Emb(id, localName)`.
+    for (const [srcPath, localName] of sourceToLocalName) {
+      const escaped = srcPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const re = new RegExp(
+        `this\\.Emb\\(\\s*([A-Za-z_$][\\w$]*)\\s*,\\s*['"]${escaped}['"]`,
+        'g'
+      )
+      js = js.replace(re, (m, idArg) => `this.Emb(${idArg}, ${localName}`)
+    }
+
+    if (inlineBlocks.length === 0) return js
+
+    const parts = []
+    parts.push('// ============================================================')
+    parts.push('// INLINED EMB FUNCTIONS (root-all export)')
+    parts.push('// Generated by SelfBuilder 📦 Export Tree / 🌳 Root toggle.')
+    parts.push('// ============================================================')
+    for (const b of inlineBlocks) {
+      parts.push('')
+      parts.push(b.body.trim())
+      parts.push('')
+    }
+    parts.push('// ============================================================')
+    parts.push('// END INLINED EMB FUNCTIONS')
+    parts.push('// ============================================================')
+    parts.push('')
+    return parts.join('\n') + js
+  }
+
   _renderTopToolbar(id, S, container) {
     const newOpen = this.Storages.Get(id, 'sb_new_open') || false
     const methodsOpen = this.Storages.Get(id, 'sb_methods_open') || false
@@ -18115,6 +18696,8 @@ class SelfBuilder extends SyAPP_Func {
     // "options" group, the whole toolbar renders as a single physical
     // line:
     //   − New   👁 View   💾 Save   📂 Load   📤 Export   ⚙ Config   🚪 Exit   🏷 untitled   ◆ MyApp
+    const rootAll = !!(this._syappInstance && this._syappInstance._embRootAll)
+
     this.Buttons(id, [
       { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
         props: { __toggleNew: 1 }, pinnedTop: true },
@@ -18123,6 +18706,16 @@ class SelfBuilder extends SyAPP_Func {
       { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
       { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
       { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
+      // "Root all on export" toggle. When ON, the next 📤 Export
+      // inlines every registered emb into the single exported .js,
+      // so a fresh `node <that file>` boots with zero external emb
+      // dependencies — the entire tree is rooted in the one file.
+      {
+        name: rootAll
+          ? ColorText.bgMagenta(ColorText.brightWhite(' 🌳 Root: ON '))
+          : ColorText.dim('🌳 Root: OFF'),
+        props: { __toggleRootAll: 1 }, pinnedTop: true
+      },
       { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
         props: { __toggleMethods: 1 }, pinnedTop: true },
       { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true },
@@ -18334,6 +18927,16 @@ class SelfBuilder extends SyAPP_Func {
           pinnedTop: true }
       ])
     }
+
+    // Entry point to the Emb Tree view.
+    const treeMap = (this._syappInstance && this._syappInstance._embTree) || null
+    const treeSize = treeMap ? treeMap.size : 0
+    const rootAllCfg = !!(this._syappInstance && this._syappInstance._embRootAll)
+    this.Button(id, {
+      name: `📦 Export Tree (${treeSize} node(s)${rootAllCfg ? ', root-all ON' : ''})`,
+      props: { __view: 'embTree' },
+      pinnedTop: true
+    })
   }
 
   async _renderItems(id, items, props) {
