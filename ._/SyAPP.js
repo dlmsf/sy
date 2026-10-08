@@ -13417,11 +13417,30 @@ function levenshteinDistance(str1, str2) {
             if (instance && instance.Name) realName = instance.Name;
             if (!realName) realName = cfg.name;
 
-            if (!this._syappInstance.Funcs.has(realName)) {
-              const inst = instance || new cls();
-              inst._syappInstance = this._syappInstance;
-              this._syappInstance.Funcs.set(realName, inst);
+            // ALWAYS (re)register the freshly-resolved class.
+            //
+            // The produced embedded func always carries the SAME class
+            // name across edits (e.g. "EmbeddedFunc"). On the first
+            // Emb → Enter Func round the name is not yet in the Funcs
+            // map, so the registration was happening naturally. On any
+            // EDIT round the name already exists — and the previous
+            // `if (!Funcs.has(realName))` guard would then keep the
+            // stale, pre-edit instance in place, so Enter Func would
+            // navigate into the OLD content and the user would only
+            // see the new content after Ctrl+C and restart.
+            //
+            // Replacing the entry unconditionally is what makes edits
+            // visible IMMEDIATELY. Cross-render user state (Storages /
+            // Alerts) is preserved from the previous instance so the
+            // embedded func does not lose its own stored data.
+            const inst = instance || new cls();
+            inst._syappInstance = this._syappInstance;
+            const previous = this._syappInstance.Funcs.get(realName);
+            if (previous) {
+              if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
+              if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
             }
+            this._syappInstance.Funcs.set(realName, inst);
 
             // Record the return target for this embedded func so its
             // default "← Return" button knows where to go back to.
@@ -13464,6 +13483,10 @@ function levenshteinDistance(str1, str2) {
           state.editPanel = false;
           this.Storages.Set(id, storageKey, state);
           // Auto-register the class so ▶ Enter Func can navigate to it.
+          //
+          // Always replace any previous registration with the freshly
+          // imported class, so a re-typed path/edited file is visible
+          // immediately instead of falling back to a stale instance.
           try {
             const cls = await this._embImportFile(v);
             if (cls && this._syappInstance) {
@@ -13471,9 +13494,14 @@ function levenshteinDistance(str1, str2) {
               let instance = null;
               try { instance = new cls(); } catch (_) {}
               if (instance && instance.Name) realName = instance.Name;
-              if (realName && !this._syappInstance.Funcs.has(realName)) {
+              if (realName) {
                 const inst = instance || new cls();
                 inst._syappInstance = this._syappInstance;
+                const previous = this._syappInstance.Funcs.get(realName);
+                if (previous) {
+                  if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
+                  if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
+                }
                 this._syappInstance.Funcs.set(realName, inst);
               }
             }
@@ -13506,6 +13534,10 @@ function levenshteinDistance(str1, str2) {
           this.Storages.Set(id, storageKey, state);
           // Auto-register the inline code so ▶ Enter Func works with a
           // real funcname navigation (no synthetic lookup).
+          //
+          // Always replace any previous registration with the freshly
+          // imported class, so re-pasted/edited inline code is visible
+          // immediately instead of falling back to a stale instance.
           try {
             const cls = await this._embImportCode(state.code);
             if (cls && this._syappInstance) {
@@ -13513,9 +13545,14 @@ function levenshteinDistance(str1, str2) {
               let instance = null;
               try { instance = new cls(); } catch (_) {}
               if (instance && instance.Name) realName = instance.Name;
-              if (realName && !this._syappInstance.Funcs.has(realName)) {
+              if (realName) {
                 const inst = instance || new cls();
                 inst._syappInstance = this._syappInstance;
+                const previous = this._syappInstance.Funcs.get(realName);
+                if (previous) {
+                  if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
+                  if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
+                }
                 this._syappInstance.Funcs.set(realName, inst);
               }
             }
@@ -13574,6 +13611,10 @@ function levenshteinDistance(str1, str2) {
 
           // Auto-register the picked class so Enter Func can navigate
           // to its real name immediately.
+          //
+          // Always replace any previous registration so re-picking the
+          // same .js file (after editing it on disk) is visible without
+          // needing Ctrl+C + restart.
           try {
             const cls = await this._embImportFile(picked[0]);
             if (cls && this._syappInstance) {
@@ -13581,9 +13622,14 @@ function levenshteinDistance(str1, str2) {
               let instance = null;
               try { instance = new cls(); } catch (_) {}
               if (instance && instance.Name) realName = instance.Name;
-              if (realName && !this._syappInstance.Funcs.has(realName)) {
+              if (realName) {
                 const inst = instance || new cls();
                 inst._syappInstance = this._syappInstance;
+                const previous = this._syappInstance.Funcs.get(realName);
+                if (previous) {
+                  if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
+                  if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
+                }
                 this._syappInstance.Funcs.set(realName, inst);
               }
             }
@@ -13893,10 +13939,21 @@ function levenshteinDistance(str1, str2) {
       }
 
       // Non-.mjs source: mirror it into a stable temp `.mjs` file.
+      //
+      // The mirror cache is keyed by ABSOLUTE PATH *AND* a content hash.
+      // If the source text has changed (e.g. the user edited the
+      // embedded func via Self Build → Finish & Return), we treat the
+      // cache as a MISS, rewrite the mirror with the fresh source and
+      // re-import. Without this hash check, the OLD mirror file would
+      // be reused and a stale class would be handed back to the Enter
+      // Func flow — which is exactly the "changes only apply after
+      // Ctrl+C and restart" symptom.
       this._embEsmMirrorCache = this._embEsmMirrorCache || new Map();
+      const srcHash = createHash('sha1').update(String(source)).digest('hex').slice(0, 16);
       const cached = this._embEsmMirrorCache.get(srcPath);
-      if (cached && fs.existsSync(cached)) {
-        const fileUrl = url.pathToFileURL(cached).href + '?t=' + Date.now();
+
+      if (cached && cached.hash === srcHash && fs.existsSync(cached.file)) {
+        const fileUrl = url.pathToFileURL(cached.file).href + '?t=' + Date.now();
         return await import(fileUrl);
       }
 
@@ -13937,7 +13994,7 @@ function levenshteinDistance(str1, str2) {
         });
 
       fs.writeFileSync(mirrorFile, mirrorSource, 'utf8');
-      this._embEsmMirrorCache.set(srcPath, mirrorFile);
+      this._embEsmMirrorCache.set(srcPath, { file: mirrorFile, hash: srcHash });
 
       const fileUrl = url.pathToFileURL(mirrorFile).href + '?t=' + Date.now();
       return await import(fileUrl);
