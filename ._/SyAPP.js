@@ -5048,6 +5048,19 @@ class SyAPP_Func {
   }) {
     /** @type {string} */
     this.Name = name
+    /**
+     * Raw build function as provided to the constructor.
+     *
+     * Kept as a private reference so `this.Emb()` can invoke the build
+     * body of an embedded SyAPP_Func WITHOUT going through the regular
+     * `Build()` lifecycle — which would otherwise create and then delete
+     * the session's `userBuild`, wiping the PARENT's in-progress build
+     * for the same session id.
+     *
+     * @type {Function}
+     * @private
+     */
+    this._rawBuild = build
     /** @type {Array<Function>} */
     this.Linked = config.linked || []
     /** @type {boolean} */
@@ -13105,6 +13118,615 @@ function levenshteinDistance(str1, str2) {
       }
     };
 
+    // --------------------------- Emb Method ---------------------------
+
+    /**
+     * Embed an entire SyAPP_Func inside the current function's view.
+     *
+     * The embedded function is rendered INLINE — its build output (text,
+     * buttons, pages, dropdowns, fields, pinned areas, ...) is appended
+     * to the CURRENT view, sharing the same session id. Pinned content
+     * is properly merged into the parent's pinned areas WITHOUT conflict:
+     *
+     *   • The embedded func's `Text`/`Button`/... calls that DID NOT
+     *     declare a pin go to the parent's scrollable body.
+     *   • Calls with `pinned: true` go to the parent's PinnedBottom.
+     *   • Calls with `pinnedTop: true` go to the parent's PinnedTop.
+     *
+     * ─── SOURCES ───────────────────────────────────────────────────────
+     * The second argument (a config object) can point at the embedded
+     * func in ONE of three mutually exclusive ways:
+     *
+     *   • `funcClass` — a class extending SyAPP_Func (or SyAPP.Func()).
+     *   • `filePath`  — path to a .js/.mjs/.cjs file exporting such a
+     *                   class. The file is loaded with dynamic `import()`,
+     *                   mirroring how `node SyAPP.js <file>` boots a func.
+     *   • `code`      — a raw source string of such a class. It is written
+     *                   to a temp file and imported the same way.
+     *
+     * ─── DEFAULT BEHAVIOUR ─────────────────────────────────────────────
+     * With NO config (or with all three source keys empty), this.Emb()
+     * renders a single `this.DropDown` containing side buttons:
+     *
+     *   • 🧩 Self Build → opens a BRAND NEW SelfBuilder session dedicated
+     *                     to crafting the embedded func. When the user
+     *                     finishes and returns, the produced file path
+     *                     (or inline code) is written back to this Emb.
+     *   • 📁 Pick File  → opens a nested `this.File()` picker so you can
+     *                     choose a .js file that exports a SyAPP_Func.
+     *   • ✎ File path   → enter the path manually via WaitInput.
+     *   • ✎ Paste code  → paste the func source manually via WaitInput.
+     *
+     * Once a source exists, an additional button appears:
+     *   • ▶ Enter Func → navigates INTO the embedded func normally
+     *                     (full Screen, not inline), so you can use it
+     *                     like any other page of the app.
+     *
+     * ─── SAVE MODES ────────────────────────────────────────────────────
+     * Once a source exists, the management panel offers two save modes:
+     *
+     *   • Path mode   → the host file records only the PATH of the
+     *                   embedded .js file. Shows the exact snippet.
+     *   • Inline mode → the embedded source is written inline in the
+     *                   host file. Shows the exact snippet.
+     *
+     * @param {string} id - User/build ID (like every other method)
+     * @param {Object} [config]
+     * @param {string}   [config.name='default']  Unique key for this Emb instance
+     * @param {Function} [config.funcClass]       Direct class reference
+     * @param {string}   [config.filePath]        Path to a .js file exporting a func
+     * @param {string}   [config.code]            Inline source of a func
+     * @param {string}   [config.sourceFile]      Path of the host file (informational)
+     * @param {boolean}  [config.autoRun=true]    Auto-run the embedded build
+     * @param {Object}   [config.dropdown]        Dropdown visuals
+     * @returns {Promise<Object|null>} The embedded func instance, or null
+     */
+    this.Emb = async (id, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Emb() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const defaults = {
+        name: 'default',
+        filePath: undefined,
+        code: undefined,
+        funcClass: undefined,
+        sourceFile: undefined,
+        autoRun: true,
+        dropdown: {
+          up_buttontext: '◈ Embed',
+          down_buttontext: 'Hide Embed',
+          up_emoji: '▶',
+          down_emoji: '▼'
+        }
+      };
+      const cfg = { ...defaults, ...config };
+      cfg.dropdown = { ...defaults.dropdown, ...(config.dropdown || {}) };
+
+      const storageKey = `emb_${cfg.name}`;
+      const pickerName = `${storageKey}_picker`;
+      const nsKey = `__emb_${cfg.name}`;
+
+      // Prop names are namespaced per Emb instance so two Emb widgets on
+      // the same screen never step on each other's buttons.
+      const P = {
+        pickFile:      `${nsKey}_pickfile`,
+        selfBuild:     `${nsKey}_selfbuild`,
+        clear:         `${nsKey}_clear`,
+        saveAsPath:    `${nsKey}_savepath`,
+        saveAsInline:  `${nsKey}_saveinline`,
+        editFilePath:  `${nsKey}_editfilepath`,
+        editCode:      `${nsKey}_editcode`,
+        enterFunc:     `${nsKey}_enterfunc`,
+        writeSource:   `${nsKey}_writesource`
+      };
+
+      // ------------------------------------------------------------------
+      // Initial state
+      // ------------------------------------------------------------------
+      if (!this.Storages.Has(id, storageKey)) {
+        const initialSource = cfg.funcClass ? 'class'
+                            : cfg.filePath  ? 'file'
+                            : cfg.code      ? 'code'
+                            : 'none';
+        this.Storages.Set(id, storageKey, {
+          source: initialSource,
+          filePath: cfg.filePath || null,
+          code: cfg.code || null,
+          saveMode: initialSource === 'class' ? 'class'
+                  : initialSource === 'file'  ? 'path'
+                  : initialSource === 'code'  ? 'inline'
+                  : null,
+          error: null,
+          pickMode: false
+        });
+      }
+
+      const state = this.Storages.Get(id, storageKey);
+      const curProps = this.Builds.get(id).Session.ActualProps || {};
+      const passProps = curProps.page ? { page: curProps.page } : {};
+
+      // ------------------------------------------------------------------
+      // Prop handlers
+      // ------------------------------------------------------------------
+      if (curProps[P.pickFile]) {
+        delete curProps[P.pickFile];
+        state.pickMode = true;
+        this.Storages.Set(id, storageKey, state);
+      }
+
+      // ---------------- Self Build launcher ----------------
+      // Opens a BRAND NEW SelfBuilder session. The SelfBuilder is
+      // registered under the special name `__selfbuilder__`; SyAPP
+      // rebuilds it on every navigation, so a fresh `SelfBuilder`
+      // instance is created — giving the user a blank canvas that is
+      // completely separate from the app's own SelfBuilder.
+      //
+      // A pending-return record is stashed on the SyAPP instance so
+      // that, when the user is done and comes back, the produced file
+      // path (or inline code) is written back into this Emb instance.
+      if (curProps[P.selfBuild]) {
+        delete curProps[P.selfBuild];
+        if (this._syappInstance) {
+          this._syappInstance._pendingEmbBuild = {
+            embName: cfg.name,
+            returnTo: this.Name,
+            returnProps: { ...passProps },
+            sourceFile: cfg.sourceFile || null
+          };
+        }
+        this.GotoNow(id, '__selfbuilder__', { props: { __embNewSession: cfg.name } });
+        return null;
+      }
+
+      if (curProps[P.clear]) {
+        delete curProps[P.clear];
+        Object.assign(state, {
+          source: 'none', filePath: null, code: null,
+          saveMode: null, error: null, pickMode: false
+        });
+        this.Storages.Set(id, storageKey, state);
+        this.FileManager.ClearSelection(id, pickerName);
+      }
+
+      if (curProps[P.saveAsPath]) {
+        delete curProps[P.saveAsPath];
+        state.saveMode = 'path';
+        this.Storages.Set(id, storageKey, state);
+      }
+      if (curProps[P.saveAsInline]) {
+        delete curProps[P.saveAsInline];
+        state.saveMode = 'inline';
+        this.Storages.Set(id, storageKey, state);
+      }
+
+      // ---------------- Enter Func ----------------
+      // Navigate INTO the embedded func as a normal screen. The chosen
+      // path is `__emb_func__:<name>` — a synthetic name that SyAPP
+      // resolves at load time by asking this Emb instance for the
+      // embedded class.
+      if (curProps[P.enterFunc]) {
+        delete curProps[P.enterFunc];
+        if (state.source !== 'none') {
+          if (this._syappInstance) {
+            // Register the currently resolved class so the loader can
+            // find it under the synthetic name.
+            const cls = await this._embResolveClass(state, cfg);
+            if (cls) {
+              this._syappInstance._embFuncRegistry =
+                this._syappInstance._embFuncRegistry || new Map();
+              this._syappInstance._embFuncRegistry.set(cfg.name, cls);
+              this.GotoNow(id, `__emb_func__:${cfg.name}`, { props: {} });
+              return null;
+            }
+          }
+        }
+      }
+
+      // Manual file path entry
+      if (curProps[P.editFilePath] === 'start') {
+        delete curProps[P.editFilePath];
+        this.WaitInput(id, {
+          question: 'File path: ', path: this.Name,
+          props: { ...passProps, [P.editFilePath]: 'commit' }
+        });
+        return null;
+      }
+      if (curProps[P.editFilePath] === 'commit') {
+        delete curProps[P.editFilePath];
+        const v = String(curProps.inputValue || '').trim();
+        delete curProps.inputValue;
+        if (v) {
+          state.filePath = v;
+          state.source = 'file';
+          state.saveMode = 'path';
+          state.error = null;
+          this.Storages.Set(id, storageKey, state);
+        }
+      }
+
+      // Manual code entry (single line, \n escaped)
+      if (curProps[P.editCode] === 'start') {
+        delete curProps[P.editCode];
+        this.WaitInput(id, {
+          question: 'Paste code (use \\n for newlines): ', path: this.Name,
+          props: { ...passProps, [P.editCode]: 'commit' }
+        });
+        return null;
+      }
+      if (curProps[P.editCode] === 'commit') {
+        delete curProps[P.editCode];
+        const raw = String(curProps.inputValue || '');
+        delete curProps.inputValue;
+        if (raw) {
+          state.code = raw.replace(/\\n/g, '\n');
+          state.source = 'code';
+          state.saveMode = 'inline';
+          state.error = null;
+          this.Storages.Set(id, storageKey, state);
+        }
+      }
+
+      // Write snippet to the host file if a sourceFile was declared
+      if (curProps[P.writeSource]) {
+        delete curProps[P.writeSource];
+        if (cfg.sourceFile) {
+          try {
+            const snippet = state.saveMode === 'inline'
+              ? this._embSnippetInline(state, cfg)
+              : this._embSnippetPath(state, cfg);
+            const existing = fs.existsSync(cfg.sourceFile)
+              ? fs.readFileSync(cfg.sourceFile, 'utf8')
+              : '';
+            const marker =
+              `\n// [SyAPP.Emb append ${new Date().toISOString()}]\n` +
+              snippet.split('\n').map(l => '// ' + l).join('\n') + '\n';
+            fs.writeFileSync(cfg.sourceFile, existing + marker);
+            this.Alert(id,
+              `📝 Appended Emb snippet to ${path.basename(cfg.sourceFile)}`,
+              { duration: 3000 });
+          } catch (e) {
+            this.Alert(id, `❌ ${e.message}`, { duration: 4000 });
+          }
+        }
+      }
+
+      // Consume any pending file picker selection
+      if (state.pickMode && state.source === 'none') {
+        const picked = this.FileManager.GetSelected(id, pickerName);
+        if (picked.length > 0) {
+          this.FileManager.ClearSelection(id, pickerName);
+          state.filePath = picked[0];
+          state.source = 'file';
+          state.saveMode = 'path';
+          state.pickMode = false;
+          state.error = null;
+          this.Storages.Set(id, storageKey, state);
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // Resolve the embedded class
+      // ------------------------------------------------------------------
+      let EmbClass = await this._embResolveClass(state, cfg);
+      if (EmbClass && state.error) {
+        state.error = null;
+        this.Storages.Set(id, storageKey, state);
+      }
+
+      // ------------------------------------------------------------------
+      // Run the embedded build INLINE
+      // ------------------------------------------------------------------
+      let embedded = null;
+      if (EmbClass && cfg.autoRun !== false) {
+        try {
+          embedded = await this._embRunInline(id, EmbClass, cfg);
+        } catch (e) {
+          state.error = e.message || String(e);
+          this.Storages.Set(id, storageKey, state);
+        }
+      }
+
+      // ------------------------------------------------------------------
+      // Render the management DropDown
+      // ------------------------------------------------------------------
+      await this.DropDown(id, `${storageKey}_mgmt`, async () => {
+        // Side buttons row — always present.
+        // SideButton merges consecutive calls into ONE horizontal row.
+        this.SideButton(id, {
+          name: ColorText.brightMagenta('🧩 Self Build'),
+          props: { [P.selfBuild]: true }
+        });
+        this.SideButton(id, {
+          name: ColorText.brightBlue('📁 Pick File'),
+          props: { [P.pickFile]: true }
+        });
+
+        // "Enter Func" only appears once a source is set — it navigates
+        // INTO the embedded func as a normal screen.
+        if (state.source !== 'none') {
+          this.SideButton(id, {
+            name: ColorText.brightGreen('▶ Enter Func'),
+            props: { [P.enterFunc]: true }
+          });
+        }
+
+        // Inline file picker
+        if (state.pickMode) {
+          await this.File(id, {
+            name: pickerName,
+            multiple: false,
+            filter: (p, isDir) => isDir || /\.(js|mjs|cjs)$/i.test(p),
+            startPath: cfg.startPath || process.cwd(),
+            displayName: '📁 Choose a Func .js file'
+          });
+        }
+
+        // Error banner
+        if (state.error) {
+          this.Text(id, ' ');
+          this.Text(id, ColorText.red('⚠ ' + state.error));
+        }
+
+        if (state.source !== 'none') {
+          // ------- Source summary + save-mode selector -------
+          this.Text(id, ' ');
+          const srcLabel = state.source === 'file'
+            ? `📄 ${_fit(path.basename(state.filePath || '?'), 40)}`
+            : state.source === 'code'
+              ? '⌨ inline code'
+              : '◆ class reference';
+          this.Text(id, `${ColorText.dim('Source:')} ${srcLabel}`);
+
+          this.Buttons(id, [
+            {
+              name: state.saveMode === 'path'
+                ? ColorText.bgGreen(ColorText.black(' ✓ Path mode '))
+                : '○ Path mode',
+              props: { [P.saveAsPath]: true }
+            },
+            {
+              name: state.saveMode === 'inline'
+                ? ColorText.bgGreen(ColorText.black(' ✓ Inline mode '))
+                : '○ Inline mode',
+              props: { [P.saveAsInline]: true }
+            }
+          ]);
+
+          // ------- Source snippet preview -------
+          const snippet = state.saveMode === 'inline'
+            ? this._embSnippetInline(state, cfg)
+            : this._embSnippetPath(state, cfg);
+
+          this.TextButton(id, `${storageKey}_snippet`, {
+            label: 'Source snippet (paste into your func file)',
+            initialValue: snippet,
+            lines: 8,
+            editable: false
+          });
+
+          if (cfg.sourceFile && fs.existsSync(cfg.sourceFile)) {
+            this.Button(id, {
+              name: ColorText.brightYellow('✎ Write snippet to host file'),
+              props: { [P.writeSource]: true }
+            });
+          }
+
+          this.Button(id, {
+            name: ColorText.red('✕ Clear Emb'),
+            props: { [P.clear]: true }
+          });
+        } else {
+          // ------- Manual entry fallback -------
+          this.Text(id, ' ');
+          this.Text(id, ColorText.dim('Or set the source manually:'));
+          this.Buttons(id, [
+            { name: '✎ File path',   props: { [P.editFilePath]: 'start' } },
+            { name: '✎ Paste code',  props: { [P.editCode]: 'start' } }
+          ]);
+        }
+      }, {
+        up_buttontext: cfg.dropdown.up_buttontext,
+        down_buttontext: cfg.dropdown.down_buttontext,
+        up_emoji: cfg.dropdown.up_emoji,
+        down_emoji: cfg.dropdown.down_emoji
+      });
+
+      return embedded;
+    };
+
+    // --------------------------- Emb Internals ---------------------------
+
+    /**
+     * Resolve the embedded class based on the current state. Handles the
+     * three source modes ('class', 'file', 'code') and returns a class,
+     * or null on failure (with `state.error` set).
+     * @private
+     */
+    this._embResolveClass = async (state, cfg) => {
+      if (state.source === 'class' && cfg.funcClass) return cfg.funcClass;
+      if (state.source === 'file' && state.filePath) {
+        try { return await this._embImportFile(state.filePath); }
+        catch (e) { state.error = e.message || String(e); return null; }
+      }
+      if (state.source === 'code' && state.code) {
+        try { return await this._embImportCode(state.code); }
+        catch (e) { state.error = e.message || String(e); return null; }
+      }
+      return null;
+    };
+
+    /**
+     * Import a SyAPP_Func class from a .js/.mjs/.cjs file.
+     * @param {string} filePath
+     * @returns {Promise<Function>}
+     * @private
+     */
+    this._embImportFile = async (filePath) => {
+      const abs = path.isAbsolute(filePath)
+        ? filePath
+        : path.resolve(process.cwd(), filePath);
+      if (!fs.existsSync(abs)) {
+        throw new Error(`Embedded func file not found: ${filePath}`);
+      }
+      const fileUrl = url.pathToFileURL(abs).href + '?t=' + Date.now();
+      const mod = await import(fileUrl);
+      return this._embPickClass(mod, abs);
+    };
+
+    /**
+     * Import a SyAPP_Func class from a raw source string.
+     * @param {string} code
+     * @returns {Promise<Function>}
+     * @private
+     */
+    this._embImportCode = async (code) => {
+      const dir = path.join(os.tmpdir(), 'syapp_emb');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const tmp = path.join(
+        dir,
+        `emb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`
+      );
+      fs.writeFileSync(tmp, String(code), 'utf8');
+      const fileUrl = url.pathToFileURL(tmp).href + '?t=' + Date.now();
+      const mod = await import(fileUrl);
+      return this._embPickClass(mod, tmp);
+    };
+
+    /**
+     * Pick the first exported class that duck-types as a SyAPP_Func.
+     * @private
+     */
+    this._embPickClass = (mod, src) => {
+      const cands = [];
+      if (mod && mod.default !== undefined) cands.push(mod.default);
+      if (mod) for (const k of Object.keys(mod)) {
+        if (k !== 'default') cands.push(mod[k]);
+      }
+      for (const c of cands) {
+        if (typeof c !== 'function') continue;
+        try {
+          const probe = new c();
+          if (probe && typeof probe.Build === 'function' && typeof probe.Text === 'function') {
+            return c;
+          }
+        } catch (_) { /* try next */ }
+      }
+      throw new Error(`No SyAPP_Func subclass exported from ${src}`);
+    };
+
+    /**
+     * Run the embedded func's raw build function with the PARENT's build
+     * maps shared, so every Text/Button/Page/… call from the embedded
+     * build lands directly on the current session's userBuild — making
+     * the embedded output render INLINE.
+     *
+     * Pinned-area isolation: the embedded instance shares the parent's
+     * session, so calls with `pinned: true` / `pinnedTop: true` from the
+     * embedded build naturally route into the parent's pinned areas.
+     * The `_pinContext` field (used by this.PinnedTop / this.PinnedBottom)
+     * is delegated to the parent's userBuild so a nested PinnedTop block
+     * inside the embedded func correctly marks its children.
+     *
+     * @private
+     */
+    this._embRunInline = async (parentId, EmbClass, cfg) => {
+      const instance = new EmbClass();
+      instance._syappInstance = this._syappInstance;
+
+      // Share the internal maps so the embedded build writes land on the
+      // PARENT's userBuild for the same session id.
+      const savedBuilds = instance.Builds;
+      const savedUserStorage = instance.UserStorage;
+      const savedAlertStorage = instance.AlertStorage;
+      const savedPinCtx = instance._pinContext;
+      instance.Builds = this.Builds;
+      instance.UserStorage = this.UserStorage;
+      instance.AlertStorage = this.AlertStorage;
+
+      try {
+        if (!this.Builds.has(parentId)) return null;
+
+        const props = {
+          session: this.Builds.get(parentId).Session,
+          _isEmbedded: true,
+          _embeddedFrom: this.Name
+        };
+
+        if (typeof instance._rawBuild === 'function') {
+          // Preferred path — direct access to the build body, no
+          // lifecycle hooks, no userBuild teardown. Pinned-area
+          // handling is transparently delegated through the shared
+          // `this.Builds` map, so this.PinnedTop()/this.PinnedBottom()
+          // inside the embedded build correctly mark the parent's
+          // userBuild._pinContext.
+          await instance._rawBuild(props);
+        } else if (typeof instance.Build === 'function') {
+          // Fallback for cross-module imports where _rawBuild is absent:
+          // call Build() and merge the returned hud_obj into the parent.
+          const r = await instance.Build(props);
+          if (r && r.hud_obj) {
+            const pb = this.Builds.get(parentId);
+            if (r.hud_obj.title) {
+              pb.Text = pb.Text ? pb.Text + '\n' + r.hud_obj.title : r.hud_obj.title;
+            }
+            if (r.hud_obj.pinnedTopTitle) {
+              pb.PinnedTopText = pb.PinnedTopText
+                ? pb.PinnedTopText + '\n' + r.hud_obj.pinnedTopTitle
+                : r.hud_obj.pinnedTopTitle;
+            }
+            if (r.hud_obj.pinnedTitle) {
+              pb.PinnedText = pb.PinnedText
+                ? pb.PinnedText + '\n' + r.hud_obj.pinnedTitle
+                : r.hud_obj.pinnedTitle;
+            }
+            if (Array.isArray(r.hud_obj.options)) {
+              for (const b of r.hud_obj.options) pb.Buttons.push(b);
+            }
+          }
+        }
+        return instance;
+      } finally {
+        instance.Builds = savedBuilds;
+        instance.UserStorage = savedUserStorage;
+        instance.AlertStorage = savedAlertStorage;
+        instance._pinContext = savedPinCtx;
+      }
+    };
+
+    /**
+     * Build the source snippet for the PATH save mode.
+     * @private
+     */
+    this._embSnippetPath = (state, cfg) => {
+      return [
+        `await this.Emb(id, {`,
+        `  name: ${JSON.stringify(cfg.name)},`,
+        `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`,
+        `})`
+      ].join('\n');
+    };
+
+    /**
+     * Build the source snippet for the INLINE save mode.
+     * @private
+     */
+    this._embSnippetInline = (state, cfg) => {
+      const safe = String(state.code || '')
+        .replace(/\\/g, '\\\\')
+        .replace(/`/g, '\\`')
+        .replace(/\$\{/g, '\\${');
+      return [
+        `await this.Emb(id, {`,
+        `  name: ${JSON.stringify(cfg.name)},`,
+        '  code: `',
+        safe,
+        '  `',
+        `})`
+      ].join('\n');
+    };
+
     // --------------------------- JavaScript Runner / Explorer ---------------------------
 
     /**
@@ -14845,6 +15467,36 @@ this.HUD = new TerminalHUD({
           config.props.notfounded_func = funcname;
           targetFuncName = 'notfounded';
         }
+
+        // ------------------------------------------------------------------
+        // SYNTHETIC "Enter Func" resolution.
+        //
+        // this.Emb()'s ▶ Enter Func button navigates to a name of the
+        // form `__emb_func__:<name>`. That name is not a real registered
+        // func — instead, an Emb instance that has already resolved its
+        // embedded class has registered it in `_embFuncRegistry`. We
+        // synthesize a short-lived Func entry for it so the rest of the
+        // loader treats it like any ordinary screen.
+        // ------------------------------------------------------------------
+        if (typeof targetFuncName === 'string' && targetFuncName.startsWith('__emb_func__:')) {
+          const embName = targetFuncName.slice('__emb_func__:'.length);
+          const registry = this._embFuncRegistry;
+          const EmbClass = registry && registry.get(embName);
+          if (EmbClass) {
+            // Register a synthetic func instance under the magic name
+            // so it is reachable via the standard Funcs map.
+            if (!this.Funcs.has(targetFuncName)) {
+              const inst = new EmbClass();
+              inst._syappInstance = this;
+              this.Funcs.set(targetFuncName, inst);
+            }
+          } else {
+            // Registry miss — show the notfounded screen with a
+            // helpful label so the user knows what happened.
+            config.props.notfounded_func = `embedded func "${embName}"`;
+            targetFuncName = 'notfounded';
+          }
+        }
         
         // Check if this is a refresh request and if the function allows it.
         //
@@ -15900,6 +16552,14 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.JavaScript(id, ${JSON.stringify(it.codeOrPath || '')}${cfgArg})`)
           break
         }
+        case 'emb': {
+          const cfg = { name: it.name }
+          if (it.filePath) cfg.filePath = it.filePath
+          if (it.code) cfg.code = it.code
+          if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
+          L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'route': {
           const m = it.method || 'Get'
           L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
@@ -15980,6 +16640,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Args: 'args',
   Cells: 'cells',
   Grid: 'grid',
+  Emb: 'emb',
   Get: 'route',
   Post: 'route',
   Put: 'route',
@@ -16105,6 +16766,20 @@ function _sbMakeItemForMethod(methodName, id) {
         codeOrPath: '',
         config: { name: 'js_' + id, classOnly: false, timeout: 30000 }
       }
+    case 'emb': {
+      // Embedded SyAPP_Func. The item can be configured with an inline
+      // code string, a file path, or left empty — in which case the
+      // runtime this.Emb() call falls back to its two-button dropdown
+      // (Self Build + File Picker).
+      return {
+        ...base,
+        name: 'emb_' + id,
+        filePath: '',
+        code: '',
+        saveMode: 'path',
+        dropdown: {}
+      }
+    }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
     case 'code':
@@ -16254,6 +16929,106 @@ class SelfBuilder extends SyAPP_Func {
     this._pendingEdit = null
     this._pendingAction = null
     this._idSeq = 0
+
+    // ------------------------------------------------------------------
+    // EMB MODE
+    //
+    // When this SelfBuilder was launched from this.Emb()'s 🧩 Self Build
+    // button, SyAPP stashes a pending-return record on the SyAPP
+    // instance and navigates here with `__embNewSession`. That marker
+    // tells the SelfBuilder to operate in EMB mode:
+    //
+    //   • The canvas starts EMPTY (no shared state with the app's own
+    //     SelfBuilder).
+    //   • The toolbar shows "✓ Finish & Return" instead of the regular
+    //     Save/Load/Export row.
+    //   • Clicking Finish writes the produced file (path or inline) back
+    //     into the target Emb instance via its own Storages entry, then
+    //     navigates back to the caller screen.
+    // ------------------------------------------------------------------
+    this._embMode = false
+    this._embTarget = null
+    this._embReturnTo = null
+    this._embReturnProps = null
+  }
+
+  /**
+   * Called by _renderSelf when the SelfBuilder is running in EMB mode.
+   * Writes the final result into the target Emb's storage and returns
+   * to the caller screen.
+   *
+   * The write-back uses the same storage key convention as this.Emb(),
+   * so the next time the caller's dropdown opens, it already has the
+   * file path (or the inline code) loaded and ready.
+   *
+   * @param {string} id - UserBuild id of the SelfBuilder session
+   * @param {object} props - Build props from the SelfBuilder render
+   * @private
+   */
+  _embFinishAndReturn = async (id, props) => {
+    const syapp = this._syappInstance;
+    if (!syapp) return;
+
+    // Build a temp file holding the produced source so the caller Emb
+    // can consume it via its filePath/inline path.
+    let producedPath = null;
+    let producedCode = null;
+    try {
+      const relSyapp = (() => {
+        try {
+          return path.relative(process.cwd(), url.fileURLToPath(import.meta.url));
+        } catch (_) { return './SyAPP.js'; }
+      })();
+      producedCode = _genFuncJS(this.State, relSyapp);
+
+      const outDir = path.join(os.tmpdir(), 'syapp_emb_builds');
+      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+      const outName = (this.State.funcName || 'EmbeddedFunc').replace(/[^A-Za-z0-9_$]/g, '') +
+                      '_' + Date.now().toString(36) + '.js';
+      producedPath = path.join(outDir, outName);
+      fs.writeFileSync(producedPath, producedCode, 'utf8');
+    } catch (e) {
+      this.Alert(id, `❌ ${e.message}`, { duration: 4000 });
+      return;
+    }
+
+    // Write back into the caller Emb's storage
+    const caller = syapp._pendingEmbBuild;
+    if (caller && caller.embName) {
+      // Find the Emb owner func instance so we can write to its
+      // Storages under the same id key it uses.
+      const session = syapp.Sessions.get(syapp.MainSessionID);
+      const sessionId = session ? session.UniqueID : id;
+      const embStorageKey = `emb_${caller.embName}`;
+
+      // Ensure the target func has initialised its storage for this
+      // Emb name — otherwise we bootstrap a fresh entry with the
+      // produced source already set.
+      const ownerFunc = syapp.Funcs.get(caller.returnTo);
+      if (ownerFunc && ownerFunc.Storages) {
+        let cur = ownerFunc.Storages.Get(sessionId, embStorageKey);
+        if (!cur || typeof cur !== 'object') {
+          cur = { source: 'file', filePath: producedPath, code: null,
+                  saveMode: 'path', error: null, pickMode: false };
+        } else {
+          cur.source = 'file';
+          cur.filePath = producedPath;
+          cur.code = producedCode;
+          cur.saveMode = 'path';
+          cur.error = null;
+        }
+        ownerFunc.Storages.Set(sessionId, embStorageKey, cur);
+      }
+
+      this.Alert(id, `✓ Embedded func produced: ${path.basename(producedPath)}`, { duration: 3000 });
+      syapp._pendingEmbBuild = null;
+
+      // Navigate back to the caller screen with its original props.
+      this.GotoNow(id, caller.returnTo, { props: caller.returnProps || {} });
+      return;
+    }
+
+    this.Alert(id, '⚠ No Emb target set — result kept in temp', { duration: 3000 });
   }
 
   _nid() { return `it_${Date.now().toString(36)}_${++this._idSeq}` }
@@ -16545,6 +17320,15 @@ class SelfBuilder extends SyAPP_Func {
 
     if (p.__toggleEdit) { this.Editing = !this.Editing; this.EditItemId = null }
 
+    // EMB mode: finish and return to the caller Emb.
+    if (p.__embFinish) {
+      // Fire-and-forget; the write-back then navigates away.
+      this._embFinishAndReturn(id, p).catch(e => {
+        this.Alert(id, `❌ ${e.message}`, { duration: 4000 });
+      });
+      return;
+    }
+
     if (p.__toggleNew) {
       const cur = this.Storages.Get(id, 'sb_new_open') || false
       this.Storages.Set(id, 'sb_new_open', !cur)
@@ -16805,6 +17589,41 @@ class SelfBuilder extends SyAPP_Func {
     const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
     const curPage = curProps.page || ''
 
+    // ------------------------------------------------------------------
+    // EMB MODE detection
+    //
+    // If the caller of this SelfBuilder render has `__embNewSession` in
+    // its props, this SelfBuilder was launched from this.Emb()'s
+    // 🧩 Self Build button. Enable EMB mode, reset the canvas so the
+    // user starts fresh (a BRAND NEW SelfBuilder session, separate from
+    // the app's own SelfBuilder state), and record the return info.
+    // ------------------------------------------------------------------
+    if (curProps.__embNewSession && !this._embMode) {
+      this._embMode = true;
+      this._embTarget = curProps.__embNewSession;
+      const pending = this._syappInstance && this._syappInstance._pendingEmbBuild;
+      this._embReturnTo = pending ? pending.returnTo : null;
+      this._embReturnProps = pending ? pending.returnProps : null;
+
+      // Fresh canvas — do NOT inherit whatever the app's own SelfBuilder
+      // had on screen. This is what "go to a brand new self build func"
+      // means: an empty State, isolated from any previously loaded file.
+      this.State = {
+        name: `emb_${this._embTarget}`,
+        funcName: 'EmbeddedFunc',
+        code: '',
+        items: [],
+        hiddenMethods: [],
+        pinnedTopSeparator: 'line',
+        pinnedBottomSeparator: 'line'
+      };
+      this.EditItemId = null;
+      this.Editing = true;
+
+      // Clear the marker so it only triggers once.
+      delete curProps.__embNewSession;
+    }
+
     this._processActions(id, props)
     if (this.Builds.get(id)?.WaitInput) return
 
@@ -16962,25 +17781,50 @@ class SelfBuilder extends SyAPP_Func {
     const newOpen = this.Storages.Get(id, 'sb_new_open') || false
     const methodsOpen = this.Storages.Get(id, 'sb_methods_open') || false
 
-    // Single toolbar row: toggle + global actions + app/class name.
-    // Because this.Buttons() appends every entry into ONE shared
-    // "options" group, the whole toolbar renders as a single physical
-    // line:
-    //   − New   👁 View   💾 Save   📂 Load   📤 Export   ⚙ Config   🚪 Exit   🏷 untitled   ◆ MyApp
-    this.Buttons(id, [
-      { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
-        props: { __toggleNew: 1 }, pinnedTop: true },
-      { name: this.Editing ? '👁 View' : '✎ Edit',
-        props: { __toggleEdit: 1 }, pinnedTop: true },
-      { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
-      { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
-      { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
-      { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
-        props: { __toggleMethods: 1 }, pinnedTop: true },
-      { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true },
-      { name: `🏷 ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
-      { name: `◆ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
-    ])
+    // ------------------------------------------------------------------
+    // EMB MODE toolbar
+    //
+    // When this SelfBuilder was launched from this.Emb()'s Self Build
+    // button, the toolbar is trimmed to the essentials and gets a
+    // dedicated "✓ Finish & Return" action. That button writes the
+    // produced source back into the caller Emb instance and navigates
+    // back to the caller screen.
+    //
+    // All the app-management actions (Save/Load/Export/Exit, plus the
+    // app/class name editors) are omitted in EMB mode: those would
+    // overwrite the app's own saves and are simply not relevant for a
+    // one-shot embedded func builder.
+    // ------------------------------------------------------------------
+    if (this._embMode) {
+      this.Buttons(id, [
+        { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
+          props: { __toggleNew: 1 }, pinnedTop: true },
+        { name: this.Editing ? '👁 View' : '✎ Edit',
+          props: { __toggleEdit: 1 }, pinnedTop: true },
+        { name: ColorText.bgGreen(ColorText.black(' ✓ Finish & Return ')),
+          props: { __embFinish: 1 }, pinnedTop: true },
+        { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
+          props: { __toggleMethods: 1 }, pinnedTop: true },
+        { name: `◆ ${_fit(S.funcName, 22)}`,
+          props: { __setFuncName: 1 }, pinnedTop: true }
+      ])
+    } else {
+      // Regular toolbar (unchanged)
+      this.Buttons(id, [
+        { name: newOpen ? ColorText.bold('− New') : ColorText.bold('＋ New'),
+          props: { __toggleNew: 1 }, pinnedTop: true },
+        { name: this.Editing ? '👁 View' : '✎ Edit',
+          props: { __toggleEdit: 1 }, pinnedTop: true },
+        { name: '💾 Save', props: { __save: 1 }, pinnedTop: true },
+        { name: '📂 Load', props: { __load: 1 }, pinnedTop: true },
+        { name: '📤 Export', props: { __export: 1 }, pinnedTop: true },
+        { name: methodsOpen ? ColorText.bold('⚙ Config ✓') : '⚙ Config',
+          props: { __toggleMethods: 1 }, pinnedTop: true },
+        { name: '🚪 Exit', props: { __exit: 1 }, pinnedTop: true },
+        { name: `🏷 ${_fit(S.name, 18)}`, props: { __setAppName: 1 }, pinnedTop: true },
+        { name: `◆ ${_fit(S.funcName, 18)}`, props: { __setFuncName: 1 }, pinnedTop: true }
+      ])
+    }
 
     // When either menu is open, break the toolbar's options group and
     // draw a separator line BEFORE the menu content. Pushing a plain
@@ -17465,6 +18309,18 @@ class SelfBuilder extends SyAPP_Func {
           // editor for tweaking `codeOrPath` and the config.
           await this.JavaScript(id, it.codeOrPath || '', it.config || {})
           break
+        case 'emb': {
+          // Render the real this.Emb() call. In VIEW mode, the embedded
+          // func runs inline. In EDIT mode, the ○/◉ dot prefix still
+          // opens the pinned editor where `filePath`, `code`, `saveMode`
+          // and `dropdown` can be tweaked.
+          const cfg = { name: it.name }
+          if (it.filePath) cfg.filePath = it.filePath
+          if (it.code) cfg.code = it.code
+          if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
+          await this.Emb(id, cfg)
+          break
+        }
         case 'route':
           this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
           break
@@ -17824,6 +18680,13 @@ class SelfBuilder extends SyAPP_Func {
         }
         break
       }
+      case 'emb':
+        mkProp('name', 'Name', 'string')
+        mkProp('filePath', 'File Path', 'string')
+        mkProp('code', 'Inline Code', 'string')
+        mkProp('saveMode', 'Save Mode (path|inline)', 'string')
+        mkProp('dropdown', 'Dropdown Config', 'json')
+        break
       case 'route':
         mkProp('path', 'Path', 'string')
         mkProp('handler', 'Handler', 'string')
