@@ -18516,59 +18516,97 @@ class SelfBuilder extends SyAPP_Func {
           outerFilePath = __BUILDER_EXPORT_TARGET;
         }
 
-        // --- 1) In-memory: THE OWNER func's storage for this session ---
+        // --- 1) In-memory recovery ---
         //
-        // STRICT owner-only lookup. The previous fallback scanned EVERY
-        // registered func for one whose storage held an `emb_<target>`
-        // entry — which at deep nesting levels could return a SIBLING
-        // or ANCESTOR func's Emb state instead of the correct parent's.
-        // That is exactly the "Self Build shows the previous func at
-        // layers 3-4" symptom. The owner is now resolved EXCLUSIVELY
-        // from `this._embReturnTo`; if it is missing or not found in
-        // `syapp.Funcs`, in-memory recovery is skipped entirely and we
-        // go straight to the correctly-namespaced disk record.
+        // The EMB-produced func is written back through whichever func
+        // is CURRENTLY rendering the Emb widget, which — for widgets
+        // that live INSIDE a Self Build canvas — is always THIS
+        // SelfBuilder instance. The owner resolved from _embReturnTo
+        // is therefore just a hint: it correctly resolves to
+        // '__selfbuilder__' in the recursive case, but the entry can
+        // also live on the SelfBuilder itself or on another registered
+        // func when the widget is rendered through a nested container.
+        //
+        // We now probe a small ordered list of candidates:
+        //   1. the owner func from _embReturnTo (primary),
+        //   2. THIS SelfBuilder instance (the actual writer in the
+        //      recursive Emb → Self Build → Emb flow),
+        //   3. a global scan over every registered func (last resort).
+        //
+        // A candidate is accepted ONLY when its entry actually carries
+        // a real source (filePath or code). Boot-only entries (source:
+        // 'none') are skipped, so a stale sibling / ancestor record
+        // can never shadow the correct produced func — this preserves
+        // the original anti-confusion fix while still recovering the
+        // produced func in every recursive flow.
         try {
           const syapp = this._syappInstance;
           const session = syapp && syapp.Sessions.get(syapp.MainSessionID);
           const sessionId = session ? session.UniqueID : id;
           const storageKeyForRecovery = `emb_${this._embTarget}`;
-          const ownerFunc = (this._embReturnTo && syapp)
-            ? syapp.Funcs.get(this._embReturnTo)
-            : null;
 
-          if (ownerFunc && ownerFunc.Storages) {
-            const cur = ownerFunc.Storages.Get(
-              sessionId,
-              storageKeyForRecovery
-            );
-            if (cur) {
-              if (cur.filePath) recoveredPath = cur.filePath;
-              if (cur.code) recoveredCode = cur.code;
+          const ownerCandidates = [];
+          const seenFuncs = new Set();
+          const addCandidate = (f) => {
+            if (f && typeof f === 'object' && f.Storages && !seenFuncs.has(f)) {
+              seenFuncs.add(f);
+              ownerCandidates.push(f);
             }
+          };
+
+          if (syapp && syapp.Funcs) {
+            if (this._embReturnTo) {
+              addCandidate(syapp.Funcs.get(this._embReturnTo));
+            }
+            addCandidate(this);
+            for (const [, f] of syapp.Funcs) addCandidate(f);
+          } else {
+            addCandidate(this);
+          }
+
+          for (const candidate of ownerCandidates) {
+            try {
+              const cur = candidate.Storages.Get(
+                sessionId,
+                storageKeyForRecovery
+              );
+              if (cur && (cur.filePath || cur.code)) {
+                if (cur.filePath) recoveredPath = cur.filePath;
+                if (cur.code) recoveredCode = cur.code;
+                break;
+              }
+            } catch (_) { /* try next candidate */ }
           }
         } catch (_) { /* fall through to disk */ }
 
-        // --- 2) Disk record (namespaced ONLY — no legacy fallback) ---
+        // --- 2) Disk record ---
         //
-        // The disk key MUST be `<owner>::<target>`. The previous code
-        // fell back to the bare `<target>` key when the namespaced
-        // lookup missed. At deep nesting levels that bare key resolved
-        // to the OUTERMOST func's Emb record, so the SelfBuilder would
-        // open showing THAT func's produced content instead of a blank
-        // canvas — the exact "showing the previous func" bug. There is
-        // no fallback any more: a miss is a genuine miss.
+        // Preferred key is `<owner>::<target>`, which is what both
+        // _embFinishAndReturn and this.Emb() write. A small ordered
+        // list of additional keys is tried as a safety net, so a
+        // widget can still recover its produced func even when the
+        // owner name was lost across a restart. The first key that
+        // yields an entry with an actual source (filePath or code)
+        // wins — boot-only records are ignored.
         if (!recoveredPath && !recoveredCode && outerFilePath) {
-          try {
-            const ownerTag = this._embReturnTo || '__unknown__';
-            const disk = _embDiskLoad(
-              outerFilePath,
-              `${ownerTag}::${this._embTarget}`
-            );
-            if (disk) {
-              if (disk.filePath) recoveredPath = disk.filePath;
-              if (disk.code) recoveredCode = disk.code;
-            }
-          } catch (_) {}
+          const diskKeys = [
+            `${this._embReturnTo || '__unknown__'}::${this._embTarget}`,
+            `__selfbuilder__::${this._embTarget}`,
+            String(this._embTarget || '')
+          ];
+          const seenKeys = new Set();
+          for (const k of diskKeys) {
+            if (!k || seenKeys.has(k)) continue;
+            seenKeys.add(k);
+            try {
+              const disk = _embDiskLoad(outerFilePath, k);
+              if (disk && (disk.filePath || disk.code)) {
+                if (disk.filePath) recoveredPath = disk.filePath;
+                if (disk.code) recoveredCode = disk.code;
+                break;
+              }
+            } catch (_) {}
+          }
         }
 
         // --- Parse the recovered source back into a builder state ---
@@ -20257,6 +20295,28 @@ function _sbCallToItem(call, sessionVar) {
     case 'PinnedBottom':
     case 'Args':
       return _sbContainerItem(call.method, rest)
+    case 'Emb': {
+      // Embedded SyAPP_Func — round-trips the widget's own config so
+      // that a produced source containing an `await this.Emb(id, ...)`
+      // call can be re-parsed back into a proper Emb item instead of a
+      // raw code block. This is what allows nested Emb widgets that
+      // live INSIDE an already-produced Self Build func to keep
+      // working across recursive edits (Emb → Self Build → Emb →
+      // Self Build → …), instead of collapsing into opaque code items
+      // that would stop round-tripping at depth ≥ 2.
+      const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {};
+      if (cfg === null) return null;
+      return {
+        type: 'emb',
+        name: typeof cfg.name === 'string' ? cfg.name : `emb_${_sbNid()}`,
+        filePath: typeof cfg.filePath === 'string' ? cfg.filePath : '',
+        code: typeof cfg.code === 'string' ? cfg.code : '',
+        saveMode: typeof cfg.saveMode === 'string' ? cfg.saveMode : 'path',
+        dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
+          ? cfg.dropdown
+          : {}
+      };
+    }
     case 'File':
       return { type: 'file', config: {} }
     case 'JSON':
