@@ -18213,9 +18213,17 @@ class SelfBuilder extends SyAPP_Func {
   // ----------------------------------------------------------
   async _renderSelf(props) {
     const id = props.session.UniqueID
-    const S = this.State
     const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
     const curPage = curProps.page || ''
+
+    // NOTE: `S = this.State` is deliberately captured further down,
+    // AFTER the EMB-mode recovery block and AFTER `_processActions`.
+    // Both of those can reassign `this.State` (EMB recovery reloads the
+    // produced func; `_processActions` 'load' replaces it with a save).
+    // Reading it here left `S` pointing at a STALE object, so the
+    // renderer's empty-canvas check (`S.items.length === 0`) always fired
+    // and the recovered items were silently ignored — the exact
+    // "blank Func after restart" symptom.
 
     // ------------------------------------------------------------------
     // EMB MODE detection
@@ -18243,18 +18251,159 @@ class SelfBuilder extends SyAPP_Func {
       this._embPreviousEdit = this.Editing;
       this._embPreviousEditId = this.EditItemId;
 
-      // Fresh canvas — do NOT inherit whatever the app's own SelfBuilder
-      // had on screen. This is what "go to a brand new self build func"
-      // means: an empty State, isolated from any previously loaded file.
-      this.State = {
-        name: `emb_${this._embTarget}`,
-        funcName: 'EmbeddedFunc',
-        code: '',
-        items: [],
-        hiddenMethods: [],
-        pinnedTopSeparator: 'line',
-        pinnedBottomSeparator: 'line'
-      };
+      // ------------------------------------------------------------------
+      // RECOVER EXISTING EMBED SOURCE (if any).
+      //
+      // A brand-new SelfBuilder instance is created on every process
+      // restart, so `_embMode` starts as `false` and this guard is
+      // entered. The previous implementation unconditionally blanked
+      // the canvas here, which is why re-opening "🧩 Self Build" on an
+      // already-produced embed showed a BLANK Func after Ctrl+C — even
+      // though the embed widget itself was correctly recovered by
+      // this.Emb() (that's why Enter Func navigated fine).
+      //
+      // Fix: before blanking, try to recover the source the embed
+      // widget already has attached. If found, parse it with the same
+      // best-effort parser used by `--edit` (`_sbParseFuncJS`) and load
+      // it into the canvas. Otherwise stay blank — so the very first
+      // entry on a fresh embed is byte-for-byte unchanged.
+      //
+      // Recovery order (first match wins):
+      //   1. The OWNER func's in-memory storage for this session, keyed
+      //      by `emb_<embName>`. On a fresh process this ALREADY carries
+      //      the disk-recovered filePath, because this.Emb() ran during
+      //      the owner's build pass just before the user clicked
+      //      🧩 Self Build.
+      //   2. The disk record read via `_embDiskLoad()` — the same self-
+      //      heal path this.Emb() itself uses.
+      //   3. Fallback: scan every registered func for one whose storage
+      //      holds an `emb_<name>` entry for this session (in case
+      //      `_embReturnTo` was somehow lost).
+      //
+      // IMPORTANT: this reassigns `this.State`. `_renderSelf` therefore
+      // captures `S = this.State` AFTER this block (and after
+      // `_processActions`), never before — see the note at the top of
+      // the method.
+      // ------------------------------------------------------------------
+      let recoveredState = null;
+      try {
+        let recoveredPath = null;
+        let recoveredCode = null;
+
+        // Resolve the outer file path EXACTLY the way this.Emb() and
+        // _embFinishAndReturn() do, so the disk key matches on both
+        // write and read.
+        let outerFilePath = null;
+        try {
+          const argvFile = process.argv[2];
+          if (typeof argvFile === 'string' &&
+              /\.(js|mjs|cjs)$/i.test(argvFile) &&
+              !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
+            const abs = path.isAbsolute(argvFile)
+              ? argvFile
+              : path.resolve(process.cwd(), argvFile);
+            if (fs.existsSync(abs)) outerFilePath = abs;
+          }
+        } catch (_) {}
+        if (!outerFilePath &&
+            typeof __BUILDER_EXPORT_TARGET === 'string' &&
+            __BUILDER_EXPORT_TARGET) {
+          outerFilePath = __BUILDER_EXPORT_TARGET;
+        }
+
+        // --- 1) In-memory: owner func's storage for this session ---
+        try {
+          const syapp = this._syappInstance;
+          const session = syapp && syapp.Sessions.get(syapp.MainSessionID);
+          const sessionId = session ? session.UniqueID : id;
+          let ownerFunc = (this._embReturnTo && syapp)
+            ? syapp.Funcs.get(this._embReturnTo)
+            : null;
+
+          // Fallback: scan every registered func for one whose storage
+          // already has an `emb_<name>` entry for this session. This
+          // covers the case where `_embReturnTo` was not set (e.g. the
+          // caller opened Self Build from a nested context).
+          if (!ownerFunc && syapp) {
+            for (const f of syapp.Funcs.values()) {
+              if (f && f.Storages &&
+                  f.Storages.Has(sessionId, `emb_${this._embTarget}`)) {
+                ownerFunc = f;
+                break;
+              }
+            }
+          }
+
+          if (ownerFunc && ownerFunc.Storages) {
+            const cur = ownerFunc.Storages.Get(
+              sessionId,
+              `emb_${this._embTarget}`
+            );
+            if (cur) {
+              if (cur.filePath) recoveredPath = cur.filePath;
+              if (cur.code) recoveredCode = cur.code;
+            }
+          }
+        } catch (_) { /* fall through to disk */ }
+
+        // --- 2) Disk record ---
+        if (!recoveredPath && !recoveredCode && outerFilePath) {
+          try {
+            const disk = _embDiskLoad(outerFilePath, this._embTarget);
+            if (disk) {
+              if (disk.filePath) recoveredPath = disk.filePath;
+              if (disk.code) recoveredCode = disk.code;
+            }
+          } catch (_) {}
+        }
+
+        // --- Parse the recovered source back into a builder state ---
+        if (recoveredPath && fs.existsSync(recoveredPath)) {
+          try {
+            const src = fs.readFileSync(recoveredPath, 'utf8');
+            recoveredState = _sbParseFuncJS(src, recoveredPath);
+          } catch (_) { /* fall through to inline code */ }
+        }
+        if (!recoveredState && recoveredCode &&
+            typeof recoveredCode === 'string') {
+          try {
+            recoveredState = _sbParseFuncJS(
+              recoveredCode,
+              `emb_${this._embTarget}.js`
+            );
+          } catch (_) { /* give up silently — blank canvas below */ }
+        }
+      } catch (_) { /* never let recovery break EMB entry */ }
+
+      if (recoveredState &&
+          (recoveredState.items.length > 0 || recoveredState.name)) {
+        // Existing produced func found — load it into the canvas so the
+        // user continues editing exactly where they left off.
+        this.State = {
+          ...recoveredState,
+          name: recoveredState.name || `emb_${this._embTarget}`,
+          funcName: recoveredState.funcName || 'EmbeddedFunc',
+          code: recoveredState.code || '',
+          items: Array.isArray(recoveredState.items) ? recoveredState.items : [],
+          hiddenMethods: Array.isArray(recoveredState.hiddenMethods)
+            ? recoveredState.hiddenMethods
+            : [],
+          pinnedTopSeparator: recoveredState.pinnedTopSeparator || 'line',
+          pinnedBottomSeparator: recoveredState.pinnedBottomSeparator || 'line'
+        };
+      } else {
+        // No existing source — start with a fresh, blank canvas.
+        this.State = {
+          name: `emb_${this._embTarget}`,
+          funcName: 'EmbeddedFunc',
+          code: '',
+          items: [],
+          hiddenMethods: [],
+          pinnedTopSeparator: 'line',
+          pinnedBottomSeparator: 'line'
+        };
+      }
+
       this.EditItemId = null;
       this.Editing = true;
 
@@ -18264,6 +18413,15 @@ class SelfBuilder extends SyAPP_Func {
 
     this._processActions(id, props)
     if (this.Builds.get(id)?.WaitInput) return
+
+    // Capture the LIVE State reference AFTER every possible mutation
+    // above. Both the EMB-mode recovery block and `_processActions`'
+    // 'load' case can reassign `this.State`. Reading it earlier left
+    // `S` pointing at the PRE-recovery (blank) object, so the
+    // renderer's `S.items.length === 0` check always fired and the
+    // recovered items were silently ignored — the exact
+    // "blank Func after restart" symptom.
+    const S = this.State
 
     const W = _termCols()
     const container = this._resolveContainer(curPage)
