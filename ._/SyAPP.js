@@ -13193,7 +13193,16 @@ function levenshteinDistance(str1, str2) {
         code: undefined,
         funcClass: undefined,
         sourceFile: undefined,
-        autoRun: true,
+        // autoRun is OFF by default: since ▶ Enter Func now performs a
+        // real navigation, running the embedded build INLINE would
+        // duplicate its content on the parent screen (which is exactly
+        // the "still loading in the main func" symptom). Callers that
+        // genuinely want the old inline behaviour can pass
+        // `autoRun: true` explicitly.
+        autoRun: false,
+        // When false, no "← Return" button is injected into the
+        // embedded func. Default true so every Emb() gets one.
+        showReturnButton: true,
         dropdown: {
           up_buttontext: '◈ Embed',
           down_buttontext: 'Hide Embed',
@@ -13211,15 +13220,16 @@ function levenshteinDistance(str1, str2) {
       // Prop names are namespaced per Emb instance so two Emb widgets on
       // the same screen never step on each other's buttons.
       const P = {
-        pickFile:      `${nsKey}_pickfile`,
-        selfBuild:     `${nsKey}_selfbuild`,
-        clear:         `${nsKey}_clear`,
-        saveAsPath:    `${nsKey}_savepath`,
-        saveAsInline:  `${nsKey}_saveinline`,
-        editFilePath:  `${nsKey}_editfilepath`,
-        editCode:      `${nsKey}_editcode`,
-        enterFunc:     `${nsKey}_enterfunc`,
-        writeSource:   `${nsKey}_writesource`
+        pickFile:        `${nsKey}_pickfile`,
+        selfBuild:       `${nsKey}_selfbuild`,
+        clear:           `${nsKey}_clear`,
+        saveAsPath:      `${nsKey}_savepath`,
+        saveAsInline:    `${nsKey}_saveinline`,
+        editFilePath:    `${nsKey}_editfilepath`,
+        editCode:        `${nsKey}_editcode`,
+        enterFunc:       `${nsKey}_enterfunc`,
+        writeSource:     `${nsKey}_writesource`,
+        toggleEditPanel: `${nsKey}_toggleeditpanel`
       };
 
       // ------------------------------------------------------------------
@@ -13239,7 +13249,11 @@ function levenshteinDistance(str1, str2) {
                   : initialSource === 'code'  ? 'inline'
                   : null,
           error: null,
-          pickMode: false
+          pickMode: false,
+          // When false, the dropdown shows only ▶ Enter + ✎ Edit.
+          // Toggled by the Edit button and reset to false whenever
+          // the source changes so the top of the dropdown stays clean.
+          editPanel: false
         });
       }
 
@@ -13284,7 +13298,8 @@ function levenshteinDistance(str1, str2) {
         delete curProps[P.clear];
         Object.assign(state, {
           source: 'none', filePath: null, code: null,
-          saveMode: null, error: null, pickMode: false
+          saveMode: null, error: null, pickMode: false,
+          editPanel: false
         });
         this.Storages.Set(id, storageKey, state);
         this.FileManager.ClearSelection(id, pickerName);
@@ -13302,24 +13317,56 @@ function levenshteinDistance(str1, str2) {
       }
 
       // ---------------- Enter Func ----------------
-      // Navigate INTO the embedded func as a normal screen. The chosen
-      // path is `__emb_func__:<name>` — a synthetic name that SyAPP
-      // resolves at load time by asking this Emb instance for the
-      // embedded class.
+      // Navigate INTO the embedded func as a normal screen.
+      //
+      // The func has already been imported and registered under its
+      // REAL class name (either by _embFinishAndReturn, or by a direct
+      // pick / paste that we now register below). We resolve the class
+      // once more here to make sure the SyAPP.Funcs map contains it,
+      // then navigate with a plain funcname — the exact same thing a
+      // `{ path: 'MyFunc' }` button would do.
+      //
+      // Before navigating, we record the RETURN TARGET for this
+      // (sessionId, embeddedFuncName) pair so the embedded func can
+      // render a default "← Return" button pointing back at this
+      // parent func. This is what makes Enter Func → Return Func work
+      // out of the box for any func produced by this.Emb().
       if (curProps[P.enterFunc]) {
         delete curProps[P.enterFunc];
         if (state.source !== 'none') {
-          if (this._syappInstance) {
-            // Register the currently resolved class so the loader can
-            // find it under the synthetic name.
-            const cls = await this._embResolveClass(state, cfg);
-            if (cls) {
-              this._syappInstance._embFuncRegistry =
-                this._syappInstance._embFuncRegistry || new Map();
-              this._syappInstance._embFuncRegistry.set(cfg.name, cls);
-              this.GotoNow(id, `__emb_func__:${cfg.name}`, { props: {} });
-              return null;
+          const cls = await this._embResolveClass(state, cfg);
+          if (cls && this._syappInstance) {
+            // Ensure the class is present in SyAPP.Funcs under a stable
+            // name. We use `cls.name` first (that is what the produced
+            // source declares), then fall back to cfg.name.
+            let realName = (typeof cls.name === 'string' && cls.name) ? cls.name : null;
+            let instance = null;
+            try { instance = new cls(); } catch (_) {}
+            if (instance && instance.Name) realName = instance.Name;
+            if (!realName) realName = cfg.name;
+
+            if (!this._syappInstance.Funcs.has(realName)) {
+              const inst = instance || new cls();
+              inst._syappInstance = this._syappInstance;
+              this._syappInstance.Funcs.set(realName, inst);
             }
+
+            // Record the return target for this embedded func so its
+            // default "← Return" button knows where to go back to.
+            this._syappInstance._embReturnTargets =
+              this._syappInstance._embReturnTargets || new Map();
+            const session = this.Builds.get(id)?.Session;
+            if (session && session.UniqueID) {
+              const existing = this._syappInstance._embReturnTargets.get(session.UniqueID) || {};
+              existing[realName] = {
+                func: this.Name,
+                props: { ...(session.ActualProps || {}) }
+              };
+              this._syappInstance._embReturnTargets.set(session.UniqueID, existing);
+            }
+
+            this.GotoNow(id, realName, { props: {} });
+            return null;
           }
         }
       }
@@ -13342,7 +13389,26 @@ function levenshteinDistance(str1, str2) {
           state.source = 'file';
           state.saveMode = 'path';
           state.error = null;
+          state.editPanel = false;
           this.Storages.Set(id, storageKey, state);
+          // Auto-register the class so ▶ Enter Func can navigate to it.
+          try {
+            const cls = await this._embImportFile(v);
+            if (cls && this._syappInstance) {
+              let realName = cls.name || null;
+              let instance = null;
+              try { instance = new cls(); } catch (_) {}
+              if (instance && instance.Name) realName = instance.Name;
+              if (realName && !this._syappInstance.Funcs.has(realName)) {
+                const inst = instance || new cls();
+                inst._syappInstance = this._syappInstance;
+                this._syappInstance.Funcs.set(realName, inst);
+              }
+            }
+          } catch (e) {
+            state.error = e.message || String(e);
+            this.Storages.Set(id, storageKey, state);
+          }
         }
       }
 
@@ -13364,7 +13430,27 @@ function levenshteinDistance(str1, str2) {
           state.source = 'code';
           state.saveMode = 'inline';
           state.error = null;
+          state.editPanel = false;
           this.Storages.Set(id, storageKey, state);
+          // Auto-register the inline code so ▶ Enter Func works with a
+          // real funcname navigation (no synthetic lookup).
+          try {
+            const cls = await this._embImportCode(state.code);
+            if (cls && this._syappInstance) {
+              let realName = cls.name || null;
+              let instance = null;
+              try { instance = new cls(); } catch (_) {}
+              if (instance && instance.Name) realName = instance.Name;
+              if (realName && !this._syappInstance.Funcs.has(realName)) {
+                const inst = instance || new cls();
+                inst._syappInstance = this._syappInstance;
+                this._syappInstance.Funcs.set(realName, inst);
+              }
+            }
+          } catch (e) {
+            state.error = e.message || String(e);
+            this.Storages.Set(id, storageKey, state);
+          }
         }
       }
 
@@ -13393,7 +13479,16 @@ function levenshteinDistance(str1, str2) {
       }
 
       // Consume any pending file picker selection
-      if (state.pickMode && state.source === 'none') {
+      //
+      // NOTE: this now triggers for BOTH the setup view AND the edit
+      // sub-panel (pickMode can be set from either), and it always
+      // resets `editPanel` to false so the dropdown snaps back to the
+      // clean 2-button view right after a new file is chosen.
+      //
+      // It also AUTO-REGISTERS the picked func into SyAPP.Funcs under
+      // its real class name, so ▶ Enter Func is always a plain
+      // funcname navigation — never a synthetic lookup.
+      if (state.pickMode) {
         const picked = this.FileManager.GetSelected(id, pickerName);
         if (picked.length > 0) {
           this.FileManager.ClearSelection(id, pickerName);
@@ -13402,7 +13497,28 @@ function levenshteinDistance(str1, str2) {
           state.saveMode = 'path';
           state.pickMode = false;
           state.error = null;
+          state.editPanel = false;
           this.Storages.Set(id, storageKey, state);
+
+          // Auto-register the picked class so Enter Func can navigate
+          // to its real name immediately.
+          try {
+            const cls = await this._embImportFile(picked[0]);
+            if (cls && this._syappInstance) {
+              let realName = cls.name || null;
+              let instance = null;
+              try { instance = new cls(); } catch (_) {}
+              if (instance && instance.Name) realName = instance.Name;
+              if (realName && !this._syappInstance.Funcs.has(realName)) {
+                const inst = instance || new cls();
+                inst._syappInstance = this._syappInstance;
+                this._syappInstance.Funcs.set(realName, inst);
+              }
+            }
+          } catch (e) {
+            state.error = e.message || String(e);
+            this.Storages.Set(id, storageKey, state);
+          }
         }
       }
 
@@ -13430,10 +13546,97 @@ function levenshteinDistance(str1, str2) {
 
       // ------------------------------------------------------------------
       // Render the management DropDown
+      //
+      // Two visual modes, driven by whether a source has been chosen:
+      //
+      //   • source === 'none'  → SETUP view (Self Build, Pick File, and
+      //                          manual entry). This is what the user
+      //                          sees right after dropping an empty
+      //                          this.Emb() widget into the canvas.
+      //
+      //   • source !== 'none'  → CLEAN view: exactly TWO buttons,
+      //                          `▶ Enter Func` and `✎ Edit`. Everything
+      //                          else (Self Build, Pick File, Path /
+      //                          Inline mode toggles, snippet, write-back,
+      //                          Clear) lives INSIDE the `✎ Edit`
+      //                          sub-panel, so the top of the dropdown
+      //                          stays minimal once a func is attached.
       // ------------------------------------------------------------------
+      if (curProps[P.toggleEditPanel]) {
+        delete curProps[P.toggleEditPanel];
+        state.editPanel = !state.editPanel;
+        this.Storages.Set(id, storageKey, state);
+      }
+
       await this.DropDown(id, `${storageKey}_mgmt`, async () => {
-        // Side buttons row — always present.
-        // SideButton merges consecutive calls into ONE horizontal row.
+        // ---------------- SETUP view (no source yet) ----------------
+        if (state.source === 'none') {
+          this.SideButton(id, {
+            name: ColorText.brightMagenta('🧩 Self Build'),
+            props: { [P.selfBuild]: true }
+          });
+          this.SideButton(id, {
+            name: ColorText.brightBlue('📁 Pick File'),
+            props: { [P.pickFile]: true }
+          });
+
+          if (state.pickMode) {
+            await this.File(id, {
+              name: pickerName,
+              multiple: false,
+              filter: (p, isDir) => isDir || /\.(js|mjs|cjs)$/i.test(p),
+              startPath: cfg.startPath || process.cwd(),
+              displayName: '📁 Choose a Func .js file'
+            });
+          }
+
+          if (state.error) {
+            this.Text(id, ' ');
+            this.Text(id, ColorText.red('⚠ ' + state.error));
+          }
+
+          this.Text(id, ' ');
+          this.Text(id, ColorText.dim('Or set the source manually:'));
+          this.Buttons(id, [
+            { name: '✎ File path',   props: { [P.editFilePath]: 'start' } },
+            { name: '✎ Paste code',  props: { [P.editCode]: 'start' } }
+          ]);
+          return;
+        }
+
+        // ---------------- CLEAN view (source present) ----------------
+        if (!state.editPanel) {
+          this.Buttons(id, [
+            {
+              name: ColorText.bgGreen(ColorText.black(' ▶ Enter Func ')),
+              props: { [P.enterFunc]: true }
+            },
+            {
+              name: ColorText.brightYellow('✎ Edit'),
+              props: { [P.toggleEditPanel]: true }
+            }
+          ]);
+
+          if (state.error) {
+            this.Text(id, ' ');
+            this.Text(id, ColorText.red('⚠ ' + state.error));
+          }
+          return;
+        }
+
+        // ---------------- EDIT sub-panel (source present) ----------------
+        this.Button(id, {
+          name: ColorText.orange('◀ Back'),
+          props: { [P.toggleEditPanel]: true }
+        });
+
+        const srcLabel = state.source === 'file'
+          ? `📄 ${_fit(path.basename(state.filePath || '?'), 40)}`
+          : state.source === 'code'
+            ? '⌨ inline code'
+            : '◆ class reference';
+        this.Text(id, `${ColorText.dim('Source:')} ${srcLabel}`);
+
         this.SideButton(id, {
           name: ColorText.brightMagenta('🧩 Self Build'),
           props: { [P.selfBuild]: true }
@@ -13442,17 +13645,11 @@ function levenshteinDistance(str1, str2) {
           name: ColorText.brightBlue('📁 Pick File'),
           props: { [P.pickFile]: true }
         });
+        this.SideButton(id, {
+          name: ColorText.brightGreen('▶ Enter Func'),
+          props: { [P.enterFunc]: true }
+        });
 
-        // "Enter Func" only appears once a source is set — it navigates
-        // INTO the embedded func as a normal screen.
-        if (state.source !== 'none') {
-          this.SideButton(id, {
-            name: ColorText.brightGreen('▶ Enter Func'),
-            props: { [P.enterFunc]: true }
-          });
-        }
-
-        // Inline file picker
         if (state.pickMode) {
           await this.File(id, {
             name: pickerName,
@@ -13463,69 +13660,49 @@ function levenshteinDistance(str1, str2) {
           });
         }
 
-        // Error banner
+        this.Text(id, ' ');
+        this.Buttons(id, [
+          {
+            name: state.saveMode === 'path'
+              ? ColorText.bgGreen(ColorText.black(' ✓ Path mode '))
+              : '○ Path mode',
+            props: { [P.saveAsPath]: true }
+          },
+          {
+            name: state.saveMode === 'inline'
+              ? ColorText.bgGreen(ColorText.black(' ✓ Inline mode '))
+              : '○ Inline mode',
+            props: { [P.saveAsInline]: true }
+          }
+        ]);
+
+        const snippet = state.saveMode === 'inline'
+          ? this._embSnippetInline(state, cfg)
+          : this._embSnippetPath(state, cfg);
+
+        this.TextButton(id, `${storageKey}_snippet`, {
+          label: 'Source snippet (paste into your func file)',
+          initialValue: snippet,
+          lines: 8,
+          editable: false
+        });
+
+        if (cfg.sourceFile && fs.existsSync(cfg.sourceFile)) {
+          this.Button(id, {
+            name: ColorText.brightYellow('✎ Write snippet to host file'),
+            props: { [P.writeSource]: true }
+          });
+        }
+
         if (state.error) {
           this.Text(id, ' ');
           this.Text(id, ColorText.red('⚠ ' + state.error));
         }
 
-        if (state.source !== 'none') {
-          // ------- Source summary + save-mode selector -------
-          this.Text(id, ' ');
-          const srcLabel = state.source === 'file'
-            ? `📄 ${_fit(path.basename(state.filePath || '?'), 40)}`
-            : state.source === 'code'
-              ? '⌨ inline code'
-              : '◆ class reference';
-          this.Text(id, `${ColorText.dim('Source:')} ${srcLabel}`);
-
-          this.Buttons(id, [
-            {
-              name: state.saveMode === 'path'
-                ? ColorText.bgGreen(ColorText.black(' ✓ Path mode '))
-                : '○ Path mode',
-              props: { [P.saveAsPath]: true }
-            },
-            {
-              name: state.saveMode === 'inline'
-                ? ColorText.bgGreen(ColorText.black(' ✓ Inline mode '))
-                : '○ Inline mode',
-              props: { [P.saveAsInline]: true }
-            }
-          ]);
-
-          // ------- Source snippet preview -------
-          const snippet = state.saveMode === 'inline'
-            ? this._embSnippetInline(state, cfg)
-            : this._embSnippetPath(state, cfg);
-
-          this.TextButton(id, `${storageKey}_snippet`, {
-            label: 'Source snippet (paste into your func file)',
-            initialValue: snippet,
-            lines: 8,
-            editable: false
-          });
-
-          if (cfg.sourceFile && fs.existsSync(cfg.sourceFile)) {
-            this.Button(id, {
-              name: ColorText.brightYellow('✎ Write snippet to host file'),
-              props: { [P.writeSource]: true }
-            });
-          }
-
-          this.Button(id, {
-            name: ColorText.red('✕ Clear Emb'),
-            props: { [P.clear]: true }
-          });
-        } else {
-          // ------- Manual entry fallback -------
-          this.Text(id, ' ');
-          this.Text(id, ColorText.dim('Or set the source manually:'));
-          this.Buttons(id, [
-            { name: '✎ File path',   props: { [P.editFilePath]: 'start' } },
-            { name: '✎ Paste code',  props: { [P.editCode]: 'start' } }
-          ]);
-        }
+        this.Button(id, {
+          name: ColorText.red('✕ Clear Emb'),
+          props: { [P.clear]: true }
+        });
       }, {
         up_buttontext: cfg.dropdown.up_buttontext,
         down_buttontext: cfg.dropdown.down_buttontext,
@@ -13559,6 +13736,23 @@ function levenshteinDistance(str1, str2) {
 
     /**
      * Import a SyAPP_Func class from a .js/.mjs/.cjs file.
+     *
+     * `Cannot use import statement outside a module`:
+     * Node treats `.js` as CommonJS unless the nearest package.json has
+     * `"type": "module"`. Any embedded func file we generate — or any
+     * hand-written func file a user picks — contains ESM `import` /
+     * `export` statements, so importing it as a plain `.js` blows up
+     * with exactly that error.
+     *
+     * We solve it by resolving to one of two safe entry points:
+     *   • `.mjs` / `.cjs` → import directly (Node already knows the
+     *     module system from the extension).
+     *   • `.js`           → mirror the source into a temp `.mjs` file
+     *     (rewriting relative import specifiers so they still resolve
+     *     from the ORIGINAL directory), then import THAT. The mirror is
+     *     cached per absolute path so repeated Emb() renders do not
+     *     rewrite the same file again and again.
+     *
      * @param {string} filePath
      * @returns {Promise<Function>}
      * @private
@@ -13570,13 +13764,15 @@ function levenshteinDistance(str1, str2) {
       if (!fs.existsSync(abs)) {
         throw new Error(`Embedded func file not found: ${filePath}`);
       }
-      const fileUrl = url.pathToFileURL(abs).href + '?t=' + Date.now();
-      const mod = await import(fileUrl);
+      const mod = await this._embImportAsEsm(abs, fs.readFileSync(abs, 'utf8'));
       return this._embPickClass(mod, abs);
     };
 
     /**
      * Import a SyAPP_Func class from a raw source string.
+     * Always written to a `.mjs` temp file — safe regardless of the
+     * surrounding project's package.json "type" field.
+     *
      * @param {string} code
      * @returns {Promise<Function>}
      * @private
@@ -13592,6 +13788,87 @@ function levenshteinDistance(str1, str2) {
       const fileUrl = url.pathToFileURL(tmp).href + '?t=' + Date.now();
       const mod = await import(fileUrl);
       return this._embPickClass(mod, tmp);
+    };
+
+    /**
+     * Import the source of an embedded func as an ES module, safely,
+     * regardless of the file's original extension.
+     *
+     * If `srcPath` already ends in `.mjs`, the file is imported directly.
+     * Otherwise, the source is written to a mirrored `.mjs` file inside
+     * a stable temp directory, with:
+     *   • a generated `package.json` marking the directory as ESM, so
+     *     even a bare `.js` mirror is treated as a module by Node;
+     *   • RELATIVE import specifiers rewritten to point back at the
+     *     original directory (so `./something.js` still resolves);
+     *   • non-relative (bare / absolute / `file:`) specifiers left
+     *     untouched, because those resolve identically from anywhere.
+     *
+     * The mirror is cached per absolute source path, so the same file
+     * is only mirrored once per process.
+     *
+     * @param {string} srcPath  Absolute path to the original source file
+     * @param {string} source   Raw source text (already read)
+     * @returns {Promise<object>}  The imported module namespace object
+     * @private
+     */
+    this._embImportAsEsm = async (srcPath, source) => {
+      // `.mjs` (or `.cjs`) already tell Node the module system. Import
+      // the original file directly.
+      if (srcPath.endsWith('.mjs') || srcPath.endsWith('.cjs')) {
+        const fileUrl = url.pathToFileURL(srcPath).href + '?t=' + Date.now();
+        return await import(fileUrl);
+      }
+
+      // Non-.mjs source: mirror it into a stable temp `.mjs` file.
+      this._embEsmMirrorCache = this._embEsmMirrorCache || new Map();
+      const cached = this._embEsmMirrorCache.get(srcPath);
+      if (cached && fs.existsSync(cached)) {
+        const fileUrl = url.pathToFileURL(cached).href + '?t=' + Date.now();
+        return await import(fileUrl);
+      }
+
+      const srcDir = path.dirname(srcPath);
+      const mirrorRoot = path.join(os.tmpdir(), 'syapp_emb_mirror');
+      if (!fs.existsSync(mirrorRoot)) fs.mkdirSync(mirrorRoot, { recursive: true });
+
+      // `package.json` marking the mirror tree as ESM. Written once;
+      // harmless if it already exists.
+      const pkgPath = path.join(mirrorRoot, 'package.json');
+      if (!fs.existsSync(pkgPath)) {
+        fs.writeFileSync(pkgPath, JSON.stringify({ type: 'module' }, null, 2), 'utf8');
+      }
+
+      // Unique subdirectory per source file, keyed by a hash of the
+      // absolute path, so no two mirrors ever collide.
+      const hash = createHash('sha1').update(srcPath).digest('hex').slice(0, 16);
+      const mirrorDir = path.join(mirrorRoot, hash);
+      if (!fs.existsSync(mirrorDir)) fs.mkdirSync(mirrorDir, { recursive: true });
+      const mirrorFile = path.join(mirrorDir, path.basename(srcPath).replace(/\.js$/i, '.mjs'));
+
+      // Rewrite only RELATIVE import specifiers so they resolve from the
+      // ORIGINAL directory, not from the mirror directory. Bare and
+      // absolute specifiers are left untouched.
+      const rewriteSpecifier = (spec) => {
+        if (!spec) return spec;
+        if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+        const absTarget = path.resolve(srcDir, spec);
+        return url.pathToFileURL(absTarget).href;
+      };
+
+      let mirrorSource = source
+        .replace(/(\bfrom\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+          return kw + q + rewriteSpecifier(spec) + q;
+        })
+        .replace(/(\bimport\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+          return kw + q + rewriteSpecifier(spec) + q;
+        });
+
+      fs.writeFileSync(mirrorFile, mirrorSource, 'utf8');
+      this._embEsmMirrorCache.set(srcPath, mirrorFile);
+
+      const fileUrl = url.pathToFileURL(mirrorFile).href + '?t=' + Date.now();
+      return await import(fileUrl);
     };
 
     /**
@@ -15421,6 +15698,29 @@ this.HUD = new TerminalHUD({
     this.ProcessFuncs(this.MainFunc.Func);
     this.ProcessFuncs(NotFounded);
     this.ProcessFuncs(Error);
+    // Pre-load the SelfBuilder as a built-in func, exactly like NotFounded
+    // and Error above. This guarantees `__selfbuilder__` is ALWAYS reachable
+    // via this.Emb() / GotoNow / any user code, regardless of which func
+    // is the main func for this SyAPP instance.
+    this.ProcessFuncs(SelfBuilder);
+
+    // ============================================================
+    // EMB RETURN TARGETS
+    // ============================================================
+    // Per-session map of { <embeddedFuncName>: { func, props } }.
+    //
+    // Every time an Emb instance navigates INTO an embedded func via
+    // ▶ Enter Func (or runs it inline), it records the parent func here.
+    // The loader then uses this map to inject a default "← Return"
+    // button into the embedded func's rendered output, so the user can
+    // always get back to the func that owns the this.Emb() widget —
+    // without the embedded func's author having to do anything.
+    //
+    // Keyed by session id first (different sessions can be embedded
+    // from different parents), then by embedded func name.
+    // ============================================================
+    /** @type {Map<string, Object<string, {func: string, props: Object}>>} */
+    this._embReturnTargets = new Map();
 
     // Discover routes from all functions (only if HTTP is enabled)
     if (this.serverConfig.enableHTTP) {
@@ -15560,6 +15860,50 @@ this.HUD = new TerminalHUD({
 
         try {
           const return_obj = await this.Funcs.get(targetFuncName).Build(config.props);
+
+          // ============================================================
+          // DEFAULT "← Return" BUTTON INJECTION
+          // ============================================================
+          // If the func we just built was entered via an Emb widget's
+          // ▶ Enter Func button, it has an entry in _embReturnTargets
+          // for this session. In that case, append a default ← Return
+          // button to the rendered HUD options, pointing back at the
+          // parent func that owns the Emb.
+          //
+          // This is a per-session, per-embedded-func lookup, so nested
+          // Emb-in-Func-in-Emb flows each get their own Return button
+          // that goes back exactly one layer.
+          // ============================================================
+          if (return_obj && return_obj.hud_obj) {
+            try {
+              const session = config.props && config.props.session;
+              const sessionId = session && session.UniqueID;
+              if (sessionId && this._embReturnTargets.has(sessionId)) {
+                const perSession = this._embReturnTargets.get(sessionId);
+                const target = perSession && perSession[targetFuncName];
+                if (target && target.func && target.func !== targetFuncName) {
+                  if (!Array.isArray(return_obj.hud_obj.options)) {
+                    return_obj.hud_obj.options = [];
+                  }
+                  return_obj.hud_obj.options.push({
+                    name: ColorText.brightYellow('← Return to ' + target.func),
+                    metadata: {
+                      props: { ...(target.props || {}) },
+                      path: target.func,
+                      resetSelection: true,
+                      jumpTo: false,
+                      pinned: false,
+                      pinnedTop: false
+                    },
+                    action: () => {}
+                  });
+                }
+              }
+            } catch (_) {
+              // Injection is a convenience layer — never let it break
+              // the actual screen render.
+            }
+          }
 
           if (config.props) {
             if (config.props.session) {
@@ -16950,6 +17294,14 @@ class SelfBuilder extends SyAPP_Func {
     this._embTarget = null
     this._embReturnTo = null
     this._embReturnProps = null
+
+    // Snapshot of the SelfBuilder state taken right BEFORE entering EMB
+    // mode. Restored when the user finishes (or otherwise leaves) the
+    // EMB run, so the parent builder view comes back exactly as it was.
+    // This is what makes the Emb / Self-Build flow recursive.
+    this._embPreviousState = null
+    this._embPreviousEdit = undefined
+    this._embPreviousEditId = null
   }
 
   /**
@@ -17604,6 +17956,16 @@ class SelfBuilder extends SyAPP_Func {
       const pending = this._syappInstance && this._syappInstance._pendingEmbBuild;
       this._embReturnTo = pending ? pending.returnTo : null;
       this._embReturnProps = pending ? pending.returnProps : null;
+
+      // Preserve the pre-EMB state so the parent SelfBuilder view can be
+      // restored the moment the user finishes (or cancels) the EMB run.
+      // Storing State (rather than reusing the live reference) is what
+      // makes the Emb-in-Func-in-Emb recursion behave correctly: each
+      // nesting level has its own snapshot on the instance stack, and
+      // the innermost Finish & Return puts everything back one layer.
+      this._embPreviousState = this.State;
+      this._embPreviousEdit = this.Editing;
+      this._embPreviousEditId = this.EditItemId;
 
       // Fresh canvas — do NOT inherit whatever the app's own SelfBuilder
       // had on screen. This is what "go to a brand new self build func"
