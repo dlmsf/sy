@@ -13271,6 +13271,35 @@ function levenshteinDistance(str1, str2) {
         outerFilePath = __BUILDER_EXPORT_TARGET;
       }
 
+      // ------------------------------------------------------------------
+      // DISK KEY NAMESPACING + OUTER-FUNC DETECTION (recursive-Emb fix)
+      //
+      // process.argv[2] always resolves to the OUTER file, even while an
+      // embedded func (imported from a temp file) is executing. Without
+      // extra guards, an embedded func's own Emb() would read the OUTER
+      // func's disk mirror — which still holds the embedded func's own
+      // file path — and render a stale "Enter Func" button that just
+      // re-enters the same embedded func in an infinite loop.
+      //
+      // Two independent defences fix this:
+      //
+      //   1. Every disk key is namespaced by the OWNING func's runtime
+      //      Name, so two Emb widgets with the same `name` in different
+      //      funcs never share a disk record. This is what keeps nested
+      //      Emb-inside-Emb-inside-Emb flows fully independent.
+      //
+      //   2. The running-file self-heal SCAN (which cannot distinguish
+      //      between Embs that live in the outer file and Embs that
+      //      belong to a dynamically imported func) is restricted to
+      //      the outer func only.
+      // ------------------------------------------------------------------
+      const _syappForEmb = this._syappInstance;
+      const _mainFuncName = _syappForEmb && _syappForEmb.MainFunc && _syappForEmb.MainFunc.Name;
+      const isOuterFunc = !!(_syappForEmb && _mainFuncName && this.Name === _mainFuncName);
+      // Disk key = owning func + widget name. Matching key is used by
+      // SelfBuilder's _embFinishAndReturn() write-back.
+      const diskKey = `${this.Name}::${cfg.name}`;
+
       if (!this.Storages.Has(id, storageKey)) {
         const initialSource = cfg.funcClass ? 'class'
                             : cfg.filePath  ? 'file'
@@ -13290,9 +13319,11 @@ function levenshteinDistance(str1, str2) {
           editPanel: false
         };
 
-        // Step 1 — disk record keyed by (outer file, widget name).
+        // Step 1 — disk record keyed by (outer file, owner func, widget
+        // name). The namespaced key guarantees that an embedded func's
+        // own Emb() never collides with the OUTER func's Emb() record.
         if (!boot.filePath && !boot.code && outerFilePath) {
-          const disk = _embDiskLoad(outerFilePath, cfg.name);
+          const disk = _embDiskLoad(outerFilePath, diskKey);
           if (disk && (disk.filePath || disk.code)) {
             boot.source = disk.source || (disk.filePath ? 'file' : 'code');
             boot.filePath = disk.filePath || null;
@@ -13303,11 +13334,15 @@ function levenshteinDistance(str1, str2) {
 
         // Step 2 — self-heal by scanning the running file for an
         // existing this.Emb(...) call already carrying a filePath.
-        // This recovers the widget even when no disk record exists
-        // (e.g. first run after a fresh checkout, or when the disk
-        // mirror was cleared), because Save & Return already inlined
-        // the produced path into the outer file.
-        if (!boot.filePath && !boot.code && outerFilePath) {
+        //
+        // IMPORTANT: this scan is now restricted to the OUTER func
+        // (isOuterFunc) only. The scan matches by `name:` string, so it
+        // cannot tell apart an Emb declared in the outer file from an
+        // Emb declared inside a dynamically imported embedded func. An
+        // embedded func whose Emb shares the same `name` would otherwise
+        // recover the OUTER func's Emb record — the exact recursive
+        // Enter-Func loop this guard prevents.
+        if (!boot.filePath && !boot.code && outerFilePath && isOuterFunc) {
           try {
             const src = fs.readFileSync(outerFilePath, 'utf8');
             const healed = _embScanRunningFileForWidget(src, cfg.name);
@@ -13330,7 +13365,7 @@ function levenshteinDistance(str1, str2) {
       // Persist any successfully-recovered entry to disk so the NEXT
       // boot does not have to re-scan the outer file. Best-effort.
       if (outerFilePath && (state.filePath || state.code)) {
-        _embDiskSave(outerFilePath, cfg.name, state);
+        _embDiskSave(outerFilePath, diskKey, state);
       }
 
       // ------------------------------------------------------------------
@@ -13354,15 +13389,32 @@ function levenshteinDistance(str1, str2) {
       // path (or inline code) is written back into this Emb instance.
       if (curProps[P.selfBuild]) {
         delete curProps[P.selfBuild];
+        const returnInfo = {
+          embName: cfg.name,
+          returnTo: this.Name,
+          returnProps: { ...passProps },
+          sourceFile: cfg.sourceFile || null
+        };
         if (this._syappInstance) {
-          this._syappInstance._pendingEmbBuild = {
-            embName: cfg.name,
-            returnTo: this.Name,
-            returnProps: { ...passProps },
-            sourceFile: cfg.sourceFile || null
-          };
+          this._syappInstance._pendingEmbBuild = returnInfo;
         }
-        this.GotoNow(id, '__selfbuilder__', { props: { __embNewSession: cfg.name } });
+        // Pass the return info BOTH on the shared _pendingEmbBuild
+        // slot (legacy path) AND on session-scoped props. The props
+        // are what make nested Emb-in-Emb-in-Emb flows reliable:
+        // whenever a NESTED EMB session's Self Build fires, a previous
+        // (outer) session's Finish & Return may still be running
+        // asynchronously and clobber the shared slot to null. Props
+        // are set on the CURRENT session's ActualProps and are read
+        // back by the SelfBuilder before anything else clears them, so
+        // they can never be lost to a race with an older session.
+        this.GotoNow(id, '__selfbuilder__', {
+          props: {
+            __embNewSession: cfg.name,
+            __embReturnTo: returnInfo.returnTo,
+            __embReturnProps: returnInfo.returnProps,
+            __embSourceFile: returnInfo.sourceFile
+          }
+        });
         return null;
       }
 
@@ -17549,6 +17601,15 @@ class SelfBuilder extends SyAPP_Func {
     this._embPreviousState = null
     this._embPreviousEdit = undefined
     this._embPreviousEditId = null
+
+    // Stack of pre-EMB state snapshots. Every time a new EMB session
+    // opens (which can happen recursively when a produced embedded func
+    // itself hosts an Emb widget and the user clicks its 🧩 Self Build),
+    // the current SelfBuilder state is pushed here. Clicking
+    // ✓ Finish & Return pops the top snapshot, so every nesting level
+    // restores cleanly and each Emb / Self-Build session is fully
+    // independent from every other one — at ANY depth.
+    this._embStateStack = []
   }
 
   /**
@@ -17591,13 +17652,42 @@ class SelfBuilder extends SyAPP_Func {
       return;
     }
 
-    // Write back into the caller Emb's storage
-    const caller = syapp._pendingEmbBuild;
+    // ------------------------------------------------------------------
+    // RESOLVE THE CALLER (props-first, shared-slot second).
+    //
+    // The shared `_pendingEmbBuild` slot is a SINGLE-SLOT field on the
+    // SyAPP instance. When two EMB sessions overlap (which happens on
+    // every recursive Emb → Self Build → Emb → Self Build flow because
+    // the outer session's Finish & Return may still be running when the
+    // inner session starts), an outer session can clobber the slot to
+    // null while an inner session is still expecting its return info.
+    //
+    // This SelfBuilder's own `_embTarget` / `_embReturnTo` /
+    // `_embReturnProps` are set from session-scoped props on EMB entry
+    // and are NEVER touched by any other session, so they are the
+    // reliable source. The shared slot is used only as a legacy
+    // fallback for code paths that predate the props-based flow.
+    // ------------------------------------------------------------------
+    let caller = null;
+    let callerFromSharedSlot = false;
+    if (this._embTarget && this._embReturnTo) {
+      caller = {
+        embName: this._embTarget,
+        returnTo: this._embReturnTo,
+        returnProps: this._embReturnProps || {}
+      };
+    } else if (syapp._pendingEmbBuild && syapp._pendingEmbBuild.embName) {
+      caller = syapp._pendingEmbBuild;
+      callerFromSharedSlot = true;
+    }
+
     if (caller && caller.embName) {
       // Find the Emb owner func instance so we can write to its
       // Storages under the same id key it uses.
       const session = syapp.Sessions.get(syapp.MainSessionID);
       const sessionId = session ? session.UniqueID : id;
+      // In-memory storage is per-SyAPP_Func instance, so the same
+      // storageKey across two different funcs is already isolated.
       const embStorageKey = `emb_${caller.embName}`;
 
       // Ensure the target func has initialised its storage for this
@@ -17639,7 +17729,11 @@ class SelfBuilder extends SyAPP_Func {
           }
         }
         if (outerFilePath) {
-          _embDiskSave(outerFilePath, caller.embName, {
+          // Namespaced disk key matching this.Emb()'s read/write key
+          // exactly: owner func + widget name. This is what keeps the
+          // outer func's Emb record and every nested embedded func's
+          // Emb record completely independent on disk.
+          _embDiskSave(outerFilePath, `${caller.returnTo || '__unknown__'}::${caller.embName}`, {
             source: 'file',
             filePath: producedPath,
             code: producedCode,
@@ -17649,14 +17743,83 @@ class SelfBuilder extends SyAPP_Func {
       } catch (_) { /* best-effort */ }
 
       this.Alert(id, `✓ Embedded func produced: ${path.basename(producedPath)}`, { duration: 3000 });
-      syapp._pendingEmbBuild = null;
+
+      // Only clear the shared slot when WE consumed it. If we resolved
+      // the caller via this SelfBuilder's own EMB state (because a
+      // nested session had already overwritten the slot), leave the
+      // slot alone — it now belongs to the nested session and clearing
+      // it here would lose that session's return info.
+      if (callerFromSharedSlot && syapp._pendingEmbBuild === caller) {
+        syapp._pendingEmbBuild = null;
+      }
+
+      // ------------------------------------------------------------------
+      // POP THE EMB STATE SNAPSHOT STACK.
+      //
+      // Every Emb → Self Build push contributes exactly one snapshot,
+      // and every ✓ Finish & Return pops it back — so nested flows
+      // (Emb inside a produced func, inside another Emb, ...) each
+      // restore cleanly to the state that was current when their own
+      // EMB session started. This is what makes the Emb / Self-Build
+      // flow fully recursive at any depth.
+      // ------------------------------------------------------------------
+      if (Array.isArray(this._embStateStack) && this._embStateStack.length > 0) {
+        const prev = this._embStateStack.pop();
+        if (prev) {
+          this.State = prev.state;
+          this.Editing = prev.editing;
+          this.EditItemId = prev.editItemId;
+          this._embMode = prev.embMode;
+          this._embTarget = prev.embTarget;
+          this._embReturnTo = prev.embReturnTo;
+          this._embReturnProps = prev.embReturnProps;
+        }
+      } else {
+        // No snapshot on the stack — fall back to the legacy
+        // single-snapshot field and exit EMB mode.
+        if (this._embPreviousState) {
+          this.State = this._embPreviousState;
+          this.Editing = this._embPreviousEdit;
+          this.EditItemId = this._embPreviousEditId;
+        }
+        this._embMode = false;
+        this._embTarget = null;
+        this._embReturnTo = null;
+        this._embReturnProps = null;
+      }
 
       // Navigate back to the caller screen with its original props.
       this.GotoNow(id, caller.returnTo, { props: caller.returnProps || {} });
       return;
     }
 
-    this.Alert(id, '⚠ No Emb target set — result kept in temp', { duration: 3000 });
+    // ------------------------------------------------------------------
+    // NO RESOLVABLE CALLER
+    //
+    // Even in this path we still pop the EMB stack and exit EMB mode,
+    // so the SelfBuilder is left in a usable state instead of being
+    // stuck in EMB mode with no way out. The produced func is kept in
+    // the temp directory (its path is included in the alert) so it can
+    // be picked manually with 📁 Pick File if needed.
+    // ------------------------------------------------------------------
+    this.Alert(id, `⚠ No Emb target set — result kept in temp: ${path.basename(producedPath)}`, { duration: 5000 });
+    if (Array.isArray(this._embStateStack) && this._embStateStack.length > 0) {
+      const prev = this._embStateStack.pop();
+      if (prev) {
+        this.State = prev.state;
+        this.Editing = prev.editing;
+        this.EditItemId = prev.editItemId;
+        this._embMode = prev.embMode;
+        this._embTarget = prev.embTarget;
+        this._embReturnTo = prev.embReturnTo;
+        this._embReturnProps = prev.embReturnProps;
+      }
+    } else {
+      this._embMode = false;
+      this._embTarget = null;
+      this._embReturnTo = null;
+      this._embReturnProps = null;
+    }
   }
 
   _nid() { return `it_${Date.now().toString(36)}_${++this._idSeq}` }
@@ -18234,12 +18397,54 @@ class SelfBuilder extends SyAPP_Func {
     // user starts fresh (a BRAND NEW SelfBuilder session, separate from
     // the app's own SelfBuilder state), and record the return info.
     // ------------------------------------------------------------------
-    if (curProps.__embNewSession && !this._embMode) {
+    // NOTE: no `!this._embMode` guard here any more. That guard prevented
+    // the SelfBuilder from switching into a NEW EMB session when the
+    // instance was already in EMB mode from a previous flow — which
+    // silently broke nested Emb-in-Emb recursion (the second Self Build
+    // would reuse the first one's target and then Finish & Return would
+    // write the result to the wrong place). We now always enter fresh
+    // whenever the marker prop is present, and push the CURRENT state
+    // onto the EMB stack so the previous session can be restored when
+    // this one finishes.
+    if (curProps.__embNewSession) {
+      // Push the current state BEFORE mutating anything so that nested
+      // flows restore cleanly, one level at a time.
+      if (!Array.isArray(this._embStateStack)) this._embStateStack = [];
+      this._embStateStack.push({
+        state: this.State,
+        editing: this.Editing,
+        editItemId: this.EditItemId,
+        embMode: this._embMode,
+        embTarget: this._embTarget,
+        embReturnTo: this._embReturnTo,
+        embReturnProps: this._embReturnProps
+      });
+
       this._embMode = true;
       this._embTarget = curProps.__embNewSession;
+
+      // ------------------------------------------------------------------
+      // RESOLVE RETURN INFO — PROPS FIRST, SHARED SLOT SECOND.
+      //
+      // The return info is now also shipped as session-scoped props
+      // (__embReturnTo / __embReturnProps / __embSourceFile) set by
+      // this.Emb()'s 🧩 Self Build handler. Props are the RELIABLE
+      // source because they live on the current session's ActualProps
+      // and cannot be cleared by any other EMB session.
+      //
+      // The shared `_pendingEmbBuild` slot remains supported as a
+      // legacy fallback for older code paths (and for disk-recovery
+      // flows that never touched the shared slot).
+      // ------------------------------------------------------------------
       const pending = this._syappInstance && this._syappInstance._pendingEmbBuild;
-      this._embReturnTo = pending ? pending.returnTo : null;
-      this._embReturnProps = pending ? pending.returnProps : null;
+      this._embReturnTo =
+        (curProps.__embReturnTo !== undefined && curProps.__embReturnTo !== null)
+          ? curProps.__embReturnTo
+          : (pending ? pending.returnTo : null);
+      this._embReturnProps =
+        (curProps.__embReturnProps !== undefined && curProps.__embReturnProps !== null)
+          ? curProps.__embReturnProps
+          : (pending ? pending.returnProps : null);
 
       // Preserve the pre-EMB state so the parent SelfBuilder view can be
       // restored the moment the user finishes (or cancels) the EMB run.
@@ -18311,33 +18516,30 @@ class SelfBuilder extends SyAPP_Func {
           outerFilePath = __BUILDER_EXPORT_TARGET;
         }
 
-        // --- 1) In-memory: owner func's storage for this session ---
+        // --- 1) In-memory: THE OWNER func's storage for this session ---
+        //
+        // STRICT owner-only lookup. The previous fallback scanned EVERY
+        // registered func for one whose storage held an `emb_<target>`
+        // entry — which at deep nesting levels could return a SIBLING
+        // or ANCESTOR func's Emb state instead of the correct parent's.
+        // That is exactly the "Self Build shows the previous func at
+        // layers 3-4" symptom. The owner is now resolved EXCLUSIVELY
+        // from `this._embReturnTo`; if it is missing or not found in
+        // `syapp.Funcs`, in-memory recovery is skipped entirely and we
+        // go straight to the correctly-namespaced disk record.
         try {
           const syapp = this._syappInstance;
           const session = syapp && syapp.Sessions.get(syapp.MainSessionID);
           const sessionId = session ? session.UniqueID : id;
-          let ownerFunc = (this._embReturnTo && syapp)
+          const storageKeyForRecovery = `emb_${this._embTarget}`;
+          const ownerFunc = (this._embReturnTo && syapp)
             ? syapp.Funcs.get(this._embReturnTo)
             : null;
-
-          // Fallback: scan every registered func for one whose storage
-          // already has an `emb_<name>` entry for this session. This
-          // covers the case where `_embReturnTo` was not set (e.g. the
-          // caller opened Self Build from a nested context).
-          if (!ownerFunc && syapp) {
-            for (const f of syapp.Funcs.values()) {
-              if (f && f.Storages &&
-                  f.Storages.Has(sessionId, `emb_${this._embTarget}`)) {
-                ownerFunc = f;
-                break;
-              }
-            }
-          }
 
           if (ownerFunc && ownerFunc.Storages) {
             const cur = ownerFunc.Storages.Get(
               sessionId,
-              `emb_${this._embTarget}`
+              storageKeyForRecovery
             );
             if (cur) {
               if (cur.filePath) recoveredPath = cur.filePath;
@@ -18346,10 +18548,22 @@ class SelfBuilder extends SyAPP_Func {
           }
         } catch (_) { /* fall through to disk */ }
 
-        // --- 2) Disk record ---
+        // --- 2) Disk record (namespaced ONLY — no legacy fallback) ---
+        //
+        // The disk key MUST be `<owner>::<target>`. The previous code
+        // fell back to the bare `<target>` key when the namespaced
+        // lookup missed. At deep nesting levels that bare key resolved
+        // to the OUTERMOST func's Emb record, so the SelfBuilder would
+        // open showing THAT func's produced content instead of a blank
+        // canvas — the exact "showing the previous func" bug. There is
+        // no fallback any more: a miss is a genuine miss.
         if (!recoveredPath && !recoveredCode && outerFilePath) {
           try {
-            const disk = _embDiskLoad(outerFilePath, this._embTarget);
+            const ownerTag = this._embReturnTo || '__unknown__';
+            const disk = _embDiskLoad(
+              outerFilePath,
+              `${ownerTag}::${this._embTarget}`
+            );
             if (disk) {
               if (disk.filePath) recoveredPath = disk.filePath;
               if (disk.code) recoveredCode = disk.code;
@@ -18381,7 +18595,7 @@ class SelfBuilder extends SyAPP_Func {
         // user continues editing exactly where they left off.
         this.State = {
           ...recoveredState,
-          name: recoveredState.name || `emb_${this._embTarget}`,
+          name: recoveredState.name || `emb_${this._embReturnTo || 'unknown'}_${this._embTarget}`,
           funcName: recoveredState.funcName || 'EmbeddedFunc',
           code: recoveredState.code || '',
           items: Array.isArray(recoveredState.items) ? recoveredState.items : [],
@@ -18393,8 +18607,15 @@ class SelfBuilder extends SyAPP_Func {
         };
       } else {
         // No existing source — start with a fresh, blank canvas.
+        //
+        // The app name embeds the OWNER func's runtime Name so two
+        // nested Emb flows never produce funcs with the SAME runtime
+        // Name. Otherwise they collide inside SyAPP.Funcs and the
+        // ▶ Enter Func button silently re-enters the WRONG embedded
+        // func — the "directs to the same emb func" symptom at every
+        // subsequent nesting level.
         this.State = {
-          name: `emb_${this._embTarget}`,
+          name: `emb_${this._embReturnTo || 'unknown'}_${this._embTarget}`,
           funcName: 'EmbeddedFunc',
           code: '',
           items: [],
@@ -18407,8 +18628,15 @@ class SelfBuilder extends SyAPP_Func {
       this.EditItemId = null;
       this.Editing = true;
 
-      // Clear the marker so it only triggers once.
+      // Clear ALL of the EMB-entry markers so they only trigger once.
+      // The return-info props are consumed here (they were already
+      // copied onto `this._embReturnTo` / `this._embReturnProps`
+      // above), so a subsequent SelfBuilder render does not re-enter
+      // EMB mode or leave stale state behind.
       delete curProps.__embNewSession;
+      delete curProps.__embReturnTo;
+      delete curProps.__embReturnProps;
+      delete curProps.__embSourceFile;
     }
 
     this._processActions(id, props)
