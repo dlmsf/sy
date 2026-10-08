@@ -13233,14 +13233,51 @@ function levenshteinDistance(str1, str2) {
       };
 
       // ------------------------------------------------------------------
-      // Initial state
+      // Outer file resolution + initial state
+      //
+      // Storage is per-session, and session ids change across process
+      // restarts — so a freshly-booted SyAPP always starts with an
+      // EMPTY emb slot even though the widget was populated on a
+      // previous run. To recover, we anchor the widget's state to the
+      // file that is currently RUNNING (the outer func file), which
+      // survives restarts by definition.
+      //
+      //   outerFilePath := the .js / .mjs / .cjs that SyAPP is
+      //                    currently executing (process.argv[2]).
+      //
+      // Recovery order (most-specific wins):
+      //   1. explicit disk record keyed by (outerFilePath, name)
+      //   2. self-heal by scanning the running file's source for an
+      //      existing this.Emb(id, { name: <this>, filePath }) call —
+      //      this is what the previous Save & Return already wrote
+      //      into the outer file, so it is the strongest possible
+      //      hint that the widget was once populated.
+      //   3. cfg.funcClass / cfg.filePath / cfg.code (constructor args)
+      //   4. 'none' → setup view
       // ------------------------------------------------------------------
+      let outerFilePath = null;
+      try {
+        const argvFile = process.argv[2];
+        if (typeof argvFile === 'string' &&
+            /\.(js|mjs|cjs)$/i.test(argvFile) &&
+            !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
+          const abs = path.isAbsolute(argvFile)
+            ? argvFile
+            : path.resolve(process.cwd(), argvFile);
+          if (fs.existsSync(abs)) outerFilePath = abs;
+        }
+      } catch (_) {}
+      if (!outerFilePath && typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET) {
+        outerFilePath = __BUILDER_EXPORT_TARGET;
+      }
+
       if (!this.Storages.Has(id, storageKey)) {
         const initialSource = cfg.funcClass ? 'class'
                             : cfg.filePath  ? 'file'
                             : cfg.code      ? 'code'
                             : 'none';
-        this.Storages.Set(id, storageKey, {
+
+        const boot = {
           source: initialSource,
           filePath: cfg.filePath || null,
           code: cfg.code || null,
@@ -13250,16 +13287,51 @@ function levenshteinDistance(str1, str2) {
                   : null,
           error: null,
           pickMode: false,
-          // When false, the dropdown shows only ▶ Enter + ✎ Edit.
-          // Toggled by the Edit button and reset to false whenever
-          // the source changes so the top of the dropdown stays clean.
           editPanel: false
-        });
+        };
+
+        // Step 1 — disk record keyed by (outer file, widget name).
+        if (!boot.filePath && !boot.code && outerFilePath) {
+          const disk = _embDiskLoad(outerFilePath, cfg.name);
+          if (disk && (disk.filePath || disk.code)) {
+            boot.source = disk.source || (disk.filePath ? 'file' : 'code');
+            boot.filePath = disk.filePath || null;
+            boot.code = disk.code || null;
+            boot.saveMode = disk.saveMode || (boot.filePath ? 'path' : 'inline');
+          }
+        }
+
+        // Step 2 — self-heal by scanning the running file for an
+        // existing this.Emb(...) call already carrying a filePath.
+        // This recovers the widget even when no disk record exists
+        // (e.g. first run after a fresh checkout, or when the disk
+        // mirror was cleared), because Save & Return already inlined
+        // the produced path into the outer file.
+        if (!boot.filePath && !boot.code && outerFilePath) {
+          try {
+            const src = fs.readFileSync(outerFilePath, 'utf8');
+            const healed = _embScanRunningFileForWidget(src, cfg.name);
+            if (healed && (healed.filePath || healed.code)) {
+              boot.source = healed.filePath ? 'file' : 'code';
+              boot.filePath = healed.filePath || null;
+              boot.code = healed.code || null;
+              boot.saveMode = healed.filePath ? 'path' : 'inline';
+            }
+          } catch (_) {}
+        }
+
+        this.Storages.Set(id, storageKey, boot);
       }
 
       const state = this.Storages.Get(id, storageKey);
       const curProps = this.Builds.get(id).Session.ActualProps || {};
       const passProps = curProps.page ? { page: curProps.page } : {};
+
+      // Persist any successfully-recovered entry to disk so the NEXT
+      // boot does not have to re-scan the outer file. Best-effort.
+      if (outerFilePath && (state.filePath || state.code)) {
+        _embDiskSave(outerFilePath, cfg.name, state);
+      }
 
       // ------------------------------------------------------------------
       // Prop handlers
@@ -16655,6 +16727,124 @@ function _writeSaveState(name, state) {
   fs.writeFileSync(_getSaveFile(name), JSON.stringify(safe, null, 2))
 }
 
+// ============================================================
+// EMB DISK PERSISTENCE
+// ============================================================
+// Emb widget storage is per-session (keyed by session.UniqueID), and
+// session ids are rebuilt from machine id + process id — which change
+// across process restarts. So the in-memory `emb_<name>` entry does
+// NOT survive a Ctrl+C / relaunch, and the widget comes back empty.
+//
+// To make produced emb funcs recoverable across runs, we mirror the
+// widget state to a disk file keyed by a STABLE identifier:
+//   (the running outer file's absolute path) + (the widget name)
+//
+// The outer file path is the natural anchor: an emb widget belongs to
+// a specific func file, and that file itself is what `node SyAPP.js
+// MyApp.js` reopens. As long as the same file is relaunched, the
+// widget's produced path is recoverable.
+//
+//   ~/.syapp/emb/<hash>.json  → { filePath, code, saveMode, ... }
+// ============================================================
+
+function _embDiskKeyFor(outerFilePath, embName) {
+  const anchor = String(outerFilePath || '__no_file__');
+  return createHash('sha1')
+    .update(anchor + '::' + String(embName || 'default'))
+    .digest('hex')
+    .slice(0, 20);
+}
+
+function _embDiskFileFor(outerFilePath, embName) {
+  const dir = path.join(SYAPP_HOME, 'emb');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, _embDiskKeyFor(outerFilePath, embName) + '.json');
+}
+
+function _embDiskSave(outerFilePath, embName, storageEntry) {
+  try {
+    const f = _embDiskFileFor(outerFilePath, embName);
+    const payload = {
+      filePath: storageEntry && storageEntry.filePath ? storageEntry.filePath : null,
+      code: storageEntry && storageEntry.code ? storageEntry.code : null,
+      source: storageEntry && storageEntry.source ? storageEntry.source : 'none',
+      saveMode: storageEntry && storageEntry.saveMode ? storageEntry.saveMode : null,
+      updatedAt: Date.now()
+    };
+    fs.writeFileSync(f, JSON.stringify(payload, null, 2), 'utf8');
+  } catch (_) { /* best-effort */ }
+}
+
+function _embDiskLoad(outerFilePath, embName) {
+  try {
+    const f = _embDiskFileFor(outerFilePath, embName);
+    if (!fs.existsSync(f)) return null;
+    const j = JSON.parse(fs.readFileSync(f, 'utf8'));
+    if (!j || typeof j !== 'object') return null;
+    // If the recorded file no longer exists, only adopt it when we have
+    // inline code to fall back on — otherwise drop the stale entry so
+    // the widget shows its setup view cleanly.
+    if (j.source === 'file' && j.filePath && !fs.existsSync(j.filePath) && !j.code) {
+      return null;
+    }
+    return j;
+  } catch (_) { return null; }
+}
+
+/**
+ * Scan an already-written outer func file for the `this.Emb(id, { ... })`
+ * call that corresponds to a given widget name, and return the filePath
+ * and/or inline code it carries.
+ *
+ * This is the self-heal path: after a Save & Return the outer file
+ * itself contains `await this.Emb(id, { name: '<embName>', filePath:
+ * '<produced>' })`, so we can recover the widget's produced source
+ * WITHOUT depending on any session-keyed storage or auxiliary disk
+ * record. It works even on a fresh checkout of the outer file, as long
+ * as that file was written by this SelfBuilder.
+ *
+ * Matching is tolerant:
+ *   • whitespace and newlines are ignored,
+ *   • both single and double quotes on the string values are accepted,
+ *   • the `name:` key may appear in any position inside the object.
+ *
+ * @param {string} src - Source text of the outer file.
+ * @param {string} embName - The widget's name (config.name).
+ * @returns {{ filePath: string|null, code: string|null }|null}
+ * @private
+ */
+function _embScanRunningFileForWidget(src, embName) {
+  if (typeof src !== 'string' || !src) return null;
+  const nameEsc = String(embName || 'default').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // Find `this.Emb(` calls and inspect each one's argument object.
+  // The regex intentionally stops at the FIRST top-level `}` — object
+  // literals passed to this.Emb are flat (name, filePath, code, dropdown),
+  // so a shallow match is safe and far more robust than a full parser.
+  const callRe = /this\.Emb\s*\([^,]*,\s*\{([\s\S]*?)\}\s*\)/g;
+  let m;
+  while ((m = callRe.exec(src)) !== null) {
+    const body = m[1];
+
+    // Match the widget name: `name: 'x'` or `name: "x"`, with optional
+    // whitespace on either side of the colon.
+    const nameRe = new RegExp(
+      `(?:^|[,{\\s])name\\s*:\\s*(['"])${nameEsc}\\1(?:\\s*,|\\s*$|\\s*[},])`,
+      'm'
+    );
+    if (!nameRe.test(body)) continue;
+
+    // Extract filePath (single or double quoted) if present.
+    const fpM = body.match(/(?:^|[,{\s])filePath\s*:\s*(['"])([\s\S]*?)\1/);
+    const codeM = body.match(/(?:^|[,{\s])code\s*:\s*(['"])([\s\S]*?)\1/);
+    return {
+      filePath: fpM ? fpM[2] : null,
+      code: codeM ? codeM[2] : null
+    };
+  }
+  return null;
+}
+
 // ---------- responsive helpers ----------
 function _termCols() { return stdout.columns || 80 }
 function _termRows() { return stdout.rows || 24 }
@@ -17371,6 +17561,35 @@ class SelfBuilder extends SyAPP_Func {
         }
         ownerFunc.Storages.Set(sessionId, embStorageKey, cur);
       }
+
+      // Mirror the produced source into the disk-backed emb record so
+      // the widget can be recovered after a Ctrl+C and relaunch, even
+      // though the in-memory session-keyed storage entry will be gone
+      // the moment the process exits.
+      try {
+        let outerFilePath = null;
+        if (typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET) {
+          outerFilePath = __BUILDER_EXPORT_TARGET;
+        } else {
+          const argvFile = process.argv[2];
+          if (typeof argvFile === 'string' &&
+              /\.(js|mjs|cjs)$/i.test(argvFile) &&
+              !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
+            const abs = path.isAbsolute(argvFile)
+              ? argvFile
+              : path.resolve(process.cwd(), argvFile);
+            if (fs.existsSync(abs)) outerFilePath = abs;
+          }
+        }
+        if (outerFilePath) {
+          _embDiskSave(outerFilePath, caller.embName, {
+            source: 'file',
+            filePath: producedPath,
+            code: producedCode,
+            saveMode: 'path'
+          });
+        }
+      } catch (_) { /* best-effort */ }
 
       this.Alert(id, `✓ Embedded func produced: ${path.basename(producedPath)}`, { duration: 3000 });
       syapp._pendingEmbBuild = null;
