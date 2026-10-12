@@ -15772,6 +15772,962 @@ function levenshteinDistance(str1, str2) {
       });
     };
 
+    // --------------------------- Chart Method ---------------------------
+
+    /**
+     * Compact embedded terminal chart, rendered ENTIRELY in the button
+     * area of the HUD (never via this.Text()).
+     *
+     * Self-usage is deliberately minimal:
+     *
+     *   Collapsed:
+     *     [ ▶ 📊 Chart: <name>   ✦ example ]
+     *
+     *   Expanded (default view — 4 buttons max):
+     *     [ ▼ 📊 Chart: <name>   ✦ example ]
+     *     ┌───────────────────────────────────────────────┐
+     *     │  100 ┤            ▇                            │
+     *     │   75 ┤      ▇     █        ▇                   │
+     *     │   50 ┤ ▇    █     █   ▇    █    ▇              │
+     *     │    0 └──┴────┴─────┴───┴────┴────┴────          │
+     *     │       01/01  01/05  01/09  01/13  01/17         │
+     *     └───────────────────────────────────────────────┘
+     *     [ █ revenue ]  [ ○ cost ]  [ ○ profit ]
+     *     [ ⚙ Config ]   [ 📁 Load ]  [ ↺ Reset ]
+     *
+     *   Config panel (only shown when ⚙ Config is toggled ON):
+     *     [ ✕ Close ]
+     *     [ X: ● timestamp ] [ ○ date ] [ ○ time ]
+     *     [ Style: ● bar ] [ ○ line ]
+     *     [ Height: - 10 + ]   [ Max Points: - 40 + ]
+     *     [ ✕ Y ] [ ✕ Clear file ]
+     *
+     * Data sources
+     *   • JSON / JSONL  → array of objects OR plain object
+     *   • CSV           → first row = header; auto-detected delimiter
+     *                     (`,` `;` `\t` `|`); numeric columns become Y
+     *                     series; timestamp/date columns become X.
+     *   • XLSX / XLSM   → first sheet parsed to rows (uses the optional
+     *                     `xlsx` package when installed; falls back to
+     *                     a friendly error if it isn't available).
+     *   • null / config → a pretty built-in example dataset.
+     *
+     * Array-of-objects rules
+     *   • Timestamp key is auto-detected across unix s/ms, ISO 8601,
+     *     `M/D/YYYY`, `D-M-YYYY`, and key-name heuristics.
+     *   • Every numeric key becomes a selectable Y series (multi-select).
+     *
+     * @param {string} id - User/build ID
+     * @param {Array|Object|null} [data=null] - Data to chart
+     * @param {Object} [config]
+     * @param {string} [config.name='default'] - Unique chart instance name
+     * @param {number} [config.height=10] - Chart rows (min 4, max 20)
+     * @param {number} [config.maxPoints=40] - Max X columns rendered
+     * @param {'bar'|'line'} [config.type='bar'] - Chart style
+     * @returns {Promise<Array|Object|null>} Currently displayed data
+     */
+    this.Chart = async (id, data = null, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Chart() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const cfg = { name: 'default', height: 10, maxPoints: 40, type: 'bar', ...config };
+      const sk = `chart_${cfg.name}`;
+      const fp = `${sk}_picker`;
+
+      // ---------------- Storage bootstrap ----------------
+      if (!this.Storages.Has(id, sk)) {
+        this.Storages.Set(id, sk, {
+          loadedData: null,
+          source: 'none',
+          filePath: null,
+          xKey: null,
+          yKeys: [],
+          chartType: cfg.type,
+          height: cfg.height,
+          maxPoints: cfg.maxPoints,
+          loading: false,
+          error: null,
+          open: false,
+          configOpen: false
+        });
+      }
+      const state = this.Storages.Get(id, sk);
+      const curProps = this.Builds.get(id).Session.ActualProps || {};
+      const curPage = curProps.page || '';
+      const passProps = curPage ? { page: curPage } : {};
+
+      const P = {
+        toggle:       `${sk}_toggle`,
+        toggleConfig: `${sk}_toggleConfig`,
+        toggleY:      `${sk}_toggleY`,
+        clearY:       `${sk}_clearY`,
+        setX:         `${sk}_setX`,
+        setType:      `${sk}_setType`,
+        heightUp:     `${sk}_heightUp`,
+        heightDown:   `${sk}_heightDown`,
+        pointsUp:     `${sk}_pointsUp`,
+        pointsDown:   `${sk}_pointsDown`,
+        loadFile:     `${sk}_loadFile`,
+        clearFile:    `${sk}_clearFile`,
+        reset:        `${sk}_reset`
+      };
+
+      // ---------------- Top-level toggle ----------------
+      if (curProps[P.toggle]) {
+        delete curProps[P.toggle];
+        state.open = !state.open;
+        // Closing the chart also closes the config panel so the next
+        // open starts from the clean default view.
+        if (!state.open) state.configOpen = false;
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.toggleConfig]) {
+        delete curProps[P.toggleConfig];
+        state.configOpen = !state.configOpen;
+        this.Storages.Set(id, sk, state);
+      }
+
+      // ---------------- Action props ----------------
+      if (curProps[P.reset]) {
+        delete curProps[P.reset];
+        state.xKey = null;
+        state.yKeys = [];
+        state.chartType = cfg.type;
+        state.height = cfg.height;
+        state.maxPoints = cfg.maxPoints;
+        state.error = null;
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.clearFile]) {
+        delete curProps[P.clearFile];
+        state.loadedData = null;
+        state.source = 'none';
+        state.filePath = null;
+        state.error = null;
+        state.yKeys = [];
+        state.xKey = null;
+        state.loading = false;
+        this.Storages.Set(id, sk, state);
+        this.FileManager.ClearSelection(id, fp);
+      }
+      if (curProps[P.loadFile]) {
+        delete curProps[P.loadFile];
+        state.loading = true;
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.setType]) {
+        state.chartType = curProps[P.setType] === 'line' ? 'line' : 'bar';
+        delete curProps[P.setType];
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.setX]) {
+        state.xKey = curProps[P.setX];
+        delete curProps[P.setX];
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.toggleY]) {
+        const k = curProps[P.toggleY];
+        delete curProps[P.toggleY];
+        if (!Array.isArray(state.yKeys)) state.yKeys = [];
+        const idx = state.yKeys.indexOf(k);
+        if (idx >= 0) state.yKeys.splice(idx, 1);
+        else state.yKeys.push(k);
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.clearY]) {
+        delete curProps[P.clearY];
+        state.yKeys = [];
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.heightUp] || curProps[P.heightDown]) {
+        const delta = curProps[P.heightUp] ? 1 : -1;
+        delete curProps[P.heightUp];
+        delete curProps[P.heightDown];
+        state.height = Math.max(4, Math.min(20, (state.height || cfg.height) + delta));
+        this.Storages.Set(id, sk, state);
+      }
+      if (curProps[P.pointsUp] || curProps[P.pointsDown]) {
+        const delta = curProps[P.pointsUp] ? 10 : -10;
+        delete curProps[P.pointsUp];
+        delete curProps[P.pointsDown];
+        state.maxPoints = Math.max(10, Math.min(200, (state.maxPoints || cfg.maxPoints) + delta));
+        this.Storages.Set(id, sk, state);
+      }
+
+      // ---------------- File picker resolution ----------------
+      if (state.loading) {
+        const picked = this.FileManager.GetSelected(id, fp);
+        if (picked.length > 0) {
+          this.FileManager.ClearSelection(id, fp);
+          try {
+            const parsed = await this._chartParseFile(picked[0]);
+            state.loadedData = parsed;
+            state.source = 'file';
+            state.filePath = picked[0];
+            state.error = null;
+            state.loading = false;
+            state.yKeys = [];
+            state.xKey = null;
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              const detected = this._chartDetectTimestampKey(parsed);
+              if (detected) state.xKey = detected;
+            }
+            this.Storages.Set(id, sk, state);
+          } catch (e) {
+            state.error = e.message;
+            state.loading = false;
+            this.Storages.Set(id, sk, state);
+          }
+        }
+      }
+
+      // ---------------- Resolve active data ----------------
+      let activeData;
+      let sourceLabel;
+      if (state.loadedData) {
+        activeData = state.loadedData;
+        sourceLabel = '📄 ' + path.basename(state.filePath || '');
+      } else if (Array.isArray(data) && data.length > 0) {
+        activeData = data;
+        sourceLabel = '✎ inline';
+      } else if (data && typeof data === 'object' && !Array.isArray(data)) {
+        activeData = data;
+        sourceLabel = '✎ inline';
+      } else {
+        activeData = this._chartDefaultExample();
+        sourceLabel = '✦ example';
+      }
+
+      // Auto-detect xKey for array data
+      if (!state.xKey && Array.isArray(activeData) && activeData.length > 0) {
+        const detected = this._chartDetectTimestampKey(activeData);
+        if (detected) {
+          state.xKey = detected;
+          this.Storages.Set(id, sk, state);
+        }
+      }
+
+      // Auto-select first Y series
+      if (!Array.isArray(state.yKeys)) state.yKeys = [];
+      if (state.yKeys.length === 0) {
+        const numericKeys = this._chartNumericKeys(activeData);
+        const candidates = numericKeys.filter(k => k !== state.xKey && k !== 'value');
+        if (candidates.length > 0) {
+          state.yKeys = [candidates[0]];
+          this.Storages.Set(id, sk, state);
+        }
+      }
+
+      // ---------------- Header button (always visible) ----------------
+      const arrow = state.open ? '▼' : '▶';
+      const header = state.open
+        ? ColorText.orange(`${arrow} 📊 ${cfg.name}`) +
+          ColorText.dim(`   ${sourceLabel}`) +
+          ColorText.orange('   (Hide)')
+        : ColorText.gold(`${arrow} 📊 Chart: ${cfg.name}`) +
+          ColorText.dim(`   ${sourceLabel}`);
+
+      this.Button(id, {
+        name: header,
+        props: { [P.toggle]: 1 }
+      });
+
+      if (!state.open) return activeData;
+
+      // ==================================================================
+      // EXPANDED VIEW — everything below is emitted as buttons so it all
+      // stays inside the button/HUD area (never in this.Text()).
+      // ==================================================================
+
+      // ---------------- Chart area (each line = one button) ----------------
+      const termCols = stdout.columns || 80;
+      const chartWidth = Math.min(Math.max(40, termCols - 8), 100);
+      const points = this._chartBuildPoints(activeData, state.xKey, state.yKeys);
+      const chartText = this._chartRender(points, state.yKeys, {
+        width: chartWidth,
+        height: state.height || cfg.height,
+        maxPoints: state.maxPoints || cfg.maxPoints,
+        type: state.chartType
+      });
+
+      const chartLines = chartText.split('\n');
+      for (const line of chartLines) {
+        this.Button(id, { name: line });
+      }
+
+      // ---------------- Error (as a button row) ----------------
+      if (state.error) {
+        this.Button(id, { name: ColorText.red('  ⚠ ' + state.error) });
+      }
+
+      // ==================================================================
+      // DEFAULT ROW — the clean "self usage" view: series legend +
+      // quick series toggles + Config / Load / Reset.
+      // ==================================================================
+      const numericKeys = this._chartNumericKeys(activeData);
+      const isObjectMode = !Array.isArray(activeData) && activeData && typeof activeData === 'object';
+
+      // Series toggle row (multi-select). Only shown for array/object
+      // data with numeric keys — object-mode auto-shows the single
+      // implicit series so no toggles are needed.
+      if (!isObjectMode && numericKeys.length > 0) {
+        const yButtons = numericKeys.map(k => {
+          const active = state.yKeys.includes(k);
+          return {
+            name: active
+              ? ColorText.green('▓ ' + k + ' ✓')
+              : ColorText.dim('○ ' + k),
+            props: { [P.toggleY]: k }
+          };
+        });
+        this.Buttons(id, yButtons);
+      }
+
+      // Action row (always visible).
+      this.Buttons(id, [
+        {
+          name: state.configOpen
+            ? ColorText.bgYellow(ColorText.black(' ⚙ Config ✓ '))
+            : ColorText.brightYellow('⚙ Config'),
+          props: { [P.toggleConfig]: 1 }
+        },
+        { name: ColorText.brightBlue('📁 Load'),  props: { [P.loadFile]: 1 } },
+        { name: ColorText.brightYellow('↺ Reset'), props: { [P.reset]: 1 } }
+      ]);
+
+      // ==================================================================
+      // CONFIG PANEL — everything advanced hides behind ⚙ Config, so the
+      // default view stays clean. Nothing is lost: every feature that
+      // was directly visible in the previous version is reachable here.
+      // ==================================================================
+      if (state.configOpen) {
+        // X-axis selector
+        if (!isObjectMode && Array.isArray(activeData) && activeData.length > 0 &&
+            activeData[0] && typeof activeData[0] === 'object' && !Array.isArray(activeData[0])) {
+          const allKeys = new Set();
+          const sampleN = Math.min(15, activeData.length);
+          for (let i = 0; i < sampleN; i++) {
+            const item = activeData[i];
+            if (item && typeof item === 'object' && !Array.isArray(item)) {
+              for (const k of Object.keys(item)) allKeys.add(k);
+            }
+          }
+          const keyList = [...allKeys];
+          if (keyList.length > 1) {
+            const xButtons = keyList.map(k => ({
+              name: state.xKey === k
+                ? ColorText.brightGreen('● X: ' + k)
+                : ColorText.dim('○ X: ' + k),
+              props: { [P.setX]: k }
+            }));
+            this.Buttons(id, xButtons);
+          }
+        }
+
+        // Style selector
+        this.Buttons(id, [
+          {
+            name: state.chartType === 'bar'
+              ? ColorText.bgGreen(ColorText.black(' ● bar '))
+              : ColorText.dim('○ bar'),
+            props: { [P.setType]: 'bar' }
+          },
+          {
+            name: state.chartType === 'line'
+              ? ColorText.bgGreen(ColorText.black(' ● line '))
+              : ColorText.dim('○ line'),
+            props: { [P.setType]: 'line' }
+          }
+        ]);
+
+        // Height + max points steppers
+        const curH = state.height || cfg.height;
+        const curP = state.maxPoints || cfg.maxPoints;
+        this.Buttons(id, [
+          { name: ColorText.dim('Height'),          props: {} },
+          { name: ColorText.dim('−'),               props: { [P.heightDown]: 1 } },
+          { name: ColorText.brightWhite(String(curH)), props: {} },
+          { name: ColorText.dim('+'),               props: { [P.heightUp]: 1 } },
+          { name: ColorText.dim('│'),               props: {} },
+          { name: ColorText.dim('Points'),          props: {} },
+          { name: ColorText.dim('−'),               props: { [P.pointsDown]: 1 } },
+          { name: ColorText.brightWhite(String(curP)), props: {} },
+          { name: ColorText.dim('+'),               props: { [P.pointsUp]: 1 } }
+        ]);
+
+        // Destructive row: clear the loaded file (resets to example data)
+        const cfgActions = [];
+        if (state.source === 'file') {
+          cfgActions.push({ name: ColorText.red('✕ Clear file'), props: { [P.clearFile]: 1 } });
+        }
+        if (state.yKeys.length > 0) {
+          cfgActions.push({ name: ColorText.brightRed('✕ Y'), props: { [P.clearY]: 1 } });
+        }
+        cfgActions.push({
+          name: ColorText.orange('✕ Close Config'),
+          props: { [P.toggleConfig]: 1 }
+        });
+        this.Buttons(id, cfgActions);
+      }
+
+      // ---------------- File picker ----------------
+      if (state.loading) {
+        this.Button(id, { name: ColorText.dim('  Select a JSON / JSONL / CSV / XLSX file:') });
+        await this.File(id, {
+          name: fp,
+          multiple: false,
+          filter: (p, isDir) => isDir || /\.(json|jsonl|csv|tsv|xlsx|xlsm)$/i.test(p),
+          displayName: '📁 Select data file'
+        });
+      }
+
+      return activeData;
+    };
+
+    // ------------------------------------------------------------------
+    // Chart helpers — self-contained so the Chart method stays readable.
+    // ------------------------------------------------------------------
+
+    /**
+     * Parse a data file (.json, .jsonl, .csv, .tsv, .xlsx, .xlsm) into
+     * either an array of plain objects or a plain object.
+     *
+     * CSV / TSV:
+     *   • First non-empty row = header.
+     *   • Delimiter is auto-detected from `,` `;` `\t` `|` by picking
+     *     whichever produces the most consistent column count.
+     *   • Numeric-looking values are coerced to Number.
+     *   • Quoted cells (RFC 4180 `"..."`) are supported.
+     *
+     * XLSX / XLSM:
+     *   • Uses the optional `xlsx` npm package (`npm i xlsx`).
+     *   • First sheet is taken; first row = header.
+     *   • Missing dependency produces a friendly error instead of a
+     *     crash — the chart keeps showing its previous data.
+     *
+     * @param {string} filePath
+     * @returns {Promise<Array|Object>}
+     * @private
+     */
+    this._chartParseFile = async (filePath) => {
+      const lower = String(filePath).toLowerCase();
+
+      // ---------------- JSON / JSONL ----------------
+      if (lower.endsWith('.json') || lower.endsWith('.jsonl')) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (lower.endsWith('.jsonl')) {
+          return content
+            .split(/\r?\n/)
+            .filter(l => l.trim() !== '')
+            .map(l => JSON.parse(l));
+        }
+        return JSON.parse(content);
+      }
+
+      // ---------------- CSV / TSV ----------------
+      if (lower.endsWith('.csv') || lower.endsWith('.tsv')) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        return this._chartParseCSV(content);
+      }
+
+      // ---------------- XLSX / XLSM ----------------
+      if (lower.endsWith('.xlsx') || lower.endsWith('.xlsm')) {
+        return await this._chartParseXLSX(filePath);
+      }
+
+      // Unknown extension — try JSON first, then CSV.
+      const content = fs.readFileSync(filePath, 'utf8');
+      try { return JSON.parse(content); }
+      catch (_) { return this._chartParseCSV(content); }
+    };
+
+    /**
+     * Parse a CSV / TSV string into an array of plain objects.
+     *
+     * Handles:
+     *   • RFC 4180 quoted cells with embedded delimiters / newlines.
+     *   • Auto delimiter detection (`,` `;` `\t` `|`) by consistency
+     *     score across the first 20 non-empty rows.
+     *   • Numeric coercion so downstream auto-detection finds Y series.
+     * @private
+     */
+    this._chartParseCSV = (text) => {
+      const src = String(text || '').replace(/^\uFEFF/, '');
+      if (!src.trim()) return [];
+
+      // --- Delimiter auto-detection ---
+      const candidates = [',', ';', '\t', '|'];
+      const sampleLines = src.split(/\r?\n/).filter(l => l.trim() !== '').slice(0, 20);
+      let bestDelim = ',';
+      let bestScore = -1;
+      for (const d of candidates) {
+        const counts = sampleLines.map(l => {
+          // count delimiter occurrences outside quotes
+          let count = 0, inQ = false;
+          for (let i = 0; i < l.length; i++) {
+            const c = l[i];
+            if (c === '"') inQ = !inQ;
+            else if (c === d && !inQ) count++;
+          }
+          return count;
+        });
+        const nonZero = counts.filter(c => c > 0);
+        if (nonZero.length === 0) continue;
+        const avg = nonZero.reduce((a, b) => a + b, 0) / nonZero.length;
+        const variance = nonZero.reduce((a, b) => a + (b - avg) ** 2, 0) / nonZero.length;
+        // Prefer higher avg (more columns) and lower variance (consistent).
+        const score = avg * 10 - variance;
+        if (score > bestScore) { bestScore = score; bestDelim = d; }
+      }
+
+      // --- Row splitter that respects quoted cells ---
+      const rows = [];
+      let cur = '', row = [], inQ = false;
+      for (let i = 0; i < src.length; i++) {
+        const c = src[i];
+        if (inQ) {
+          if (c === '"' && src[i + 1] === '"') { cur += '"'; i++; }
+          else if (c === '"') { inQ = false; }
+          else { cur += c; }
+        } else {
+          if (c === '"') { inQ = true; }
+          else if (c === bestDelim) { row.push(cur); cur = ''; }
+          else if (c === '\r') { /* swallow CR */ }
+          else if (c === '\n') {
+            row.push(cur); cur = '';
+            if (row.some(cell => cell.trim() !== '')) rows.push(row);
+            row = [];
+          } else { cur += c; }
+        }
+      }
+      if (cur !== '' || row.length > 0) {
+        row.push(cur);
+        if (row.some(cell => cell.trim() !== '')) rows.push(row);
+      }
+      if (rows.length < 2) return [];
+
+      const header = rows[0].map(h => String(h).trim());
+      const out = [];
+      for (let r = 1; r < rows.length; r++) {
+        const cells = rows[r];
+        const obj = {};
+        for (let c = 0; c < header.length; c++) {
+          const raw = c < cells.length ? cells[c] : '';
+          obj[header[c]] = this._chartCoerceCell(raw);
+        }
+        out.push(obj);
+      }
+      return out;
+    };
+
+    /**
+     * Coerce a CSV cell string into a number, boolean, null, or leave
+     * as string. Only pure numeric strings become numbers so that values
+     * like `"2024-01-01"` stay strings (and are still detectable as
+     * timestamps by the date heuristics).
+     * @private
+     */
+    this._chartCoerceCell = (raw) => {
+      const s = String(raw == null ? '' : raw).trim();
+      if (s === '') return null;
+      if (s === 'true') return true;
+      if (s === 'false') return false;
+      // Plain number (integer or decimal, optional sign) — do NOT match
+      // things like "2024-01-01" which contain '-' inside.
+      if (/^-?\d+(\.\d+)?$/.test(s)) {
+        const n = Number(s);
+        if (isFinite(n)) return n;
+      }
+      return s;
+    };
+
+    /**
+     * Parse an XLSX / XLSM workbook and return the first sheet as an
+     * array of plain objects. Uses the optional `xlsx` npm package when
+     * available; otherwise throws a friendly error.
+     *
+     * @param {string} filePath
+     * @returns {Promise<Array>}
+     * @private
+     */
+    this._chartParseXLSX = async (filePath) => {
+      let XLSX;
+      try {
+        // Optional dependency — installed only when the user needs it.
+        XLSX = await import('xlsx');
+      } catch (_) {
+        throw new Error(
+          'XLSX support requires the "xlsx" package. Install it with: npm i xlsx'
+        );
+      }
+      const wb = XLSX.readFile(filePath);
+      const firstSheetName = wb.SheetNames && wb.SheetNames[0];
+      if (!firstSheetName) return [];
+      const sheet = wb.Sheets[firstSheetName];
+      // `header: 1` → array of arrays; first row becomes the header.
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
+      if (!Array.isArray(rows) || rows.length < 2) return [];
+
+      const header = rows[0].map(h => String(h == null ? '' : h).trim());
+      const out = [];
+      for (let r = 1; r < rows.length; r++) {
+        const cells = rows[r];
+        const obj = {};
+        for (let c = 0; c < header.length; c++) {
+          const raw = c < cells.length ? cells[c] : null;
+          if (raw == null) { obj[header[c]] = null; continue; }
+          if (typeof raw === 'number' || typeof raw === 'boolean') {
+            obj[header[c]] = raw;
+          } else {
+            obj[header[c]] = this._chartCoerceCell(raw);
+          }
+        }
+        out.push(obj);
+      }
+      return out;
+    };
+
+    /**
+     * Robustly identify the timestamp key of an array of objects.
+     *
+     * Combines key-name scoring (timestamp / time / date / created_at /
+     * updated_at / ts / _at$ …) with a value-shape score sampled across
+     * the first 20 items (unix ms/s, ISO 8601, `M/D/YYYY`, `D-M-YYYY`,
+     * any string containing a 4-digit year that parses via Date.parse).
+     * Returns the key with the highest combined score, or null.
+     * @private
+     */
+    this._chartDetectTimestampKey = (data) => {
+      if (!Array.isArray(data) || data.length === 0) return null;
+      const sampleN = Math.min(20, data.length);
+      const sample = [];
+      for (let i = 0; i < sampleN; i++) {
+        const it = data[i];
+        if (it && typeof it === 'object' && !Array.isArray(it)) sample.push(it);
+      }
+      if (sample.length === 0) return null;
+
+      const allKeys = new Set();
+      for (const item of sample) for (const k of Object.keys(item)) allKeys.add(k);
+
+      const scores = new Map();
+      for (const k of allKeys) {
+        const lk = k.toLowerCase();
+        let nameScore = 0;
+        if (/^(timestamp|time_stamp|time|date|datetime|date_time|created_?at|updated_?at|modified_?at|ts|when|at)$/.test(lk)) nameScore = 20;
+        else if (/^(created|updated|modified|deleted|published|expired)$/.test(lk)) nameScore = 12;
+        else if (/(^|_)(time|date|ts|at)(_|$)/.test(lk)) nameScore = 12;
+        else if (/time|date|_at$|^at$|created|updated/.test(lk)) nameScore = 6;
+
+        let valueScore = 0;
+        let valueCount = 0;
+        for (const item of sample) {
+          const v = item[k];
+          if (v == null) continue;
+          valueCount++;
+          if (typeof v === 'number' && isFinite(v)) {
+            if (v >= 1e12 && v < 1e14) valueScore += 5;      // unix ms
+            else if (v >= 1e9 && v < 1e11) valueScore += 4;  // unix s
+            else if (v >= 1e8 && v < 1e9) valueScore += 2;
+          } else if (typeof v === 'string') {
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(v)) valueScore += 6;
+            else if (/^\d{4}-\d{2}-\d{2}/.test(v)) valueScore += 5;
+            else if (/^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(v)) valueScore += 4;
+            else if (/^\d{1,2}-\d{1,2}-\d{2,4}/.test(v)) valueScore += 3;
+            else if (!isNaN(Date.parse(v)) && /\d{4}/.test(v)) valueScore += 3;
+          }
+        }
+
+        if (valueCount === 0) continue;
+        const total = nameScore + (valueScore / valueCount) * 2;
+        if (total > 0) scores.set(k, total);
+      }
+
+      if (scores.size === 0) return null;
+      let best = null, bestScore = -Infinity;
+      for (const [k, s] of scores) {
+        if (s > bestScore) { best = k; bestScore = s; }
+      }
+      return best;
+    };
+
+    /**
+     * Return the keys whose values are predominantly numeric.
+     *
+     *   • Array of objects → keys present in ≥60% of sampled items whose
+     *                        values are finite numbers.
+     *   • Plain object     → ['value'] when every value is numeric.
+     * @private
+     */
+    this._chartNumericKeys = (data) => {
+      if (!data) return [];
+      if (Array.isArray(data)) {
+        if (data.length === 0) return [];
+        const sampleN = Math.min(20, data.length);
+        const stats = new Map();
+        for (let i = 0; i < sampleN; i++) {
+          const it = data[i];
+          if (!it || typeof it !== 'object' || Array.isArray(it)) continue;
+          for (const [k, v] of Object.entries(it)) {
+            if (!stats.has(k)) stats.set(k, { total: 0, numeric: 0 });
+            const s = stats.get(k);
+            s.total++;
+            if (v != null && typeof v !== 'boolean' && typeof v !== 'object') {
+              const n = Number(v);
+              if (isFinite(n)) s.numeric++;
+            }
+          }
+        }
+        const result = [];
+        for (const [k, s] of stats) {
+          if (s.numeric > 0 && s.numeric / s.total >= 0.6) result.push(k);
+        }
+        return result;
+      }
+      if (typeof data === 'object') {
+        const vals = Object.values(data);
+        if (vals.length > 0 && vals.every(v => v != null && typeof v !== 'boolean' && typeof v !== 'object' && isFinite(Number(v)))) {
+          return ['value'];
+        }
+        return [];
+      }
+      return [];
+    };
+
+    /**
+     * Built-in example dataset used when no data is supplied. 24 daily
+     * points across three intersecting series so the default view is
+     * immediately readable.
+     * @private
+     */
+    this._chartDefaultExample = () => {
+      const now = Date.now();
+      const day = 86400000;
+      const out = [];
+      let rev = 120, prof = 25, cost = 70;
+      for (let i = 0; i < 24; i++) {
+        rev  += Math.sin(i / 3) * 25 + (Math.random() - 0.3) * 20;
+        prof += Math.sin(i / 2) * 8  + (Math.random() - 0.4) * 10;
+        cost += Math.cos(i / 4) * 12 + (Math.random() - 0.5) * 8;
+        out.push({
+          timestamp: now - (23 - i) * day,
+          revenue: Math.max(0, Math.round(rev)),
+          profit:  Math.max(0, Math.round(prof)),
+          cost:    Math.max(0, Math.round(cost))
+        });
+      }
+      return out;
+    };
+
+    /**
+     * Convert the active dataset into `[{ x, values: [v1, v2, ...] }]`.
+     * `x` is taken from `xKey` when applicable, else the array index. In
+     * object mode the keys become `x` and the numeric values become a
+     * single-entry `values` array.
+     * @private
+     */
+    this._chartBuildPoints = (data, xKey, yKeys) => {
+      const points = [];
+      if (Array.isArray(data)) {
+        const keys = Array.isArray(yKeys) ? yKeys : [];
+        for (let i = 0; i < data.length; i++) {
+          const item = data[i];
+          let x = i;
+          if (item && typeof item === 'object' && xKey) x = item[xKey];
+          const values = keys.map(k => {
+            if (item && typeof item === 'object') {
+              const n = Number(item[k]);
+              return isFinite(n) ? n : null;
+            }
+            return null;
+          });
+          points.push({ x, values });
+        }
+      } else if (data && typeof data === 'object') {
+        for (const [k, v] of Object.entries(data)) {
+          const n = Number(v);
+          points.push({ x: k, values: [isFinite(n) ? n : null] });
+        }
+      }
+      return points;
+    };
+
+    /**
+     * Format an X-axis value as a compact label (e.g. `01/17` for unix
+     * timestamps and date strings; index/truncated text otherwise).
+     * @private
+     */
+    this._chartFormatXLabel = (x) => {
+      if (x == null) return '';
+      if (typeof x === 'number') {
+        if (x > 1e9) {
+          const ms = x < 1e12 ? x * 1000 : x;
+          const d = new Date(ms);
+          if (!isNaN(d.getTime())) {
+            const mo = String(d.getMonth() + 1).padStart(2, '0');
+            const dy = String(d.getDate()).padStart(2, '0');
+            return `${mo}/${dy}`;
+          }
+        }
+        if (Number.isInteger(x)) return String(x);
+        return x.toFixed(2);
+      }
+      if (typeof x === 'string') {
+        if (/\d{4}/.test(x)) {
+          const d = new Date(x);
+          if (!isNaN(d.getTime())) {
+            const mo = String(d.getMonth() + 1).padStart(2, '0');
+            const dy = String(d.getDate()).padStart(2, '0');
+            return `${mo}/${dy}`;
+          }
+        }
+        return x.length > 10 ? x.slice(0, 10) : x;
+      }
+      return String(x);
+    };
+
+    /**
+     * Render the chart as a multi-line ANSI-colored string. Each data
+     * point becomes `numSeries` adjacent columns; partial block glyphs
+     * (▁▂▃▄▅▆▇█) give each row 8 levels of vertical resolution.
+     * @private
+     */
+    this._chartRender = (points, yKeys, options) => {
+      const height    = options.height || 10;
+      const maxPoints = options.maxPoints || 40;
+      const width     = options.width || 70;
+
+      if (!points || points.length === 0) {
+        return ColorText.dim('  (no data to display)');
+      }
+
+      const numSeries = Math.max(1, Array.isArray(yKeys) ? yKeys.length : 1);
+      const maxCols = Math.max(6, Math.min(maxPoints, Math.floor(width / numSeries)));
+      let sampled = points;
+      if (points.length > maxCols) {
+        const step = points.length / maxCols;
+        sampled = [];
+        for (let i = 0; i < maxCols; i++) {
+          sampled.push(points[Math.min(points.length - 1, Math.floor(i * step))]);
+        }
+      }
+      const W = sampled.length;
+
+      const allVals = [];
+      for (const p of sampled) {
+        for (const v of p.values) {
+          if (v != null && isFinite(v)) allVals.push(v);
+        }
+      }
+      if (allVals.length === 0) {
+        return ColorText.dim('  (no numeric values to plot)');
+      }
+      let yMin = Math.min(0, ...allVals);
+      let yMax = Math.max(...allVals);
+      if (yMax === yMin) yMax = yMin + 1;
+
+      const H = Math.max(4, height);
+      const TOTAL_LEVELS = H * 8;
+      const PARTIAL = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+      const TOTAL_COLS = W * numSeries;
+
+      const chars  = [];
+      const colors = [];
+      for (let r = 0; r < H; r++) {
+        chars.push(new Array(TOTAL_COLS).fill(' '));
+        colors.push(new Array(TOTAL_COLS).fill(-1));
+      }
+
+      for (let ci = 0; ci < W; ci++) {
+        const p = sampled[ci];
+        for (let s = 0; s < numSeries; s++) {
+          const v = p.values[s];
+          if (v == null || !isFinite(v)) continue;
+          const norm = (v - yMin) / (yMax - yMin);
+          const lvl = Math.max(0, Math.min(TOTAL_LEVELS, Math.round(norm * TOTAL_LEVELS)));
+          const col = ci * numSeries + s;
+          for (let r = 0; r < H; r++) {
+            const fromBottom = H - 1 - r;
+            const rowStart = fromBottom * 8;
+            const rowEnd = rowStart + 8;
+            let ch = ' ';
+            if (lvl >= rowEnd) ch = '█';
+            else if (lvl > rowStart) ch = PARTIAL[lvl - rowStart];
+            if (ch !== ' ') {
+              chars[r][col] = ch;
+              colors[r][col] = s;
+            }
+          }
+        }
+      }
+
+      const fmtY = (v) => {
+        const a = Math.abs(v);
+        if (a >= 1e9) return (v / 1e9).toFixed(1) + 'G';
+        if (a >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+        if (a >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+        if (Number.isInteger(v)) return String(v);
+        return v.toFixed(1);
+      };
+      const yLabels = [];
+      for (let r = 0; r < H; r++) {
+        if (r % 2 === 0 || r === H - 1) {
+          const yVal = yMax - (r / Math.max(1, H - 1)) * (yMax - yMin);
+          yLabels.push(fmtY(yVal));
+        } else {
+          yLabels.push('');
+        }
+      }
+      const yW = Math.max(4, ...yLabels.map(l => l.length));
+
+      const SERIES_COLORS = [
+        ColorText.brightCyan, ColorText.brightMagenta, ColorText.brightYellow,
+        ColorText.brightGreen, ColorText.brightBlue, ColorText.brightRed,
+        ColorText.orange, ColorText.pink, ColorText.lime, ColorText.teal
+      ];
+
+      const lines = [];
+      for (let r = 0; r < H; r++) {
+        const yLbl = yLabels[r].padStart(yW);
+        let rowStr = '';
+        for (let c = 0; c < TOTAL_COLS; c++) {
+          const sIdx = colors[r][c];
+          const ch = chars[r][c];
+          if (sIdx >= 0 && ch !== ' ') {
+            rowStr += SERIES_COLORS[sIdx % SERIES_COLORS.length](ch);
+          } else {
+            rowStr += ch;
+          }
+        }
+        lines.push(ColorText.dim(yLbl) + ' ' + ColorText.dim('│') + rowStr);
+      }
+
+      lines.push(' '.repeat(yW) + ' ' + ColorText.dim('└' + '─'.repeat(TOTAL_COLS)));
+
+      const labelRow = new Array(TOTAL_COLS).fill(' ');
+      const numLabels = Math.min(W, Math.max(2, Math.floor(TOTAL_COLS / 10)));
+      for (let i = 0; i < numLabels; i++) {
+        const idx = numLabels === 1
+          ? Math.floor(W / 2)
+          : Math.floor((i / (numLabels - 1)) * (W - 1));
+        let label = this._chartFormatXLabel(sampled[idx].x);
+        if (label.length > 8) label = label.slice(0, 7) + '…';
+        const centerCol = idx * numSeries + Math.floor(numSeries / 2);
+        const startCol = Math.max(0, Math.min(TOTAL_COLS - label.length, centerCol - Math.floor(label.length / 2)));
+        for (let j = 0; j < label.length; j++) {
+          const pos = startCol + j;
+          if (pos >= 0 && pos < TOTAL_COLS && labelRow[pos] === ' ') {
+            labelRow[pos] = label[j];
+          }
+        }
+      }
+      lines.push(' '.repeat(yW) + '  ' + ColorText.dim(labelRow.join('')));
+
+      return lines.join('\n');
+    };
+
     // --------------------------- Build Method ---------------------------
 
     this.Build = async (props = { session: new Session }) => {
@@ -18246,6 +19202,24 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'chart': {
+          // Emits `await this.Chart(id, <data|null>, {...})`. Inline data
+          // is embedded as a JSON literal when present, otherwise `null`
+          // is emitted so the runtime falls back to its built-in
+          // example dataset (and the widget's own "📁 Load" button
+          // becomes the data source).
+          const cfg = { name: it.name }
+          if (it.config && typeof it.config === 'object') {
+            for (const [ck, cv] of Object.entries(it.config)) {
+              if (cv !== undefined) cfg[ck] = cv
+            }
+          }
+          const dataLit = (it.data === null || it.data === undefined)
+            ? 'null'
+            : JSON.stringify(it.data)
+          L.push(`${indent}await this.Chart(id, ${dataLit}, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'route': {
           const m = it.method || 'Get'
           L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
@@ -18331,7 +19305,8 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Get: 'route',
   Post: 'route',
   Put: 'route',
-  Delete: 'route'
+  Delete: 'route',
+  Chart: 'chart'
 }
 
 /**
@@ -18478,6 +19453,20 @@ function _sbMakeItemForMethod(methodName, id) {
         dropdown: {}
       }
     }
+    case 'chart':
+      // Compact chart widget. `data` starts null → the runtime falls
+      // back to its built-in example dataset; the widget's own
+      // "📁 Load" button (using this.File) lets the user upload their
+      // own JSON / JSONL / CSV / XLSX. Interactive controls live
+      // INSIDE the button/HUD area via this.Buttons(), and every
+      // advanced option hides behind the ⚙ Config toggle so the
+      // default view stays clean.
+      return {
+        ...base,
+        name: 'chart_' + id,
+        data: null,
+        config: {}
+      }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
     case 'code':
@@ -20491,6 +21480,18 @@ class SelfBuilder extends SyAPP_Func {
           } catch (_) { /* sync is best-effort — never break render */ }
           break
         }
+        case 'chart':
+          // Render the compact this.Chart() widget. Everything (header,
+          // chart rows, Y-series toggles, config panel and file
+          // actions) is emitted inside the button/HUD area, never
+          // through this.Text(). The widget drives itself purely
+          // through props on ActualProps (like this.File / this.JSON),
+          // so its controls keep working in BOTH edit and view modes.
+          await this.Chart(id, it.data || null, {
+            name: it.name,
+            ...(it.config || {})
+          })
+          break
         case 'route':
           this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
           break
@@ -21427,6 +22428,27 @@ function _sbCallToItem(call, sessionVar) {
     case 'PinnedBottom':
     case 'Args':
       return _sbContainerItem(call.method, rest)
+    case 'Chart': {
+      // Embedded chart widget — round-trips the widget's own config so a
+      // produced source containing `await this.Chart(id, data, {...})`
+      // re-opens in the SelfBuilder as a proper Chart item instead of a
+      // raw code block. `data` is captured as a JSON literal when the
+      // parsed value is JSON-safe; otherwise null (which means "use the
+      // built-in example dataset").
+      const cfg = rest[1] !== undefined ? _sbObjArg(rest[1]) : {};
+      if (cfg === null) return null;
+      let parsedData = null;
+      if (rest[0] !== undefined) {
+        const v = _sbParseValue(rest[0]);
+        if (v !== _SB_CODE && v !== undefined && v !== null) parsedData = v;
+      }
+      return {
+        type: 'chart',
+        name: typeof cfg.name === 'string' ? cfg.name : `chart_${_sbNid()}`,
+        data: parsedData,
+        config: (cfg && typeof cfg === 'object') ? cfg : {}
+      };
+    }
     case 'Emb': {
       // Embedded SyAPP_Func — round-trips the widget's own config so
       // that a produced source containing an `await this.Emb(id, ...)`
