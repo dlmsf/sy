@@ -14345,10 +14345,7 @@ function levenshteinDistance(str1, str2) {
           source: initialSource,
           filePath: cfg.filePath || null,
           code: cfg.code || null,
-          saveMode: initialSource === 'class' ? 'class'
-                  : initialSource === 'file'  ? 'path'
-                  : initialSource === 'code'  ? 'inline'
-                  : null,
+          saveMode: initialSource === 'class' ? 'class' : 'inline',
           error: null,
           pickMode: false,
           editPanel: false
@@ -14363,7 +14360,9 @@ function levenshteinDistance(str1, str2) {
             boot.source = disk.source || (disk.filePath ? 'file' : 'code');
             boot.filePath = disk.filePath || null;
             boot.code = disk.code || null;
-            boot.saveMode = disk.saveMode || (boot.filePath ? 'path' : 'inline');
+            boot.saveMode = (disk.saveMode === 'inline' || disk.saveMode === 'path')
+              ? disk.saveMode
+              : 'inline';
           }
         }
 
@@ -14385,7 +14384,7 @@ function levenshteinDistance(str1, str2) {
               boot.source = healed.filePath ? 'file' : 'code';
               boot.filePath = healed.filePath || null;
               boot.code = healed.code || null;
-              boot.saveMode = healed.filePath ? 'path' : 'inline';
+              boot.saveMode = 'inline';
             }
           } catch (_) {}
         }
@@ -14424,30 +14423,37 @@ function levenshteinDistance(str1, str2) {
       // path (or inline code) is written back into this Emb instance.
       if (curProps[P.selfBuild]) {
         delete curProps[P.selfBuild];
+
         const returnInfo = {
           embName: cfg.name,
           returnTo: this.Name,
           returnProps: { ...passProps },
-          sourceFile: cfg.sourceFile || null
+          sourceFile: cfg.sourceFile || null,
+          saveMode: state.saveMode || 'inline',
+          hostFile: outerFilePath || cfg.sourceFile || null,
+          // IMPORTANT: propagate the CURRENT emb's host file
+          // (which is the file where THIS widget's call lives).
+          // For a top-level widget this equals test.js. For a nested
+          // widget, it STILL equals test.js — because the outer
+          // widget's produced file was written back to test.js, and
+          // the inner widget's call lives there (inside the outer's
+          // code: blob). No extra plumbing is needed.
+          parentHostFile: (curProps.__embHostFile && typeof curProps.__embHostFile === 'string')
+            ? curProps.__embHostFile
+            : (outerFilePath || cfg.sourceFile || null)
         };
         if (this._syappInstance) {
           this._syappInstance._pendingEmbBuild = returnInfo;
         }
-        // Pass the return info BOTH on the shared _pendingEmbBuild
-        // slot (legacy path) AND on session-scoped props. The props
-        // are what make nested Emb-in-Emb-in-Emb flows reliable:
-        // whenever a NESTED EMB session's Self Build fires, a previous
-        // (outer) session's Finish & Return may still be running
-        // asynchronously and clobber the shared slot to null. Props
-        // are set on the CURRENT session's ActualProps and are read
-        // back by the SelfBuilder before anything else clears them, so
-        // they can never be lost to a race with an older session.
         this.GotoNow(id, '__selfbuilder__', {
           props: {
             __embNewSession: cfg.name,
             __embReturnTo: returnInfo.returnTo,
             __embReturnProps: returnInfo.returnProps,
-            __embSourceFile: returnInfo.sourceFile
+            __embSourceFile: returnInfo.sourceFile,
+            __embSaveMode: returnInfo.saveMode,
+            __embHostFile: returnInfo.hostFile,
+            __embParentHostFile: returnInfo.parentHostFile
           }
         });
         return null;
@@ -14467,12 +14473,91 @@ function levenshteinDistance(str1, str2) {
       if (curProps[P.saveAsPath]) {
         delete curProps[P.saveAsPath];
         state.saveMode = 'path';
+
         this.Storages.Set(id, storageKey, state);
+
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+
+        const __pathHost = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+
+        if (__pathHost && state.filePath) {
+          try {
+            const snippet = this._embSnippetPath(state, cfg);
+            const existing = fs.existsSync(__pathHost)
+              ? fs.readFileSync(__pathHost, 'utf8')
+              : '';
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+
+            if (replaced !== null) {
+              fs.writeFileSync(__pathHost, replaced);
+              this.Alert(id,
+                `📝 Emb("${cfg.name}") → PATH in ${path.basename(__pathHost)}`,
+                { duration: 4000 });
+            } else {
+              this.Alert(id,
+                `⚠ Could not find this.Emb("${cfg.name}") in ${path.basename(__pathHost)}.`,
+                { duration: 7000 });
+            }
+          } catch (e) {
+            this.Alert(id, `❌ Write failed: ${e.message}`, { duration: 5000 });
+          }
+        }
       }
       if (curProps[P.saveAsInline]) {
         delete curProps[P.saveAsInline];
         state.saveMode = 'inline';
+
+        try {
+          if (state.filePath && fs.existsSync(state.filePath)) {
+            const raw = fs.readFileSync(state.filePath, 'utf8');
+            state.code = this._embExtractInlineClass(raw);
+          } else if (state.code && String(state.code).trim()) {
+            state.code = this._embExtractInlineClass(state.code);
+          }
+          state.error = null;
+        } catch (e) {
+          state.error = e.message || String(e);
+        }
+
         this.Storages.Set(id, storageKey, state);
+
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+
+        const __inlineHost = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+
+        if (__inlineHost) {
+          try {
+            const snippet = this._embSnippetInline(state, cfg);
+            const existing = fs.existsSync(__inlineHost)
+              ? fs.readFileSync(__inlineHost, 'utf8')
+              : '';
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+
+            if (replaced !== null) {
+              fs.writeFileSync(__inlineHost, replaced);
+              this.Alert(id,
+                `📝 Emb("${cfg.name}") → INLINE in ${path.basename(__inlineHost)}`,
+                { duration: 4000 });
+            } else {
+              this.Alert(id,
+                `⚠ Could not find this.Emb("${cfg.name}") in ${path.basename(__inlineHost)}. ` +
+                `Use "Write snippet to host file" to insert it manually.`,
+                { duration: 7000 });
+            }
+          } catch (e) {
+            this.Alert(id, `❌ Write failed: ${e.message}`, { duration: 5000 });
+          }
+        } else {
+          this.Alert(id,
+            `⚠ No host file to write into. Use "Write snippet to host file".`,
+            { duration: 5000 });
+        }
       }
 
       // ---------------- Enter Func ----------------
@@ -14650,24 +14735,40 @@ function levenshteinDistance(str1, str2) {
         }
       }
 
-      // Write snippet to the host file if a sourceFile was declared
       if (curProps[P.writeSource]) {
         delete curProps[P.writeSource];
-        if (cfg.sourceFile) {
+
+        if (state.saveMode === 'inline' && state.code && String(state.code).trim()) {
+          try {
+            state.code = this._embExtractInlineClass(state.code);
+            this.Storages.Set(id, storageKey, state);
+          } catch (_) {}
+        }
+
+        const hostFile = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+
+        if (hostFile) {
           try {
             const snippet = state.saveMode === 'inline'
               ? this._embSnippetInline(state, cfg)
               : this._embSnippetPath(state, cfg);
-            const existing = fs.existsSync(cfg.sourceFile)
-              ? fs.readFileSync(cfg.sourceFile, 'utf8')
+            const existing = fs.existsSync(hostFile)
+              ? fs.readFileSync(hostFile, 'utf8')
               : '';
-            const marker =
-              `\n// [SyAPP.Emb append ${new Date().toISOString()}]\n` +
-              snippet.split('\n').map(l => '// ' + l).join('\n') + '\n';
-            fs.writeFileSync(cfg.sourceFile, existing + marker);
-            this.Alert(id,
-              `📝 Appended Emb snippet to ${path.basename(cfg.sourceFile)}`,
-              { duration: 3000 });
+
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+            if (replaced !== null) {
+              fs.writeFileSync(hostFile, replaced);
+              this.Alert(id,
+                `📝 Updated Emb("${cfg.name}") in ${path.basename(hostFile)}`,
+                { duration: 3000 });
+            } else {
+              this.Alert(id,
+                `⚠ No this.Emb("${cfg.name}") call found in ${path.basename(hostFile)}. ` +
+                `Add the widget inside a func method first, then click this button again.`,
+                { duration: 7000 });
+            }
           } catch (e) {
             this.Alert(id, `❌ ${e.message}`, { duration: 4000 });
           }
@@ -14730,6 +14831,16 @@ function levenshteinDistance(str1, str2) {
       // ------------------------------------------------------------------
       // Resolve the embedded class
       // ------------------------------------------------------------------
+      if (state.saveMode === 'inline' &&
+          (!state.code || !String(state.code).trim()) &&
+          state.filePath && fs.existsSync(state.filePath)) {
+        try {
+          const raw = fs.readFileSync(state.filePath, 'utf8');
+          state.code = this._embExtractInlineClass(raw);
+          this.Storages.Set(id, storageKey, state);
+        } catch (_) {}
+      }
+
       let EmbClass = await this._embResolveClass(state, cfg);
       if (EmbClass && state.error) {
         state.error = null;
@@ -14866,18 +14977,22 @@ function levenshteinDistance(str1, str2) {
         }
 
         this.Text(id, ' ');
+
+        const __inlineSelected = state.saveMode === 'inline';
+        const __pathSelected   = state.saveMode === 'path';
+
         this.Buttons(id, [
           {
-            name: state.saveMode === 'path'
-              ? ColorText.bgGreen(ColorText.black(' ✓ Path mode '))
-              : '○ Path mode',
-            props: { [P.saveAsPath]: true }
-          },
-          {
-            name: state.saveMode === 'inline'
+            name: __inlineSelected
               ? ColorText.bgGreen(ColorText.black(' ✓ Inline mode '))
               : '○ Inline mode',
             props: { [P.saveAsInline]: true }
+          },
+          {
+            name: __pathSelected
+              ? ColorText.bgGreen(ColorText.black(' ✓ Path mode '))
+              : '○ Path mode',
+            props: { [P.saveAsPath]: true }
           }
         ]);
 
@@ -14892,7 +15007,9 @@ function levenshteinDistance(str1, str2) {
           editable: false
         });
 
-        if (cfg.sourceFile && fs.existsSync(cfg.sourceFile)) {
+        const __embHostFile = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+        if (__embHostFile) {
           this.Button(id, {
             name: ColorText.brightYellow('✎ Write snippet to host file'),
             props: { [P.writeSource]: true }
@@ -14928,13 +15045,45 @@ function levenshteinDistance(str1, str2) {
      */
     this._embResolveClass = async (state, cfg) => {
       if (state.source === 'class' && cfg.funcClass) return cfg.funcClass;
-      if (state.source === 'file' && state.filePath) {
+
+      const tryFile = async () => {
+        if (!state.filePath || !fs.existsSync(state.filePath)) return null;
         try { return await this._embImportFile(state.filePath); }
         catch (e) { state.error = e.message || String(e); return null; }
-      }
-      if (state.source === 'code' && state.code) {
+      };
+      const tryCode = async () => {
+        if (!state.code || !String(state.code).trim()) return null;
         try { return await this._embImportCode(state.code); }
         catch (e) { state.error = e.message || String(e); return null; }
+      };
+
+      if (state.saveMode === 'inline' &&
+          (!state.code || !String(state.code).trim()) &&
+          state.filePath && fs.existsSync(state.filePath)) {
+        try {
+          const raw = fs.readFileSync(state.filePath, 'utf8');
+          state.code = this._embExtractInlineClass(raw);
+        } catch (_) {}
+      }
+
+      if (state.saveMode === 'inline') {
+        const c = await tryCode();
+        if (c) return c;
+        return await tryFile();
+      }
+      if (state.saveMode === 'path') {
+        const f = await tryFile();
+        if (f) return f;
+        return await tryCode();
+      }
+
+      if (state.source === 'file') {
+        const f = await tryFile();
+        if (f) return f;
+      }
+      if (state.source === 'code') {
+        const c = await tryCode();
+        if (c) return c;
       }
       return null;
     };
@@ -14989,10 +15138,66 @@ function levenshteinDistance(str1, str2) {
         dir,
         `emb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`
       );
-      fs.writeFileSync(tmp, String(code), 'utf8');
+
+      let source = this._embExtractInlineClass(String(code));
+
+      source = `import SyAPP from ${JSON.stringify(import.meta.url)};\n` + source;
+
+      if (!/\bexport\b/.test(source)) {
+        const clsM = source.match(/\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
+        if (clsM) {
+          source += `\nexport default ${clsM[1]};\n`;
+        }
+      }
+
+      fs.writeFileSync(tmp, source, 'utf8');
       const fileUrl = url.pathToFileURL(tmp).href + '?t=' + Date.now();
       const mod = await import(fileUrl);
       return this._embPickClass(mod, tmp);
+    };
+
+    this._embExtractInlineClass = (src) => {
+      if (!src) return '';
+      const lines = String(src).split('\n');
+      const out = [];
+
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        if (/^import\b/.test(trimmed)) {
+          let stmt = trimmed;
+          let j = i;
+          while (!/;\s*$/.test(stmt) &&
+                 !/from\s+['"][^'"]+['"]\s*;?\s*$/.test(stmt) &&
+                 !/^import\s+['"][^'"]+['"]\s*;?\s*$/.test(stmt) &&
+                 j + 1 < lines.length) {
+            j++;
+            stmt += ' ' + lines[j].trim();
+          }
+
+          const importsSyAPP =
+            /^import\s+SyAPP\b/.test(stmt) ||
+            /^import\s*\{[^}]*\bSyAPP\b[^}]*\}\s*from\b/.test(stmt) ||
+            /^import\s+SyAPP\s*,\s*\{[^}]*\}\s*from\b/.test(stmt) ||
+            /^import\s+[\w$]+\s*,\s*\{\s*[^}]*\bSyAPP\b[^}]*\}\s*from\b/.test(stmt);
+
+          if (importsSyAPP) { i = j; continue; }
+
+          for (let k = i; k <= j; k++) out.push(lines[k]);
+          i = j;
+          continue;
+        }
+
+        out.push(line);
+      }
+
+      let result = out.join('\n');
+      result = result.replace(/^(\s*)export\s+default\s+(class\s+)/gm, '$1$2');
+      result = result.replace(/^(\s*)export\s+(class\s+)/gm, '$1$2');
+      result = result.replace(/^\s*export\s+default\s+[A-Za-z_$][\w$]*\s*;?\s*$/gm, '');
+      result = result.replace(/^\s*export\s*\{[^}]*\}\s*;?\s*$/gm, '');
+      return result.replace(/^\s*\n+/, '').replace(/\s+$/, '');
     };
 
     /**
@@ -15085,6 +15290,440 @@ function levenshteinDistance(str1, str2) {
 
       const fileUrl = url.pathToFileURL(mirrorFile).href + '?t=' + Date.now();
       return await import(fileUrl);
+    };
+
+    /**
+     * Balanced-paren scanner — TEMPLATE-AGNOSTIC. Skips only string
+     * literals and comments. Backticks are PLAIN characters, which is
+     * what makes it work for calls nested inside other templates.
+     * @private
+     */
+    this._embScanParenSimple = (src, openIdx) => {
+      let i = openIdx;
+      let depth = 0;
+      let inStr = null;
+      let inLineComment = false;
+      let inBlockComment = false;
+
+      while (i < src.length) {
+        const c = src[i];
+        const next = src[i + 1];
+
+        if (inLineComment) { if (c === '\n') inLineComment = false; i++; continue; }
+        if (inBlockComment) { if (c === '*' && next === '/') { inBlockComment = false; i += 2; continue; } i++; continue; }
+        if (inStr) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === inStr) inStr = null;
+          i++; continue;
+        }
+        if (c === '"' || c === "'") { inStr = c; i++; continue; }
+        if (c === '/' && next === '/') { inLineComment = true; i += 2; continue; }
+        if (c === '/' && next === '*') { inBlockComment = true; i += 2; continue; }
+
+        if (c === '(') depth++;
+        else if (c === ')') {
+          depth--;
+          if (depth === 0) return i;
+        }
+        i++;
+      }
+      return -1;
+    };
+
+    /**
+     * Escape snippet for splicing inside a template literal.
+     * @private
+     */
+    this._embEscapeSnippetForTemplate = (snippet) => {
+      return String(snippet)
+        .replace(/\\/g, '\\\\')
+        .replace(/`/g, '\\`')
+        .replace(/\$\{/g, '\\${');
+    };
+
+    /**
+     * Reverse of `_embEscapeSnippetForTemplate`.
+     *
+     * Because escaping can be applied N times (once per nesting level
+     * of Self Build-in-Self Build-in-…), this function is applied
+     * iteratively — one pass per descent — rather than as a fixed
+     * inverse. Calling it once undoes exactly one escape layer.
+     * @private
+     */
+    this._embUnescapeOneLayer = (s) => {
+      return String(s)
+        .replace(/\\\$\{/g, '${')
+        .replace(/\\`/g, '`')
+        .replace(/\\\\/g, '\\');
+    };
+
+    /**
+     * Check whether a call body carries a `name` property matching
+     * `embName`, ESCAPE-AGNOSTIC.
+     *
+     * Accepts any number of backslashes before the value quotes, so
+     * `"x"`, `\"x\"`, `\\\"x\\\"` (any nesting depth) all match.
+     * The key may be bare or quoted.
+     * @private
+     */
+    this._embBodyHasName = (callBody, embName) => {
+      const nameEsc = String(embName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(
+        `(?:["']?name["']?)\\s*:\\s*(?:\\\\?)*(["'])${nameEsc}(?:\\\\?)*\\1`
+      );
+      return re.test(callBody);
+    };
+
+    /**
+     * Extract the RAW `code:` value from a call body. Returns the raw
+     * text between the delimiters — escapes intact.
+     * @private
+     */
+    this._embExtractRawCodeValue = (callBody) => {
+      const btM = callBody.match(/(?:^|[{,\s])["']?code["']?\s*:\s*`([\s\S]*?)`/);
+      if (btM) return { value: btM[1], kind: 'template' };
+
+      const sqM = callBody.match(
+        /(?:^|[{,\s])["']?code["']?\s*:\s*'((?:\\.|[^'\\])*)'/
+      );
+      if (sqM) return { value: sqM[1], kind: 'single' };
+
+      const dqM = callBody.match(
+        /(?:^|[{,\s])["']?code["']?\s*:\s*"((?:\\.|[^"\\])*)?"/
+      );
+      if (dqM) return { value: dqM[1], kind: 'double' };
+
+      return null;
+    };
+
+    /**
+     * Recursive find that walks into each outer call's `code:` blob
+     * ONE LEVEL AT A TIME, unescaping one layer per descent.
+     *
+     * Returns a "path" — a chain of one or more hops, each describing
+     * one outer call and the offsets of the code value within it.
+     * The final hop describes the target call itself.
+     *
+     * Structure of the return value:
+     *   {
+     *     hops: [
+     *       { openIdx, closeIdx, codeKeyStart, codeKeyEnd,
+     *         codeDelim, codeContentStart, codeContentEnd,
+     *         codeKind },
+     *       ...
+     *     ],
+     *     targetBodyStart, targetBodyEnd, // within final hop's content
+     *     targetInsideTemplate (bool),
+     *     embeddingLayers: N  // how many escape layers wrap the target
+     *   }
+     *
+     * `embeddingLayers` is the number of escape layers between the
+     * outer-file raw text and the target's logical content. It drives
+     * how many times we must escape the replacement snippet.
+     * @private
+     */
+    this._embFindCall = (src, embName) => {
+      if (typeof src !== 'string' || !src) return null;
+
+      // Depth = number of escape layers we've descended so far.
+      const search = (content, depth) => {
+        const callStartRe = /this\.Emb\s*\(/g;
+        let m;
+
+        while ((m = callStartRe.exec(content)) !== null) {
+          const openIdx = m.index + m[0].length - 1;
+          const closeIdx = this._embScanParenSimple(content, openIdx);
+          if (closeIdx < 0) continue;
+
+          const bodyStart = openIdx + 1;
+          const bodyEnd = closeIdx;
+          const callBody = content.slice(bodyStart, bodyEnd);
+
+          // Direct match at this depth?
+          if (this._embBodyHasName(callBody, embName)) {
+            return {
+              hops: [],
+              targetCallStart: m.index,
+              targetCallEnd: closeIdx + 1,
+              targetBodyStart: bodyStart,
+              targetBodyEnd: bodyEnd,
+              targetInsideTemplate: depth > 0,
+              embeddingLayers: depth
+            };
+          }
+
+          // No direct match. Descend into this call's `code:` value.
+          const codeInfo = this._embExtractRawCodeValue(callBody);
+          if (!codeInfo) continue;
+
+          // Unescape ONE layer to reveal the code value's logical
+          // content. This is the content as it appears to the next
+          // nesting level's `this.Emb(...)` calls.
+          const innerContent = this._embUnescapeOneLayer(codeInfo.value);
+
+          const deeper = search(innerContent, depth + 1);
+          if (deeper) {
+            // Prepend this hop to the chain.
+            const hop = {
+              callStart: m.index,
+              callEnd: closeIdx + 1,
+              bodyStart,
+              bodyEnd,
+              codeKind: codeInfo.kind,
+              codeRawValue: codeInfo.value
+            };
+            return {
+              ...deeper,
+              hops: [hop, ...deeper.hops]
+            };
+          }
+        }
+        return null;
+      };
+
+      return search(src, 0);
+    };
+
+    /**
+     * Replace an existing `this.Emb(...)` call with `newSnippet`,
+     * handling nested cases transparently.
+     *
+     * The replacement algorithm walks the hop chain from the deepest
+     * hop outwards:
+     *
+     *   1. Inside the deepest hop's content, splice the new snippet
+     *      (unescaped) at the target's span.
+     *   2. Re-escape the resulting content ONCE (it goes back inside
+     *      a template layer).
+     *   3. Splice that re-escaped content back into the hop's code
+     *      delimiters, producing a new call text for that hop.
+     *   4. Move up to the parent hop: splice that new call text at
+     *      the parent's code content span, re-escape once, etc.
+     *   5. After the outer hop is processed, the resulting text is
+     *      the new top-level `this.Emb(...)` call — splice it into
+     *      `src` at the outer hop's call span.
+     *
+     * This is exactly symmetric with the search descent, so escape
+     * layers are preserved end-to-end.
+     * @private
+     */
+    this._embReplaceExistingCall = (src, embName, newSnippet) => {
+      const found = this._embFindCall(src, embName);
+      if (!found) return null;
+
+      // The replacement text (with `await ` stripped, since the call
+      // site's own context supplies awaits).
+      const plain = String(newSnippet).replace(/^\s*await\s+/, '');
+
+      // -----------------------------------------------------------
+      // Case 1: direct top-level match. Splice directly.
+      // -----------------------------------------------------------
+      if (found.hops.length === 0) {
+        return src.slice(0, found.targetCallStart) + plain + src.slice(found.targetCallEnd);
+      }
+
+      // -----------------------------------------------------------
+      // Case 2: nested. Rebuild from the deepest hop outward.
+      // -----------------------------------------------------------
+      const hops = found.hops; // outermost first
+      let content = null;      // the CURRENT content at each stage
+
+      // Start from the innermost hop — the one directly containing
+      // the target call.
+      const lastHopIdx = hops.length - 1;
+      const lastHop = hops[lastHopIdx];
+
+      // Reconstruct the innermost content (unescaped once, as used in
+      // search) so we can splice the target and re-escape.
+      const innermostUnescaped = this._embUnescapeOneLayer(lastHop.codeRawValue);
+
+      // Splice the target call replacement into the innermost
+      // unescaped content.
+      //
+      // Offsets of the target within the innermost unescaped content
+      // must be derived from `found` — they refer to the content AT
+      // that depth, and since we track depth, we know how many times
+      // the raw value has been unescaped.
+      //
+      // To find them, we re-scan the innermost content for the target
+      // call using the same scanner.
+      const targetInInner = (() => {
+        const re = /this\.Emb\s*\(/g;
+        let m;
+        while ((m = re.exec(innermostUnescaped)) !== null) {
+          const oIdx = m.index + m[0].length - 1;
+          const cIdx = this._embScanParenSimple(innermostUnescaped, oIdx);
+          if (cIdx < 0) continue;
+          const body = innermostUnescaped.slice(oIdx + 1, cIdx);
+          if (this._embBodyHasName(body, embName)) {
+            return { start: m.index, end: cIdx + 1 };
+          }
+        }
+        return null;
+      })();
+
+      if (!targetInInner) return null;
+
+      const innerReplaced =
+        innermostUnescaped.slice(0, targetInInner.start) +
+        plain +
+        innermostUnescaped.slice(targetInInner.end);
+
+      // Re-escape once to reconstruct the raw code value of the last
+      // hop.
+      const lastHopCodeRaw = this._embEscapeSnippetForTemplate(innerReplaced);
+
+      // Now walk up the hop chain, reconstructing each level.
+      let currentCodeRaw = lastHopCodeRaw;
+      let currentCodeKind = lastHop.codeKind;
+
+      for (let i = hops.length - 2; i >= 0; i--) {
+        const hop = hops[i];
+
+        // Extract the outer hop's raw call body, which we use to
+        // determine the code delimiters and the span of the code
+        // value.
+        const outerCallRaw = src.slice(
+          hop.callStart,
+          hop.callEnd
+        );
+        // NOTE: for hops that are NOT the outermost one, the call raw
+        // lives INSIDE the previously-processed hop's content — but
+        // since we spliced from the deepest outward, `src` still has
+        // the ORIGINAL contents. Reconstruct from the hop's stored
+        // raw value instead, which is exactly the code value that
+        // contains the newly-rebuilt inner call.
+        const outerRawBody = src.slice(hop.bodyStart, hop.bodyEnd);
+
+        const codeInfo = this._embExtractRawCodeValue(outerRawBody);
+        if (!codeInfo) return null;
+
+        // Reconstruct outer code value with the new inner call spliced in.
+        //
+        // The hop's codeRawValue contains the OUTER content (with the
+        // inner call as-is at this point in the reconstruction). We
+        // need to find the span of the inner call inside this raw
+        // value — that is the span of the NEXT inner hop's call.
+        const nextHop = hops[i + 1];
+        // The next hop's call span, expressed in coordinates of the
+        // current hop's UNESCAPED content, is:
+        //   nextHop.callStart ... nextHop.callEnd
+        // — because those were computed during the search pass on
+        // unescaped content at exactly this depth.
+        //
+        // Convert to coordinates within the RAW value by re-escaping
+        // the portion before the inner call. Since escape is
+        // deterministic, we compute:
+        //   rawBeforeInner = escape(unescape(currentCodeRaw).slice(0, nextHop.callStart))
+        //   rawAfterInner  = escape(unescape(currentCodeRaw).slice(nextHop.callEnd))
+        // where `currentCodeRaw` is the INNER hop's new code, already
+        // rebuilt — but the outer hop's codeRawValue hasn't been
+        // touched yet, so we need the ORIGINAL raw value as reference.
+
+        const originalRawValue = hop.codeRawValue;
+        const originalUnescaped = this._embUnescapeOneLayer(originalRawValue);
+
+        // Rebuild: before + (new inner call escaped) + after
+        const before = originalUnescaped.slice(0, nextHop.callStart);
+        const after = originalUnescaped.slice(nextHop.callEnd);
+
+        // The new inner call text, unescaped as it should appear
+        // within the outer's content, is:
+        //   (reconstructed call of the next hop with its new code)
+        //
+        // The next hop's call is itself composed of its original
+        // prefix (up to its code value's opening delimiter) + the new
+        // code + its original suffix.
+        const nextCallPrefix = originalUnescaped.slice(
+          nextHop.callStart,
+          (() => {
+            // find the code: opener within the next hop's call
+            const nextCallBody = originalUnescaped.slice(
+              nextHop.bodyStart,
+              nextHop.bodyEnd
+            );
+            const m = nextCallBody.match(
+              /(?:^|[{,\s])["']?code["']?\s*:\s*(`|'|")/
+            );
+            if (!m) return nextHop.bodyStart;
+            return nextHop.bodyStart + m.index + m[0].length - 1;
+          })()
+        );
+        const nextDelimChar = (() => {
+          const nextCallBody = originalUnescaped.slice(
+            nextHop.bodyStart,
+            nextHop.bodyEnd
+          );
+          const m = nextCallBody.match(
+            /(?:^|[{,\s])["']?code["']?\s*:\s*(`|'|")/
+          );
+          return m ? m[1] : '`';
+        })();
+
+        const nextCallSuffix = (() => {
+          const nextCallBody = originalUnescaped.slice(
+            nextHop.bodyStart,
+            nextHop.bodyEnd
+          );
+          const m = nextCallBody.match(
+            /(?:^|[{,\s])["']?code["']?\s*:\s*[\s\S]*?(`|'|")/
+          );
+          if (!m) return '';
+          // The closing delimiter is the LAST occurrence of the same
+          // delimiter char before the end of the body.
+          return nextDelimChar;
+        })();
+
+        // The new code value for the next hop is `currentCodeRaw`.
+        // Emit the next hop's call with the new code.
+        const nextCallNew =
+          nextCallPrefix +
+          nextDelimChar + currentCodeRaw + nextDelimChar +
+          nextCallSuffix;
+
+        // Splice into outer's unescaped content.
+        const outerUnescapedNew = before + nextCallNew + after;
+
+        // Re-escape once for storage inside the hop's own code value.
+        currentCodeRaw = this._embEscapeSnippetForTemplate(outerUnescapedNew);
+        currentCodeKind = codeInfo.kind;
+      }
+
+      // After walking up the chain, `currentCodeRaw` holds the new
+      // content for the OUTERMOST hop's code value. Rebuild that
+      // outermost call.
+      const outerHop = hops[0];
+      const outerCallRaw = src.slice(outerHop.callStart, outerHop.callEnd);
+      const outerBodyRaw = src.slice(outerHop.bodyStart, outerHop.bodyEnd);
+
+      const outerCodeInfo = this._embExtractRawCodeValue(outerBodyRaw);
+      if (!outerCodeInfo) return null;
+
+      const outerDelim =
+        outerCodeInfo.kind === 'template' ? '`'
+        : outerCodeInfo.kind === 'single' ? "'"
+        : '"';
+      const codeKeyRe = new RegExp(
+        `(["']?code["']?\\s*:\\s*)${outerDelim}([\\s\\S]*?)${outerDelim}`
+      );
+      const outerMatch = outerBodyRaw.match(codeKeyRe);
+      if (!outerMatch) return null;
+
+      const newOuterBody =
+        outerBodyRaw.slice(0, outerMatch.index) +
+        outerMatch[1] + outerDelim + currentCodeRaw + outerDelim +
+        outerBodyRaw.slice(outerMatch.index + outerMatch[0].length);
+
+      const outerOpenIdx = outerCallRaw.indexOf('(');
+      const newOuterCall =
+        outerCallRaw.slice(0, outerOpenIdx + 1) +
+        newOuterBody + ')';
+
+      return (
+        src.slice(0, outerHop.callStart) +
+        newOuterCall +
+        src.slice(outerHop.callEnd)
+      );
     };
 
     /**
@@ -15206,10 +15845,24 @@ function levenshteinDistance(str1, str2) {
      * @private
      */
     this._embSnippetInline = (state, cfg) => {
-      const safe = String(state.code || '')
+      const raw = String(state.code || '').trim();
+
+      if (!raw) {
+        return [
+          `await this.Emb(id, {`,
+          `  name: ${JSON.stringify(cfg.name)},`,
+          `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`,
+          `})`
+        ].join('\n');
+      }
+
+      const cleaned = this._embExtractInlineClass(raw);
+
+      const safe = cleaned
         .replace(/\\/g, '\\\\')
         .replace(/`/g, '\\`')
         .replace(/\$\{/g, '\\${');
+
       return [
         `await this.Emb(id, {`,
         `  name: ${JSON.stringify(cfg.name)},`,
@@ -18913,36 +19566,118 @@ function _embDiskLoad(outerFilePath, embName) {
  * @returns {{ filePath: string|null, code: string|null }|null}
  * @private
  */
+/**
+ * Scan a host file for the `this.Emb(id, { ... })` call matching
+ * `embName`, recursing into nested `code:` blobs at ANY depth.
+ *
+ * Escape layers are undone one at a time as the scan descends, so
+ * deeply nested widgets (from nested Self Build flows) are found
+ * correctly.
+ * @private
+ */
 function _embScanRunningFileForWidget(src, embName) {
   if (typeof src !== 'string' || !src) return null;
   const nameEsc = String(embName || 'default').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-  // Find `this.Emb(` calls and inspect each one's argument object.
-  // The regex intentionally stops at the FIRST top-level `}` — object
-  // literals passed to this.Emb are flat (name, filePath, code, dropdown),
-  // so a shallow match is safe and far more robust than a full parser.
-  const callRe = /this\.Emb\s*\([^,]*,\s*\{([\s\S]*?)\}\s*\)/g;
-  let m;
-  while ((m = callRe.exec(src)) !== null) {
-    const body = m[1];
+  const unescapeOneLayer = (s) => String(s)
+    .replace(/\\\$\{/g, '${')
+    .replace(/\\`/g, '`')
+    .replace(/\\\\/g, '\\');
 
-    // Match the widget name: `name: 'x'` or `name: "x"`, with optional
-    // whitespace on either side of the colon.
-    const nameRe = new RegExp(
-      `(?:^|[,{\\s])name\\s*:\\s*(['"])${nameEsc}\\1(?:\\s*,|\\s*$|\\s*[},])`,
-      'm'
+  const scanParenForSource = (source, openIdx) => {
+    let i = openIdx;
+    let depth = 0;
+    let inStr = null;
+    let inLineComment = false;
+    let inBlockComment = false;
+
+    while (i < source.length) {
+      const c = source[i];
+      const next = source[i + 1];
+
+      if (inLineComment) { if (c === '\n') inLineComment = false; i++; continue; }
+      if (inBlockComment) { if (c === '*' && next === '/') { inBlockComment = false; i += 2; continue; } i++; continue; }
+      if (inStr) {
+        if (c === '\\') { i += 2; continue; }
+        if (c === inStr) inStr = null;
+        i++; continue;
+      }
+      if (c === '"' || c === "'") { inStr = c; i++; continue; }
+      if (c === '/' && next === '/') { inLineComment = true; i += 2; continue; }
+      if (c === '/' && next === '*') { inBlockComment = true; i += 2; continue; }
+
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) return i;
+      }
+      i++;
+    }
+    return -1;
+  };
+
+  const extractFileInfo = (rawBody) => {
+    const fpM = rawBody.match(
+      /(?:^|[{,\s])["']?filePath["']?\s*:\s*(?:\\\\?)*(["'])((?:\\.|[^\\])*?)(?:\\\\?)*\1/
     );
-    if (!nameRe.test(body)) continue;
 
-    // Extract filePath (single or double quoted) if present.
-    const fpM = body.match(/(?:^|[,{\s])filePath\s*:\s*(['"])([\s\S]*?)\1/);
-    const codeM = body.match(/(?:^|[,{\s])code\s*:\s*(['"])([\s\S]*?)\1/);
+    let codeVal = null;
+    const btM = rawBody.match(
+      /(?:^|[{,\s])["']?code["']?\s*:\s*`([\s\S]*?)`/
+    );
+    if (btM) {
+      codeVal = btM[1];
+    } else {
+      const sqM = rawBody.match(
+        /(?:^|[{,\s])["']?code["']?\s*:\s*'((?:\\.|[^'\\])*)'/
+      );
+      const dqM = rawBody.match(
+        /(?:^|[{,\s])["']?code["']?\s*:\s*"((?:\\.|[^"\\])*)?"/
+      );
+      if (sqM) codeVal = sqM[1];
+      else if (dqM) codeVal = dqM[1];
+    }
+
+    if (typeof codeVal === 'string') codeVal = unescapeOneLayer(codeVal);
+
     return {
-      filePath: fpM ? fpM[2] : null,
-      code: codeM ? codeM[2] : null
+      filePath: fpM ? unescapeOneLayer(fpM[2]) : null,
+      code: codeVal
     };
-  }
-  return null;
+  };
+
+  // Escape-agnostic name matcher: any number of backslashes before
+  // quotes, key bare or quoted.
+  const nameRe = new RegExp(
+    `(?:["']?name["']?)\\s*:\\s*(?:\\\\?)*(["'])${nameEsc}(?:\\\\?)*\\1`
+  );
+
+  const recursive = (source) => {
+    const callStartRe = /this\.Emb\s*\(/g;
+    let m;
+
+    while ((m = callStartRe.exec(source)) !== null) {
+      const openIdx = m.index + m[0].length - 1;
+      const endIdx = scanParenForSource(source, openIdx);
+      if (endIdx < 0) continue;
+
+      const rawBody = source.slice(openIdx + 1, endIdx);
+      const info = extractFileInfo(rawBody);
+
+      if (nameRe.test(rawBody)) {
+        return info;
+      }
+
+      // Recurse into the `code:` value (unescaped one layer).
+      if (info && typeof info.code === 'string' && info.code.length > 0) {
+        const deeper = recursive(info.code);
+        if (deeper) return deeper;
+      }
+    }
+    return null;
+  };
+
+  return recursive(src);
 }
 
 // ---------- responsive helpers ----------
@@ -19637,6 +20372,8 @@ class SelfBuilder extends SyAPP_Func {
     this._embTarget = null
     this._embReturnTo = null
     this._embReturnProps = null
+    this._embSaveMode = 'inline'
+    this._embHostFile = null
 
     // Snapshot of the SelfBuilder state taken right BEFORE entering EMB
     // mode. Restored when the user finishes (or otherwise leaves) the
@@ -19656,19 +20393,40 @@ class SelfBuilder extends SyAPP_Func {
     this._embStateStack = []
   }
 
-  /**
-   * Called by _renderSelf when the SelfBuilder is running in EMB mode.
-   * Writes the final result into the target Emb's storage and returns
-   * to the caller screen.
-   *
-   * The write-back uses the same storage key convention as this.Emb(),
-   * so the next time the caller's dropdown opens, it already has the
-   * file path (or the inline code) loaded and ready.
-   *
-   * @param {string} id - UserBuild id of the SelfBuilder session
-   * @param {object} props - Build props from the SelfBuilder render
-   * @private
-   */
+  _embResolveReturnSaveMode(caller) {
+    if (caller && (caller.saveMode === 'inline' || caller.saveMode === 'path')) {
+      return caller.saveMode;
+    }
+    if (this._embSaveMode === 'inline' || this._embSaveMode === 'path') {
+      return this._embSaveMode;
+    }
+    return 'inline';
+  }
+
+  _embResolveReturnHostFile(caller) {
+    if (caller && typeof caller.hostFile === 'string' && caller.hostFile && fs.existsSync(caller.hostFile)) {
+      return caller.hostFile;
+    }
+    if (typeof this._embHostFile === 'string' && this._embHostFile && fs.existsSync(this._embHostFile)) {
+      return this._embHostFile;
+    }
+    if (typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET && fs.existsSync(__BUILDER_EXPORT_TARGET)) {
+      return __BUILDER_EXPORT_TARGET;
+    }
+    try {
+      const argvFile = process.argv[2];
+      if (typeof argvFile === 'string' &&
+          /\.(js|mjs|cjs)$/i.test(argvFile) &&
+          !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
+        const abs = path.isAbsolute(argvFile)
+          ? argvFile
+          : path.resolve(process.cwd(), argvFile);
+        if (fs.existsSync(abs)) return abs;
+      }
+    } catch (_) {}
+    return null;
+  }
+
   _embFinishAndReturn = async (id, props) => {
     const syapp = this._syappInstance;
     if (!syapp) return;
@@ -19737,20 +20495,72 @@ class SelfBuilder extends SyAPP_Func {
       // Ensure the target func has initialised its storage for this
       // Emb name — otherwise we bootstrap a fresh entry with the
       // produced source already set.
+      const returnSaveMode = this._embResolveReturnSaveMode(caller);
+
+      let producedInlineCode = producedCode;
+      try {
+        producedInlineCode = this._embExtractInlineClass(producedCode);
+      } catch (_) {}
+
       const ownerFunc = syapp.Funcs.get(caller.returnTo);
       if (ownerFunc && ownerFunc.Storages) {
         let cur = ownerFunc.Storages.Get(sessionId, embStorageKey);
         if (!cur || typeof cur !== 'object') {
-          cur = { source: 'file', filePath: producedPath, code: null,
-                  saveMode: 'path', error: null, pickMode: false };
+          cur = {
+            source: 'file',
+            filePath: producedPath,
+            code: producedInlineCode,
+            saveMode: returnSaveMode,
+            error: null,
+            pickMode: false
+          };
         } else {
           cur.source = 'file';
           cur.filePath = producedPath;
-          cur.code = producedCode;
-          cur.saveMode = 'path';
+          cur.code = producedInlineCode;
+          cur.saveMode = returnSaveMode;
           cur.error = null;
         }
         ownerFunc.Storages.Set(sessionId, embStorageKey, cur);
+      }
+
+      try {
+        const hostFile = this._embResolveReturnHostFile(caller);
+        if (hostFile) {
+          const snippetState = {
+            source: 'file',
+            filePath: producedPath,
+            code: producedInlineCode,
+            saveMode: returnSaveMode
+          };
+          const snippetCfg = { name: caller.embName };
+
+          const snippet = (returnSaveMode === 'inline')
+            ? ownerFunc && typeof ownerFunc._embSnippetInline === 'function'
+              ? ownerFunc._embSnippetInline(snippetState, snippetCfg)
+              : ''
+            : ownerFunc && typeof ownerFunc._embSnippetPath === 'function'
+              ? ownerFunc._embSnippetPath(snippetState, snippetCfg)
+              : '';
+
+          if (snippet && ownerFunc && typeof ownerFunc._embReplaceExistingCall === 'function') {
+            const existing = fs.readFileSync(hostFile, 'utf8');
+            const replaced = ownerFunc._embReplaceExistingCall(existing, caller.embName, snippet);
+            if (replaced !== null) {
+              fs.writeFileSync(hostFile, replaced);
+              this.Alert(id,
+                `📝 Emb("${caller.embName}") updated in ${path.basename(hostFile)} (${returnSaveMode})`,
+                { duration: 4000 });
+            } else {
+              this.Alert(id,
+                `⚠ Could not find this.Emb("${caller.embName}") in ${path.basename(hostFile)}. ` +
+                `Change applied to widget only.`,
+                { duration: 6000 });
+            }
+          }
+        }
+      } catch (e) {
+        this.Alert(id, `⚠ Host-file update failed: ${e.message}`, { duration: 5000 });
       }
 
       // Mirror the produced source into the disk-backed emb record so
@@ -19773,18 +20583,14 @@ class SelfBuilder extends SyAPP_Func {
           }
         }
         if (outerFilePath) {
-          // Namespaced disk key matching this.Emb()'s read/write key
-          // exactly: owner func + widget name. This is what keeps the
-          // outer func's Emb record and every nested embedded func's
-          // Emb record completely independent on disk.
           _embDiskSave(outerFilePath, `${caller.returnTo || '__unknown__'}::${caller.embName}`, {
             source: 'file',
             filePath: producedPath,
-            code: producedCode,
-            saveMode: 'path'
+            code: producedInlineCode,
+            saveMode: returnSaveMode
           });
         }
-      } catch (_) { /* best-effort */ }
+      } catch (_) {}
 
       this.Alert(id, `✓ Embedded func produced: ${path.basename(producedPath)}`, { duration: 3000 });
 
@@ -20461,7 +21267,9 @@ class SelfBuilder extends SyAPP_Func {
         embMode: this._embMode,
         embTarget: this._embTarget,
         embReturnTo: this._embReturnTo,
-        embReturnProps: this._embReturnProps
+        embReturnProps: this._embReturnProps,
+        embSaveMode: this._embSaveMode,
+        embHostFile: this._embHostFile
       });
 
       this._embMode = true;
@@ -20489,6 +21297,22 @@ class SelfBuilder extends SyAPP_Func {
         (curProps.__embReturnProps !== undefined && curProps.__embReturnProps !== null)
           ? curProps.__embReturnProps
           : (pending ? pending.returnProps : null);
+
+      const propSaveMode = curProps.__embSaveMode;
+      const pendingSaveMode = pending && pending.saveMode;
+      if (propSaveMode === 'inline' || propSaveMode === 'path') {
+        this._embSaveMode = propSaveMode;
+      } else if (pendingSaveMode === 'inline' || pendingSaveMode === 'path') {
+        this._embSaveMode = pendingSaveMode;
+      }
+
+      const propHostFile = curProps.__embHostFile;
+      const pendingHostFile = pending && pending.hostFile;
+      if (typeof propHostFile === 'string' && propHostFile) {
+        this._embHostFile = propHostFile;
+      } else if (typeof pendingHostFile === 'string' && pendingHostFile) {
+        this._embHostFile = pendingHostFile;
+      }
 
       // Preserve the pre-EMB state so the parent SelfBuilder view can be
       // restored the moment the user finishes (or cancels) the EMB run.
@@ -20719,6 +21543,8 @@ class SelfBuilder extends SyAPP_Func {
       delete curProps.__embReturnTo;
       delete curProps.__embReturnProps;
       delete curProps.__embSourceFile;
+      delete curProps.__embSaveMode;
+      delete curProps.__embHostFile;
     }
 
     this._processActions(id, props)
