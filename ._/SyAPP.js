@@ -23081,6 +23081,122 @@ function _sbSplitStatements(body) {
 }
 
 /**
+ * Unescape a JS string / template literal's inner content (the text
+ * BETWEEN the delimiters, excluding the delimiters themselves).
+ *
+ * Processes escapes LEFT-TO-RIGHT so backslash sequences like `\\n`
+ * round-trip correctly:
+ *
+ *   • `\\` consumes TWO characters and produces ONE backslash;
+ *   • the following `n` is then kept as a literal `n`;
+ *   • the whole sequence becomes `\n` (two characters: backslash, n),
+ *     never an orphan backslash plus a real newline.
+ *
+ * This is the piece that makes nested Emb inline-code round-trip
+ * cleanly at any depth:
+ *
+ *   in-file (template literal):   ...\\n...
+ *   parsed logical source:        ...\n...
+ *   re-exported (JSON.stringify): ...\\n...
+ *
+ * Older code used sequential .replace() calls applied in the wrong
+ * order. That double-processed `\\n` (turning it into backslash + an
+ * actual newline), which in turn produced broken embedded source that
+ * Node rejected with "Invalid or unexpected token" whenever a file
+ * with nested Emb widgets was opened via `--edit`.
+ *
+ * @param {string} raw - content between the delimiters (no quotes)
+ * @returns {string}
+ * @private
+ */
+function _sbUnescapeStringLiteral(raw) {
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]
+    if (c !== '\\') { out += c; continue }
+    const next = raw[i + 1]
+    if (next === undefined) { out += c; break }
+    i++
+    switch (next) {
+      case 'n': out += '\n'; break
+      case 't': out += '\t'; break
+      case 'r': out += '\r'; break
+      case '\\': out += '\\'; break
+      case "'": out += "'"; break
+      case '"': out += '"'; break
+      case '`': out += '`'; break
+      case '$': out += '$'; break
+      case 'b': out += '\b'; break
+      case 'f': out += '\f'; break
+      case 'v': out += '\v'; break
+      case '0': out += '\0'; break
+      case 'u': {
+        // \uXXXX or \u{XXXXX}
+        if (raw[i + 1] === '{') {
+          const end = raw.indexOf('}', i + 2)
+          if (end !== -1) {
+            const hex = raw.slice(i + 2, end)
+            const cp = parseInt(hex, 16)
+            if (!isNaN(cp)) {
+              out += String.fromCodePoint(cp)
+              i = end
+              break
+            }
+          }
+        }
+        const hex = raw.slice(i + 1, i + 5)
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16))
+          i += 4
+        } else {
+          out += 'u'
+        }
+        break
+      }
+      case 'x': {
+        const hex = raw.slice(i + 1, i + 3)
+        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16))
+          i += 2
+        } else {
+          out += 'x'
+        }
+        break
+      }
+      default: out += next; break
+    }
+  }
+  return out
+}
+
+/**
+ * Does a template literal's inner content contain an UNESCAPED `${...}`
+ * interpolation? An escaped `\${` is a literal and must not trigger the
+ * conservative "cannot evaluate this statically" bail-out — otherwise
+ * any embedded code containing `${` (very common in template-heavy
+ * funcs) would be silently preserved as opaque raw code and never
+ * round-trip properly through the SelfBuilder.
+ *
+ * Handles any backslash depth: `\$`, `\\$`, `\\\$`, ... — only an EVEN
+ * number of preceding backslashes means the `$` is unescaped.
+ *
+ * @param {string} raw
+ * @returns {boolean}
+ * @private
+ */
+function _sbHasTemplateInterpolation(raw) {
+  for (let i = 0; i < raw.length - 1; i++) {
+    if (raw[i] === '$' && raw[i + 1] === '{') {
+      let bsCount = 0
+      let j = i - 1
+      while (j >= 0 && raw[j] === '\\') { bsCount++; j-- }
+      if (bsCount % 2 === 0) return true
+    }
+  }
+  return false
+}
+
+/**
  * Parse a value expression (literal, object, array) into a JSON-safe
  * JavaScript value. Returns _SB_CODE when the expression contains any
  * runtime evaluation (identifier, call, template interpolation, ...).
@@ -23096,15 +23212,21 @@ function _sbParseValue(src) {
   if (/^-?\d+(?:\.\d+)?$/.test(src)) return Number(src)
   if ((src[0] === "'" && src[src.length - 1] === "'") ||
       (src[0] === '"' && src[src.length - 1] === '"')) {
-    return src.slice(1, -1)
-      .replace(/\\n/g, '\n').replace(/\\t/g, '\t')
-      .replace(/\\r/g, '\r').replace(/\\'/g, "'")
-      .replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+    // Single-pass left-to-right unescape. The old chained-replace form
+    // double-processed `\\n` and produced an orphan backslash — the
+    // root cause of the "Invalid or unexpected token" crash on nested
+    // Emb inline-code.
+    return _sbUnescapeStringLiteral(src.slice(1, -1))
   }
   if (src[0] === '`' && src[src.length - 1] === '`') {
     const inner = src.slice(1, -1)
-    if (inner.includes('${')) return _SB_CODE
-    return inner
+    // Only bail out on genuinely dynamic interpolation. Escaped `\${`
+    // is a literal and must round-trip as text.
+    if (_sbHasTemplateInterpolation(inner)) return _SB_CODE
+    // Template literals and string literals share the same escape
+    // grammar (backslash + n / t / r / ` / $ / \\), so the same
+    // single-pass unescaper works for both.
+    return _sbUnescapeStringLiteral(inner)
   }
   if (src.startsWith('{') && src.endsWith('}')) {
     const inner = src.slice(1, -1).trim()
