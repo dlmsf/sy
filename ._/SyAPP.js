@@ -15371,7 +15371,61 @@ function levenshteinDistance(str1, str2) {
       const re = new RegExp(
         `(?:["']?name["']?)\\s*:\\s*(?:\\\\?)*(["'])${nameEsc}(?:\\\\?)*\\1`
       );
-      return re.test(callBody);
+      // ------------------------------------------------------------------
+      // TEMPLATE-LITERAL STRIPPING
+      // ------------------------------------------------------------------
+      // Previously this regex ran over the WHOLE call body, including
+      // the content of any nested `code:` template literal. That made
+      // an OUTER `this.Emb(...)` call whose nested `code:` blob
+      // contained `name: "<target>"` look like a DIRECT match for the
+      // target itself — so the outer call was replaced with the inner
+      // snippet, structurally corrupting the file.
+      //
+      // We now scrub template-literal contents before testing, so only
+      // `name:` values that belong DIRECTLY to THIS call's config
+      // object can match. Nested calls are still reachable — via the
+      // explicit recursive descent into `code:` in `_embFindCall`.
+      // ------------------------------------------------------------------
+      return re.test(this._embStripTemplateContents(callBody));
+    };
+
+    /**
+     * Replace every backtick-delimited template literal in `src` with
+     * an empty placeholder, so a `name:` sitting INSIDE a nested
+     * `code:` template can never be mistaken for a direct property of
+     * the enclosing call's config object.
+     *
+     * Escape handling: `\`` does not end a template, `\\` consumes two
+     * characters. Template interpolations (`${...}`) are treated as
+     * ordinary template content and are stripped along with the rest
+     * of the literal, which is exactly the conservative behaviour we
+     * want here — a name inside `${...}` is not a direct config key
+     * either.
+     * @private
+     */
+    this._embStripTemplateContents = (src) => {
+      let out = '';
+      let i = 0;
+      const n = String(src || '').length;
+      const s = String(src || '');
+      while (i < n) {
+        if (s[i] === '`') {
+          // Emit an inert placeholder so positions stay roughly aligned
+          // for any downstream diagnostics, then skip to the matching
+          // close backtick.
+          out += '""';
+          i++;
+          while (i < n) {
+            if (s[i] === '\\') { i += 2; continue; }
+            if (s[i] === '`') { i++; break; }
+            i++;
+          }
+        } else {
+          out += s[i];
+          i++;
+        }
+      }
+      return out;
     };
 
     /**
@@ -19930,9 +19984,52 @@ function _genFuncJS(state, syappRelPath) {
           break
         }
         case 'emb': {
+          // ------------------------------------------------------------------
+          // SAVE MODE HONORING (nested Emb recursion fix)
+          // ------------------------------------------------------------------
+          // The widget's saveMode decides whether the embed should be
+          // committed INLINE (full class source in `code:`) or by PATH
+          // (`filePath:` reference). A widget produced to a temp file
+          // is still perfectly able to embed itself INLINE — `source`
+          // and `saveMode` are orthogonal axes:
+          //
+          //     source   = where the widget's current definition lives
+          //                ('file' = produced on disk, 'code' = pasted
+          //                inline, 'none' = empty)
+          //
+          //     saveMode = how the widget wants to be embedded in the
+          //                parent file ('inline' = full code blob,
+          //                'path' = file reference)
+          //
+          // Previously this branch emitted `filePath` whenever it was
+          // present, ignoring `saveMode` entirely. That forced every
+          // nested Emb to fall back to path mode on export, even when
+          // the user had explicitly selected inline mode at every
+          // level — which is exactly the "second emb loses inline
+          // mode" symptom.
+          // ------------------------------------------------------------------
           const cfg = { name: it.name }
-          if (it.filePath) cfg.filePath = it.filePath
-          if (it.code) cfg.code = it.code
+          const mode = (it.saveMode === 'path') ? 'path' : 'inline'
+          if (mode === 'inline') {
+            if (it.code && String(it.code).trim()) {
+              cfg.code = it.code
+            } else if (it.filePath) {
+              // Inline requested but no code available yet — fall back
+              // to path so we still emit a usable reference.
+              cfg.filePath = it.filePath
+            }
+          } else {
+            if (it.filePath) {
+              cfg.filePath = it.filePath
+            } else if (it.code && String(it.code).trim()) {
+              // Path requested but no filePath available yet — fall
+              // back to inline so the produced source is not lost.
+              cfg.code = it.code
+            }
+          }
+          // Persist the resolved mode so round-tripping through the
+          // parser keeps the user's choice stable across re-exports.
+          cfg.saveMode = mode
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
           break
@@ -20179,12 +20276,20 @@ function _sbMakeItemForMethod(methodName, id) {
       // code string, a file path, or left empty — in which case the
       // runtime this.Emb() call falls back to its two-button dropdown
       // (Self Build + File Picker).
+      //
+      // DEFAULT saveMode is 'inline' — this matches the runtime
+      // this.Emb() default (see the `boot` object built in
+      // SyAPP_Func.Emb, which sets `saveMode: initialSource === 'class'
+      // ? 'class' : 'inline'`). Using 'path' here was inconsistent
+      // with the runtime and forced every freshly created Emb to fall
+      // back to path mode on its first export, breaking the recursive
+      // inline behaviour for any nested Emb chain.
       return {
         ...base,
         name: 'emb_' + id,
         filePath: '',
         code: '',
-        saveMode: 'path',
+        saveMode: 'inline',
         dropdown: {}
       }
     }
@@ -20525,37 +20630,72 @@ class SelfBuilder extends SyAPP_Func {
       }
 
       try {
-        const hostFile = this._embResolveReturnHostFile(caller);
-        if (hostFile) {
-          const snippetState = {
-            source: 'file',
-            filePath: producedPath,
-            code: producedInlineCode,
-            saveMode: returnSaveMode
-          };
-          const snippetCfg = { name: caller.embName };
+        // ------------------------------------------------------------------
+        // NESTED SELF BUILD SUPPORT
+        // ------------------------------------------------------------------
+        // When this SelfBuilder was launched from an Emb widget that
+        // lives INSIDE another SelfBuilder's canvas (the
+        // 🧩 Self Build → new emb → 🧩 Self Build flow), the widget's
+        // `this.Emb(...)` call does NOT exist in any host file yet — it
+        // is still an in-memory item inside the outer SelfBuilder's
+        // State, and the outer SelfBuilder will only write that item
+        // into test.js when IT finishes.
+        //
+        // In that case, `_embReplaceExistingCall(hostFile, ...)` would
+        // inevitably fail to find the widget and the user would see the
+        // misleading "Could not find this.Emb(...) in test.js" warning,
+        // even though the widget update itself already went through
+        // `Storages.Set()` above and is perfectly correct.
+        //
+        // We therefore DETECT the SelfBuilder caller explicitly and
+        // skip the file-write entirely. The widget's updated source is
+        // already persisted via `Storages.Set` and the outer
+        // SelfBuilder's `_renderItem('emb')` syncs that storage back
+        // onto the item — so the produced func is baked into test.js
+        // automatically when the OUTER Self Build finishes. No
+        // additional plumbing is required, and no confusing warning
+        // is surfaced.
+        // ------------------------------------------------------------------
+        const isSelfBuilderCaller = caller.returnTo === '__selfbuilder__';
 
-          const snippet = (returnSaveMode === 'inline')
-            ? ownerFunc && typeof ownerFunc._embSnippetInline === 'function'
-              ? ownerFunc._embSnippetInline(snippetState, snippetCfg)
-              : ''
-            : ownerFunc && typeof ownerFunc._embSnippetPath === 'function'
-              ? ownerFunc._embSnippetPath(snippetState, snippetCfg)
-              : '';
+        if (isSelfBuilderCaller) {
+          this.Alert(id,
+            `✓ Embedded "${caller.embName}" updated — ` +
+            `the produced func will be committed to the host file when the outer Self Build finishes.`,
+            { duration: 4000 });
+        } else {
+          const hostFile = this._embResolveReturnHostFile(caller);
+          if (hostFile) {
+            const snippetState = {
+              source: 'file',
+              filePath: producedPath,
+              code: producedInlineCode,
+              saveMode: returnSaveMode
+            };
+            const snippetCfg = { name: caller.embName };
 
-          if (snippet && ownerFunc && typeof ownerFunc._embReplaceExistingCall === 'function') {
-            const existing = fs.readFileSync(hostFile, 'utf8');
-            const replaced = ownerFunc._embReplaceExistingCall(existing, caller.embName, snippet);
-            if (replaced !== null) {
-              fs.writeFileSync(hostFile, replaced);
-              this.Alert(id,
-                `📝 Emb("${caller.embName}") updated in ${path.basename(hostFile)} (${returnSaveMode})`,
-                { duration: 4000 });
-            } else {
-              this.Alert(id,
-                `⚠ Could not find this.Emb("${caller.embName}") in ${path.basename(hostFile)}. ` +
-                `Change applied to widget only.`,
-                { duration: 6000 });
+            const snippet = (returnSaveMode === 'inline')
+              ? ownerFunc && typeof ownerFunc._embSnippetInline === 'function'
+                ? ownerFunc._embSnippetInline(snippetState, snippetCfg)
+                : ''
+              : ownerFunc && typeof ownerFunc._embSnippetPath === 'function'
+                ? ownerFunc._embSnippetPath(snippetState, snippetCfg)
+                : '';
+
+            if (snippet && ownerFunc && typeof ownerFunc._embReplaceExistingCall === 'function') {
+              const existing = fs.readFileSync(hostFile, 'utf8');
+              const replaced = ownerFunc._embReplaceExistingCall(existing, caller.embName, snippet);
+              if (replaced !== null) {
+                fs.writeFileSync(hostFile, replaced);
+                this.Alert(id,
+                  `📝 Emb("${caller.embName}") updated in ${path.basename(hostFile)} (${returnSaveMode})`,
+                  { duration: 4000 });
+              } else {
+                this.Alert(id,
+                  `⚠ Could not find this.Emb("${caller.embName}") in ${path.basename(hostFile)}. ` +
+                  `Change applied to widget only.`,
+                  { duration: 6000 });
+              }
             }
           }
         }
@@ -22294,13 +22434,47 @@ class SelfBuilder extends SyAPP_Func {
           try {
             const embStorageKey = `emb_${it.name}`
             const st = this.Storages.Get(id, embStorageKey)
-            if (st && typeof st === 'object') {
-              if (st.source === 'file' && st.filePath) {
-                if (it.filePath !== st.filePath) it.filePath = st.filePath
-                if (it.code !== '') it.code = ''
-              } else if (st.source === 'code' && st.code) {
-                if (it.code !== st.code) it.code = st.code
+            if (st && typeof st === 'object' && st.source !== 'none') {
+              // ------------------------------------------------------------------
+              // SAVE MODE HONORING (nested Emb recursion fix)
+              // ------------------------------------------------------------------
+              // `source` and `saveMode` are ORTHOGONAL concepts:
+              //
+              //     source   = WHERE the widget's current definition lives
+              //                ('file' = produced on disk, 'code' = pasted
+              //                inline, 'none' = empty)
+              //
+              //     saveMode = HOW the widget wants to be embedded in
+              //                the PARENT file ('inline' = full code
+              //                blob, 'path' = file reference)
+              //
+              // A widget produced to a temp file (source: 'file') can
+              // still want to be embedded INLINE in its parent — which
+              // is precisely what every nested Emb → Self Build → Emb
+              // chain requires, because the produced file is a build
+              // artefact that must not leak into the parent source.
+              //
+              // The old code keyed the sync off `source`, so a widget
+              // produced to a temp file had its `code` field wiped and
+              // its `filePath` set — forcing the OUTER SelfBuilder to
+              // emit the inner widget as `filePath:` on export, which
+              // is the "nested Embs lose inline mode" bug.
+              //
+              // We now key off `saveMode` instead, so every level of
+              // nesting inherits the mode the user explicitly picked
+              // at every level — recursively, at any depth.
+              // ------------------------------------------------------------------
+              const mode = st.saveMode === 'path' ? 'path' : 'inline'
+              if (mode === 'inline') {
+                if (typeof st.code === 'string' && st.code.trim()) {
+                  if (it.code !== st.code) it.code = st.code
+                }
                 if (it.filePath !== '') it.filePath = ''
+                if (it.saveMode !== 'inline') it.saveMode = 'inline'
+              } else {
+                if (st.filePath && it.filePath !== st.filePath) it.filePath = st.filePath
+                if (it.code !== '') it.code = ''
+                if (it.saveMode !== 'path') it.saveMode = 'path'
               }
             }
           } catch (_) { /* sync is best-effort — never break render */ }
@@ -23286,12 +23460,39 @@ function _sbCallToItem(call, sessionVar) {
       // that would stop round-tripping at depth ≥ 2.
       const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {};
       if (cfg === null) return null;
+
+      // ------------------------------------------------------------------
+      // saveMode INFERENCE (nested Emb recursion fix)
+      // ------------------------------------------------------------------
+      // Old code defaulted `saveMode` to 'path' whenever the config
+      // object did not carry an explicit `saveMode`. That meant an
+      // Emb emitted as `{ name, code: "<produced>" }` (inline) got
+      // re-parsed as PATH mode, and every subsequent export wrote it
+      // out as `filePath:` — losing the inline source entirely.
+      //
+      // Inference rules, in priority order:
+      //   1. Explicit `cfg.saveMode` of 'inline' or 'path' → trust it.
+      //   2. `code` present, no `filePath`               → 'inline'.
+      //   3. `filePath` present, no `code`               → 'path'.
+      //   4. Neither present                             → 'inline'
+      //      (matches the runtime this.Emb() default and is a safe
+      //      no-op since there is nothing to embed either way).
+      // ------------------------------------------------------------------
+      let inferredMode = 'inline';
+      if (cfg.saveMode === 'inline' || cfg.saveMode === 'path') {
+        inferredMode = cfg.saveMode;
+      } else if (cfg.filePath && !cfg.code) {
+        inferredMode = 'path';
+      } else if (cfg.code && !cfg.filePath) {
+        inferredMode = 'inline';
+      }
+
       return {
         type: 'emb',
         name: typeof cfg.name === 'string' ? cfg.name : `emb_${_sbNid()}`,
         filePath: typeof cfg.filePath === 'string' ? cfg.filePath : '',
         code: typeof cfg.code === 'string' ? cfg.code : '',
-        saveMode: typeof cfg.saveMode === 'string' ? cfg.saveMode : 'path',
+        saveMode: inferredMode,
         dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
           ? cfg.dropdown
           : {}
