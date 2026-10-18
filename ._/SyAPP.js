@@ -14468,6 +14468,55 @@ function levenshteinDistance(str1, str2) {
         });
         this.Storages.Set(id, storageKey, state);
         this.FileManager.ClearSelection(id, pickerName);
+
+        // ------------------------------------------------------------------
+        // CLEAR MUST ALSO PURGE THE PRODUCED FUNC FROM EVERY RECOVERY PATH.
+        //
+        // Otherwise the next 🧩 Self Build would find the still-persisted
+        // produced func (either in the owner func's in-memory storage, or
+        // in the disk-backed emb record written by a previous
+        // Save & Return) and reload it — so the user would see the "last
+        // of the selected file" even after Clear.
+        //
+        // There are three recovery sources that must be wiped:
+        //   1. the owner func's in-memory entry under `emb_<name>`
+        //      for the CURRENT session — already wiped by the
+        //      `state` reset above, but a stale entry may still exist
+        //      for a DIFFERENT owner func;
+        //   2. the disk record keyed by (outerFilePath, diskKey);
+        //   3. any stale disk records written under alternative keys
+        //      (legacy `__selfbuilder__::<name>` and bare `<name>`).
+        //
+        // After all three are gone, the next Self Build starts from a
+        // truly blank canvas.
+        // ------------------------------------------------------------------
+        try {
+          const syapp = this._syappInstance;
+          const session = syapp && syapp.Sessions.get(syapp.MainSessionID);
+          const sessionId = session ? session.UniqueID : id;
+
+          // 1) Wipe the owner's in-memory entry for EVERY registered func
+          //    (the widget may have been written back into a different
+          //    owner when the caller resolved recursively).
+          if (syapp && syapp.Funcs) {
+            for (const [, f] of syapp.Funcs) {
+              try {
+                if (f && f.Storages) {
+                  f.Storages.Delete(sessionId, storageKey);
+                }
+              } catch (_) {}
+            }
+          }
+        } catch (_) {}
+
+        // 2) + 3) Wipe every known disk record for this widget.
+        try {
+          if (outerFilePath) {
+            _embDiskClear(outerFilePath, diskKey);
+            _embDiskClear(outerFilePath, `__selfbuilder__::${cfg.name}`);
+            _embDiskClear(outerFilePath, String(cfg.name || ''));
+          }
+        } catch (_) {}
       }
 
       if (curProps[P.saveAsPath]) {
@@ -14626,6 +14675,11 @@ function levenshteinDistance(str1, str2) {
               await this._syappInstance._ensureEmbSyappInit(inst, { embeddedIn: this.Name });
             } catch (_) { /* init failure never blocks Enter Func */ }
 
+            // NEW: Register the embedded func's Linked funcs so any
+            // button pointing to one of them by name (e.g.
+            // `path: 'otherfunc'`) navigates correctly via LoadScreen.
+            try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
+
             // Record the return target for this embedded func so its
             // default "← Return" button knows where to go back to.
             this._syappInstance._embReturnTargets =
@@ -14687,6 +14741,9 @@ function levenshteinDistance(str1, str2) {
                   if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
                 }
                 this._syappInstance.Funcs.set(realName, inst);
+                // NEW: register the embedded func's Linked funcs so
+                // buttons pointing to them by name work correctly.
+                try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
               }
             }
           } catch (e) {
@@ -14738,6 +14795,9 @@ function levenshteinDistance(str1, str2) {
                   if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
                 }
                 this._syappInstance.Funcs.set(realName, inst);
+                // NEW: register the embedded func's Linked funcs so
+                // buttons pointing to them by name work correctly.
+                try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
               }
             }
           } catch (e) {
@@ -14831,6 +14891,9 @@ function levenshteinDistance(str1, str2) {
                   if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
                 }
                 this._syappInstance.Funcs.set(realName, inst);
+                // NEW: register the embedded func's Linked funcs so
+                // buttons pointing to them by name work correctly.
+                try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
               }
             }
           } catch (e) {
@@ -15815,6 +15878,77 @@ function levenshteinDistance(str1, str2) {
     };
 
     /**
+     * Register the Linked functions of an embedded func so any button
+     * pointing to them by name works via LoadScreen.
+     *
+     * When a func is imported through this.Emb() and it declares
+     * `linked: [OtherFunc, ...]`, those linked funcs are NOT
+     * automatically registered in SyAPP.Funcs — only the top-level
+     * func is. As a result, a button like
+     *
+     *     this.Button(id, { name: 'Go', path: 'otherfunc' })
+     *
+     * would silently navigate to the notfounded screen, because
+     * `SyAPP.Funcs.has('otherfunc')` is false.
+     *
+     * This helper walks the func's Linked array (recursively, with
+     * cycle detection) and registers every linked func in
+     * SyAPP.Funcs, preserving UserStorage/AlertStorage from any
+     * previously-registered instance of the same func. It also adds
+     * every registered name to `_embRegisteredFuncs`, which enables
+     * LoadScreen's defensive SyAPPInit backstop — so each linked
+     * func's own SyAPPInit hook runs (once) the first time it is
+     * navigated to, exactly like a normal func.
+     *
+     * This is what makes the standard SyAPP pattern
+     *
+     *     class MyFunc extends SyAPP.Func() {
+     *       constructor() {
+     *         super('myfunc', async (props) => { ... },
+     *               { linked: [OtherFunc] })
+     *       }
+     *     }
+     *
+     * work unchanged when MyFunc is loaded through this.Emb().
+     *
+     * @param {SyAPP_Func} instance - The imported top-level func instance.
+     * @private
+     */
+    this._embRegisterLinkedFuncs = (instance) => {
+      if (!instance || !Array.isArray(instance.Linked)) return;
+      const syapp = this._syappInstance;
+      if (!syapp) return;
+      const visited = new Set();
+
+      const register = (parentInstance) => {
+        if (!parentInstance || !Array.isArray(parentInstance.Linked)) return;
+        for (const linkedFunc of parentInstance.Linked) {
+          if (typeof linkedFunc !== 'function') continue;
+          let linkedInstance;
+          try {
+            linkedInstance = new linkedFunc();
+          } catch (_) { continue; }
+          if (!linkedInstance || !linkedInstance.Name) continue;
+
+          const linkedName = linkedInstance.Name;
+          if (visited.has(linkedName)) continue;
+          visited.add(linkedName);
+
+          if (!syapp.Funcs.has(linkedName)) {
+            linkedInstance._syappInstance = syapp;
+            syapp.Funcs.set(linkedName, linkedInstance);
+          }
+
+          try { syapp._embRegisteredFuncs.add(linkedName); } catch (_) {}
+
+          register(linkedInstance);
+        }
+      };
+
+      register(instance);
+    };
+
+    /**
      * Run the embedded func's raw build function with the PARENT's build
      * maps shared, so every Text/Button/Page/… call from the embedded
      * build lands directly on the current session's userBuild — making
@@ -15853,6 +15987,11 @@ function levenshteinDistance(str1, str2) {
           await this._syappInstance._ensureEmbSyappInit(instance, { embeddedIn: this.Name });
         } catch (_) { /* init failure never breaks inline render */ }
       }
+
+      // NEW: Register the embedded func's Linked funcs so any button
+      // in the inline-rendered build that points to a linked func by
+      // name (e.g. `path: 'otherfunc'`) works via LoadScreen.
+      try { this._embRegisterLinkedFuncs(instance); } catch (_) {}
 
       // Share the internal maps so the embedded build writes land on the
       // PARENT's userBuild for the same session id.
@@ -19792,8 +19931,37 @@ function _embDiskLoad(outerFilePath, embName) {
     if (j.source === 'file' && j.filePath && !fs.existsSync(j.filePath) && !j.code) {
       return null;
     }
+    // NEW: an explicit "cleared" record (source: 'none', no filePath,
+    // no code) must be honoured as an authoritative "no source" signal.
+    // Without this, a stale produced-func record with the same key
+    // could shadow the clear and the widget would resurrect the old
+    // func on the next process restart. Returning the cleared record
+    // lets this.Emb() restore the setup view cleanly.
     return j;
   } catch (_) { return null; }
+}
+
+/**
+ * Delete an emb widget's disk record entirely.
+ *
+ * Used by this.Emb()'s ✕ Clear handler to guarantee that no recovery
+ * path (owner in-memory storage, primary disk record, or a legacy
+ * alternative-key disk record) can resurrect a previously-produced
+ * func after the user explicitly cleared the widget.
+ *
+ * @param {string} outerFilePath - Absolute path of the host func file.
+ * @param {string} key - The disk key (either the namespaced form
+ *                       `<owner>::<name>` or a legacy alternative).
+ * @private
+ */
+function _embDiskClear(outerFilePath, key) {
+  try {
+    if (!outerFilePath) return;
+    const f = _embDiskFileFor(outerFilePath, key);
+    if (f && fs.existsSync(f)) {
+      try { fs.unlinkSync(f); } catch (_) {}
+    }
+  } catch (_) { /* best-effort */ }
 }
 
 /**
@@ -21701,6 +21869,59 @@ class SelfBuilder extends SyAPP_Func {
         let recoveredPath = null;
         let recoveredCode = null;
 
+        // ------------------------------------------------------------------
+        // AUTHORITATIVE CLEAR CHECK (before ANY recovery path).
+        //
+        // If the widget's CURRENT storage entry is an explicit "cleared"
+        // record (source: 'none', no filePath, no code), we MUST NOT
+        // recover anything — not from the owner's in-memory storage, not
+        // from the disk record, not from a file-system scan. This is
+        // what makes "✕ Clear Emb" stick: after Clear, the next
+        // 🧩 Self Build genuinely starts from a blank canvas, even if a
+        // stale produced-func record still exists somewhere.
+        //
+        // The widget's storage is the source of truth for "was this
+        // widget explicitly cleared?", because Clear() writes
+        // `source: 'none'` synchronously and that value survives
+        // across process restarts via the disk mirror.
+        // ------------------------------------------------------------------
+        let __widgetCleared = false;
+        try {
+          const syapp = this._syappInstance;
+          const session = syapp && syapp.Sessions.get(syapp.MainSessionID);
+          const sessionId = session ? session.UniqueID : id;
+          const storageKeyForRecovery = `emb_${this._embTarget}`;
+
+          const candidates = [];
+          if (syapp && syapp.Funcs) {
+            if (this._embReturnTo) {
+              const f = syapp.Funcs.get(this._embReturnTo);
+              if (f) candidates.push(f);
+            }
+            candidates.push(this);
+          } else {
+            candidates.push(this);
+          }
+
+          for (const cand of candidates) {
+            try {
+              const cur = cand.Storages.Get(sessionId, storageKeyForRecovery);
+              if (cur && cur.source === 'none' &&
+                  !cur.filePath && !cur.code) {
+                __widgetCleared = true;
+                break;
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
+
+        if (__widgetCleared) {
+          // Skip the entire recovery block — start blank.
+          // `recoveredState` stays null, and the caller falls through
+          // to the "fresh blank canvas" branch below.
+          throw new Error('__SB_EMB_CLEARED__');
+        }
+
         // Resolve the outer file path EXACTLY the way this.Emb() and
         // _embFinishAndReturn() do, so the disk key matches on both
         // write and read.
@@ -21831,7 +22052,16 @@ class SelfBuilder extends SyAPP_Func {
             );
           } catch (_) { /* give up silently — blank canvas below */ }
         }
-      } catch (_) { /* never let recovery break EMB entry */ }
+      } catch (err) {
+        // `__SB_EMB_CLEARED__` is an internal sentinel thrown above when
+        // the widget was explicitly cleared — falling here just means
+        // "skip recovery and start blank". Any other error is a genuine
+        // recovery failure and is also non-fatal (we simply show the
+        // blank canvas).
+        if (err && err.message !== '__SB_EMB_CLEARED__') {
+          /* silent — recovery is best-effort */
+        }
+      }
 
       if (recoveredState &&
           (recoveredState.items.length > 0 || recoveredState.name)) {
