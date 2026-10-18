@@ -14614,6 +14614,18 @@ function levenshteinDistance(str1, str2) {
             }
             this._syappInstance.Funcs.set(realName, inst);
 
+            // NEW: Register the func as embedded and ensure its
+            // SyAPPInit hook runs BEFORE LoadScreen navigates to it.
+            // Without this, Enter Func would load a func whose DB
+            // connection was never established, causing the classic
+            // "No active connection" error on the first Build().
+            // The call is awaited so the subsequent GotoNow → LoadScreen
+            // → Build() chain sees a fully-initialised func.
+            try {
+              this._syappInstance._embRegisteredFuncs.add(realName);
+              await this._syappInstance._ensureEmbSyappInit(inst, { embeddedIn: this.Name });
+            } catch (_) { /* init failure never blocks Enter Func */ }
+
             // Record the return target for this embedded func so its
             // default "← Return" button knows where to go back to.
             this._syappInstance._embReturnTargets =
@@ -15820,6 +15832,27 @@ function levenshteinDistance(str1, str2) {
     this._embRunInline = async (parentId, EmbClass, cfg) => {
       const instance = new EmbClass();
       instance._syappInstance = this._syappInstance;
+
+      // ------------------------------------------------------------------
+      // NEW: Run the embedded func's SyAPPInit hook if it hasn't already
+      // run for this func name.
+      //
+      // Without this, any startup work the func performs inside
+      // SyAPPInit (SyDB.Connect(), schema setup, migrations, etc.) is
+      // skipped for funcs loaded through Emb, and the first DB call in
+      // Build() throws:
+      //     "No active connection. Call SyDB.Connect() before using model methods."
+      //
+      // The call is awaited so `_rawBuild` (and any DB calls it makes)
+      // always sees a fully-initialised func. On repeated renders the
+      // global `_embSyappInitDone` set makes this a cheap no-op.
+      // ------------------------------------------------------------------
+      if (this._syappInstance && typeof this._syappInstance._ensureEmbSyappInit === 'function') {
+        try {
+          this._syappInstance._embRegisteredFuncs.add(instance.Name);
+          await this._syappInstance._ensureEmbSyappInit(instance, { embeddedIn: this.Name });
+        } catch (_) { /* init failure never breaks inline render */ }
+      }
 
       // Share the internal maps so the embedded build writes land on the
       // PARENT's userBuild for the same session id.
@@ -18601,6 +18634,148 @@ this.HUD = new TerminalHUD({
     /** @type {Map<string, Object<string, {func: string, props: Object}>>} */
     this._embReturnTargets = new Map();
 
+    // ============================================================
+    // EMB SYNAPP-INIT TRACKING
+    // ============================================================
+    // Funcs loaded via this.Emb() (either inline render through
+    // _embRunInline, or full-screen via ▶ Enter Func) are registered
+    // DYNAMICALLY — they never go through the standard SyAPP startup
+    // init process, and therefore their own SyAPPInit hook was silently
+    // skipped.
+    //
+    // Consequence: any startup work the embedded func performs inside
+    // SyAPPInit (SyDB.Connect(), schema setup, migrations, etc.) was
+    // never executed, and the FIRST Build() pass would touch the DB
+    // with no active connection — surfacing as
+    //     "No active connection. Call SyDB.Connect() before using model methods."
+    //
+    // The three fields + helper below close that gap:
+    //   • _embRegisteredFuncs   → every func name that Emb has ever
+    //                             registered (inline or Enter Func), so
+    //                             LoadScreen can defensively re-check.
+    //   • _embSyappInitDone     → func names whose SyAPPInit has already
+    //                             executed (success or final failure),
+    //                             making the check idempotent.
+    //   • _embSyappInitPromises → in-flight init promises, so parallel
+    //                             renders of the same func never race.
+    // ============================================================
+    /** @type {Set<string>} */
+    this._embRegisteredFuncs = new Set();
+    /** @type {Set<string>} */
+    this._embSyappInitDone = new Set();
+    /** @type {Map<string, Promise<void>>} */
+    this._embSyappInitPromises = new Map();
+
+    /**
+     * Ensure an embedded func's SyAPPInit hook has been executed.
+     *
+     * Behaviour contract:
+     *   • Runs SyAPPInit ONCE per func name, no matter how many times
+     *     that func is rendered, re-registered, or re-entered.
+     *   • Uses the SAME context shape as the standard main-func init,
+     *     so user code (e.g. `await SyDB.Connect(mainFuncName)`) runs
+     *     identically inside an embedded func and as a standalone main
+     *     func.
+     *   • Passes the embedded func's OWN name as `mainFuncName`, which
+     *     matches what the func would receive when loaded as the main
+     *     func — so `SyDB.Connect(mainFuncName)` connects to the same
+     *     DB the func uses when run standalone.
+     *   • Retries up to 3 times with exponential backoff to absorb
+     *     transient failures (a briefly unavailable DB, etc.).
+     *   • Never throws — a failed init is logged clearly, marked done,
+     *     and the func's Build runs anyway. If Build then fails because
+     *     it truly depends on init succeeding, the standard error screen
+     *     shows the real underlying error.
+     *
+     * @param {SyAPP_Func} instance - Instance of the embedded func.
+     * @param {Object} [options]
+     * @param {string} [options.embeddedIn] - Name of the embedding func.
+     * @returns {Promise<void>}
+     * @private
+     */
+    this._ensureEmbSyappInit = async (instance, options = {}) => {
+      if (!instance || typeof instance !== 'object') return;
+      if (!instance.Name) return;
+
+      // Already executed on THIS instance (covers the main func, whose
+      // init ran via the standard startup path).
+      if (instance._syappInitExecuted) return;
+
+      const name = String(instance.Name);
+
+      // Already handled globally → nothing to do.
+      if (this._embSyappInitDone.has(name)) return;
+
+      // Another invocation is already in flight → wait for it.
+      if (this._embSyappInitPromises.has(name)) {
+        return this._embSyappInitPromises.get(name);
+      }
+
+      const promise = (async () => {
+        try {
+          // No init hook → mark done and return.
+          if (typeof instance.SyAPPInit !== 'function') {
+            this._embSyappInitDone.add(name);
+            return;
+          }
+
+          // Build a context identical in shape to the main-init context,
+          // except that `mainFuncName` is the embedded func's own name
+          // and `_isEmbedded` is flagged.
+          const context = {
+            syapp: this,
+            mainFuncName: name,
+            mainFuncOriginalName: instance.OriginalName || name,
+            serverConfig: this.serverConfig,
+            config: this.serverConfig,
+            userConfig: this._userConfig,
+            funcs: this.Funcs,
+            sessions: this.Sessions,
+            mainSessionId: this.MainSessionID,
+            logMaster: LogMaster,
+            colorText: ColorText,
+            configManager: ConfigManager,
+            _isEmbedded: true,
+            _embeddedIn: options.embeddedIn || null
+          };
+
+          const maxAttempts = 3;
+          let lastError = null;
+          for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+              const result = instance.SyAPPInit(context);
+              if (result instanceof Promise) {
+                await result;
+              }
+              instance._syappInitExecuted = true;
+              this._embSyappInitDone.add(name);
+              return;
+            } catch (err) {
+              lastError = err;
+              if (attempt < maxAttempts - 1) {
+                // Exponential backoff: 200ms, then 400ms.
+                await new Promise(r => setTimeout(r, 200 * Math.pow(2, attempt)));
+              }
+            }
+          }
+
+          // All attempts failed → log clearly and mark done (no further
+          // retries this process). A rebuild of the current screen will
+          // still surface the underlying error from the func's Build().
+          console.error(
+            `[Emb syappInit] ${name} failed after ${maxAttempts} attempt(s):`,
+            lastError
+          );
+          this._embSyappInitDone.add(name);
+        } finally {
+          this._embSyappInitPromises.delete(name);
+        }
+      })();
+
+      this._embSyappInitPromises.set(name, promise);
+      return promise;
+    };
+
     // Discover routes from all functions (only if HTTP is enabled)
     if (this.serverConfig.enableHTTP) {
       this.discoverAllRoutes();
@@ -18676,7 +18851,30 @@ this.HUD = new TerminalHUD({
             targetFuncName = 'notfounded';
           }
         }
-        
+
+        // ------------------------------------------------------------------
+        // EMBEDDED-FUNC SYNAPP-INIT GUARANTEE (defensive backstop)
+        // ------------------------------------------------------------------
+        // Funcs registered via this.Emb() (inline render or ▶ Enter Func)
+        // skip the standard SyAPP startup init process, so their own
+        // SyAPPInit hook would never run. Both entry points already
+        // call `_ensureEmbSyappInit` directly, but this is a defensive
+        // backstop: any navigation to a func known to have been
+        // registered through Emb will re-check (and, if needed, run)
+        // its init BEFORE Build() executes. When init already ran, the
+        // check is a single Set lookup and returns immediately.
+        // ------------------------------------------------------------------
+        if (typeof targetFuncName === 'string' &&
+            this._embRegisteredFuncs &&
+            this._embRegisteredFuncs.has(targetFuncName)) {
+          const _embTargetFunc = this.Funcs.get(targetFuncName);
+          if (_embTargetFunc && typeof this._ensureEmbSyappInit === 'function') {
+            try {
+              await this._ensureEmbSyappInit(_embTargetFunc);
+            } catch (_) { /* init failure never blocks navigation */ }
+          }
+        }
+
         // Check if this is a refresh request and if the function allows it.
         //
         // A resize-driven redraw (config.props._resizeRedraw === true) is
