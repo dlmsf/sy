@@ -14336,16 +14336,34 @@ function levenshteinDistance(str1, str2) {
       const diskKey = `${this.Name}::${cfg.name}`;
 
       if (!this.Storages.Has(id, storageKey)) {
+        // Prefer `code` over `filePath` when BOTH are set: the inline
+        // code is the source of truth, while `filePath` only serves as
+        // the base-directory hint for resolving relative imports. The
+        // previous priority mislabelled `{ filePath, code }` snippets
+        // as "file" source and forced _embResolveClass through the file
+        // fallback even though the user had embedded inline code.
         const initialSource = cfg.funcClass ? 'class'
-                            : cfg.filePath  ? 'file'
                             : cfg.code      ? 'code'
+                            : cfg.filePath  ? 'file'
                             : 'none';
+
+        // Default save mode:
+        //   • class     → 'class'  (direct funcClass reference)
+        //   • file only → 'path'   (no inline code — path is the source)
+        //   • code      → 'inline' (DEFAULT when a file is picked)
+        // This is what makes a freshly-picked file start in INLINE mode,
+        // while an explicit path-only embedding still opens in PATH mode.
+        const initialSaveMode = initialSource === 'class'
+          ? 'class'
+          : (initialSource === 'file' && !cfg.code)
+            ? 'path'
+            : 'inline';
 
         const boot = {
           source: initialSource,
           filePath: cfg.filePath || null,
           code: cfg.code || null,
-          saveMode: initialSource === 'class' ? 'class' : 'inline',
+          saveMode: initialSaveMode,
           error: null,
           pickMode: false,
           editPanel: false
@@ -14716,10 +14734,45 @@ function levenshteinDistance(str1, str2) {
         if (v) {
           state.filePath = v;
           state.source = 'file';
-          state.saveMode = 'path';
+          state.saveMode = 'inline';
           state.error = null;
           state.editPanel = false;
+
+          // Extract the inline source IMMEDIATELY (same reasoning as
+          // the picker handler above). This ensures the widget reflects
+          // inline mode as soon as the path is committed, and gives the
+          // next _embResolveClass call real code to import.
+          try {
+            if (fs.existsSync(v)) {
+              const raw = fs.readFileSync(v, 'utf8');
+              state.code = this._embExtractInlineClass(raw);
+            } else {
+              state.code = null;
+            }
+          } catch (_) {
+            state.code = null;
+          }
+
           this.Storages.Set(id, storageKey, state);
+
+          if (outerFilePath) {
+            try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+          }
+
+          // Rewrite the host file's Emb call to the INLINE snippet when
+          // it is already present. Silent no-op otherwise.
+          try {
+            const __inlineHost = cfg.sourceFile ||
+              ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+            if (__inlineHost && state.code) {
+              const snippet = this._embSnippetInline(state, cfg);
+              const existing = fs.readFileSync(__inlineHost, 'utf8');
+              const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+              if (replaced !== null) {
+                fs.writeFileSync(__inlineHost, replaced);
+              }
+            }
+          } catch (_) {}
           // Auto-register the class so ▶ Enter Func can navigate to it.
           //
           // Always replace any previous registration with the freshly
@@ -14863,11 +14916,48 @@ function levenshteinDistance(str1, str2) {
           this.FileManager.ClearSelection(id, pickerName);
           state.filePath = picked[0];
           state.source = 'file';
-          state.saveMode = 'path';
+          state.saveMode = 'inline';
           state.pickMode = false;
           state.error = null;
           state.editPanel = false;
+
+          // Extract the inline source IMMEDIATELY so the widget reflects
+          // inline mode right away and the very next _embResolveClass
+          // call has real code to import. Any previously extracted code
+          // from a different pick is cleared first, so a stale blob can
+          // never leak into the new import.
+          try {
+            const raw = fs.readFileSync(picked[0], 'utf8');
+            state.code = this._embExtractInlineClass(raw);
+          } catch (_) {
+            state.code = null;
+          }
+
           this.Storages.Set(id, storageKey, state);
+
+          // Persist the new state to the disk mirror so a restart can
+          // recover the file in INLINE mode without re-scanning.
+          if (outerFilePath) {
+            try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+          }
+
+          // If the host file already contains this Emb call, rewrite
+          // it to the INLINE snippet right now. This is a no-op when
+          // the widget lives inside a SelfBuilder canvas that has not
+          // been exported yet (the widget state is still correct and
+          // will be baked in on the next export).
+          try {
+            const __inlineHost = cfg.sourceFile ||
+              ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+            if (__inlineHost && state.code) {
+              const snippet = this._embSnippetInline(state, cfg);
+              const existing = fs.readFileSync(__inlineHost, 'utf8');
+              const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+              if (replaced !== null) {
+                fs.writeFileSync(__inlineHost, replaced);
+              }
+            }
+          } catch (_) {}
 
           // Auto-register the picked class so Enter Func can navigate
           // to its real name immediately.
@@ -15128,7 +15218,12 @@ function levenshteinDistance(str1, str2) {
       };
       const tryCode = async () => {
         if (!state.code || !String(state.code).trim()) return null;
-        try { return await this._embImportCode(state.code); }
+        try {
+          // Pass the ORIGINAL file path (when known) so relative imports
+          // inside the inline code resolve against the real project
+          // directory instead of `os.tmpdir()/syapp_emb/`.
+          return await this._embImportCode(state.code, state.filePath || null);
+        }
         catch (e) { state.error = e.message || String(e); return null; }
       };
 
@@ -15206,7 +15301,7 @@ function levenshteinDistance(str1, str2) {
      * @returns {Promise<Function>}
      * @private
      */
-    this._embImportCode = async (code) => {
+    this._embImportCode = async (code, sourceFile = null) => {
       const dir = path.join(os.tmpdir(), 'syapp_emb');
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       const tmp = path.join(
@@ -15215,6 +15310,48 @@ function levenshteinDistance(str1, str2) {
       );
 
       let source = this._embExtractInlineClass(String(code));
+
+      // ------------------------------------------------------------------
+      // REWRITE RELATIVE IMPORTS against the ORIGINAL source directory
+      // ------------------------------------------------------------------
+      // The temp .mjs file lives under `os.tmpdir()/syapp_emb/`, so any
+      // RELATIVE import inside it (`./Config/Config.js`, `../SyDB.js`, …)
+      // would resolve against that temp dir instead of the real project
+      // directory — producing the classic error:
+      //
+      //     Cannot find module '/tmp/syapp_emb/Config/Config.js'
+      //     imported from /tmp/syapp_emb/emb_<ts>_<rand>.mjs
+      //
+      // We therefore rewrite ONLY the relative specifiers (leading `./`
+      // or `../`) to absolute `file://` URLs anchored at the ORIGINAL
+      // source file's directory. Bare package names, absolute paths and
+      // `file:` URLs resolve identically from anywhere, so they are left
+      // completely untouched.
+      //
+      // `sourceFile` is the file the inline code was originally loaded
+      // from (via 📁 Pick File or ✎ File path). When it is unknown —
+      // e.g. the user pasted raw code — no rewriting is performed and
+      // the caller is expected to provide self-contained code.
+      // ------------------------------------------------------------------
+      if (sourceFile) {
+        const absSource = path.isAbsolute(sourceFile)
+          ? sourceFile
+          : path.resolve(process.cwd(), sourceFile);
+        const srcDir = path.dirname(absSource);
+        const rewriteSpecifier = (spec) => {
+          if (!spec) return spec;
+          if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+          const absTarget = path.resolve(srcDir, spec);
+          return url.pathToFileURL(absTarget).href;
+        };
+        source = source
+          .replace(/(\bfrom\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+            return kw + q + rewriteSpecifier(spec) + q;
+          })
+          .replace(/(\bimport\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+            return kw + q + rewriteSpecifier(spec) + q;
+          });
+      }
 
       source = `import SyAPP from ${JSON.stringify(import.meta.url)};\n` + source;
 
@@ -16089,14 +16226,36 @@ function levenshteinDistance(str1, str2) {
         .replace(/`/g, '\\`')
         .replace(/\$\{/g, '\\${');
 
-      return [
+      // ------------------------------------------------------------------
+      // Emit `filePath` ALONGSIDE `code` when it is known.
+      //
+      // The filePath is NOT used to load the func (the `code` field is
+      // the source of truth in inline mode) — it is used ONLY as the
+      // anchor directory for resolving any RELATIVE imports inside the
+      // inline code. Without it, a freshly booted process has no way to
+      // know where `./Config/Config.js` and `../SyDB.js` should resolve,
+      // so they end up resolving against `os.tmpdir()/syapp_emb/` and
+      // fail with:
+      //
+      //   Cannot find module '/tmp/syapp_emb/Config/Config.js'
+      //   imported from /tmp/syapp_emb/emb_<ts>_<rand>.mjs
+      //
+      // Non-relative imports (bare names / absolute paths) are unaffected
+      // either way, so this is safe for hand-pasted self-contained code
+      // as well.
+      // ------------------------------------------------------------------
+      const lines = [
         `await this.Emb(id, {`,
-        `  name: ${JSON.stringify(cfg.name)},`,
-        '  code: `',
-        safe,
-        '  `',
-        `})`
-      ].join('\n');
+        `  name: ${JSON.stringify(cfg.name)},`
+      ];
+      if (state.filePath) {
+        lines.push(`  filePath: ${JSON.stringify(state.filePath)},`);
+      }
+      lines.push('  code: `');
+      lines.push(safe);
+      lines.push('  `');
+      lines.push(`})`);
+      return lines.join('\n');
     };
 
     // --------------------------- JavaScript Runner / Explorer ---------------------------
