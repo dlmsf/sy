@@ -13997,18 +13997,23 @@ function levenshteinDistance(str1, str2) {
       // no per-session state, no alerts, no build-map access.
       // ------------------------------------------------------------------
       if (initMode) {
+        const embOverride = syapp && Array.isArray(syapp._embInitProcessArgs)
+          ? syapp._embInitProcessArgs
+          : null;
+        const effectiveCliArgs = embOverride !== null ? embOverride : cliArgs;
+
         const args = [];
         for (let i = 0; i < opts.required.length; i++) {
           const spec = opts.required[i];
           if (!spec || !spec.name) continue;
-          const v = cliArgs[i] !== undefined
-            ? cliArgs[i]
+          const v = effectiveCliArgs[i] !== undefined
+            ? effectiveCliArgs[i]
             : spec.defaultValue;
           args.push(v);
           if (!(spec.name in args)) args[spec.name] = v;
         }
-        for (let i = opts.required.length; i < cliArgs.length; i++) {
-          args.push(cliArgs[i]);
+        for (let i = opts.required.length; i < effectiveCliArgs.length; i++) {
+          args.push(effectiveCliArgs[i]);
         }
         try {
           await handler(args);
@@ -14266,15 +14271,8 @@ function levenshteinDistance(str1, str2) {
         code: undefined,
         funcClass: undefined,
         sourceFile: undefined,
-        // autoRun is OFF by default: since ▶ Enter Func now performs a
-        // real navigation, running the embedded build INLINE would
-        // duplicate its content on the parent screen (which is exactly
-        // the "still loading in the main func" symptom). Callers that
-        // genuinely want the old inline behaviour can pass
-        // `autoRun: true` explicitly.
+        args: [],
         autoRun: false,
-        // When false, no "← Return" button is injected into the
-        // embedded func. Default true so every Emb() gets one.
         showReturnButton: true,
         dropdown: {
           up_buttontext: '◈ Embed',
@@ -14300,6 +14298,12 @@ function levenshteinDistance(str1, str2) {
         saveAsInline:    `${nsKey}_saveinline`,
         editFilePath:    `${nsKey}_editfilepath`,
         editCode:        `${nsKey}_editcode`,
+        argsAdd:         `${nsKey}_argsadd`,
+        argsClear:       `${nsKey}_argsclear`,
+        argsDelPrefix:   `${nsKey}_argsdel_`,
+        argsEditPrefix:  `${nsKey}_argsedit_`,
+        argsEditCommit:  `${nsKey}_argseditcommit`,
+        restartFunc:     `${nsKey}_restartfunc`,
         enterFunc:       `${nsKey}_enterfunc`,
         writeSource:     `${nsKey}_writesource`,
         toggleEditPanel: `${nsKey}_toggleeditpanel`
@@ -14404,7 +14408,8 @@ function levenshteinDistance(str1, str2) {
           saveMode: initialSaveMode,
           error: null,
           pickMode: false,
-          editPanel: false
+          editPanel: false,
+          args: Array.isArray(cfg.args) ? cfg.args.slice() : []
         };
 
         // Step 1 — disk record keyed by (outer file, owner func, widget
@@ -14419,6 +14424,7 @@ function levenshteinDistance(str1, str2) {
             boot.saveMode = (disk.saveMode === 'inline' || disk.saveMode === 'path')
               ? disk.saveMode
               : 'inline';
+            if (Array.isArray(disk.args)) boot.args = disk.args.slice();
           }
         }
 
@@ -14520,7 +14526,7 @@ function levenshteinDistance(str1, str2) {
         Object.assign(state, {
           source: 'none', filePath: null, code: null,
           saveMode: null, error: null, pickMode: false,
-          editPanel: false
+          editPanel: false, args: []
         });
         this.Storages.Set(id, storageKey, state);
         this.FileManager.ClearSelection(id, pickerName);
@@ -14680,6 +14686,149 @@ function levenshteinDistance(str1, str2) {
       // render a default "← Return" button pointing back at this
       // parent func. This is what makes Enter Func → Return Func work
       // out of the box for any func produced by this.Emb().
+      // ---------------- Args handlers (persist + auto-restart) ----------------
+      const __embAutoRestart = async () => {
+        if (state.source === 'none') return;
+        const cls = await this._embResolveClass(state, cfg);
+        if (!cls || !this._syappInstance) return;
+
+        let realName = (typeof cls.name === 'string' && cls.name) ? cls.name : null;
+        let instance = null;
+        try { instance = new cls(); } catch (_) {}
+        if (instance && instance.Name) realName = instance.Name;
+        if (!realName) realName = cfg.name;
+
+        const inst = instance || new cls();
+        inst._syappInstance = this._syappInstance;
+        const previous = this._syappInstance.Funcs.get(realName);
+        if (previous) {
+          if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
+          if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
+        }
+        this._syappInstance.Funcs.set(realName, inst);
+
+        try {
+          this._syappInstance._embRegisteredFuncs.add(realName);
+          this._syappInstance._embSyappInitDone.delete(realName);
+          this._syappInstance._embSyappInitPromises.delete(realName);
+          await this._syappInstance._ensureEmbSyappInit(inst, {
+            embeddedIn: this.Name,
+            args: Array.isArray(state.args) ? state.args.slice() : []
+          });
+        } catch (_) {}
+
+        try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
+      };
+
+      // Write args back to a host FILE only when this Emb widget lives in
+      // a real, on-disk func file. Inside SelfBuilder the widget source is
+      // produced from the builder State (via _genFuncJS), so file-level
+      // persistence would fight the SelfBuilder's own export and get
+      // clobbered on the next Save.
+      const __embPersistArgsToHost = () => {
+        if (this.Name === '__selfbuilder__') return false;
+        const hostFile = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+        if (!hostFile) return false;
+        try {
+          const snippet = (state.saveMode === 'path')
+            ? this._embSnippetPath(state, cfg)
+            : this._embSnippetInline(state, cfg);
+          const existing = fs.readFileSync(hostFile, 'utf8');
+          const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+          if (replaced !== null) {
+            fs.writeFileSync(hostFile, replaced);
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+
+      if (curProps[P.argsAdd] === 'start') {
+        delete curProps[P.argsAdd];
+        this.WaitInput(id, {
+          question: 'New arg: ', path: this.Name,
+          props: { ...passProps, [P.argsAdd]: 'commit' }
+        });
+        return null;
+      }
+      if (curProps[P.argsAdd] === 'commit') {
+        delete curProps[P.argsAdd];
+        const v = String(curProps.inputValue || '');
+        delete curProps.inputValue;
+        if (v !== '') {
+          if (!Array.isArray(state.args)) state.args = [];
+          state.args.push(v);
+          this.Storages.Set(id, storageKey, state);
+          if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+          __embPersistArgsToHost();
+          try { await __embAutoRestart(); } catch (_) {}
+        }
+      }
+
+      if (curProps[P.argsClear]) {
+        delete curProps[P.argsClear];
+        state.args = [];
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+        __embPersistArgsToHost();
+        try { await __embAutoRestart(); } catch (_) {}
+      }
+
+      if (typeof curProps[P.argsEditCommit] === 'string') {
+        const idx = parseInt(curProps[P.argsEditCommit], 10);
+        delete curProps[P.argsEditCommit];
+        const v = String(curProps.inputValue || '');
+        delete curProps.inputValue;
+        if (!isNaN(idx) && Array.isArray(state.args) && idx >= 0 && idx < state.args.length) {
+          state.args[idx] = v;
+          this.Storages.Set(id, storageKey, state);
+          if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+          __embPersistArgsToHost();
+          try { await __embAutoRestart(); } catch (_) {}
+        }
+      }
+
+      for (const k of Object.keys(curProps)) {
+        if (k.startsWith(P.argsDelPrefix)) {
+          const idx = parseInt(k.slice(P.argsDelPrefix.length), 10);
+          delete curProps[k];
+          if (!isNaN(idx) && Array.isArray(state.args) && idx >= 0 && idx < state.args.length) {
+            state.args.splice(idx, 1);
+            this.Storages.Set(id, storageKey, state);
+            if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+            __embPersistArgsToHost();
+            try { await __embAutoRestart(); } catch (_) {}
+          }
+          break;
+        }
+      }
+      for (const k of Object.keys(curProps)) {
+        if (k.startsWith(P.argsEditPrefix)) {
+          const idx = parseInt(k.slice(P.argsEditPrefix.length), 10);
+          delete curProps[k];
+          if (!isNaN(idx) && Array.isArray(state.args) && idx >= 0 && idx < state.args.length) {
+            this.WaitInput(id, {
+              question: `Arg #${idx + 1} (current: ${JSON.stringify(state.args[idx])}): `,
+              path: this.Name,
+              props: { ...passProps, [P.argsEditCommit]: String(idx) }
+            });
+            return null;
+          }
+          break;
+        }
+      }
+
+      if (curProps[P.restartFunc]) {
+        delete curProps[P.restartFunc];
+        try {
+          await __embAutoRestart();
+          this.Alert(id, `↻ Restarted with ${(state.args || []).length} arg(s)`, { duration: 2000 });
+        } catch (e) {
+          this.Alert(id, `❌ Restart failed: ${e.message}`, { duration: 4000 });
+        }
+      }
+
       if (curProps[P.enterFunc]) {
         delete curProps[P.enterFunc];
         if (state.source !== 'none') {
@@ -14728,7 +14877,10 @@ function levenshteinDistance(str1, str2) {
             // → Build() chain sees a fully-initialised func.
             try {
               this._syappInstance._embRegisteredFuncs.add(realName);
-              await this._syappInstance._ensureEmbSyappInit(inst, { embeddedIn: this.Name });
+              await this._syappInstance._ensureEmbSyappInit(inst, {
+                embeddedIn: this.Name,
+                args: Array.isArray(state.args) ? state.args.slice() : []
+              });
             } catch (_) { /* init failure never blocks Enter Func */ }
 
             // NEW: Register the embedded func's Linked funcs so any
@@ -15056,7 +15208,11 @@ function levenshteinDistance(str1, str2) {
       let embedded = null;
       if (EmbClass && cfg.autoRun !== false) {
         try {
-          embedded = await this._embRunInline(id, EmbClass, cfg);
+          const runCfg = {
+            ...cfg,
+            args: Array.isArray(state.args) ? state.args.slice() : []
+          };
+          embedded = await this._embRunInline(id, EmbClass, runCfg);
         } catch (e) {
           state.error = e.message || String(e);
           this.Storages.Set(id, storageKey, state);
@@ -15168,6 +15324,10 @@ function levenshteinDistance(str1, str2) {
           name: ColorText.brightGreen('▶ Enter Func'),
           props: { [P.enterFunc]: true }
         });
+        this.SideButton(id, {
+          name: ColorText.brightYellow('↻ Restart'),
+          props: { [P.restartFunc]: true }
+        });
 
         if (state.pickMode) {
           await this.File(id, {
@@ -15176,6 +15336,33 @@ function levenshteinDistance(str1, str2) {
             filter: (p, isDir) => isDir || /\.(js|mjs|cjs)$/i.test(p),
             startPath: cfg.startPath || process.cwd(),
             displayName: '📁 Choose a Func .js file'
+          });
+        }
+
+        const curArgs = Array.isArray(state.args) ? state.args : [];
+        if (curArgs.length === 0) {
+          this.SideButton(id, {
+            name: ColorText.dim('+ Add arg'),
+            props: { [P.argsAdd]: 'start' }
+          });
+        } else {
+          for (let i = 0; i < curArgs.length; i++) {
+            this.SideButton(id, {
+              name: ColorText.cyan(`${i + 1}: ${_fit(String(curArgs[i]), 18)}`),
+              props: { [P.argsEditPrefix + i]: true }
+            });
+            this.SideButton(id, {
+              name: ColorText.red('×'),
+              props: { [P.argsDelPrefix + i]: true }
+            });
+          }
+          this.SideButton(id, {
+            name: ColorText.dim('+ Add'),
+            props: { [P.argsAdd]: 'start' }
+          });
+          this.SideButton(id, {
+            name: ColorText.brightRed('Clear'),
+            props: { [P.argsClear]: true }
           });
         }
 
@@ -16159,7 +16346,10 @@ function levenshteinDistance(str1, str2) {
       if (this._syappInstance && typeof this._syappInstance._ensureEmbSyappInit === 'function') {
         try {
           this._syappInstance._embRegisteredFuncs.add(instance.Name);
-          await this._syappInstance._ensureEmbSyappInit(instance, { embeddedIn: this.Name });
+          await this._syappInstance._ensureEmbSyappInit(instance, {
+            embeddedIn: this.Name,
+            args: Array.isArray(cfg && cfg.args) ? cfg.args.slice() : []
+          });
         } catch (_) { /* init failure never breaks inline render */ }
       }
 
@@ -16233,12 +16423,16 @@ function levenshteinDistance(str1, str2) {
      * @private
      */
     this._embSnippetPath = (state, cfg) => {
-      return [
+      const lines = [
         `await this.Emb(id, {`,
         `  name: ${JSON.stringify(cfg.name)},`,
-        `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`,
-        `})`
-      ].join('\n');
+        `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`
+      ];
+      if (Array.isArray(state.args) && state.args.length > 0) {
+        lines.push(`  args: ${JSON.stringify(state.args)},`);
+      }
+      lines.push(`})`);
+      return lines.join('\n');
     };
 
     /**
@@ -16249,12 +16443,16 @@ function levenshteinDistance(str1, str2) {
       const raw = String(state.code || '').trim();
 
       if (!raw) {
-        return [
+        const lines = [
           `await this.Emb(id, {`,
           `  name: ${JSON.stringify(cfg.name)},`,
-          `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`,
-          `})`
-        ].join('\n');
+          `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`
+        ];
+        if (Array.isArray(state.args) && state.args.length > 0) {
+          lines.push(`  args: ${JSON.stringify(state.args)},`);
+        }
+        lines.push(`})`);
+        return lines.join('\n');
       }
 
       const cleaned = this._embExtractInlineClass(raw);
@@ -16288,6 +16486,9 @@ function levenshteinDistance(str1, str2) {
       ];
       if (state.filePath) {
         lines.push(`  filePath: ${JSON.stringify(state.filePath)},`);
+      }
+      if (Array.isArray(state.args) && state.args.length > 0) {
+        lines.push(`  args: ${JSON.stringify(state.args)},`);
       }
       lines.push('  code: `');
       lines.push(safe);
@@ -19032,32 +19233,25 @@ this.HUD = new TerminalHUD({
     this._ensureEmbSyappInit = async (instance, options = {}) => {
       if (!instance || typeof instance !== 'object') return;
       if (!instance.Name) return;
-
-      // Already executed on THIS instance (covers the main func, whose
-      // init ran via the standard startup path).
       if (instance._syappInitExecuted) return;
 
       const name = String(instance.Name);
-
-      // Already handled globally → nothing to do.
       if (this._embSyappInitDone.has(name)) return;
-
-      // Another invocation is already in flight → wait for it.
       if (this._embSyappInitPromises.has(name)) {
         return this._embSyappInitPromises.get(name);
       }
 
+      const initArgs = Array.isArray(options.args) ? options.args.slice() : [];
+
       const promise = (async () => {
+        const previousEmbArgs = this._embInitProcessArgs;
+        this._embInitProcessArgs = initArgs;
         try {
-          // No init hook → mark done and return.
           if (typeof instance.SyAPPInit !== 'function') {
             this._embSyappInitDone.add(name);
             return;
           }
 
-          // Build a context identical in shape to the main-init context,
-          // except that `mainFuncName` is the embedded func's own name
-          // and `_isEmbedded` is flagged.
           const context = {
             syapp: this,
             mainFuncName: name,
@@ -19072,7 +19266,8 @@ this.HUD = new TerminalHUD({
             colorText: ColorText,
             configManager: ConfigManager,
             _isEmbedded: true,
-            _embeddedIn: options.embeddedIn || null
+            _embeddedIn: options.embeddedIn || null,
+            processArgs: initArgs.slice()
           };
 
           const maxAttempts = 3;
@@ -19089,21 +19284,18 @@ this.HUD = new TerminalHUD({
             } catch (err) {
               lastError = err;
               if (attempt < maxAttempts - 1) {
-                // Exponential backoff: 200ms, then 400ms.
                 await new Promise(r => setTimeout(r, 200 * Math.pow(2, attempt)));
               }
             }
           }
 
-          // All attempts failed → log clearly and mark done (no further
-          // retries this process). A rebuild of the current screen will
-          // still surface the underlying error from the func's Build().
           console.error(
             `[Emb syappInit] ${name} failed after ${maxAttempts} attempt(s):`,
             lastError
           );
           this._embSyappInitDone.add(name);
         } finally {
+          this._embInitProcessArgs = previousEmbArgs;
           this._embSyappInitPromises.delete(name);
         }
       })();
@@ -20133,6 +20325,7 @@ function _embDiskSave(outerFilePath, embName, storageEntry) {
       code: storageEntry && storageEntry.code ? storageEntry.code : null,
       source: storageEntry && storageEntry.source ? storageEntry.source : 'none',
       saveMode: storageEntry && storageEntry.saveMode ? storageEntry.saveMode : null,
+      args: (storageEntry && Array.isArray(storageEntry.args)) ? storageEntry.args : [],
       updatedAt: Date.now()
     };
     fs.writeFileSync(f, JSON.stringify(payload, null, 2), 'utf8');
@@ -20587,6 +20780,7 @@ function _genFuncJS(state, syappRelPath) {
             }
           }
           cfg.saveMode = mode
+          if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
           break
@@ -21370,6 +21564,15 @@ class SelfBuilder extends SyAPP_Func {
   }
 
   _nid() { return `it_${Date.now().toString(36)}_${++this._idSeq}` }
+
+  _embArgsEqual(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false
+    if (a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      if (String(a[i]) !== String(b[i])) return false
+    }
+    return true
+  }
 
   _findItem(id, items) {
     items = items || this.State.items
@@ -23013,40 +23216,17 @@ class SelfBuilder extends SyAPP_Func {
         case 'emb': {
           // Render the real this.Emb() call. In VIEW mode, the embedded
           // func runs inline. In EDIT mode, the ○/◉ dot prefix still
-          // opens the pinned editor where `filePath`, `code`, `saveMode`
-          // and `dropdown` can be tweaked.
+          // opens the pinned editor where `filePath`, `code`, `saveMode`,
+          // `args` and `dropdown` can be tweaked.
           //
-          // ─────────────────────────────────────────────────────────
-          // ROBUST NESTED SAVE (recursive Emb fix)
-          // ─────────────────────────────────────────────────────────
-          // After this.Emb() runs, we read the widget's OWN storage
-          // entry back and mirror the produced source (filePath/code)
-          // into the item's own fields. This is the piece that makes
-          // Emb chains save correctly at EVERY nesting depth:
-          //
-          //   • When a nested Emb's Self Build finishes, it writes the
-          //     produced func into the widget's storage entry under
-          //     this builder instance (owner === '__selfbuilder__').
-          //   • Without this sync, the item's own `filePath`/`code`
-          //     fields stay at their initial (empty) values forever,
-          //     so a later export of the OUTER Emb emits an empty
-          //     `await this.Emb(id, { name: ... })` call — the nested
-          //     func's produced source is silently LOST.
-          //   • By pulling the storage back into the item immediately
-          //     after every render, the produced path/code is baked
-          //     into the outer source on the next Finish & Return, so
-          //     the nested func survives arbitrarily deep recursion,
-          //     process restarts, and every subsequent edit cycle.
-          //
-          // The sync is one-directional (widget storage → item) and
-          // only fires when the widget actually holds a real source
-          // (`source === 'file'` with a filePath, or `source === 'code'`
-          // with a code string). Empty widgets leave the item alone,
-          // so a user's manual `filePath` edit via the pinned editor
-          // is never clobbered.
+          // After the widget renders we sync the widget's live state
+          // (filePath / code / saveMode / args) back into the item so
+          // _genFuncJS emits them on export. This is what makes every
+          // widget-level change survive the SelfBuilder's save/export.
           const cfg = { name: it.name }
           if (it.filePath) cfg.filePath = it.filePath
           if (it.code) cfg.code = it.code
+          if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args.slice()
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           await this.Emb(id, cfg)
 
@@ -23065,6 +23245,9 @@ class SelfBuilder extends SyAPP_Func {
                 if (st.filePath && it.filePath !== st.filePath) it.filePath = st.filePath
                 if (it.code !== '') it.code = ''
                 if (it.saveMode !== 'path') it.saveMode = 'path'
+              }
+              if (Array.isArray(st.args) && !this._embArgsEqual(st.args, it.args || [])) {
+                it.args = st.args.slice()
               }
             }
           } catch (_) { /* sync is best-effort — never break render */ }
@@ -23453,6 +23636,7 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('filePath', 'File Path', 'string')
         mkProp('code', 'Inline Code', 'string')
         mkProp('saveMode', 'Save Mode (path|inline)', 'string')
+        mkProp('args', 'Args (JSON array)', 'json')
         mkProp('dropdown', 'Dropdown Config', 'json')
         break
       case 'route':
@@ -24207,7 +24391,8 @@ function _sbCallToItem(call, sessionVar) {
         saveMode: inferredMode,
         dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
           ? cfg.dropdown
-          : {}
+          : {},
+        args: Array.isArray(cfg.args) ? cfg.args : []
       };
     }
     case 'File':
