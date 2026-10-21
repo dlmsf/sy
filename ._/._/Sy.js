@@ -1185,7 +1185,40 @@ class Sy extends SyAPP.Func() {
         });
       },
       { linked: [Config],syappInit : async ({ mainFuncName, syapp, userConfig, sessions }) => {
-        await SyDB.Connect(mainFuncName)
+        // ------------------------------------------------------------------
+        // Resolve the SyDB target from the FIRST positional CLI arg.
+        //
+        // Example:
+        //   node SyAPP.js MyApp.js prodDB
+        //     → args[0] = "prodDB"   → SyDB.Connect("prodDB")
+        //   node SyAPP.js MyApp.js
+        //     → args[0] = undefined  → SyDB.Connect(mainFuncName)
+        //
+        // this.Args() is invoked with { initMode: true } so it works
+        // outside a build context (syappInit runs before any LoadScreen
+        // and therefore before any userBuild exists). The handler is
+        // called with the resolved args array, and args[0] — when not
+        // null/undefined/empty — becomes the SyDB.Connect target.
+        // ------------------------------------------------------------------
+        let dbTarget = mainFuncName;
+        try {
+          await this.Args(
+            null,
+            async (args) => {
+              if (Array.isArray(args) && args.length > 0) {
+                const first = args[0];
+                if (first !== undefined && first !== null && String(first).trim() !== '') {
+                  dbTarget = String(first);
+                }
+              }
+            },
+            { initMode: true }
+          );
+        } catch (e) {
+          console.error('[Sy syappInit] Args resolution failed:', e && e.message);
+        }
+
+        await SyDB.Connect(dbTarget)
 
         // ---------- ACID BOOT SWEEP ----------
         // One-shot full reconciliation BEFORE the first screen renders.

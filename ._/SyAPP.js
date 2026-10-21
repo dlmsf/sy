@@ -13943,7 +13943,17 @@ function levenshteinDistance(str1, str2) {
      * @returns {Promise<void>}
      */
     this.Args = async (id, handler, config = {}) => {
-      if (!this.Builds.has(id)) {
+      // Allow this.Args() to be invoked OUTSIDE a build context — most
+      // importantly from a SyAPPInit hook, which runs before the very
+      // first LoadScreen and therefore before any userBuild exists.
+      //
+      // In initMode the method does NOT touch per-session storage, does
+      // NOT render a form, and does NOT use curProps at all: it simply
+      // resolves positional CLI args against the (optional) schema and
+      // invokes the handler with the resulting args array.
+      const initMode = config.initMode === true;
+
+      if (!this.Builds.has(id) && !initMode) {
         if (this.Log) console.log(`this.Args() Error - userBuild not found | BuildID: ${id}`);
         return;
       }
@@ -13979,6 +13989,34 @@ function levenshteinDistance(str1, str2) {
       const cliArgs = (syapp && Array.isArray(syapp._processArgs))
         ? syapp._processArgs
         : [];
+
+      // ------------------------------------------------------------------
+      // INIT MODE — called from a SyAPPInit hook (or any other place that
+      // has no active userBuild). Resolve positional CLI args against the
+      // optional schema and invoke the handler immediately. No form,
+      // no per-session state, no alerts, no build-map access.
+      // ------------------------------------------------------------------
+      if (initMode) {
+        const args = [];
+        for (let i = 0; i < opts.required.length; i++) {
+          const spec = opts.required[i];
+          if (!spec || !spec.name) continue;
+          const v = cliArgs[i] !== undefined
+            ? cliArgs[i]
+            : spec.defaultValue;
+          args.push(v);
+          if (!(spec.name in args)) args[spec.name] = v;
+        }
+        for (let i = opts.required.length; i < cliArgs.length; i++) {
+          args.push(cliArgs[i]);
+        }
+        try {
+          await handler(args);
+        } catch (e) {
+          if (this.Log) console.error(`Args init error in ${this.Name}:`, e);
+        }
+        return;
+      }
 
       // ------------------------------------------------------------------
       // ROUTE DISCOVERY MODE — never show a form, just hand the handler
