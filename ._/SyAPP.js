@@ -20570,51 +20570,22 @@ function _genFuncJS(state, syappRelPath) {
           break
         }
         case 'emb': {
-          // ------------------------------------------------------------------
-          // SAVE MODE HONORING (nested Emb recursion fix)
-          // ------------------------------------------------------------------
-          // The widget's saveMode decides whether the embed should be
-          // committed INLINE (full class source in `code:`) or by PATH
-          // (`filePath:` reference). A widget produced to a temp file
-          // is still perfectly able to embed itself INLINE — `source`
-          // and `saveMode` are orthogonal axes:
-          //
-          //     source   = where the widget's current definition lives
-          //                ('file' = produced on disk, 'code' = pasted
-          //                inline, 'none' = empty)
-          //
-          //     saveMode = how the widget wants to be embedded in the
-          //                parent file ('inline' = full code blob,
-          //                'path' = file reference)
-          //
-          // Previously this branch emitted `filePath` whenever it was
-          // present, ignoring `saveMode` entirely. That forced every
-          // nested Emb to fall back to path mode on export, even when
-          // the user had explicitly selected inline mode at every
-          // level — which is exactly the "second emb loses inline
-          // mode" symptom.
-          // ------------------------------------------------------------------
           const cfg = { name: it.name }
           const mode = (it.saveMode === 'path') ? 'path' : 'inline'
           if (mode === 'inline') {
             if (it.code && String(it.code).trim()) {
               cfg.code = it.code
-            } else if (it.filePath) {
-              // Inline requested but no code available yet — fall back
-              // to path so we still emit a usable reference.
+            }
+            if (it.filePath) {
               cfg.filePath = it.filePath
             }
           } else {
             if (it.filePath) {
               cfg.filePath = it.filePath
             } else if (it.code && String(it.code).trim()) {
-              // Path requested but no filePath available yet — fall
-              // back to inline so the produced source is not lost.
               cfg.code = it.code
             }
           }
-          // Persist the resolved mode so round-tripping through the
-          // parser keeps the user's choice stable across re-exports.
           cfg.saveMode = mode
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
@@ -23083,41 +23054,12 @@ class SelfBuilder extends SyAPP_Func {
             const embStorageKey = `emb_${it.name}`
             const st = this.Storages.Get(id, embStorageKey)
             if (st && typeof st === 'object' && st.source !== 'none') {
-              // ------------------------------------------------------------------
-              // SAVE MODE HONORING (nested Emb recursion fix)
-              // ------------------------------------------------------------------
-              // `source` and `saveMode` are ORTHOGONAL concepts:
-              //
-              //     source   = WHERE the widget's current definition lives
-              //                ('file' = produced on disk, 'code' = pasted
-              //                inline, 'none' = empty)
-              //
-              //     saveMode = HOW the widget wants to be embedded in
-              //                the PARENT file ('inline' = full code
-              //                blob, 'path' = file reference)
-              //
-              // A widget produced to a temp file (source: 'file') can
-              // still want to be embedded INLINE in its parent — which
-              // is precisely what every nested Emb → Self Build → Emb
-              // chain requires, because the produced file is a build
-              // artefact that must not leak into the parent source.
-              //
-              // The old code keyed the sync off `source`, so a widget
-              // produced to a temp file had its `code` field wiped and
-              // its `filePath` set — forcing the OUTER SelfBuilder to
-              // emit the inner widget as `filePath:` on export, which
-              // is the "nested Embs lose inline mode" bug.
-              //
-              // We now key off `saveMode` instead, so every level of
-              // nesting inherits the mode the user explicitly picked
-              // at every level — recursively, at any depth.
-              // ------------------------------------------------------------------
               const mode = st.saveMode === 'path' ? 'path' : 'inline'
               if (mode === 'inline') {
                 if (typeof st.code === 'string' && st.code.trim()) {
                   if (it.code !== st.code) it.code = st.code
                 }
-                if (it.filePath !== '') it.filePath = ''
+                if (st.filePath && it.filePath !== st.filePath) it.filePath = st.filePath
                 if (it.saveMode !== 'inline') it.saveMode = 'inline'
               } else {
                 if (st.filePath && it.filePath !== st.filePath) it.filePath = st.filePath
