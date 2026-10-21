@@ -19298,6 +19298,29 @@ this.HUD = new TerminalHUD({
                   if (!Array.isArray(return_obj.hud_obj.options)) {
                     return_obj.hud_obj.options = [];
                   }
+
+                  const hasExistingPinnedBottom = return_obj.hud_obj.options.some(opt => {
+                    if (!opt || typeof opt !== 'object') return false;
+                    if (opt.pinned === true) return true;
+                    if (opt.metadata && opt.metadata.pinned === true) return true;
+                    return false;
+                  });
+
+                  if (hasExistingPinnedBottom) {
+                    return_obj.hud_obj.options.push({
+                      name: ' ',
+                      metadata: {
+                        props: {},
+                        path: targetFuncName,
+                        resetSelection: false,
+                        jumpTo: false,
+                        pinned: true,
+                        pinnedTop: false
+                      },
+                      action: () => {}
+                    });
+                  }
+
                   return_obj.hud_obj.options.push({
                     name: ColorText.brightYellow('← Return to ' + target.func),
                     metadata: {
@@ -19305,7 +19328,7 @@ this.HUD = new TerminalHUD({
                       path: target.func,
                       resetSelection: true,
                       jumpTo: false,
-                      pinned: false,
+                      pinned: true,
                       pinnedTop: false
                     },
                     action: () => {}
