@@ -5012,6 +5012,24 @@ function _jsRunClass(filePath, cls, meth, args = {}, options = {}) {
   });
 }
 
+/**
+ * Default dropdown text/emoji used by this.Emb() when the widget is
+ * newly created and not yet customized.
+ *
+ * Kept at module level so that:
+ *   • the snippet generators (_embSnippetPath / _embSnippetInline)
+ *     can emit only the NON-default values (keeping untouched
+ *     widget sources byte-for-byte identical), and
+ *   • the SelfBuilder item sync can use the same diff criteria when
+ *     folding widget edits back into its state for export.
+ */
+const _EMB_DEFAULT_DROPDOWN = {
+  up_buttontext: '◈ Embed',
+  down_buttontext: 'Hide Embed',
+  up_emoji: '▶',
+  down_emoji: '▼'
+};
+
 // --------------------------- SyAPP_Func Class ---------------------------
 
 /**
@@ -14306,7 +14324,11 @@ function levenshteinDistance(str1, str2) {
         restartFunc:     `${nsKey}_restartfunc`,
         enterFunc:       `${nsKey}_enterfunc`,
         writeSource:     `${nsKey}_writesource`,
-        toggleEditPanel: `${nsKey}_toggleeditpanel`
+        toggleEditPanel: `${nsKey}_toggleeditpanel`,
+        editUpText:      `${nsKey}_editUpText`,
+        editDownText:    `${nsKey}_editDownText`,
+        editBothText:    `${nsKey}_editBothText`,
+        resetDropdown:   `${nsKey}_resetDropdown`
       };
 
       // ------------------------------------------------------------------
@@ -14409,7 +14431,17 @@ function levenshteinDistance(str1, str2) {
           error: null,
           pickMode: false,
           editPanel: false,
-          args: Array.isArray(cfg.args) ? cfg.args.slice() : []
+          args: Array.isArray(cfg.args) ? cfg.args.slice() : [],
+          // Persistent dropdown text/emoji state. Initialized from the
+          // call-site config so the widget renders with the caller's
+          // values on the first pass, and overwritten by the disk
+          // record (if any) so user edits survive a process restart.
+          dropdown: {
+            up_buttontext: cfg.dropdown.up_buttontext,
+            down_buttontext: cfg.dropdown.down_buttontext,
+            up_emoji: cfg.dropdown.up_emoji,
+            down_emoji: cfg.dropdown.down_emoji
+          }
         };
 
         // Step 1 — disk record keyed by (outer file, owner func, widget
@@ -14425,6 +14457,11 @@ function levenshteinDistance(str1, str2) {
               ? disk.saveMode
               : 'inline';
             if (Array.isArray(disk.args)) boot.args = disk.args.slice();
+            // Restore custom dropdown text/emoji from disk so a widget
+            // whose label was edited keeps its label across restarts.
+            if (disk.dropdown && typeof disk.dropdown === 'object') {
+              boot.dropdown = { ...boot.dropdown, ...disk.dropdown };
+            }
           }
         }
 
@@ -14455,6 +14492,32 @@ function levenshteinDistance(str1, str2) {
       }
 
       const state = this.Storages.Get(id, storageKey);
+      // Backward compatibility: older state entries (or state loaded
+      // from a disk record that predates the dropdown-text feature) may
+      // not have a `dropdown` field yet. Seed it from the call-site
+      // config so the widget always renders with concrete text values.
+      if (!state.dropdown || typeof state.dropdown !== 'object') {
+        state.dropdown = {
+          up_buttontext: cfg.dropdown.up_buttontext,
+          down_buttontext: cfg.dropdown.down_buttontext,
+          up_emoji: cfg.dropdown.up_emoji,
+          down_emoji: cfg.dropdown.down_emoji
+        };
+        this.Storages.Set(id, storageKey, state);
+      } else {
+        // Fill in any missing keys from the call-site config so a
+        // partially populated record (e.g. only `up_buttontext`
+        // customised) never renders with `undefined`.
+        let changed = false;
+        for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+          if (state.dropdown[k] === undefined) {
+            state.dropdown[k] = cfg.dropdown[k];
+            changed = true;
+          }
+        }
+        if (changed) this.Storages.Set(id, storageKey, state);
+      }
+
       const curProps = this.Builds.get(id).Session.ActualProps || {};
       const passProps = curProps.page ? { page: curProps.page } : {};
 
@@ -14827,6 +14890,114 @@ function levenshteinDistance(str1, str2) {
         } catch (e) {
           this.Alert(id, `❌ Restart failed: ${e.message}`, { duration: 4000 });
         }
+      }
+
+      // ------------------------------------------------------------------
+      // DROPDOWN TEXT EDITING
+      // ------------------------------------------------------------------
+      // Allows editing the label shown on the widget's own collapsed /
+      // expanded buttons (`up_buttontext` / `down_buttontext`), either
+      // individually OR both at once.
+      //
+      // Every edit is persisted across THREE layers so it survives both
+      // the live session and a hard process restart:
+      //
+      //   1. `state.dropdown` — the in-memory value used by the
+      //      `this.DropDown(...)` call below.
+      //   2. `_embDiskSave(...)` — the disk mirror (so re-opening the
+      //      process recovers the edit even though the session id has
+      //      changed).
+      //   3. `__embPersistArgsToHost()` — rewrites the host file's
+      //      `this.Emb(...)` call so the change is baked into source,
+      //      exactly like the inline ↔ path toggle does.
+      //
+      // No auto-restart is required: the widget simply re-renders with
+      // the new label on the next build pass.
+      // ------------------------------------------------------------------
+      if (curProps[P.editUpText] === 'start') {
+        delete curProps[P.editUpText];
+        this.WaitInput(id, {
+          question: `Up button text (current: ${JSON.stringify(state.dropdown.up_buttontext)}): `,
+          path: this.Name,
+          props: { ...passProps, [P.editUpText]: 'commit' }
+        });
+        return null;
+      }
+      if (curProps[P.editUpText] === 'commit') {
+        delete curProps[P.editUpText];
+        const v = String(curProps.inputValue || '');
+        delete curProps.inputValue;
+        state.dropdown.up_buttontext = v;
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        __embPersistArgsToHost();
+      }
+
+      if (curProps[P.editDownText] === 'start') {
+        delete curProps[P.editDownText];
+        this.WaitInput(id, {
+          question: `Down button text (current: ${JSON.stringify(state.dropdown.down_buttontext)}): `,
+          path: this.Name,
+          props: { ...passProps, [P.editDownText]: 'commit' }
+        });
+        return null;
+      }
+      if (curProps[P.editDownText] === 'commit') {
+        delete curProps[P.editDownText];
+        const v = String(curProps.inputValue || '');
+        delete curProps.inputValue;
+        state.dropdown.down_buttontext = v;
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        __embPersistArgsToHost();
+      }
+
+      // ---------------- Combined (both up + down) ----------------
+      // Sets `up_buttontext` AND `down_buttontext` to the SAME value
+      // in a single action. Useful when the widget should read as one
+      // consistent label regardless of its open/closed state.
+      if (curProps[P.editBothText] === 'start') {
+        delete curProps[P.editBothText];
+        const cur = (state.dropdown.up_buttontext === state.dropdown.down_buttontext)
+          ? state.dropdown.up_buttontext
+          : `${state.dropdown.up_buttontext} / ${state.dropdown.down_buttontext}`;
+        this.WaitInput(id, {
+          question: `Both up & down text (current: ${JSON.stringify(cur)}): `,
+          path: this.Name,
+          props: { ...passProps, [P.editBothText]: 'commit' }
+        });
+        return null;
+      }
+      if (curProps[P.editBothText] === 'commit') {
+        delete curProps[P.editBothText];
+        const v = String(curProps.inputValue || '');
+        delete curProps.inputValue;
+        state.dropdown.up_buttontext = v;
+        state.dropdown.down_buttontext = v;
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        __embPersistArgsToHost();
+      }
+
+      if (curProps[P.resetDropdown]) {
+        delete curProps[P.resetDropdown];
+        state.dropdown = {
+          up_buttontext: _EMB_DEFAULT_DROPDOWN.up_buttontext,
+          down_buttontext: _EMB_DEFAULT_DROPDOWN.down_buttontext,
+          up_emoji: _EMB_DEFAULT_DROPDOWN.up_emoji,
+          down_emoji: _EMB_DEFAULT_DROPDOWN.down_emoji
+        };
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        __embPersistArgsToHost();
       }
 
       if (curProps[P.enterFunc]) {
@@ -15367,6 +15538,36 @@ function levenshteinDistance(str1, str2) {
         }
 
         this.Text(id, ' ');
+        this.Text(id, ColorText.dim('Dropdown text:'));
+
+        this.SideButton(id, {
+          name: ColorText.cyan(`Up: ${_fit(state.dropdown.up_buttontext, 20)}`),
+          props: { [P.editUpText]: 'start' }
+        });
+        this.SideButton(id, {
+          name: ColorText.cyan(`Down: ${_fit(state.dropdown.down_buttontext, 20)}`),
+          props: { [P.editDownText]: 'start' }
+        });
+
+        this.Buttons(id, [
+          {
+            name: ColorText.brightYellow(
+              `⇅ Both: ${_fit(
+                state.dropdown.up_buttontext === state.dropdown.down_buttontext
+                  ? state.dropdown.up_buttontext
+                  : `${state.dropdown.up_buttontext} / ${state.dropdown.down_buttontext}`,
+                30
+              )}`
+            ),
+            props: { [P.editBothText]: 'start' }
+          },
+          {
+            name: ColorText.brightRed('↺ Reset text'),
+            props: { [P.resetDropdown]: true }
+          }
+        ]);
+
+        this.Text(id, ' ');
 
         const __inlineSelected = state.saveMode === 'inline';
         const __pathSelected   = state.saveMode === 'path';
@@ -15416,10 +15617,10 @@ function levenshteinDistance(str1, str2) {
           props: { [P.clear]: true }
         });
       }, {
-        up_buttontext: cfg.dropdown.up_buttontext,
-        down_buttontext: cfg.dropdown.down_buttontext,
-        up_emoji: cfg.dropdown.up_emoji,
-        down_emoji: cfg.dropdown.down_emoji
+        up_buttontext: state.dropdown.up_buttontext,
+        down_buttontext: state.dropdown.down_buttontext,
+        up_emoji: state.dropdown.up_emoji,
+        down_emoji: state.dropdown.down_emoji
       });
 
       return embedded;
@@ -16431,6 +16632,19 @@ function levenshteinDistance(str1, str2) {
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
       }
+      // Emit only non-default dropdown text/emoji, so an untouched
+      // widget's source stays byte-for-byte identical.
+      const ddOut = {};
+      if (state.dropdown && typeof state.dropdown === 'object') {
+        for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+          if (state.dropdown[k] !== undefined && state.dropdown[k] !== _EMB_DEFAULT_DROPDOWN[k]) {
+            ddOut[k] = state.dropdown[k];
+          }
+        }
+      }
+      if (Object.keys(ddOut).length > 0) {
+        lines.push(`  dropdown: ${JSON.stringify(ddOut)},`);
+      }
       lines.push(`})`);
       return lines.join('\n');
     };
@@ -16450,6 +16664,17 @@ function levenshteinDistance(str1, str2) {
         ];
         if (Array.isArray(state.args) && state.args.length > 0) {
           lines.push(`  args: ${JSON.stringify(state.args)},`);
+        }
+        const ddOut = {};
+        if (state.dropdown && typeof state.dropdown === 'object') {
+          for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+            if (state.dropdown[k] !== undefined && state.dropdown[k] !== _EMB_DEFAULT_DROPDOWN[k]) {
+              ddOut[k] = state.dropdown[k];
+            }
+          }
+        }
+        if (Object.keys(ddOut).length > 0) {
+          lines.push(`  dropdown: ${JSON.stringify(ddOut)},`);
         }
         lines.push(`})`);
         return lines.join('\n');
@@ -16489,6 +16714,17 @@ function levenshteinDistance(str1, str2) {
       }
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
+      }
+      const ddOut = {};
+      if (state.dropdown && typeof state.dropdown === 'object') {
+        for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+          if (state.dropdown[k] !== undefined && state.dropdown[k] !== _EMB_DEFAULT_DROPDOWN[k]) {
+            ddOut[k] = state.dropdown[k];
+          }
+        }
+      }
+      if (Object.keys(ddOut).length > 0) {
+        lines.push(`  dropdown: ${JSON.stringify(ddOut)},`);
       }
       lines.push('  code: `');
       lines.push(safe);
@@ -20326,6 +20562,11 @@ function _embDiskSave(outerFilePath, embName, storageEntry) {
       source: storageEntry && storageEntry.source ? storageEntry.source : 'none',
       saveMode: storageEntry && storageEntry.saveMode ? storageEntry.saveMode : null,
       args: (storageEntry && Array.isArray(storageEntry.args)) ? storageEntry.args : [],
+      // Persist custom dropdown text/emoji so edits survive restarts,
+      // matching the behaviour of `args` and the filePath/code pair.
+      dropdown: (storageEntry && storageEntry.dropdown && typeof storageEntry.dropdown === 'object')
+        ? storageEntry.dropdown
+        : null,
       updatedAt: Date.now()
     };
     fs.writeFileSync(f, JSON.stringify(payload, null, 2), 'utf8');
@@ -23248,6 +23489,20 @@ class SelfBuilder extends SyAPP_Func {
               }
               if (Array.isArray(st.args) && !this._embArgsEqual(st.args, it.args || [])) {
                 it.args = st.args.slice()
+              }
+              // Sync the widget's dropdown text/emoji back to the item
+              // (non-default values only), so _genFuncJS emits them when
+              // the SelfBuilder exports / saves. Without this, edits made
+              // through the widget's "Up / Down / Both" buttons would be
+              // lost as soon as the user pressed Save or Export.
+              if (st.dropdown && typeof st.dropdown === 'object') {
+                const ddOut = {}
+                for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+                  if (st.dropdown[k] !== undefined && st.dropdown[k] !== _EMB_DEFAULT_DROPDOWN[k]) {
+                    ddOut[k] = st.dropdown[k]
+                  }
+                }
+                it.dropdown = ddOut
               }
             }
           } catch (_) { /* sync is best-effort — never break render */ }
