@@ -1187,7 +1187,7 @@ class TerminalHUD extends EventEmitter {
     });
     this.isLoading = false;
     this.numberedMenus = configuration.numberedMenus || false;
-    this.highlightColor = this.getAnsiBackgroundColor(configuration.highlightColor || 'blue');
+    this.highlightColor = this.getAnsiBackgroundColor(configuration.highlightColor || 'softBlue');
     this.clickMode = configuration.clickMode || 'single';   // 'single' or 'double'
     this.lastMenuGenerator = null;
     this.lastSelectedIndex = 0;
@@ -1306,7 +1306,8 @@ class TerminalHUD extends EventEmitter {
       blue: '\x1b[44m',
       magenta: '\x1b[45m',
       cyan: '\x1b[46m',
-      white: '\x1b[47m'
+      white: '\x1b[47m',
+      softBlue: '\x1b[48;5;19m'
     };
     return colors[color] || '';
   }
