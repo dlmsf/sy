@@ -14620,13 +14620,14 @@ function levenshteinDistance(str1, str2) {
           const session = syapp && syapp.Sessions.get(syapp.MainSessionID);
           const sessionId = session ? session.UniqueID : id;
 
-          // 1) Wipe the owner's in-memory entry for EVERY registered func
-          //    (the widget may have been written back into a different
-          //    owner when the caller resolved recursively).
+          // 1) Wipe the owner's in-memory entry from every OTHER func
+          //    (this func's entry is kept — it holds the reset state
+          //    set above — so the setup view renders immediately on
+          //    the next build pass without falling through to bootstrap).
           if (syapp && syapp.Funcs) {
             for (const [, f] of syapp.Funcs) {
               try {
-                if (f && f.Storages) {
+                if (f && f.Storages && f !== this) {
                   f.Storages.Delete(sessionId, storageKey);
                 }
               } catch (_) {}
@@ -14640,6 +14641,51 @@ function levenshteinDistance(str1, str2) {
             _embDiskClear(outerFilePath, diskKey);
             _embDiskClear(outerFilePath, `__selfbuilder__::${cfg.name}`);
             _embDiskClear(outerFilePath, String(cfg.name || ''));
+          }
+        } catch (_) {}
+
+        // Rewrite the host file's this.Emb(...) call to a FRESH minimal
+        // snippet (name + preserved dropdown only — no filePath / code /
+        // args). Mirrors what the Path / Inline mode toggles do, so a
+        // hard process restart does not restore the previously attached
+        // func through cfg.filePath / cfg.code.
+        //
+        // Skipped when this.Emb() runs inside SelfBuilder: there the
+        // "host" is the builder's in-memory State, and the item is
+        // reset directly by _renderItem('emb')'s pre-check.
+        try {
+          if (this.Name !== '__selfbuilder__') {
+            const __hostFile = cfg.sourceFile ||
+              ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+            if (__hostFile) {
+              const freshLines = [
+                `await this.Emb(id, {`,
+                `  name: ${JSON.stringify(cfg.name)}`
+              ];
+              const ddOut = {};
+              if (state.dropdown && typeof state.dropdown === 'object') {
+                for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+                  if (state.dropdown[k] !== undefined &&
+                      state.dropdown[k] !== _EMB_DEFAULT_DROPDOWN[k]) {
+                    ddOut[k] = state.dropdown[k];
+                  }
+                }
+              }
+              if (Object.keys(ddOut).length > 0) {
+                freshLines.push(`  dropdown: ${JSON.stringify(ddOut)},`);
+              }
+              freshLines.push(`})`);
+              const freshSnippet = freshLines.join('\n');
+
+              const existing = fs.readFileSync(__hostFile, 'utf8');
+              const replaced = this._embReplaceExistingCall(existing, cfg.name, freshSnippet);
+              if (replaced !== null) {
+                fs.writeFileSync(__hostFile, replaced);
+                this.Alert(id,
+                  `🧹 Cleared Emb("${cfg.name}") in ${path.basename(__hostFile)}`,
+                  { duration: 3000 });
+              }
+            }
           }
         } catch (_) {}
       }
@@ -23464,6 +23510,20 @@ class SelfBuilder extends SyAPP_Func {
           // (filePath / code / saveMode / args) back into the item so
           // _genFuncJS emits them on export. This is what makes every
           // widget-level change survive the SelfBuilder's save/export.
+          // Pre-check: if the widget's storage has been reset (e.g. by
+          // clicking ✕ Clear), reset the item's source fields so cfg
+          // does not carry stale values into this.Emb()'s bootstrap and
+          // the next export does not emit the previously attached func.
+          try {
+            const stPre = this.Storages.Get(id, `emb_${it.name}`)
+            if (stPre && typeof stPre === 'object' && stPre.source === 'none') {
+              if (it.code !== '') it.code = ''
+              if (it.filePath !== '') it.filePath = ''
+              if (it.saveMode !== 'inline') it.saveMode = 'inline'
+              if (Array.isArray(it.args) && it.args.length > 0) it.args = []
+            }
+          } catch (_) {}
+
           const cfg = { name: it.name }
           if (it.filePath) cfg.filePath = it.filePath
           if (it.code) cfg.code = it.code
