@@ -273,30 +273,175 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
 }
 
 // ============================================================
-//  Save absolute paths to a file (one per line) in /tmp
+//  Save session state (files + options + parsing selections) as
+//  JSON in /tmp. This captures EXACTLY what the interactive flow
+//  produced, so `node Struct.js <savename>` can regenerate the
+//  SAME struct from the LATEST file contents on disk.
 // ============================================================
-async function savePaths(filePaths, saveName) {
+async function saveState(state, saveName) {
     const temporaryDirectory = os.tmpdir();
     const savePath = path.join(temporaryDirectory, saveName);
 
-    await fs.writeFile(savePath, filePaths.join('\n'), 'utf8');
-    console.log(`Paths saved to: ${savePath}`);
+    await fs.writeFile(savePath, JSON.stringify(state, null, 2), 'utf8');
+    console.log(`Session state saved to: ${savePath}`);
+    console.log(`To regenerate later: node Struct.js ${saveName}`);
 
     return savePath;
 }
 
 // ============================================================
-//  Load absolute paths from a savename file in /tmp
+//  Load session state from a savename file in /tmp.
+//  Supports BOTH:
+//    - new JSON format (full state: files + options + parsing)
+//    - legacy plain-text format (one path per line)
+//  Legacy saves are upgraded to a minimal state object so older
+//  save files keep working.
 // ============================================================
-async function loadPaths(saveName) {
+async function loadState(saveName) {
     const temporaryDirectory = os.tmpdir();
     const savePath = path.join(temporaryDirectory, saveName);
     const data = await fs.readFile(savePath, 'utf8');
 
-    return data
+    // New format: JSON object with a `files` array.
+    try {
+        const parsed = JSON.parse(data);
+        if (
+            parsed &&
+            typeof parsed === 'object' &&
+            !Array.isArray(parsed) &&
+            Array.isArray(parsed.files)
+        ) {
+            return {
+                files: parsed.files,
+                includeInstructions: !!parsed.includeInstructions,
+                userDemand: parsed.userDemand || '',
+                outputFormat: parsed.outputFormat || 'full',
+                parsed: parsed.parsed && typeof parsed.parsed === 'object' ? parsed.parsed : {},
+                referenceOnly: Array.isArray(parsed.referenceOnly) ? parsed.referenceOnly : [],
+            };
+        }
+    } catch {
+        // Not JSON - fall through to legacy plain-text parsing.
+    }
+
+    // Legacy format: newline-separated absolute paths.
+    const paths = data
         .split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 0);
+
+    return {
+        files: paths,
+        includeInstructions: false,
+        userDemand: '',
+        outputFormat: 'full',
+        parsed: {},
+        referenceOnly: [],
+    };
+}
+
+// ============================================================
+//  Regenerate struct from a saved session state.
+//  - Reads the LATEST file contents from disk (files may have
+//    been edited since the save).
+//  - Re-applies the saved CodeParser selections by re-parsing.
+//  - NEVER aborts on a single failure: missing files, empty
+//    parses, or invalid selections fall back to the original
+//    file content with a clear warning.
+// ============================================================
+async function regenerateFromState(state) {
+    const {
+        files = [],
+        includeInstructions = false,
+        userDemand = '',
+        outputFormat = 'full',
+        parsed = {},
+        referenceOnly = [],
+    } = state;
+
+    const existingFiles = [];
+    const missingFiles = [];
+
+    // Filter files that still exist on disk.
+    for (const filePath of files) {
+        try {
+            await fs.access(filePath);
+            existingFiles.push(filePath);
+        } catch {
+            missingFiles.push(filePath);
+        }
+    }
+
+    if (missingFiles.length > 0) {
+        console.log(`\n${YELLOW}⚠️  ${missingFiles.length} saved file(s) no longer exist:${RESET}`);
+        missingFiles.forEach(f => console.log(`  • ${f}`));
+        console.log(`${YELLOW}These will be skipped.${RESET}\n`);
+    }
+
+    if (existingFiles.length === 0) {
+        console.error('No existing files to process.');
+        process.exit(1);
+    }
+
+    // Restrict reference-only to files that actually exist now.
+    const existingSet = new Set(existingFiles);
+    const referenceOnlyFiles = new Set(
+        referenceOnly.filter(f => existingSet.has(f))
+    );
+
+    const parsedFiles = new Map();
+
+    // Re-parse every file that had a saved parser selection.
+    for (const filePath of existingFiles) {
+        const parseInfo = parsed[filePath];
+        if (!parseInfo || !parseInfo.selection) continue;
+
+        try {
+            CodeParser.parse(filePath);
+            const summary = CodeParser.getSummary();
+            const filtered = CodeParser.generateFiltered(parseInfo.selection);
+            const report = CodeParser.getLastReport();
+            const validation = report.validation || { ok: true, issues: [] };
+            const notes = report.notes || [];
+            const originalContent = await fs.readFile(filePath, 'utf8');
+
+            if (filtered && filtered.trim()) {
+                parsedFiles.set(filePath, {
+                    parsedContent: filtered,
+                    originalSize: originalContent.length,
+                    parsedSize: filtered.length,
+                    stats: summary,
+                    notes,
+                    validation,
+                });
+
+                console.log(`${GREEN}✓ Re-parsed: ${path.basename(filePath)}${RESET}`);
+
+                if (notes.length > 0) {
+                    notes.forEach(n => console.log(`  • ${n}`));
+                }
+                if (!validation.ok) {
+                    console.log(`  ${YELLOW}Validation issues:${RESET}`);
+                    validation.issues.forEach(i => console.log(`    • ${i}`));
+                }
+            } else {
+                console.log(`${YELLOW}⚠️  Empty parse result for ${path.basename(filePath)} - using original file${RESET}`);
+            }
+        } catch (err) {
+            // Selection may no longer be valid (e.g. code was heavily
+            // refactored). Fall back to the original file content.
+            console.log(`${YELLOW}⚠️  Could not re-parse ${path.basename(filePath)}: ${err.message}${RESET}`);
+            console.log(`${YELLOW}   Using original file content.${RESET}`);
+        }
+    }
+
+    await generateStruct(existingFiles, 'struct', {
+        includeInstructions,
+        userDemand,
+        outputFormat,
+        parsedFiles,
+        referenceOnlyFiles,
+    });
 }
 
 // ============================================================
@@ -1567,7 +1712,10 @@ async function interactiveMode() {
                                 parsedSize: parseResult.content.length,
                                 stats: parseResult.stats,
                                 notes: parseResult.notes,
-                                validation: parseResult.validation
+                                validation: parseResult.validation,
+                                // Persisted so the saved session can re-parse
+                                // against the LATEST disk content on load.
+                                selection: parseResult.selection
                             });
                             console.log(`\n${GREEN}✓ ${path.basename(filePath)} parsed successfully${RESET}`);
                         }
@@ -1640,11 +1788,29 @@ async function interactiveMode() {
             referenceOnlyFiles,
         });
 
-        // STEP 4: Ask if save paths
-        const saveName = await askQuestion('\nSave selected file paths? Enter a filename (or leave empty to skip):');
+        // STEP 4: Ask if save session state (files + options + parsing)
+        const saveName = await askQuestion('\nSave session (files + options + parsing)? Enter a filename (or leave empty to skip):');
 
         if (saveName) {
-            await savePaths([...selectedFiles], saveName);
+            // Serialize only the parser SELECTIONS - the actual parsed
+            // content is regenerated from disk when the save is loaded,
+            // so edits made to the files afterwards are picked up.
+            const parsedState = {};
+            for (const [filePath, info] of parsedFiles.entries()) {
+                parsedState[filePath] = {
+                    selection: info.selection || null,
+                };
+            }
+
+            await saveState({
+                version: 1,
+                files: [...selectedFiles],
+                includeInstructions,
+                userDemand,
+                outputFormat,
+                parsed: parsedState,
+                referenceOnly: [...referenceOnlyFiles],
+            }, saveName);
         }
 
         cleanupAndExit(0);
@@ -2149,14 +2315,16 @@ async function main() {
         const saveName = args[0];
 
         try {
-            const paths = await loadPaths(saveName);
+            const state = await loadState(saveName);
 
-            if (paths.length === 0) {
-                console.error('No paths found in save file.');
+            if (!state.files || state.files.length === 0) {
+                console.error('No files found in save file.');
                 process.exit(1);
             }
 
-            await generateStruct(paths);
+            // Regenerate exactly like the interactive flow, but using
+            // the LATEST file contents on disk.
+            await regenerateFromState(state);
         } catch (err) {
             console.error(`Error: ${err.message}`);
             process.exit(1);
