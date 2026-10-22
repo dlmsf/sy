@@ -14322,6 +14322,8 @@ function levenshteinDistance(str1, str2) {
         argsDelPrefix:   `${nsKey}_argsdel_`,
         argsEditPrefix:  `${nsKey}_argsedit_`,
         argsEditCommit:  `${nsKey}_argseditcommit`,
+        argsApplyBothPrefix: `${nsKey}_argsapplyboth_`,
+        toggleAutoApply: `${nsKey}_autoapply`,
         restartFunc:     `${nsKey}_restartfunc`,
         enterFunc:       `${nsKey}_enterfunc`,
         writeSource:     `${nsKey}_writesource`,
@@ -14442,7 +14444,8 @@ function levenshteinDistance(str1, str2) {
             down_buttontext: cfg.dropdown.down_buttontext,
             up_emoji: cfg.dropdown.up_emoji,
             down_emoji: cfg.dropdown.down_emoji
-          }
+          },
+          autoApplyArgToDropdown: false
         };
 
         // Step 1 — disk record keyed by (outer file, owner func, widget
@@ -14521,6 +14524,11 @@ function levenshteinDistance(str1, str2) {
 
       const curProps = this.Builds.get(id).Session.ActualProps || {};
       const passProps = curProps.page ? { page: curProps.page } : {};
+
+      if (typeof state.autoApplyArgToDropdown !== 'boolean') {
+        state.autoApplyArgToDropdown = false;
+        this.Storages.Set(id, storageKey, state);
+      }
 
       // Persist any successfully-recovered entry to disk so the NEXT
       // boot does not have to re-scan the outer file. Best-effort.
@@ -14869,6 +14877,10 @@ function levenshteinDistance(str1, str2) {
         if (v !== '') {
           if (!Array.isArray(state.args)) state.args = [];
           state.args.push(v);
+          if (state.autoApplyArgToDropdown) {
+            state.dropdown.up_buttontext = v;
+            state.dropdown.down_buttontext = v;
+          }
           this.Storages.Set(id, storageKey, state);
           if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
           __embPersistArgsToHost();
@@ -14892,10 +14904,45 @@ function levenshteinDistance(str1, str2) {
         delete curProps.inputValue;
         if (!isNaN(idx) && Array.isArray(state.args) && idx >= 0 && idx < state.args.length) {
           state.args[idx] = v;
+          if (state.autoApplyArgToDropdown) {
+            state.dropdown.up_buttontext = v;
+            state.dropdown.down_buttontext = v;
+          }
           this.Storages.Set(id, storageKey, state);
           if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
           __embPersistArgsToHost();
           try { await __embAutoRestart(); } catch (_) {}
+        }
+      }
+
+      if (curProps[P.toggleAutoApply]) {
+        delete curProps[P.toggleAutoApply];
+        state.autoApplyArgToDropdown = !state.autoApplyArgToDropdown;
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        this.Alert(id,
+          `⇅ Auto-apply: ${state.autoApplyArgToDropdown ? 'ON' : 'OFF'}`,
+          { duration: 1800 });
+      }
+
+      for (const k of Object.keys(curProps)) {
+        if (k.startsWith(P.argsApplyBothPrefix)) {
+          const idx = parseInt(k.slice(P.argsApplyBothPrefix.length), 10);
+          delete curProps[k];
+          if (!isNaN(idx) && Array.isArray(state.args) && idx >= 0 && idx < state.args.length) {
+            const v = String(state.args[idx]);
+            state.dropdown.up_buttontext = v;
+            state.dropdown.down_buttontext = v;
+            this.Storages.Set(id, storageKey, state);
+            if (outerFilePath) {
+              try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+            }
+            __embPersistArgsToHost();
+            this.Alert(id, `⇅ Dropdown text → ${JSON.stringify(v)}`, { duration: 2000 });
+          }
+          break;
         }
       }
 
@@ -15570,10 +15617,20 @@ function levenshteinDistance(str1, str2) {
               props: { [P.argsEditPrefix + i]: true }
             });
             this.SideButton(id, {
+              name: ColorText.brightYellow('⇅'),
+              props: { [P.argsApplyBothPrefix + i]: true }
+            });
+            this.SideButton(id, {
               name: ColorText.red('×'),
               props: { [P.argsDelPrefix + i]: true }
             });
           }
+          this.SideButton(id, {
+            name: state.autoApplyArgToDropdown
+              ? ColorText.bgGreen(ColorText.black(' ⇅ Auto: ON '))
+              : ColorText.dim('⇅ Auto: OFF'),
+            props: { [P.toggleAutoApply]: true }
+          });
           this.SideButton(id, {
             name: ColorText.dim('+ Add'),
             props: { [P.argsAdd]: 'start' }
