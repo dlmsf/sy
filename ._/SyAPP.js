@@ -25193,18 +25193,61 @@ function _installCtrlC(syapp) {
     try { stdin.removeAllListeners('keypress'); } catch (_) {}
   };
 
-  // OS-level SIGINT (e.g. Ctrl+C pressed outside raw-mode menus).
+  // OS-level SIGINT (e.g. Ctrl+C pressed outside raw-mode menus, or
+  // Ctrl+C on the host's OWN local terminal when no menu is active).
   process.on('SIGINT', () => {
     cleanupTerminal();
     process.exit(0);
   });
 
   syapp.HUD.on('ctrl+c', async () => {
+    // ------------------------------------------------------------------
+    // REMOTE-INPUT GUARD (streaming safety).
+    //
+    // `_startStreamingServer` strips \x03 out of client input before
+    // injecting it into stdin, but as a second, independent defence
+    // we ALSO refuse to exit when the ctrl+c event was triggered by
+    // a byte that arrived from the network. The flag is set
+    // synchronously around the emit and cleared in a finally block,
+    // so it can only ever be `true` while a remote byte is being
+    // dispatched. If it is true here, the Ctrl+C came from a client,
+    // not from the host operator — do nothing. The peer's own client
+    // handles the disconnect locally.
+    //
+    // Together with the \x03-stripping in /input, this guarantees a
+    // remote keystroke can NEVER terminate the host process, no
+    // matter which handler chain the byte happens to reach.
+    // ------------------------------------------------------------------
+    if (syapp && syapp._streamingInputFromRemote === true) {
+      return
+    }
+
+    // ------------------------------------------------------------------
+    // Only the SelfBuilder wants the interactive "Save as:" prompt on
+    // Ctrl+C. Every other main func (user apps, JSON viewer, streaming
+    // host, etc.) simply exits cleanly — otherwise Ctrl+C opens an
+    // input prompt that cannot be cancelled.
+    //
+    // The check uses the CURRENT main function name, not the mere
+    // presence of a SelfBuilder instance (which is always registered
+    // as a built-in func).
+    // ------------------------------------------------------------------
+    const mainName = syapp && syapp.MainFunc ? syapp.MainFunc.Name : null
+    const isSelfBuilder = mainName === '__selfbuilder__'
+
+    if (!isSelfBuilder) {
+      cleanupTerminal()
+      process.exit(0)
+      return
+    }
+
     const builder = syapp.Funcs.get('__selfbuilder__')
     if (!builder) {
-      cleanupTerminal();
+      cleanupTerminal()
       process.exit(0)
+      return
     }
+
     try {
       const name = await syapp.HUD.ask('\nSave as: ')
       const trimmed = String(name || '').trim()
@@ -25214,8 +25257,371 @@ function _installCtrlC(syapp) {
         console.log(ColorText.brightGreen(`💾 Saved "${trimmed}" → ${_getSaveFile(trimmed)}`))
       }
     } catch (_) { }
-    cleanupTerminal();
+    cleanupTerminal()
     process.exit(0)
+  })
+}
+
+// ============================================================
+// STREAMING NAVIGATION — server + client
+// ============================================================
+// Lets one SyAPP instance act as a "host" that renders its terminal
+// screen to remote clients, while remote clients only send input
+// events back to the host. All app logic (rendering, state, input
+// handling, HUD menus, refresh ticks) runs exclusively on the host.
+//
+//   Host:    node SyAPP.js --server 9000 MyApp.js
+//   Client:  node SyAPP.js --connect 9000 localhost
+//
+// Both flags accept their optional arguments in ANY order:
+//
+//   node SyAPP.js --server 9000 MyApp.js
+//   node SyAPP.js MyApp.js --server 9000
+//   node SyAPP.js --server MyApp.js           (port 9000 default)
+//   node SyAPP.js --connect 9000 localhost
+//   node SyAPP.js --connect localhost 9000
+//   node SyAPP.js --connect 9000              (host = localhost)
+//   node SyAPP.js --connect                   (9000 + localhost)
+//
+// Defaults: port 9000, host localhost.
+//
+// Ctrl+C contract:
+//   • Host's LOCAL terminal Ctrl+C → exits the host process (and every
+//     client disconnects as a natural consequence).
+//   • Client's Ctrl+C            → disconnects ONLY that client and
+//     returns to its own shell. The host and every other peer stay
+//     untouched. Ctrl+C bytes are stripped at the /input boundary and
+//     additionally guarded at the HUD ctrl+c handler, so no remote
+//     keystroke can ever terminate the host.
+//
+// Protocol:
+//   GET  /stream   → chunked stream of every byte the host's HUD
+//                    writes to stdout (i.e. the live terminal render)
+//   POST /input    → raw terminal input bytes from the client,
+//                    injected into the host's stdin data pipeline
+//                    (Ctrl+C bytes are stripped before injection)
+//   POST /resize   → { cols, rows } from the client, overriding the
+//                    host's stdout dimensions so the HUD renders at
+//                    the client's size
+//   GET  /info     → health / status JSON
+// ============================================================
+
+const _STREAM_DEFAULT_PORT = 9000
+const _STREAM_DEFAULT_HOST = 'localhost'
+
+/**
+ * Start the streaming server that mirrors the host's terminal output
+ * to connected clients and forwards client input into the host's
+ * stdin data pipeline.
+ *
+ * @param {SyAPP} syapp - The booted SyAPP instance (already running).
+ * @param {number} port - TCP port to listen on.
+ * @param {string} host - Host/interface (used verbatim in the
+ *                        "connect with..." help line).
+ * @returns {http.Server}
+ * @private
+ */
+function _startStreamingServer(syapp, port, host) {
+  const clients = new Set()
+
+  // ------------------------------------------------------------------
+  // Patch stdout.write so every byte the HUD renders is ALSO mirrored
+  // to every connected client. The original write is preserved and
+  // still executes normally, so the host's local terminal keeps
+  // rendering — host and remote clients see the exact same screen.
+  // ------------------------------------------------------------------
+  const origWrite = stdout.write.bind(stdout)
+  stdout.write = function (chunk, ...rest) {
+    for (const c of clients) {
+      try {
+        const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+        c.res.write(str)
+      } catch (_) {
+        clients.delete(c)
+      }
+    }
+    return origWrite(chunk, ...rest)
+  }
+
+  const server = http.createServer((req, res) => {
+    const parsedUrl = url.parse(req.url, true)
+    const pathname = parsedUrl.pathname
+
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204)
+      res.end()
+      return
+    }
+
+    // ---------- /stream : host → client render data ----------
+    if (pathname === '/stream' && req.method === 'GET') {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Cache-Control': 'no-cache, no-store',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no'
+      })
+
+      const client = { res, id: Date.now() + Math.random() }
+      clients.add(client)
+
+      // Clear the client's terminal before the first real render byte.
+      try { res.write('\x1b[2J\x1b[H') } catch (_) {}
+
+      const cleanup = () => { clients.delete(client) }
+      req.on('close', cleanup)
+      req.on('error', cleanup)
+      res.on('close', cleanup)
+      res.on('error', cleanup)
+
+      // Force a redraw so this client immediately sees the current
+      // screen instead of waiting for the next navigation/refresh.
+      setTimeout(() => {
+        try { stdout.emit('resize') } catch (_) {}
+      }, 100)
+
+      return
+    }
+
+    // ---------- /input : client → host terminal input ----------
+    //
+    // CRITICAL: Ctrl+C bytes (\x03) are stripped from remote input
+    // before injection. Without this, a client pressing Ctrl+C would
+    // terminate the HOST process — killing every other peer. Ctrl+C
+    // is a LOCAL action for whichever peer pressed it, never a remote
+    // command against the host.
+    //
+    // As a belt-and-braces measure, the injection is wrapped in
+    // `syapp._streamingInputFromRemote = true`, so `_installCtrlC`'s
+    // ctrl+c handler can independently refuse to exit when the byte
+    // arrived from the network. Together these two guards make it
+    // impossible for a remote keystroke to terminate the host.
+    if (pathname === '/input' && req.method === 'POST') {
+      const chunks = []
+      req.on('data', chunk => chunks.push(chunk))
+      req.on('end', () => {
+        const raw = Buffer.concat(chunks)
+
+        // Strip every 0x03 byte. The rest of the input passes
+        // through unchanged (escape sequences, mouse reports, text).
+        const filtered = []
+        for (let i = 0; i < raw.length; i++) {
+          if (raw[i] !== 0x03) filtered.push(raw[i])
+        }
+        const body = Buffer.from(filtered)
+
+        if (body.length > 0) {
+          try {
+            syapp._streamingInputFromRemote = true
+            // Emitting 'data' on stdin triggers every reader that
+            // the HUD / readline has registered for the current
+            // interaction: the keypress decoder, the mouse handler,
+            // the field editor, askPassword, pressWait, ...
+            stdin.emit('data', body)
+          } catch (_) {
+            /* never let an input dispatch error take down the host */
+          } finally {
+            syapp._streamingInputFromRemote = false
+          }
+        }
+
+        res.writeHead(200, { 'Content-Type': 'text/plain' })
+        res.end('OK')
+      })
+      req.on('error', () => {
+        try { res.writeHead(500); res.end('err') } catch (_) {}
+      })
+      return
+    }
+
+    // ---------- /resize : override host render dimensions ----------
+    if (pathname === '/resize' && req.method === 'POST') {
+      let body = ''
+      req.on('data', chunk => { body += chunk })
+      req.on('end', () => {
+        try {
+          const { cols, rows } = JSON.parse(body)
+          if (typeof cols === 'number' && cols > 0) {
+            Object.defineProperty(stdout, 'columns', { value: cols, configurable: true })
+          }
+          if (typeof rows === 'number' && rows > 0) {
+            Object.defineProperty(stdout, 'rows', { value: rows, configurable: true })
+          }
+          stdout.emit('resize')
+        } catch (_) {}
+        res.writeHead(200, { 'Content-Type': 'text/plain' })
+        res.end('OK')
+      })
+      return
+    }
+
+    // ---------- /info : health / status ----------
+    if (pathname === '/' || pathname === '/info') {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({
+        app: 'SyAPP Streaming Server',
+        status: 'ok',
+        clients: clients.size,
+        port,
+        host,
+        mainFunc: syapp && syapp.MainFunc ? syapp.MainFunc.Name : null
+      }))
+      return
+    }
+
+    res.writeHead(404)
+    res.end('Not found')
+  })
+
+  const listenHost = (host === 'localhost' || host === '127.0.0.1') ? '0.0.0.0' : host
+
+  server.on('error', (err) => {
+    console.error(ColorText.brightRed(`❌ Streaming server error: ${err.message}`))
+  })
+
+  server.listen(port, listenHost, () => {
+    console.log('')
+    console.log(ColorText.brightGreen(`🌐 Streaming server listening on port ${port}`))
+    console.log(ColorText.dim(`   Connect with:  node SyAPP.js --connect ${port} ${host}`))
+    console.log(ColorText.dim(`   Or:            node SyAPP.js --connect ${host} ${port}`))
+    console.log('')
+  })
+
+  // Ensure the stream closes cleanly if the process exits.
+  process.on('exit', () => {
+    try { server.close() } catch (_) {}
+    for (const c of clients) {
+      try { c.res.end() } catch (_) {}
+    }
+  })
+
+  return server
+}
+
+/**
+ * Connect to a remote streaming host. The client does NOT boot any
+ * SyAPP app — it proxies local stdin to the host's stdin pipeline and
+ * writes the host's stdout stream to its own stdout.
+ *
+ * Ctrl+C handling on the CLIENT:
+ *   Raw mode suppresses the OS-generated SIGINT, so a local Ctrl+C
+ *   arrives as a raw \x03 byte on stdin. We intercept it here,
+ *   disconnect THIS client, and return to the local shell. The host
+ *   is never notified (the byte is not forwarded), so pressing
+ *   Ctrl+C on one peer cannot affect the host or any other peer.
+ *
+ * @param {number} port - Port of the host's streaming server.
+ * @param {string} host - Hostname / IP of the host.
+ * @returns {Promise<void>}
+ * @private
+ */
+async function _connectStreamingHost(port, host) {
+  const baseUrl = `http://${host}:${port}`
+
+  process.stderr.write(`Connecting to ${baseUrl}...\n`)
+
+  return new Promise((resolve, reject) => {
+    let shuttingDown = false
+    const shutdown = (code = 0) => {
+      if (shuttingDown) return
+      shuttingDown = true
+      try { if (stdin.isRaw) stdin.setRawMode(false) } catch (_) {}
+      try {
+        stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m\n')
+      } catch (_) {}
+      process.exit(code)
+    }
+
+    const streamReq = http.get(`${baseUrl}/stream`, (res) => {
+      if (res.statusCode !== 200) {
+        process.stderr.write(`Server returned ${res.statusCode}\n`)
+        reject(new Error(`HTTP ${res.statusCode}`))
+        return
+      }
+
+      process.stderr.write(`Connected.  (Ctrl+C to disconnect)\n`)
+
+      // ---------- host → local stdout ----------
+      res.on('data', chunk => {
+        try { stdout.write(chunk) } catch (_) {}
+      })
+      res.on('end', () => shutdown(0))
+      res.on('error', () => shutdown(0))
+      res.on('close', () => shutdown(0))
+
+      // ---------- local terminal size → host ----------
+      const sendResize = () => {
+        try {
+          const body = JSON.stringify({
+            cols: stdout.columns || 80,
+            rows: stdout.rows || 24
+          })
+          const r = http.request(`${baseUrl}/resize`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(body)
+            }
+          })
+          r.on('error', () => {})
+          r.end(body)
+        } catch (_) {}
+      }
+      sendResize()
+      stdout.on('resize', sendResize)
+
+      // ---------- local stdin → host ----------
+      //
+      // Raw mode is required to capture every keystroke (including
+      // escape sequences and mouse reports). It also suppresses the
+      // OS-generated SIGINT, so Ctrl+C arrives here as a raw \x03
+      // byte instead of killing the client out from under us.
+      //
+      // \x03 is intercepted LOCALLY: this client disconnects and
+      // returns to its shell. The byte is never forwarded, so the
+      // host (and every other peer) is completely unaffected.
+      try { stdin.setRawMode(true) } catch (_) {}
+      try { stdin.resume() } catch (_) {}
+
+      stdin.on('data', chunk => {
+        // Intercept Ctrl+C locally. If the chunk contains \x03 the
+        // user is disconnecting — close this client and exit.
+        for (let i = 0; i < chunk.length; i++) {
+          if (chunk[i] === 0x03) {
+            shutdown(0)
+            return
+          }
+        }
+
+        try {
+          const r = http.request(`${baseUrl}/input`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': chunk.length
+            }
+          })
+          r.on('error', () => {})
+          r.end(chunk)
+        } catch (_) {}
+      })
+
+      // If the process is asked to terminate (e.g. SIGTERM from
+      // outside), still restore the local terminal cleanly.
+      process.on('SIGTERM', () => shutdown(0))
+      process.on('SIGHUP', () => shutdown(0))
+
+      resolve()
+    })
+
+    streamReq.on('error', (err) => {
+      process.stderr.write(`Connection failed: ${err.message}\n`)
+      reject(err)
+    })
   })
 }
 
@@ -25232,10 +25638,82 @@ function _installCtrlC(syapp) {
 // exactly the same way it does for its own built-in main function.
 if (import.meta.url === `file://${process.argv[1]}`) {
   (async () => {
-    const arg1 = process.argv[2];
-    const arg2 = process.argv[3];
+    // ---- Streaming flag parsing ----
+    //
+    // Extracted BEFORE the rest of the CLI logic so the standard
+    // positional arguments (file name, --edit, list, save names, JSON
+    // files) keep working exactly as before when no streaming flag
+    // is present.
+    const _rawCliArgs = process.argv.slice(2)
+    let _streamMode = null
+    let _streamPort = _STREAM_DEFAULT_PORT
+    let _streamHost = _STREAM_DEFAULT_HOST
+    const _plainArgs = []
 
-    // --- `node SyAPP.js list` ---
+    for (let i = 0; i < _rawCliArgs.length; i++) {
+      const a = _rawCliArgs[i]
+      if (a === '--server') {
+        _streamMode = 'server'
+        if (_rawCliArgs[i + 1] && /^\d+$/.test(_rawCliArgs[i + 1])) {
+          _streamPort = parseInt(_rawCliArgs[++i], 10)
+        }
+      } else if (a === '--connect') {
+        _streamMode = 'connect'
+        let j = i + 1
+        while (j < _rawCliArgs.length) {
+          const next = _rawCliArgs[j]
+          if (next.startsWith('--')) break
+          if (/^\d+$/.test(next)) {
+            _streamPort = parseInt(next, 10); j++
+          } else if (
+            next === 'localhost' ||
+            /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(next) ||
+            /^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$/.test(next)
+          ) {
+            _streamHost = next; j++
+          } else {
+            break
+          }
+        }
+        i = j - 1
+      } else {
+        _plainArgs.push(a)
+      }
+    }
+
+    // `--connect` mode runs standalone — no SyAPP app is loaded.
+    //
+    // All further logic (startup flags, app loading, streaming server,
+    // SelfBuilder, JSON viewer, save names) is skipped entirely. The
+    // local terminal is dedicated to the remote host until the
+    // connection ends (Ctrl+C locally disconnects, see
+    // _connectStreamingHost).
+    if (_streamMode === 'connect') {
+      try {
+        await _connectStreamingHost(_streamPort, _streamHost)
+      } catch (_) {
+        process.exit(1)
+      }
+      return
+    }
+
+    // Boot helper: creates the SyAPP instance, installs the SIGINT
+    // cleanup, and (in --server mode) starts the streaming server.
+    // Every new SyAPP(...) in this CLI block is routed through here,
+    // so --server works uniformly for the SelfBuilder, JSON viewer,
+    // save loader and user-file loader paths.
+    const _bootApp = (FuncClass) => {
+      const app = new SyAPP(FuncClass)
+      _installCtrlC(app)
+      if (_streamMode === 'server') {
+        _startStreamingServer(app, _streamPort, _streamHost)
+      }
+      return app
+    }
+
+    const arg1 = _plainArgs[0];
+    const arg2 = _plainArgs[1];
+
     if (arg1 === 'list') {
       const saves = _listSaves();
       if (saves.length === 0) {
@@ -25285,8 +25763,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         __BUILDER_INITIAL_STATE = null;
       }
 
-      const syapp = new SyAPP(SelfBuilder);
-      _installCtrlC(syapp);
+      _bootApp(SelfBuilder);
       return;
     }
 
@@ -25294,8 +25771,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     if (!arg1) {
       __BUILDER_INITIAL_STATE = null;
       __BUILDER_EXPORT_TARGET = null;
-      const syapp = new SyAPP(SelfBuilder);
-      _installCtrlC(syapp);
+      _bootApp(SelfBuilder);
       return;
     }
 
@@ -25329,8 +25805,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         try {
           const result = await _sbLoadJsonWithProgress(jsonPath);
           const JSONViewerFunc = _sbMakeJSONViewerFunc(jsonPath, result.data, result.searchIndex);
-          const syapp = new SyAPP(JSONViewerFunc);
-          _installCtrlC(syapp);
+          _bootApp(JSONViewerFunc);
         } catch (err) {
           console.error(ColorText.brightRed(`❌ Failed to load "${arg1}": ${err.message}`));
           process.exit(1);
@@ -25353,8 +25828,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       }
       __BUILDER_INITIAL_STATE = st;
       __BUILDER_EXPORT_TARGET = null;
-      const syapp = new SyAPP(SelfBuilder);
-      _installCtrlC(syapp);
+      _bootApp(SelfBuilder);
       return;
     }
 
@@ -25558,7 +26032,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       //   2. recursively register every Linked function it declares,
       //   3. start the terminal HUD / refresh loop / HTTP routes
       //      exactly as if it were the built-in main func.
-      new SyAPP(ExportedFunc);
+      //
+      // Routed through _bootApp so that --server mode also starts the
+      // streaming server. This is the primary entry point for running
+      // a real user app, so this is where streaming support matters
+      // most.
+      _bootApp(ExportedFunc);
 
     } catch (err) {
       console.error(ColorText.brightRed(`❌ SyAPP runner: unexpected error while loading "${targetFile}":`));
