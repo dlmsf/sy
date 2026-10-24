@@ -20217,6 +20217,209 @@ function levenshteinDistance(str1, str2) {
       return embedded;
     };
 
+    // --------------------------- Connection Method ---------------------------
+
+    /**
+     * Create a connection widget that connects the CURRENT SyAPP to ANOTHER
+     * SyAPP streaming server (started with `node SyAPP.js --server <port>`).
+     *
+     * Renders a self-usage dropdown (like this.DropDown / this.Emb) with:
+     *
+     *   • 🌐 URL field   — default `localhost`
+     *   • 🔌 Port field  — default `9000`
+     *   • ▶ Enter Func   — verifies the remote, then streams its view
+     *                      and forwards local input until disconnection
+     *
+     * NESTED CONNECTION CHAIN — ONE LAYER PER CTRL+C, SERVERS STAY ALIVE
+     * ────────────────────────────────────────────────────────────────
+     * L (a client, no --server) → A (--server 9000) → B (--server 9001)
+     * → C (--server 9002). Every Ctrl+C must pop exactly ONE layer, and
+     * every `--server` host must remain alive — it is serving clients,
+     * not just running its own local HUD.
+     *
+     * Mechanism:
+     *   • Local client's Ctrl+C → POST `/ctrl-c` to its remote.
+     *   • The remote's `/ctrl-c` handler sets `_remoteCtrlCRequest = true`
+     *     and injects `\x03` into its OWN stdin.
+     *   • If that remote has an active `_runRemoteSession`, its
+     *     dataHandler consumes the byte and recursively POSTs `/ctrl-c`
+     *     one level deeper — it does NOT touch the remote's HUD.
+     *   • If that remote has NO active session, the byte reaches its
+     *     HUD → emits `ctrl+c` → `_installCtrlC` runs. Because the
+     *     remote is a `--server` host, `_installCtrlC` does NOT exit
+     *     the process — it calls `_closeAllStreamClients()`, which
+     *     closes every `/stream` response. That unblocks the CALLER's
+     *     `_runRemoteSession` (via `res.on('close')`), which then
+     *     restores its own local view.
+     *
+     * The requesting peer therefore always returns one layer up, and
+     * every `--server` host keeps its process alive.
+     *
+     * @param {string} id - User/build ID
+     * @param {Object} [config]
+     * @param {string} [config.name='default'] - Unique key for this Connection instance
+     * @param {string} [config.defaultUrl='localhost'] - Default host
+     * @param {number} [config.defaultPort=9000] - Default port
+     * @param {string} [config.up_buttontext] - Collapsed button text
+     * @param {string} [config.down_buttontext] - Expanded button text
+     * @param {string} [config.up_emoji] - Collapsed emoji
+     * @param {string} [config.down_emoji] - Expanded emoji
+     * @returns {Promise<Object|null>} The widget state, or null
+     */
+    this.Connection = async (id, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Connection() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const cfg = {
+        name: 'default',
+        defaultUrl: 'localhost',
+        defaultPort: 9000,
+        up_buttontext: '🔗 Connection',
+        down_buttontext: 'Hide Connection',
+        up_emoji: '▶',
+        down_emoji: '▼',
+        ...config
+      };
+
+      const storageKey = `connection_${cfg.name}`;
+      const urlFieldKey = `${storageKey}_url`;
+      const portFieldKey = `${storageKey}_port`;
+
+      if (!this.Storages.Has(id, storageKey)) {
+        this.Storages.Set(id, storageKey, {
+          url: cfg.defaultUrl,
+          port: cfg.defaultPort,
+          error: null
+        });
+      }
+      const state = this.Storages.Get(id, storageKey);
+      if (!state.url) state.url = cfg.defaultUrl;
+      if (!state.port) state.port = cfg.defaultPort;
+
+      const build = this.Builds.get(id);
+      const curProps = (build && build.Session && build.Session.ActualProps) || {};
+      const passProps = curProps.page ? { page: curProps.page } : {};
+
+      const restoreLocalView = (syapp, session, propsToRestore, errorMessage) => {
+        try {
+          stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m');
+        } catch (_) {}
+        try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+        try { stdin.pause(); } catch (_) {}
+
+        try {
+          if (syapp && syapp.HUD) {
+            syapp.HUD.isInMenu = false;
+            syapp.HUD.currentMenuState = null;
+            syapp.HUD.isMouseEnabled = false;
+            syapp.HUD.wheelAccumulator = 0;
+          }
+        } catch (_) {}
+
+        try { if (session) session.InAction = false; } catch (_) {}
+
+        if (errorMessage) {
+          try { this.Alert(id, errorMessage, { duration: 6000 }); } catch (_) {}
+        }
+
+        try {
+          syapp.LoadScreen(this.Name, { props: { ...propsToRestore } }).catch(() => {});
+        } catch (_) {}
+      };
+
+      const doConnect = async () => {
+        const syapp = this._syappInstance;
+        if (!syapp || typeof syapp._verifyRemote !== 'function') return;
+
+        const session = syapp.Sessions.get(syapp.MainSessionID);
+        if (session) session.InAction = true;
+
+        state.error = null;
+        this.Storages.Set(id, storageKey, state);
+
+        let restoreError = null;
+
+        try {
+          try {
+            await syapp._verifyRemote(state.port, state.url);
+          } catch (e) {
+            state.error = `Cannot connect to ${state.url}:${state.port} — ${e.message}`;
+            this.Storages.Set(id, storageKey, state);
+            restoreError = `❌ ${state.error}`;
+            return;
+          }
+
+          try {
+            const streamError = await syapp._runRemoteSession(state.port, state.url);
+            if (streamError) {
+              state.error = `Remote session ended: ${streamError.message || streamError}`;
+              this.Storages.Set(id, storageKey, state);
+              restoreError = `⚠️ ${state.error}`;
+            }
+          } catch (e) {
+            restoreError = `⚠️ ${e.message || e}`;
+          }
+        } finally {
+          setImmediate(() => {
+            restoreLocalView(syapp, session, passProps, restoreError);
+          });
+        }
+      };
+
+      await this.DropDown(id, `${storageKey}_dd`, async () => {
+        this.Field(id, urlFieldKey, {
+          label: '🌐 URL',
+          initialValue: state.url,
+          maxWidth: 40,
+          onChange: (v) => {
+            const trimmed = String(v == null ? '' : v).trim();
+            state.url = trimmed || cfg.defaultUrl;
+            state.error = null;
+            this.Storages.Set(id, storageKey, state);
+          }
+        });
+
+        this.Field(id, portFieldKey, {
+          label: '🔌 Port',
+          initialValue: String(state.port),
+          maxWidth: 8,
+          onChange: (v) => {
+            const n = parseInt(String(v == null ? '' : v).trim(), 10);
+            if (!isNaN(n) && n > 0 && n < 65536) {
+              state.port = n;
+              state.error = null;
+              this.Storages.Set(id, storageKey, state);
+            }
+          }
+        });
+
+        this.Button(id, {
+          name: ColorText.bgGreen(ColorText.black(' ▶ Enter Func ')),
+          props: { [`${storageKey}_connect`]: 1, __skipLoadScreen: true },
+          action: doConnect
+        });
+
+        if (state.error) {
+          this.Text(id, ' ');
+          this.Text(id, ColorText.red('⚠️ ' + state.error));
+        }
+
+        this.Text(id, ' ');
+        this.Text(id, ColorText.dim('Default: localhost:9000 (SyAPP --server default)'));
+        this.Text(id, ColorText.dim('Start remote: node SyAPP.js --server 9000 <app.js>'));
+        this.Text(id, ColorText.dim('In session: Ctrl+C pops one level | Ctrl+B exits to local'));
+      }, {
+        up_buttontext: cfg.up_buttontext,
+        down_buttontext: cfg.down_buttontext,
+        up_emoji: cfg.up_emoji,
+        down_emoji: cfg.down_emoji
+      });
+
+      return state;
+    };
+
     // --------------------------- Emb Internals ---------------------------
 
     /**
@@ -24137,6 +24340,295 @@ this.HUD = new TerminalHUD({
       this.startHTTPServer();
     }
 
+    // --------------------------- Remote Connection Helpers ---------------------------
+
+    /**
+     * Verify that the given host:port is a reachable SyAPP streaming
+     * server. Fails fast (within 5s) so `Connection` can show a clean
+     * error without tearing down the terminal.
+     *
+     * @param {number} port
+     * @param {string} host
+     * @returns {Promise<Object>} The remote's /info payload
+     * @private
+     */
+    this._verifyRemote = (port, host) => {
+      return new Promise((resolve, reject) => {
+        const baseUrl = `http://${host}:${port}`;
+        let done = false;
+        const finish = (err, info) => {
+          if (done) return;
+          done = true;
+          if (err) reject(err);
+          else resolve(info);
+        };
+
+        const timer = setTimeout(() => {
+          finish(new Error(`Connection timeout to ${host}:${port}`));
+        }, 5000);
+        try { if (timer.unref) timer.unref(); } catch (_) {}
+
+        let req;
+        try {
+          req = http.get(`${baseUrl}/info`, { timeout: 3000 }, (res) => {
+            if (res.statusCode !== 200) {
+              try { res.resume(); } catch (_) {}
+              clearTimeout(timer);
+              finish(new Error(`Remote returned HTTP ${res.statusCode}`));
+              return;
+            }
+            let body = '';
+            res.on('data', (c) => { body += c; });
+            res.on('end', () => {
+              clearTimeout(timer);
+              try {
+                const info = JSON.parse(body);
+                if (info && (info.app === 'SyAPP Streaming Server' || info.status === 'ok')) {
+                  finish(null, info);
+                } else {
+                  finish(new Error(`Remote at ${host}:${port} is not a SyAPP streaming server`));
+                }
+              } catch (_) {
+                finish(new Error(`Remote at ${host}:${port} returned invalid response`));
+              }
+            });
+            res.on('error', (e) => {
+              clearTimeout(timer);
+              finish(new Error(`Response error: ${e.message}`));
+            });
+          });
+        } catch (e) {
+          clearTimeout(timer);
+          finish(new Error(`Cannot reach ${host}:${port}: ${e.message}`));
+          return;
+        }
+
+        req.on('error', (e) => {
+          clearTimeout(timer);
+          finish(new Error(`Cannot reach ${host}:${port}: ${e.message}`));
+        });
+        req.on('timeout', () => {
+          clearTimeout(timer);
+          try { req.destroy(); } catch (_) {}
+          finish(new Error(`Connection timeout to ${host}:${port}`));
+        });
+      });
+    };
+
+    /**
+     * Close every open `/stream` response on this SyAPP instance.
+     *
+     * Called by `_installCtrlC` when a `--server` host receives a
+     * remote `/ctrl-c` request and has no active `_runRemoteSession`
+     * of its own. Rather than exiting the process (which would kill
+     * the server for every other client), we simply end every open
+     * stream — the requesting client sees its own `_runRemoteSession`
+     * resolve via `res.on('close')` and restores its local view.
+     *
+     * @returns {number} Number of clients disconnected
+     * @private
+     */
+    this._closeAllStreamClients = () => {
+      let n = 0;
+      try {
+        const set = this._streamClients;
+        if (set && typeof set.forEach === 'function') {
+          const list = Array.from(set);
+          for (const c of list) {
+            try { c.res.end(); } catch (_) {}
+            n++;
+          }
+          set.clear();
+        }
+      } catch (_) {}
+      return n;
+    };
+
+    /**
+     * Take over the local terminal and proxy a remote streaming session.
+     *
+     * KEY BEHAVIOUR — one Ctrl+C = one layer popped, at any depth.
+     *
+     *   • Ctrl+C  → POST `/ctrl-c` to the remote; DO NOT close our own
+     *               stream. The remote pops its own child layer (or
+     *               closes its client streams if it has no child). If
+     *               it pops, its stream continues and we simply keep
+     *               reading the parent view. If it closes, its stream
+     *               ends and our session finishes naturally (via
+     *               `res.on('close')`).
+     *
+     *   • Ctrl+B  → hard local disconnect. Closes our own stream
+     *               immediately, restoring the local SyAPP view. Used
+     *               as an escape hatch.
+     *
+     *   • Stream close / end / error → finish() as before.
+     *
+     * @param {number} port
+     * @param {string} host
+     * @returns {Promise<Error|null>} null on normal close, Error otherwise
+     * @private
+     */
+    this._runRemoteSession = (port, host) => {
+      return new Promise((resolve) => {
+        const baseUrl = `http://${host}:${port}`;
+        let done = false;
+        let dataHandler = null;
+        let resizeHandler = null;
+        let streamReq = null;
+        let response = null;
+
+        const RETURN_HINT = '[Ctrl+C pop one level | Ctrl+B exit to local]';
+        const drawReturnHint = () => {
+          try {
+            const rows = stdout.rows || 24;
+            const cols = stdout.columns || 80;
+            const text = RETURN_HINT.length > cols
+              ? RETURN_HINT.slice(0, Math.max(0, cols - 1))
+              : RETURN_HINT;
+            const padded = text + ' '.repeat(Math.max(0, cols - text.length));
+            stdout.write(`\x1b7\x1b[${rows};1H\x1b[7m${padded}\x1b[0m\x1b8`);
+          } catch (_) {}
+        };
+
+        const finish = (err) => {
+          if (done) return;
+          done = true;
+
+          if (resizeHandler) {
+            try { stdout.removeListener('resize', resizeHandler); } catch (_) {}
+            resizeHandler = null;
+          }
+          if (dataHandler) {
+            try { stdin.removeListener('data', dataHandler); } catch (_) {}
+            dataHandler = null;
+          }
+          if (streamReq) {
+            try { streamReq.destroy(); } catch (_) {}
+            streamReq = null;
+          }
+          if (response) {
+            try { response.destroy(); } catch (_) {}
+            response = null;
+          }
+
+          try {
+            stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
+          } catch (_) {}
+
+          try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+          try { stdin.pause(); } catch (_) {}
+
+          try {
+            const rows = stdout.rows || 24;
+            const cols = stdout.columns || 80;
+            stdout.write(`\x1b7\x1b[${rows};1H${' '.repeat(cols)}\x1b8\x1b[0m\x1b[?25h\n`);
+          } catch (_) {
+            try { stdout.write('\x1b[0m\x1b[?25h\n'); } catch (_) {}
+          }
+
+          resolve(err || null);
+        };
+
+        try {
+          streamReq = http.get(`${baseUrl}/stream`, (res) => {
+            response = res;
+            if (res.statusCode !== 200) {
+              try { res.resume(); } catch (_) {}
+              finish(new Error(`Stream HTTP ${res.statusCode}`));
+              return;
+            }
+
+            res.on('data', (chunk) => {
+              try {
+                stdout.write(chunk);
+                drawReturnHint();
+              } catch (_) {}
+            });
+            res.on('end', () => finish(null));
+            res.on('close', () => finish(null));
+            res.on('error', (e) => finish(e));
+
+            const sendResize = () => {
+              try {
+                const body = JSON.stringify({
+                  cols: stdout.columns || 80,
+                  rows: stdout.rows || 24
+                });
+                const r = http.request(`${baseUrl}/resize`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(body)
+                  }
+                });
+                r.on('error', () => {});
+                r.end(body);
+                drawReturnHint();
+              } catch (_) {}
+            };
+            sendResize();
+            resizeHandler = sendResize;
+            try { stdout.on('resize', sendResize); } catch (_) {}
+
+            try { stdin.setRawMode(true); } catch (_) {}
+            try { stdin.resume(); } catch (_) {}
+
+            dataHandler = (chunk) => {
+              let sawCtrlC = false;
+              for (let i = 0; i < chunk.length; i++) {
+                const b = chunk[i];
+                if (b === 0x03) { sawCtrlC = true; }
+                else if (b === 0x02) {
+                  finish(null);
+                  return;
+                }
+              }
+
+              if (sawCtrlC) {
+                try {
+                  const r = http.request(`${baseUrl}/ctrl-c`, {
+                    method: 'POST',
+                    headers: { 'Content-Length': 0 }
+                  }, (res2) => {
+                    if (res2.statusCode !== 200) {
+                      try { res2.resume(); } catch (_) {}
+                      finish(null);
+                      return;
+                    }
+                    try { res2.resume(); } catch (_) {}
+                  });
+                  r.on('error', () => { finish(null); });
+                  r.end();
+                } catch (_) {
+                  finish(null);
+                }
+                return;
+              }
+
+              try {
+                const r = http.request(`${baseUrl}/input`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/octet-stream',
+                    'Content-Length': chunk.length
+                  }
+                });
+                r.on('error', () => {});
+                r.end(chunk);
+              } catch (_) {}
+            };
+            stdin.on('data', dataHandler);
+
+            drawReturnHint();
+          });
+
+          streamReq.on('error', (e) => finish(e));
+        } catch (e) {
+          finish(e);
+        }
+      });
+    };
+
     // --------------------------- LoadScreen Method ---------------------------
 
     /**
@@ -24466,6 +24958,13 @@ this.HUD = new TerminalHUD({
     };
 
     this.HUD.on(this.HUD.eventTypes.MENU_SELECTION, (e) => {
+      // ------------------------------------------------------------------
+      // SELF-MANAGED BUTTONS (Connection widget's ▶ Enter Func)
+      // ------------------------------------------------------------------
+      if (e.metadata && e.metadata.props && e.metadata.props.__skipLoadScreen) {
+        return;
+      }
+
       const currentSession = this.Sessions.get(this.MainSessionID);
       const currentProps = currentSession.ActualProps || {};
       const currentPage = currentProps.page || '';
@@ -25635,6 +26134,16 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.Chart(id, ${dataLit}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'connection': {
+          const cfg = { name: it.name }
+          if (it.config && typeof it.config === 'object') {
+            for (const [ck, cv] of Object.entries(it.config)) {
+              if (cv !== undefined) cfg[ck] = cv
+            }
+          }
+          L.push(`${indent}await this.Connection(id, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'route': {
           const m = it.method || 'Get'
           L.push(`${indent}this.${m}(id, ${JSON.stringify(it.path || '/')}, async (req, res) => {`)
@@ -25721,7 +26230,8 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Post: 'route',
   Put: 'route',
   Delete: 'route',
-  Chart: 'chart'
+  Chart: 'chart',
+  Connection: 'connection'
 }
 
 /**
@@ -25888,6 +26398,16 @@ function _sbMakeItemForMethod(methodName, id) {
         ...base,
         name: 'chart_' + id,
         data: null,
+        config: {}
+      }
+    case 'connection':
+      // Remote SyAPP streaming client. Renders a dropdown with URL /
+      // Port fields and an Enter Func button. Enter Func streams the
+      // remote view; every Ctrl+C pops exactly one layer of the
+      // (possibly nested) connection chain, and Ctrl+B exits to local.
+      return {
+        ...base,
+        name: 'conn_' + id,
         config: {}
       }
     case 'route':
@@ -28125,6 +28645,14 @@ class SelfBuilder extends SyAPP_Func {
             ...(it.config || {})
           })
           break
+        case 'connection': {
+          const connCfg = it.config && typeof it.config === 'object'
+            ? { ...it.config }
+            : {}
+          if (!connCfg.name) connCfg.name = it.name || 'default'
+          await this.Connection(id, connCfg)
+          break
+        }
         case 'route':
           this.Text(id, ColorText.magenta(`[ROUTE ${it.method || 'GET'} ${it.path || '/'}]`))
           break
@@ -28499,6 +29027,11 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('args', 'Args (JSON array)', 'json')
         mkProp('dropdown', 'Dropdown Config', 'json')
         break
+      case 'connection':
+        mkProp('name', 'Name', 'string')
+        mkProp('config', 'Config (JSON)', 'json')
+        break
+
       case 'route':
         mkProp('path', 'Path', 'string')
         mkProp('handler', 'Handler', 'string')
@@ -29255,6 +29788,15 @@ function _sbCallToItem(call, sessionVar) {
         args: Array.isArray(cfg.args) ? cfg.args : []
       };
     }
+    case 'Connection': {
+      const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {};
+      if (cfg === null) return null;
+      return {
+        type: 'connection',
+        name: typeof cfg.name === 'string' ? cfg.name : `conn_${_sbNid()}`,
+        config: cfg
+      };
+    }
     case 'File':
       return { type: 'file', config: {} }
     case 'JSON':
@@ -29690,22 +30232,52 @@ function _installCtrlC(syapp) {
   syapp.HUD.on('ctrl+c', async () => {
     // ------------------------------------------------------------------
     // REMOTE-INPUT GUARD (streaming safety).
-    //
-    // `_startStreamingServer` strips \x03 out of client input before
-    // injecting it into stdin, but as a second, independent defence
-    // we ALSO refuse to exit when the ctrl+c event was triggered by
-    // a byte that arrived from the network. The flag is set
-    // synchronously around the emit and cleared in a finally block,
-    // so it can only ever be `true` while a remote byte is being
-    // dispatched. If it is true here, the Ctrl+C came from a client,
-    // not from the host operator — do nothing. The peer's own client
-    // handles the disconnect locally.
-    //
-    // Together with the \x03-stripping in /input, this guarantees a
-    // remote keystroke can NEVER terminate the host process, no
-    // matter which handler chain the byte happens to reach.
     // ------------------------------------------------------------------
     if (syapp && syapp._streamingInputFromRemote === true) {
+      return
+    }
+
+    // ------------------------------------------------------------------
+    // REMOTE-REQUESTED CTRL+C (cascade-pop / server-safety).
+    //
+    // When `/ctrl-c` is POSTed to a host, it injects \x03 with
+    // `_remoteCtrlCRequest = true`. That flag means "a connected
+    // client asked us to pop one layer or let them leave".
+    //
+    // Two sub-cases:
+    //
+    //   A) This host is a `--server` (syapp._streamServer === true)
+    //      ────────────────────────────────────────────────────────
+    //      We must NEVER `process.exit(0)` — this host is serving
+    //      clients (possibly the whole dev chain plus any peers).
+    //      Instead, `_closeAllStreamClients()` closes every open
+    //      `/stream` response. The requesting client's
+    //      `_runRemoteSession` sees `res.on('close')`, resolves,
+    //      and restores ITS OWN local view. This host keeps running
+    //      and stays reachable for the next Enter Func.
+    //
+    //   B) This host is NOT a `--server`
+    //      ────────────────────────────────────────────────────────
+    //      There are no client streams to close. The only way to
+    //      "end this layer" is to exit the process, which closes
+    //      any outbound `/stream` the CALLER is reading from us
+    //      (via our own `_runRemoteSession`). Do it immediately,
+    //      bypassing the SelfBuilder save-prompt so we do not
+    //      freeze on a line-of-input wait mid-chain.
+    //
+    // The `_remoteCtrlCRequest` flag is cleared by the /ctrl-c
+    // handler in a `finally` that runs AFTER the synchronous part
+    // of this async listener (up to its first await) has executed.
+    // ------------------------------------------------------------------
+    if (syapp && syapp._remoteCtrlCRequest === true) {
+      if (syapp._streamServer === true) {
+        // Server case: close client streams; never exit the process.
+        try { syapp._closeAllStreamClients(); } catch (_) {}
+        return
+      }
+      // Non-server case: exit immediately (prompt-bypass).
+      cleanupTerminal()
+      process.exit(0)
       return
     }
 
@@ -29809,7 +30381,24 @@ const _STREAM_DEFAULT_HOST = 'localhost'
  * @private
  */
 function _startStreamingServer(syapp, port, host) {
-  const clients = new Set()
+  // ------------------------------------------------------------------
+  // Mark this SyAPP instance as a streaming server. Used by
+  // `_installCtrlC` to decide whether a remote `/ctrl-c` request
+  // should CLOSE CLIENT STREAMS (server case) or EXIT THE PROCESS
+  // (non-server case). A `--server` host must never kill itself.
+  // ------------------------------------------------------------------
+  syapp._streamServer = true
+
+  // ------------------------------------------------------------------
+  // The set of currently connected `/stream` clients is stored on the
+  // SyAPP instance (not a function-local) so `_closeAllStreamClients()`
+  // can drain it from `_installCtrlC` when a remote Ctrl+C request
+  // arrives and this host has no active child session.
+  // ------------------------------------------------------------------
+  if (!(syapp._streamClients instanceof Set)) {
+    syapp._streamClients = new Set()
+  }
+  const clients = syapp._streamClients
 
   // ------------------------------------------------------------------
   // Patch stdout.write so every byte the HUD renders is ALSO mirrored
@@ -29943,6 +30532,43 @@ function _startStreamingServer(syapp, port, host) {
         res.writeHead(200, { 'Content-Type': 'text/plain' })
         res.end('OK')
       })
+      return
+    }
+
+    // ---------- /ctrl-c : progressive layer pop for nested chains ----------
+    //
+    // Injects a raw \x03 byte into this host's stdin. The exact effect
+    // depends on what is currently reading stdin:
+    //
+    //   • If this host has an active `_runRemoteSession` (it is
+    //     streaming a deeper SyAPP), that session's dataHandler
+    //     consumes the byte and recursively POSTs /ctrl-c deeper —
+    //     the HUD is NOT disturbed.
+    //
+    //   • If this host has no active session, the \x03 reaches its
+    //     HUD keypress handler → emits 'ctrl+c' → `_installCtrlC`
+    //     runs. With `_remoteCtrlCRequest === true`:
+    //        · On a `--server` host  → `_closeAllStreamClients()`
+    //                                  (closes every /stream so
+    //                                   callers unwind cleanly).
+    //                                  The process stays ALIVE.
+    //        · On a non --server host → `process.exit(0)`
+    //                                  (nothing else can happen).
+    //
+    // The flag is set around the inject and cleared synchronously in
+    // `finally` — the HUD's async `ctrl+c` listener runs synchronously
+    // up to its first await, so it always reads the flag while set.
+    if (pathname === '/ctrl-c' && req.method === 'POST') {
+      try {
+        syapp._remoteCtrlCRequest = true;
+        stdin.emit('data', Buffer.from([0x03]));
+      } catch (_) {
+        // ignore
+      } finally {
+        try { syapp._remoteCtrlCRequest = false; } catch (_) {}
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain' })
+      res.end('OK')
       return
     }
 
