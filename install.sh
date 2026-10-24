@@ -1399,7 +1399,14 @@ build_config_interface() {
                         ;;
                 esac
                 
-                echo "${prev_hash}|${days}|${sub_count}|${label}" >> "$VERSION_METRICS_FILE"
+                # NEW: count total lines of code added between the two version commits
+                lines_added=0
+                if [ -n "$prev_hash" ] && [ -n "$hash" ]; then
+                    lines_added=$(git diff --numstat "${prev_hash}..${hash}" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {sum+=$1} END {print sum+0}')
+                    [ -z "$lines_added" ] && lines_added=0
+                fi
+                
+                echo "${prev_hash}|${days}|${sub_count}|${label}|${lines_added}" >> "$VERSION_METRICS_FILE"
             fi
             prev_hash="$hash"
             prev_date="$date"
@@ -1466,7 +1473,14 @@ build_config_interface() {
                     ;;
             esac
             
-            echo "${prev_hash}|${days}|${sub_count}|${label}" >> "$VERSION_METRICS_FILE"
+            # NEW: count total lines of code added between the last version and HEAD
+            lines_added=0
+            if [ -n "$prev_hash" ]; then
+                lines_added=$(git diff --numstat "${prev_hash}..HEAD" 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {sum+=$1} END {print sum+0}')
+                [ -z "$lines_added" ] && lines_added=0
+            fi
+            
+            echo "${prev_hash}|${days}|${sub_count}|${label}|${lines_added}" >> "$VERSION_METRICS_FILE"
         fi
         
         rm -f "/tmp/build_version_tags_$$.txt"
@@ -1973,7 +1987,9 @@ build_config_interface() {
                                 days=$(echo "$metrics" | cut -d'|' -f2)
                                 sub_count=$(echo "$metrics" | cut -d'|' -f3)
                                 label=$(echo "$metrics" | cut -d'|' -f4)
-                                version_extra=" (${days}d, ${sub_count} ${label})"
+                                lines_added=$(echo "$metrics" | cut -d'|' -f5)
+                                [ -z "$lines_added" ] && lines_added=0
+                                version_extra=" (${days}d, ${sub_count} ${label}, +${lines_added} lines)"
                             fi
                         fi
                         printf "  %2s. %8s %s %s %s%s%s\n" "$counter" "$size_display" "$short_hash" "$date" "$shortened_msg" "$version_extra" "$marker"
