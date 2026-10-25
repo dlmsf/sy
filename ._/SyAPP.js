@@ -31506,8 +31506,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     // Every new SyAPP(...) in this CLI block is routed through here,
     // so --server works uniformly for the SelfBuilder, JSON viewer,
     // save loader and user-file loader paths.
-    const _bootApp = (FuncClass) => {
-      const app = new SyAPP(FuncClass)
+    const _bootApp = (FuncClass, extraConfig = {}) => {
+      const app = new SyAPP(FuncClass, extraConfig)
       _installCtrlC(app)
       if (_streamMode === 'server') {
         _startStreamingServer(app, _streamPort, _streamHost)
@@ -31550,6 +31550,20 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           // Assume a save name — pass through untouched. The child
           // will load it via _loadSaveState().
           targetParts.push(arg1);
+        }
+
+        // Forward every argument AFTER the target (file path or save
+        // name) so it reaches the spawned Func as a processArg — the
+        // same way `node SyAPP.js MyApp.js arg1 arg2` behaves.
+        //
+        // Without this, `node SyAPP.js --bg MyApp.js arg1 arg2` would
+        // silently drop arg1/arg2, AND the child's `_processArgs`
+        // fallback (process.argv.slice(3)) would compute
+        // `['<port>', '<target>']` because `--server <port>` shifts
+        // every positional argument one slot to the right — i.e. the
+        // port and the file path would be misread as the Func's args.
+        for (let i = 1; i < args.length; i++) {
+          targetParts.push(JSON.stringify(String(args[i])));
         }
       }
 
@@ -31934,7 +31948,19 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       // streaming server. This is the primary entry point for running
       // a real user app, so this is where streaming support matters
       // most.
-      _bootApp(ExportedFunc);
+      //
+      // `processArgs` is supplied EXPLICITLY (rather than relying on
+      // the SyAPP constructor's default `process.argv.slice(3)`
+      // fallback). The fallback only holds for the plain
+      // `node SyAPP.js <file> [args]` shape; when the CLI is invoked
+      // with `--server <port>` (as the `--bg` flow does), the port
+      // sits at argv[3], and slice(3) would wrongly treat the port
+      // AND the file path as Func args. `_plainArgs` already contains
+      // exactly the non-flag positional arguments, so
+      // `_plainArgs.slice(1)` is precisely "everything after the
+      // target file" — the correct `processArgs` value for every
+      // invocation shape.
+      _bootApp(ExportedFunc, { processArgs: _plainArgs.slice(1) });
 
     } catch (err) {
       console.error(ColorText.brightRed(`❌ SyAPP runner: unexpected error while loading "${targetFile}":`));
