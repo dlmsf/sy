@@ -23685,6 +23685,24 @@ class SyPMManagerFunc extends SyAPP_Func {
           delete curProps.__sypm_refresh;
         }
 
+        // ------------------------------------------------------------------
+        // VIEW STYLE TOGGLE 🎨
+        // ------------------------------------------------------------------
+        // Flips between the two complete renderings of the manage view:
+        //
+        //   'card' (default) → TextButton framed cards + divider lines
+        //   'row'            → plain Button rows + blank spacers
+        //
+        // Stored per-session under 'sypm_mgr_view_style' so the choice
+        // survives refreshes. Used by both _renderListView() and
+        // _renderLogView().
+        // ------------------------------------------------------------------
+        if (curProps.__sypm_toggle_style) {
+          delete curProps.__sypm_toggle_style;
+          const current = this.Storages.Get(id, 'sypm_mgr_view_style');
+          this.Storages.Set(id, 'sypm_mgr_view_style', current === 'row' ? 'card' : 'row');
+        }
+
         if (view === 'log') {
           this._renderLogView(id);
           return;
@@ -23701,31 +23719,111 @@ class SyPMManagerFunc extends SyAPP_Func {
     try {
       list = SyPM.list().filter(p => p.name && String(p.name).startsWith('syapp-bg-'));
     } catch (e) {
+      // Base (original) error path — preserved verbatim, so anything that
+      // worked before cannot break. The view-style toggle below only
+      // affects the successful-render path.
       this.Text(id, ColorText.red(`Error reading registry: ${e.message}`));
       return;
     }
 
-    this.Text(id, ColorText.brightCyan(`📦 SyAPP Background Processes (${list.length})`));
-    this.Text(id, ColorText.dim('Click ▶ Enter to connect directly — Ctrl+C returns here.'));
-    this.Text(id, '');
+    // ------------------------------------------------------------------
+    // VIEW STYLE TOGGLE 🎨
+    // ------------------------------------------------------------------
+    // Two complete renderings are supported and switchable at runtime
+    // with the 🎨 button in the footer row:
+    //
+    //   'card' (DEFAULT)  → each process instance is a TextButton FRAMED
+    //                       CARD (┌ ┐ └ ┘ box). Instances are separated
+    //                       by a blank line + horizontal divider line +
+    //                       blank line. Header / error / empty-state are
+    //                       also framed TextButton cards so everything
+    //                       lines up perfectly in the menu column.
+    //
+    //   'row'             → each process instance is a plain styled
+    //                       Button ROW. Instances are separated by a
+    //                       single blank spacer row. Header / error /
+    //                       empty-state are Button rows too.
+    //
+    // The chosen style is stored per-session under 'sypm_mgr_view_style'
+    // and survives refresh ticks naturally (the storage layer persists
+    // across LoadScreen rebuilds).
+    // ------------------------------------------------------------------
+    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'row') ? 'row' : 'card';
+    const isCard = viewStyle === 'card';
 
-    const lastError = this.Storages.Get(id, 'sypm_mgr_last_error');
-    if (lastError) {
-      this.Text(id, ColorText.red('⚠  ' + lastError));
-      this.Button(id, { name: '✕ Dismiss', props: { __sypm_dismiss_err: 1 } });
-      this.Text(id, '');
+    // ---------- Header ----------
+    if (isCard) {
+      this.TextButton(id, 'sypm_mgr_header', {
+        label: 'Background Processes',
+        initialValue:
+          `📦 SyAPP Background Processes (${list.length})\n` +
+          'Click ▶ Enter to connect directly — Ctrl+C returns here.',
+        lines: 4,
+        editable: false
+      });
+    } else {
+      this.Button(id, { name: ColorText.brightCyan(`📦 SyAPP Background Processes (${list.length})`) });
+      this.Button(id, { name: ColorText.dim('Click ▶ Enter to connect directly — Ctrl+C returns here.') });
+      this.Button(id, { name: ' ' });
     }
 
+    // ---------- Error banner ----------
+    const lastError = this.Storages.Get(id, 'sypm_mgr_last_error');
+    if (lastError) {
+      if (isCard) {
+        this.TextButton(id, 'sypm_mgr_error', {
+          label: '⚠ Error',
+          initialValue: lastError,
+          lines: 3,
+          editable: false
+        });
+      } else {
+        this.Button(id, { name: ColorText.red('⚠  ' + lastError) });
+      }
+      this.Button(id, { name: '✕ Dismiss', props: { __sypm_dismiss_err: 1 } });
+      this.Button(id, { name: ' ' });
+    }
+
+    // ---------- Empty state ----------
     if (list.length === 0) {
-      this.Text(id, ColorText.dim('No background processes running.'));
-      this.Text(id, ColorText.dim('Start one with:'));
-      this.Text(id, ColorText.brightYellow('  node SyAPP.js --bg MyApp.js'));
-      this.Text(id, '');
-      this.Button(id, { name: '↻ Refresh', props: { __sypm_refresh: 1 } });
+      if (isCard) {
+        this.TextButton(id, 'sypm_mgr_empty', {
+          label: 'No processes',
+          initialValue:
+            'No background processes running.\n' +
+            'Start one with:\n' +
+            '  node SyAPP.js --bg MyApp.js',
+          lines: 5,
+          editable: false
+        });
+      } else {
+        this.Button(id, { name: ColorText.dim('No background processes running.') });
+        this.Button(id, { name: ColorText.dim('Start one with:') });
+        this.Button(id, { name: ColorText.brightYellow('  node SyAPP.js --bg MyApp.js') });
+      }
+      this.Button(id, { name: ' ' });
+      this.Buttons(id, [
+        { name: '↻ Refresh', props: { __sypm_refresh: 1 } },
+        {
+          name: isCard
+            ? ColorText.brightYellow('🎨 Card ▸ Row')
+            : ColorText.brightYellow('🎨 Row ▸ Card'),
+          props: { __sypm_toggle_style: 1 }
+        }
+      ]);
       return;
     }
 
-    for (const p of list) {
+    // Pre-list spacer in card mode. In row mode the spacers between
+    // instances are emitted inside the loop below, so no leading blank
+    // is needed here.
+    if (isCard) {
+      this.Button(id, { name: ' ' });
+    }
+
+    // ---------- Process instance blocks ----------
+    for (let idx = 0; idx < list.length; idx++) {
+      const p = list[idx];
       const m = String(p.name).match(/syapp-bg-(\d+)/);
       const port = m ? parseInt(m[1], 10) : null;
       const isRunning = p.status === 'Running' || p.status === 'Restarting';
@@ -23734,8 +23832,33 @@ class SyPMManagerFunc extends SyAPP_Func {
                        : p.status === 'Dead' ? ColorText.red('● Dead')
                        : ColorText.dim(`● ${p.status}`);
 
-      this.Text(id, `${statusStr} ${ColorText.bold(p.name)}  ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`);
+      if (isCard) {
+        // ----- CARD STYLE instance block -----
+        //
+        //   ┌ syapp-bg-9000 ─────────────────────┐
+        //   │ ● Running   PID ... · port 9000      │
+        //   └──────────────────────────────────────┘
+        //   📋 Log   ▶ Enter   ✕ Stop
+        this.TextButton(id, `sypm_mgr_proc_${p.id}`, {
+          label: String(p.name),
+          initialValue: `${statusStr}   ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`,
+          lines: 3,
+          editable: false
+        });
+      } else {
+        // ----- ROW STYLE instance block -----
+        //
+        //   ● Running syapp-bg-9000  PID ... · port 9000
+        //   📋 Log   ▶ Enter   ✕ Stop
+        //
+        // Blank spacer BETWEEN instances (never before the first).
+        if (idx > 0) this.Button(id, { name: ' ' });
+        this.Button(id, {
+          name: `${statusStr} ${ColorText.bold(p.name)}  ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`
+        });
+      }
 
+      // Instance action buttons (identical for both styles).
       const buttons = [
         { name: '📋 Log', props: { __sypm_viewlog: p.id } }
       ];
@@ -23752,12 +23875,39 @@ class SyPMManagerFunc extends SyAPP_Func {
         buttons.push({ name: ColorText.red('✕ Stop'), props: { __sypm_stop: p.id } });
       }
       this.Buttons(id, buttons);
+
+      // Card mode: extra breathing room — divider line between
+      // instances (skipped after the LAST one, the footer draws its
+      // own trailing separator).
+      if (isCard && idx < list.length - 1) {
+        this.Button(id, { name: ' ' });
+        this.Button(id, { name: _hr('─') });
+        this.Button(id, { name: ' ' });
+      }
     }
 
-    this.Text(id, '');
+    // ---------- Footer trailer + global actions + style toggle ----------
+    if (isCard) {
+      // Match the per-instance divider rhythm for the trailing block.
+      this.Button(id, { name: ' ' });
+      this.Button(id, { name: _hr('─') });
+      this.Button(id, { name: ' ' });
+    } else {
+      this.Button(id, { name: ' ' });
+    }
+
     this.Buttons(id, [
       { name: '↻ Refresh', props: { __sypm_refresh: 1 } },
-      { name: '🧹 Clean Dead', props: { __sypm_cleanup: 1 } }
+      { name: '🧹 Clean Dead', props: { __sypm_cleanup: 1 } },
+      {
+        // Label shows CURRENT mode ▸ NEXT mode on click.
+        //   'Card ▸ Row'  → currently card, clicking switches to row
+        //   'Row ▸ Card'  → currently row, clicking switches to card
+        name: isCard
+          ? ColorText.brightYellow('🎨 Card ▸ Row')
+          : ColorText.brightYellow('🎨 Row ▸ Card'),
+        props: { __sypm_toggle_style: 1 }
+      }
     ]);
   }
 
@@ -23874,8 +24024,22 @@ class SyPMManagerFunc extends SyAPP_Func {
       proc = registry.find(p => p.id === logId);
     } catch (_) {}
 
+    // Same view-style toggle as the list view, so the LOG screen has
+    // matching visuals with whichever style the user picked.
+    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'row') ? 'row' : 'card';
+    const isCard = viewStyle === 'card';
+
     if (!proc) {
-      this.Text(id, ColorText.red(`Process ${logId} not found.`));
+      if (isCard) {
+        this.TextButton(id, 'sypm_mgr_log_notfound', {
+          label: '⚠ Error',
+          initialValue: `Process ${logId} not found.`,
+          lines: 3,
+          editable: false
+        });
+      } else {
+        this.Button(id, { name: ColorText.red(`Process ${logId} not found.`) });
+      }
       this.Button(id, { name: '← Back', props: { __sypm_back: 1 } });
       return;
     }
@@ -23895,9 +24059,24 @@ class SyPMManagerFunc extends SyAPP_Func {
       ? ColorText.brightYellow('❄️  frozen')
       : ColorText.brightGreen('▶ live');
 
-    this.Text(id, `📋 ${ColorText.bold(proc.name)} ${ColorText.dim(`(PID ${proc.pid})`)} — ${statusLabel}`);
-    this.Text(id, '');
+    // Title block — card style uses the framed TextButton (matching the
+    // list view), row style uses a plain Button row.
+    if (isCard) {
+      this.TextButton(id, `sypm_mgr_logtitle_${logId}`, {
+        label: `Log: ${proc.name}`,
+        initialValue: `${statusLabel}   ${ColorText.dim(`PID ${proc.pid}`)}`,
+        lines: 3,
+        editable: false
+      });
+    } else {
+      this.Button(id, {
+        name: `📋 ${ColorText.bold(proc.name)} ${ColorText.dim(`(PID ${proc.pid})`)} — ${statusLabel}`
+      });
+      this.Button(id, { name: ' ' });
+    }
 
+    // Log body is always a TextButton in both styles — it is the actual
+    // log content viewport, not an informational row.
     this.TextButton(id, `sypm_log_${logId}`, {
       label: `Log tail`,
       initialValue: content,
