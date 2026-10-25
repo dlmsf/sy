@@ -23688,15 +23688,32 @@ class SyPMManagerFunc extends SyAPP_Func {
         const logIdKey          = 'sypm_mgr_logid';
         const frozenKey         = 'sypm_mgr_frozen';
         const frozenContentKey  = 'sypm_mgr_frozen_content';
+        const confirmKey        = 'sypm_mgr_confirm';
+        const selectedKey       = 'sypm_mgr_selected';
 
         let view = this.Storages.Get(id, viewKey) || 'list';
 
+        // Bulk-selection state — persists across refresh ticks.
+        let selected = this.Storages.Get(id, selectedKey);
+        if (!Array.isArray(selected)) selected = [];
+
+        // Pending inline confirmation. Either { pid } (single row) or
+        // { bulk: [ids] } (bulk toolbar). Rendered NEXT TO whatever row
+        // triggered it, so the target is always visually attached to
+        // its confirmation prompt.
+        const setConfirm = (payload) => {
+          if (payload) this.Storages.Set(id, confirmKey, payload);
+          else this.Storages.Delete(id, confirmKey);
+        };
+
+        // ---------- Navigation ----------
         if (curProps.__sypm_viewlog) {
           const procId = curProps.__sypm_viewlog;
           delete curProps.__sypm_viewlog;
           this.Storages.Set(id, logIdKey, procId);
           this.Storages.Set(id, viewKey, 'log');
           this.Storages.Set(id, frozenKey, false);
+          setConfirm(null);
           view = 'log';
         }
 
@@ -23715,17 +23732,86 @@ class SyPMManagerFunc extends SyAPP_Func {
           this.Storages.Set(id, frozenKey, !cur);
         }
 
-        if (curProps.__sypm_stop) {
-          const procId = curProps.__sypm_stop;
-          delete curProps.__sypm_stop;
+        // ---------- Selection ----------
+        if (curProps.__sypm_select) {
+          const procId = curProps.__sypm_select;
+          delete curProps.__sypm_select;
+          const idx = selected.indexOf(procId);
+          if (idx >= 0) selected.splice(idx, 1);
+          else selected.push(procId);
+          this.Storages.Set(id, selectedKey, selected);
+        }
+
+        if (curProps.__sypm_select_all) {
+          delete curProps.__sypm_select_all;
           try {
-            SyPM.kill(procId);
-            this.Alert(id, `Stopped process ${procId}`, { duration: 2500 });
-          } catch (e) {
-            this.Alert(id, `Failed to stop: ${e.message}`, { duration: 4000 });
+            const all = SyPM.list()
+              .filter(p => p.name && String(p.name).startsWith('syapp-bg-'))
+              .map(p => p.id);
+            const allAlready = all.length > 0 && all.every(x => selected.includes(x));
+            selected = allAlready ? [] : all.slice();
+            this.Storages.Set(id, selectedKey, selected);
+          } catch (_) {}
+        }
+
+        if (curProps.__sypm_clear_selection) {
+          delete curProps.__sypm_clear_selection;
+          selected = [];
+          this.Storages.Set(id, selectedKey, selected);
+          setConfirm(null);
+        }
+
+        // ---------- DELETE (single, confirmation-gated) ----------
+        // Clicking 🗑 only opens the inline confirmation for that row.
+        // Nothing is killed until the inline ✓ is clicked.
+        if (curProps.__sypm_delete) {
+          const procId = curProps.__sypm_delete;
+          delete curProps.__sypm_delete;
+          setConfirm({ pid: procId });
+        }
+
+        // ---------- Bulk delete (confirmation-gated) ----------
+        if (curProps.__sypm_bulk_delete) {
+          delete curProps.__sypm_bulk_delete;
+          if (selected.length > 0) setConfirm({ bulk: selected.slice() });
+        }
+
+        // ---------- Confirmation handlers ----------
+        if (curProps.__sypm_confirm_no) {
+          delete curProps.__sypm_confirm_no;
+          setConfirm(null);
+        }
+
+        if (curProps.__sypm_confirm_yes) {
+          delete curProps.__sypm_confirm_yes;
+
+          const pending = this.Storages.Get(id, confirmKey) || {};
+
+          try {
+            if (pending.pid) {
+              // Kill if still alive, then remove the registry entry so
+              // no Dead/Stopped row is left behind.
+              try { SyPM.kill(pending.pid); } catch (_) {}
+              try { SyPM._removeFromRegistry(pending.pid); } catch (_) {}
+              const idx = selected.indexOf(pending.pid);
+              if (idx >= 0) {
+                selected.splice(idx, 1);
+                this.Storages.Set(id, selectedKey, selected);
+              }
+            } else if (Array.isArray(pending.bulk) && pending.bulk.length > 0) {
+              for (const pid of pending.bulk) {
+                try { SyPM.kill(pid); } catch (_) {}
+                try { SyPM._removeFromRegistry(pid); } catch (_) {}
+              }
+              selected = [];
+              this.Storages.Set(id, selectedKey, selected);
+            }
+          } catch (_) {} finally {
+            setConfirm(null);
           }
         }
 
+        // ---------- Misc ----------
         if (curProps.__sypm_dismiss_err) {
           delete curProps.__sypm_dismiss_err;
           this.Storages.Delete(id, 'sypm_mgr_last_error');
@@ -23735,9 +23821,9 @@ class SyPMManagerFunc extends SyAPP_Func {
           delete curProps.__sypm_cleanup;
           try {
             SyPM.cleanup();
-            this.Alert(id, 'Cleaned up dead processes', { duration: 2000 });
+            this.Alert(id, 'Cleaned dead', { duration: 1500 });
           } catch (e) {
-            this.Alert(id, `Cleanup failed: ${e.message}`, { duration: 4000 });
+            this.Alert(id, `Cleanup failed: ${e.message}`, { duration: 3000 });
           }
         }
 
@@ -23745,22 +23831,15 @@ class SyPMManagerFunc extends SyAPP_Func {
           delete curProps.__sypm_refresh;
         }
 
-        // ------------------------------------------------------------------
-        // VIEW STYLE TOGGLE 🎨
-        // ------------------------------------------------------------------
-        // Flips between the two complete renderings of the manage view:
-        //
-        //   'card' (default) → TextButton framed cards + divider lines
-        //   'row'            → plain Button rows + blank spacers
-        //
-        // Stored per-session under 'sypm_mgr_view_style' so the choice
-        // survives refreshes. Used by both _renderListView() and
-        // _renderLogView().
-        // ------------------------------------------------------------------
+        // ---------- View style toggle (Row = DEFAULT) ----------
         if (curProps.__sypm_toggle_style) {
           delete curProps.__sypm_toggle_style;
           const current = this.Storages.Get(id, 'sypm_mgr_view_style');
-          this.Storages.Set(id, 'sypm_mgr_view_style', current === 'row' ? 'card' : 'row');
+          // Default is 'row'; the only way to leave row is via a click
+          // from 'card'. First press from the fresh default lands on
+          // 'card' (never redundantly on 'row').
+          const next = (current === 'card') ? 'row' : 'card';
+          this.Storages.Set(id, 'sypm_mgr_view_style', next);
         }
 
         if (view === 'log') {
@@ -23775,31 +23854,18 @@ class SyPMManagerFunc extends SyAPP_Func {
   }
 
   _renderListView(id) {
-    let list = [];
+    let fullList = [];
     try {
-      list = SyPM.list().filter(p => p.name && String(p.name).startsWith('syapp-bg-'));
+      fullList = SyPM.list().filter(p => p.name && String(p.name).startsWith('syapp-bg-'));
     } catch (e) {
-      // Base (original) error path — preserved verbatim, so anything that
-      // worked before cannot break. The view-style toggle below only
-      // affects the successful-render path.
       this.Text(id, ColorText.red(`Error reading registry: ${e.message}`));
       return;
     }
 
-    // ------------------------------------------------------------------
-    // SEARCH-BY-NAME FILTER
-    // ------------------------------------------------------------------
-    // A text field bound to `field_sypm_mgr_search`. When non-empty,
-    // the process list is filtered to name-similar entries and sorted
-    // so the closest match (exact match first) appears at the top.
-    // The first exact match is flagged with `_isExact` so it can be
-    // visually "focused" in the render pass below.
-    //
-    // Clearing the field (via ✕ Clear or by deleting the text) shows
-    // the full unfiltered list again.
-    // ------------------------------------------------------------------
     const curProps = this.Builds.get(id)?.Session?.ActualProps || {};
     const searchKey = 'field_sypm_mgr_search';
+    const selectedKey = 'sypm_mgr_selected';
+    const confirmKey = 'sypm_mgr_confirm';
 
     if (curProps.__sypm_clear_search) {
       delete curProps.__sypm_clear_search;
@@ -23807,78 +23873,82 @@ class SyPMManagerFunc extends SyAPP_Func {
     }
 
     const searchQuery = String(this.Storages.Get(id, searchKey) || '').trim();
-    const totalCount = list.length;
+    const totalCount = fullList.length;
 
+    let list = fullList;
     if (searchQuery) {
-      list = list
+      list = fullList
         .map(p => ({ proc: p, score: _sypmNameMatchScore(p.name, searchQuery) }))
         .filter(x => x.score > 0)
         .sort((a, b) => b.score - a.score)
         .map(x => x.proc);
     }
 
-    // "Focus" the absolute match: since the list is sorted by score,
-    // an exact (case-insensitive) match is always at index 0.
     if (searchQuery && list.length > 0) {
       if (String(list[0].name || '').toLowerCase() === searchQuery.toLowerCase()) {
         list[0]._isExact = true;
       }
     }
 
-    // ------------------------------------------------------------------
-    // VIEW STYLE TOGGLE 🎨
-    // ------------------------------------------------------------------
-    // Two complete renderings are supported and switchable at runtime
-    // with the 🎨 button in the footer row:
-    //
-    //   'card' (DEFAULT)  → each process instance is a TextButton FRAMED
-    //                       CARD (┌ ┐ └ ┘ box). Instances are separated
-    //                       by a blank line + horizontal divider line +
-    //                       blank line. Header / error / empty-state are
-    //                       also framed TextButton cards so everything
-    //                       lines up perfectly in the menu column.
-    //
-    //   'row'             → each process instance is a plain styled
-    //                       Button ROW. Instances are separated by a
-    //                       single blank spacer row. Header / error /
-    //                       empty-state are Button rows too.
-    //
-    // The chosen style is stored per-session under 'sypm_mgr_view_style'
-    // and survives refresh ticks naturally (the storage layer persists
-    // across LoadScreen rebuilds).
-    // ------------------------------------------------------------------
-    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'row') ? 'row' : 'card';
+    // ---------- Selection (pruned against FULL list, not the filtered one) ----------
+    let selected = this.Storages.Get(id, selectedKey);
+    if (!Array.isArray(selected)) selected = [];
+    if (selected.length > 0) {
+      const fullIds = new Set(fullList.map(p => p.id));
+      const pruned = selected.filter(x => fullIds.has(x));
+      if (pruned.length !== selected.length) {
+        selected = pruned;
+        this.Storages.Set(id, selectedKey, selected);
+      }
+    }
+
+    // ---------- Pending confirmation (auto-pruned if target vanished) ----------
+    let confirm = this.Storages.Get(id, confirmKey) || null;
+    if (confirm) {
+      const fullIds = new Set(fullList.map(p => p.id));
+      if (confirm.pid && !fullIds.has(confirm.pid)) {
+        confirm = null;
+        this.Storages.Delete(id, confirmKey);
+      } else if (Array.isArray(confirm.bulk)) {
+        const stillValid = confirm.bulk.filter(x => fullIds.has(x));
+        if (stillValid.length === 0) {
+          confirm = null;
+          this.Storages.Delete(id, confirmKey);
+        } else if (stillValid.length !== confirm.bulk.length) {
+          confirm = { bulk: stillValid };
+          this.Storages.Set(id, confirmKey, confirm);
+        }
+      }
+    }
+
+    // ---------- View style (Row = DEFAULT) ----------
+    // 'row'   → compact Button rows + single blank spacer between rows.
+    //           Best for small terminals and infinite scrolling.
+    // 'card'  → framed TextButton cards + divider lines.
+    // Only an explicit 'card' triggers card mode; anything else (null,
+    // undefined, fresh session) renders as row.
+    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'card') ? 'card' : 'row';
     const isCard = viewStyle === 'card';
 
-    // ---------- Header ----------
+    // ---------- Header (single line) ----------
     const headerCount = searchQuery
       ? `${list.length} of ${totalCount}`
       : String(list.length);
 
     if (isCard) {
       this.TextButton(id, 'sypm_mgr_header', {
-        label: 'Background Processes',
-        initialValue:
-          `📦 SyAPP Background Processes (${headerCount})\n` +
-          'Click ▶ Enter to connect directly — Ctrl+C returns here.',
-        lines: 4,
+        label: 'Processes',
+        initialValue: `📦 Processes (${headerCount})`,
+        lines: 3,
         editable: false
       });
     } else {
-      this.Button(id, { name: ColorText.brightCyan(`📦 SyAPP Background Processes (${headerCount})`) });
-      this.Button(id, { name: ColorText.dim('Click ▶ Enter to connect directly — Ctrl+C returns here.') });
-      this.Button(id, { name: ' ' });
+      this.Button(id, { name: ColorText.brightCyan(`📦 Processes (${headerCount})`) });
     }
 
-    // ------------------------------------------------------------------
-    // SEARCH FIELD
-    // ------------------------------------------------------------------
-    // Always visible so the search box is a stable presence across
-    // renders. When the query is non-empty, a "✕ Clear" button is
-    // added next to it.
-    // ------------------------------------------------------------------
+    // ---------- Search ----------
     this.Field(id, 'sypm_mgr_search', {
-      label: '🔍 Search by name',
+      label: '🔍',
       initialValue: searchQuery,
       maxWidth: 60,
       onChange: (v) => {
@@ -23888,10 +23958,45 @@ class SyPMManagerFunc extends SyAPP_Func {
 
     if (searchQuery) {
       this.Button(id, {
-        name: ColorText.dim(`✕ Clear search`),
+        name: ColorText.dim('✕'),
         props: { __sypm_clear_search: true }
       });
     }
+
+    // ---------- Bulk toolbar / bulk confirmation ----------
+    // These two blocks are mutually exclusive: while a bulk confirmation
+    // is pending, the SAME row is reused to show the ✓/✕ prompt, so the
+    // confirmation stays anchored where the user just clicked.
+    if (!confirm && selected.length > 0) {
+      const allIds = list.map(p => p.id);
+      const allAlreadySelected = allIds.length > 0 && allIds.every(x => selected.includes(x));
+      this.Buttons(id, [
+        {
+          name: ColorText.bgRed(ColorText.brightWhite(` 🗑 Delete ${selected.length} `)),
+          props: { __sypm_bulk_delete: 1 }
+        },
+        {
+          name: allAlreadySelected ? '⊟ None' : '⊞ All',
+          props: { __sypm_select_all: 1 }
+        },
+        {
+          name: ColorText.dim('×'),
+          props: { __sypm_clear_selection: 1 }
+        }
+      ]);
+    } else if (confirm && Array.isArray(confirm.bulk) && confirm.bulk.length > 0) {
+      this.Buttons(id, [
+        {
+          name: ColorText.bgRed(ColorText.brightWhite(` ✓ Delete ${confirm.bulk.length}? `)),
+          props: { __sypm_confirm_yes: 1 }
+        },
+        {
+          name: ColorText.dim('✕'),
+          props: { __sypm_confirm_no: 1 }
+        }
+      ]);
+    }
+
     this.Button(id, { name: ' ' });
 
     // ---------- Error banner ----------
@@ -23907,7 +24012,7 @@ class SyPMManagerFunc extends SyAPP_Func {
       } else {
         this.Button(id, { name: ColorText.red('⚠  ' + lastError) });
       }
-      this.Button(id, { name: '✕ Dismiss', props: { __sypm_dismiss_err: 1 } });
+      this.Button(id, { name: '✕', props: { __sypm_dismiss_err: 1 } });
       this.Button(id, { name: ' ' });
     }
 
@@ -23918,43 +24023,32 @@ class SyPMManagerFunc extends SyAPP_Func {
         this.TextButton(id, 'sypm_mgr_empty', {
           label: noMatch ? 'No matches' : 'No processes',
           initialValue: noMatch
-            ? `No processes match "${searchQuery}".\nClear the search to see all.`
-            : ('No background processes running.\n' +
-               'Start one with:\n' +
-               '  node SyAPP.js --bg MyApp.js'),
-          lines: 5,
+            ? `No matches for "${searchQuery}".`
+            : 'No background processes running.',
+          lines: 3,
           editable: false
         });
       } else {
-        if (noMatch) {
-          this.Button(id, { name: ColorText.dim(`No processes match "${searchQuery}".`) });
-        } else {
-          this.Button(id, { name: ColorText.dim('No background processes running.') });
-          this.Button(id, { name: ColorText.dim('Start one with:') });
-          this.Button(id, { name: ColorText.brightYellow('  node SyAPP.js --bg MyApp.js') });
-        }
+        this.Button(id, {
+          name: ColorText.dim(noMatch
+            ? `No matches for "${searchQuery}".`
+            : 'No background processes running.')
+        });
       }
       this.Button(id, { name: ' ' });
       this.Buttons(id, [
         { name: '↻ Refresh', props: { __sypm_refresh: 1 } },
         {
-          name: isCard
-            ? ColorText.brightYellow('🎨 Card ▸ Row')
-            : ColorText.brightYellow('🎨 Row ▸ Card'),
+          name: ColorText.brightYellow(isCard ? '🎨 Card ▸ Row' : '🎨 Row ▸ Card'),
           props: { __sypm_toggle_style: 1 }
         }
       ]);
       return;
     }
 
-    // Pre-list spacer in card mode. In row mode the spacers between
-    // instances are emitted inside the loop below, so no leading blank
-    // is needed here.
-    if (isCard) {
-      this.Button(id, { name: ' ' });
-    }
+    if (isCard) this.Button(id, { name: ' ' });
 
-    // ---------- Process instance blocks ----------
+    // ---------- Process instances ----------
     for (let idx = 0; idx < list.length; idx++) {
       const p = list[idx];
       const m = String(p.name).match(/syapp-bg-(\d+)/);
@@ -23965,60 +24059,66 @@ class SyPMManagerFunc extends SyAPP_Func {
                        : p.status === 'Dead' ? ColorText.red('● Dead')
                        : ColorText.dim(`● ${p.status}`);
 
-      // Truncate the display name so giant custom names never overflow
-      // the terminal. `_isExact` (set above for the closest search
-      // match) is surfaced as a 🎯 marker so the user immediately sees
-      // the absolute match that was typed.
       const displayName = _sypmDisplayName(p.name);
       const exactMarker = (p._isExact === true) ? ColorText.brightGreen('🎯 ') : '';
+      const isSelected = selected.includes(p.id);
+      const isPending = confirm && confirm.pid === p.id;
 
+      // ---------- Row header ----------
       if (isCard) {
-        // ----- CARD STYLE instance block -----
-        //
-        //   ┌ syapp-bg-9000 ─────────────────────┐
-        //   │ ● Running   PID ... · port 9000      │
-        //   └──────────────────────────────────────┘
-        //   📋 Log   ▶ Enter   ✕ Stop
+        const dot = isSelected ? '■' : '☐';
         this.TextButton(id, `sypm_mgr_proc_${p.id}`, {
-          label: displayName,
+          label: `${dot} ${displayName}`,
           initialValue: `${exactMarker}${statusStr}   ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`,
           lines: 3,
           editable: false
         });
       } else {
-        // ----- ROW STYLE instance block -----
-        //
-        //   ● Running syapp-bg-9000  PID ... · port 9000
-        //   📋 Log   ▶ Enter   ✕ Stop
-        //
-        // Blank spacer BETWEEN instances (never before the first).
         if (idx > 0) this.Button(id, { name: ' ' });
         this.Button(id, {
           name: `${exactMarker}${statusStr} ${ColorText.bold(displayName)}  ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`
         });
       }
 
-      // Instance action buttons (identical for both styles).
-      const buttons = [
-        { name: '📋 Log', props: { __sypm_viewlog: p.id } }
-      ];
-      if (isRunning && port) {
-        buttons.push({
-          name: '▶ Enter',
-          // `__skipLoadScreen` tells SyAPP's MENU_SELECTION handler
-          // NOT to fire its own LoadScreen after this button's action
-          // runs. The action below does everything itself — verify →
-          // connect → stream → return to the manager's list view.
-          props: { __skipLoadScreen: true },
-          action: () => this._directConnect(id, port)
-        });
-        buttons.push({ name: ColorText.red('✕ Stop'), props: { __sypm_stop: p.id } });
+      // ---------- Row actions / inline confirmation ----------
+      // While a confirmation is pending for THIS row, the action row is
+      // replaced by an inline ✓/✕ prompt — the target and its confirm
+      // stay visually attached.
+      //
+      // Only ONE destructive button is exposed per row: 🗑. It kills the
+      // process (no-op if dead) AND removes the registry entry, so no
+      // Dead/Stopped leftover survives the delete.
+      if (isPending) {
+        this.Buttons(id, [
+          {
+            name: ColorText.bgRed(ColorText.brightWhite(' ✓ Delete? ')),
+            props: { __sypm_confirm_yes: 1 }
+          },
+          {
+            name: ColorText.dim('✕'),
+            props: { __sypm_confirm_no: 1 }
+          }
+        ]);
+      } else {
+        const btns = [
+          {
+            name: isSelected ? ColorText.bgGreen(ColorText.black(' ■ ')) : ColorText.dim('☐'),
+            props: { __sypm_select: p.id }
+          },
+          { name: '📋', props: { __sypm_viewlog: p.id } }
+        ];
+        if (isRunning && port) {
+          btns.push({
+            name: '▶ Enter',
+            props: { __skipLoadScreen: true },
+            action: () => this._directConnect(id, port)
+          });
+        }
+        btns.push({ name: ColorText.red('🗑'), props: { __sypm_delete: p.id } });
+        this.Buttons(id, btns);
       }
-      this.Buttons(id, buttons);
 
-      // Card mode: extra breathing room — divider line between
-      // instances (skipped after the LAST one, the footer draws its
-      // own trailing separator).
+      // Card mode: divider between instances (skipped after the last).
       if (isCard && idx < list.length - 1) {
         this.Button(id, { name: ' ' });
         this.Button(id, { name: _hr('─') });
@@ -24026,9 +24126,8 @@ class SyPMManagerFunc extends SyAPP_Func {
       }
     }
 
-    // ---------- Footer trailer + global actions + style toggle ----------
+    // ---------- Footer ----------
     if (isCard) {
-      // Match the per-instance divider rhythm for the trailing block.
       this.Button(id, { name: ' ' });
       this.Button(id, { name: _hr('─') });
       this.Button(id, { name: ' ' });
@@ -24038,14 +24137,9 @@ class SyPMManagerFunc extends SyAPP_Func {
 
     this.Buttons(id, [
       { name: '↻ Refresh', props: { __sypm_refresh: 1 } },
-      { name: '🧹 Clean Dead', props: { __sypm_cleanup: 1 } },
+      { name: '🧹 Clean', props: { __sypm_cleanup: 1 } },
       {
-        // Label shows CURRENT mode ▸ NEXT mode on click.
-        //   'Card ▸ Row'  → currently card, clicking switches to row
-        //   'Row ▸ Card'  → currently row, clicking switches to card
-        name: isCard
-          ? ColorText.brightYellow('🎨 Card ▸ Row')
-          : ColorText.brightYellow('🎨 Row ▸ Card'),
+        name: ColorText.brightYellow(isCard ? '🎨 Card ▸ Row' : '🎨 Row ▸ Card'),
         props: { __sypm_toggle_style: 1 }
       }
     ]);
@@ -24164,9 +24258,9 @@ class SyPMManagerFunc extends SyAPP_Func {
       proc = registry.find(p => p.id === logId);
     } catch (_) {}
 
-    // Same view-style toggle as the list view, so the LOG screen has
-    // matching visuals with whichever style the user picked.
-    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'row') ? 'row' : 'card';
+    // Same view-style toggle as the list view. Defaults to 'row' to
+    // match the list view's new default.
+    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'card') ? 'card' : 'row';
     const isCard = viewStyle === 'card';
 
     if (!proc) {
