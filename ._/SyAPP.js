@@ -99,6 +99,152 @@ function isPersistentPath(p) {
 }
 
 /**
+ * System-level port lock manager for SyAPP background (`--bg`) instances.
+ *
+ * Combines two independent guarantees:
+ *
+ *   1. ATOMIC FILE LOCK — `fs.openSync(file, 'wx')` is atomic on every
+ *      filesystem that supports O_EXCL (all modern OSes), so concurrent
+ *      `node SyAPP.js --bg` launches from different shells never claim
+ *      the same port.
+ *
+ *   2. LIVE TCP BIND PROBE — after grabbing the lock file, we actually
+ *      try to `net.createServer().listen(port)`. If the port is already
+ *      bound (e.g. by a non-SyAPP process that slipped past the file
+ *      lock), we release the lock and move to the next port.
+ *
+ * Lock files live under `~/.sypm/ports/<port>.lock` and carry the
+ * current owner's PID so stale locks (from crashed processes) can be
+ * reclaimed automatically on the next acquire attempt.
+ *
+ * @class
+ */
+class SyPortLock {
+    static DIR = path.join(GLOBAL_BASE_DIR, 'ports');
+    static BASE = 9000;
+    static MAX = 9999;
+
+    static ensureDir() {
+        if (!fs.existsSync(this.DIR)) fs.mkdirSync(this.DIR, { recursive: true });
+    }
+
+    static isPidAlive(pid) {
+        if (!pid) return false;
+        try { process.kill(pid, 0); return true; } catch (_) { return false; }
+    }
+
+    static tryBind(port) {
+        return new Promise((resolve) => {
+            const srv = net.createServer();
+            let settled = false;
+            const done = (ok) => {
+                if (settled) return;
+                settled = true;
+                resolve(ok);
+            };
+            srv.once('error', () => done(false));
+            srv.once('listening', () => {
+                try { srv.close(() => done(true)); }
+                catch (_) { done(true); }
+            });
+            try {
+                srv.listen(port, '0.0.0.0');
+            } catch (_) {
+                done(false);
+            }
+        });
+    }
+
+    static cleanStale() {
+        this.ensureDir();
+        let entries = [];
+        try { entries = fs.readdirSync(this.DIR); } catch (_) { return; }
+        for (const f of entries) {
+            if (!f.endsWith('.lock')) continue;
+            const full = path.join(this.DIR, f);
+            try {
+                const data = JSON.parse(fs.readFileSync(full, 'utf8'));
+                if (!data.pid || !this.isPidAlive(data.pid)) {
+                    try { fs.unlinkSync(full); } catch (_) {}
+                }
+            } catch (_) {
+                try { fs.unlinkSync(full); } catch (_) {}
+            }
+        }
+    }
+
+    static async acquire(ownerId = '') {
+        this.ensureDir();
+        this.cleanStale();
+        for (let port = this.BASE; port <= this.MAX; port++) {
+            const lockFile = path.join(this.DIR, `${port}.lock`);
+            let fd;
+            try {
+                fd = fs.openSync(lockFile, 'wx');
+            } catch (e) {
+                if (e.code !== 'EEXIST') throw e;
+                continue;
+            }
+            try {
+                const free = await this.tryBind(port);
+                if (!free) {
+                    try { fs.closeSync(fd); } catch (_) {}
+                    try { fs.unlinkSync(lockFile); } catch (_) {}
+                    continue;
+                }
+                fs.writeSync(fd, JSON.stringify({
+                    ownerId,
+                    pid: process.pid,
+                    acquiredAt: new Date().toISOString()
+                }));
+                try { fs.closeSync(fd); } catch (_) {}
+                return port;
+            } catch (e) {
+                try { fs.closeSync(fd); } catch (_) {}
+                try { fs.unlinkSync(lockFile); } catch (_) {}
+                throw e;
+            }
+        }
+        throw new Error(`SyPortLock: no free port available in ${this.BASE}-${this.MAX} range`);
+    }
+
+    static reassign(port, pid, ownerId = '') {
+        try {
+            this.ensureDir();
+            const lockFile = path.join(this.DIR, `${port}.lock`);
+            fs.writeFileSync(lockFile, JSON.stringify({
+                ownerId,
+                pid,
+                acquiredAt: new Date().toISOString()
+            }));
+        } catch (_) {}
+    }
+
+    static release(port) {
+        try {
+            const lockFile = path.join(this.DIR, `${port}.lock`);
+            if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+        } catch (_) {}
+    }
+
+    static releaseAllOwned() {
+        this.ensureDir();
+        let entries = [];
+        try { entries = fs.readdirSync(this.DIR); } catch (_) { return; }
+        for (const f of entries) {
+            if (!f.endsWith('.lock')) continue;
+            const full = path.join(this.DIR, f);
+            try {
+                const data = JSON.parse(fs.readFileSync(full, 'utf8'));
+                if (data.pid === process.pid) {
+                    fs.unlinkSync(full);
+                }
+            } catch (_) {}
+        }
+    }
+}
+
+/**
  * Main SyPM class for managing system processes
  * @class
  */
@@ -23434,6 +23580,362 @@ class HTTPRoutesStorage {
   }
 }
 
+// --------------------------- SyPMManagerFunc Class ---------------------------
+
+/**
+ * SyAPP Func interface for managing SyAPP background (`--bg`) processes.
+ *
+ * Lists every `syapp-bg-<port>` process tracked by the shared SyPM
+ * registry and offers, per row:
+ *
+ *   • 📋 Log   — view the process's log file (auto-follow with a
+ *                freeze toggle, mirroring `SyPM --monit`'s log view)
+ *   • ▶ Enter  — connect DIRECTLY to the process's `--server` port
+ *                using `_verifyRemote` + `_runRemoteSession` (no
+ *                intermediate `this.Connection()` widget, no
+ *                dropdown to open)
+ *   • ✕ Stop   — kill the process via `SyPM.kill()`
+ *
+ * Plus two global actions:
+ *
+ *   • ↻ Refresh   — manual rebuild (auto-refresh runs on each tick)
+ *   • 🧹 Clean    — `SyPM.cleanup()` to prune dead entries
+ *
+ * Direct-connect flow (no dropdown):
+ *   1. Clicking ▶ Enter fires the button's `action` handler with
+ *      `props.__skipLoadScreen = true`, so SyAPP's MENU_SELECTION
+ *      listener does NOT fire its own competing LoadScreen.
+ *   2. `_directConnect()` verifies the remote, then streams it via
+ *      `_runRemoteSession()`.
+ *   3. Ctrl+C in the remote → the remote's `/ctrl-c` closes its
+ *      stream → our `_runRemoteSession` resolves → `_restoreAfterRemote`
+ *      cleans the terminal and LoadScreens the manager's list view.
+ *   4. On any connection failure, an error banner is persisted to
+ *      storage and shown on the next list render (this.Alert cannot
+ *      be used because Build has already completed by that point).
+ *
+ * @extends SyAPP_Func
+ */
+class SyPMManagerFunc extends SyAPP_Func {
+  constructor() {
+    super(
+      '__sypm_manager__',
+      async (props) => {
+        const id = props.session.UniqueID;
+        const curProps = this.Builds.get(id).Session.ActualProps || {};
+
+        const viewKey           = 'sypm_mgr_view';
+        const logIdKey          = 'sypm_mgr_logid';
+        const frozenKey         = 'sypm_mgr_frozen';
+        const frozenContentKey  = 'sypm_mgr_frozen_content';
+
+        let view = this.Storages.Get(id, viewKey) || 'list';
+
+        if (curProps.__sypm_viewlog) {
+          const procId = curProps.__sypm_viewlog;
+          delete curProps.__sypm_viewlog;
+          this.Storages.Set(id, logIdKey, procId);
+          this.Storages.Set(id, viewKey, 'log');
+          this.Storages.Set(id, frozenKey, false);
+          view = 'log';
+        }
+
+        if (curProps.__sypm_back) {
+          delete curProps.__sypm_back;
+          this.Storages.Set(id, viewKey, 'list');
+          this.Storages.Delete(id, logIdKey);
+          this.Storages.Set(id, frozenKey, false);
+          this.Storages.Delete(id, frozenContentKey);
+          view = 'list';
+        }
+
+        if (curProps.__sypm_freeze) {
+          delete curProps.__sypm_freeze;
+          const cur = this.Storages.Get(id, frozenKey) === true;
+          this.Storages.Set(id, frozenKey, !cur);
+        }
+
+        if (curProps.__sypm_stop) {
+          const procId = curProps.__sypm_stop;
+          delete curProps.__sypm_stop;
+          try {
+            SyPM.kill(procId);
+            this.Alert(id, `Stopped process ${procId}`, { duration: 2500 });
+          } catch (e) {
+            this.Alert(id, `Failed to stop: ${e.message}`, { duration: 4000 });
+          }
+        }
+
+        if (curProps.__sypm_dismiss_err) {
+          delete curProps.__sypm_dismiss_err;
+          this.Storages.Delete(id, 'sypm_mgr_last_error');
+        }
+
+        if (curProps.__sypm_cleanup) {
+          delete curProps.__sypm_cleanup;
+          try {
+            SyPM.cleanup();
+            this.Alert(id, 'Cleaned up dead processes', { duration: 2000 });
+          } catch (e) {
+            this.Alert(id, `Cleanup failed: ${e.message}`, { duration: 4000 });
+          }
+        }
+
+        if (curProps.__sypm_refresh) {
+          delete curProps.__sypm_refresh;
+        }
+
+        if (view === 'log') {
+          this._renderLogView(id);
+          return;
+        }
+
+        this._renderListView(id);
+      },
+      { refreshMode: true }
+    );
+  }
+
+  _renderListView(id) {
+    let list = [];
+    try {
+      list = SyPM.list().filter(p => p.name && String(p.name).startsWith('syapp-bg-'));
+    } catch (e) {
+      this.Text(id, ColorText.red(`Error reading registry: ${e.message}`));
+      return;
+    }
+
+    this.Text(id, ColorText.brightCyan(`📦 SyAPP Background Processes (${list.length})`));
+    this.Text(id, ColorText.dim('Click ▶ Enter to connect directly — Ctrl+C returns here.'));
+    this.Text(id, '');
+
+    const lastError = this.Storages.Get(id, 'sypm_mgr_last_error');
+    if (lastError) {
+      this.Text(id, ColorText.red('⚠  ' + lastError));
+      this.Button(id, { name: '✕ Dismiss', props: { __sypm_dismiss_err: 1 } });
+      this.Text(id, '');
+    }
+
+    if (list.length === 0) {
+      this.Text(id, ColorText.dim('No background processes running.'));
+      this.Text(id, ColorText.dim('Start one with:'));
+      this.Text(id, ColorText.brightYellow('  node SyAPP.js --bg MyApp.js'));
+      this.Text(id, '');
+      this.Button(id, { name: '↻ Refresh', props: { __sypm_refresh: 1 } });
+      return;
+    }
+
+    for (const p of list) {
+      const m = String(p.name).match(/syapp-bg-(\d+)/);
+      const port = m ? parseInt(m[1], 10) : null;
+      const isRunning = p.status === 'Running' || p.status === 'Restarting';
+      const statusStr = p.status === 'Running' ? ColorText.green('● Running')
+                       : p.status === 'Restarting' ? ColorText.yellow('● Restarting')
+                       : p.status === 'Dead' ? ColorText.red('● Dead')
+                       : ColorText.dim(`● ${p.status}`);
+
+      this.Text(id, `${statusStr} ${ColorText.bold(p.name)}  ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`);
+
+      const buttons = [
+        { name: '📋 Log', props: { __sypm_viewlog: p.id } }
+      ];
+      if (isRunning && port) {
+        buttons.push({
+          name: '▶ Enter',
+          // `__skipLoadScreen` tells SyAPP's MENU_SELECTION handler
+          // NOT to fire its own LoadScreen after this button's action
+          // runs. The action below does everything itself — verify →
+          // connect → stream → return to the manager's list view.
+          props: { __skipLoadScreen: true },
+          action: () => this._directConnect(id, port)
+        });
+        buttons.push({ name: ColorText.red('✕ Stop'), props: { __sypm_stop: p.id } });
+      }
+      this.Buttons(id, buttons);
+    }
+
+    this.Text(id, '');
+    this.Buttons(id, [
+      { name: '↻ Refresh', props: { __sypm_refresh: 1 } },
+      { name: '🧹 Clean Dead', props: { __sypm_cleanup: 1 } }
+    ]);
+  }
+
+  /**
+   * Connect DIRECTLY to a `--bg` instance's `--server` port — no
+   * intermediate `this.Connection()` widget, no dropdown to open.
+   *
+   * Flow:
+   *   1. Verify the remote is alive (`_verifyRemote`).
+   *   2. Stream its screen (`_runRemoteSession`).
+   *   3. When the stream ends (user pressed Ctrl+C in the remote, or
+   *      the remote went away), restore the terminal state and
+   *      re-render the manager list view.
+   *
+   * The button that invokes this carries `props.__skipLoadScreen`, so
+   * SyAPP's MENU_SELECTION handler does NOT fire a competing
+   * LoadScreen after the action runs — this method owns the terminal
+   * for the entire stream duration and releases it back to the
+   * manager on return.
+   *
+   * @private
+   */
+  async _directConnect(id, port) {
+    const syapp = this._syappInstance;
+    if (!syapp ||
+        typeof syapp._verifyRemote !== 'function' ||
+        typeof syapp._runRemoteSession !== 'function') {
+      this.Storages.Set(id, 'sypm_mgr_last_error', 'Connection subsystem not available');
+      return;
+    }
+
+    this.Storages.Delete(id, 'sypm_mgr_last_error');
+
+    const session = syapp.Sessions.get(syapp.MainSessionID);
+    if (session) session.InAction = true;
+
+    let restoreError = null;
+
+    try {
+      try {
+        await syapp._verifyRemote(port, 'localhost');
+      } catch (e) {
+        restoreError = `Cannot connect to localhost:${port} — ${e.message}`;
+        return;
+      }
+
+      try {
+        const streamError = await syapp._runRemoteSession(port, 'localhost');
+        if (streamError) {
+          restoreError = `Remote session ended: ${streamError.message || streamError}`;
+        }
+      } catch (e) {
+        restoreError = e.message || String(e);
+      }
+    } finally {
+      // Defer to the next macrotask so the HUD's selectOption handler
+      // can finish unwinding (it `await`s this action's promise)
+      // before we rebuild the manager menu.
+      setImmediate(() => {
+        this._restoreAfterRemote(id, syapp, session, restoreError);
+      });
+    }
+  }
+
+  /**
+   * Restore the terminal and navigate back to the manager's list view.
+   * Called from `_directConnect`'s `finally` block on both successful
+   * Ctrl+C return and connection failure.
+   *
+   * @private
+   */
+  _restoreAfterRemote(id, syapp, session, errorMessage) {
+    try {
+      stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m');
+    } catch (_) {}
+    try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+    try { stdin.pause(); } catch (_) {}
+
+    try {
+      if (syapp && syapp.HUD) {
+        syapp.HUD.isInMenu = false;
+        syapp.HUD.currentMenuState = null;
+        syapp.HUD.isMouseEnabled = false;
+        syapp.HUD.wheelAccumulator = 0;
+      }
+    } catch (_) {}
+
+    try { this.Storages.Set(id, 'sypm_mgr_view', 'list'); } catch (_) {}
+    try { this.Storages.Delete(id, 'sypm_mgr_logid'); } catch (_) {}
+
+    // Persist any error so it survives the rebuild and is shown on
+    // the list view's next render. `this.Alert` cannot be used here:
+    // by the time this runs, Build has completed and the Builds map
+    // no longer holds this session, so Alert would silently drop it.
+    if (errorMessage) {
+      try { this.Storages.Set(id, 'sypm_mgr_last_error', errorMessage); } catch (_) {}
+      try { console.error('[SyPM Manager] ' + errorMessage); } catch (_) {}
+    }
+
+    // Release the session lock BEFORE LoadScreen so the rebuild is
+    // not skipped by the InAction guard.
+    try { if (session) session.InAction = false; } catch (_) {}
+
+    try {
+      syapp.LoadScreen(this.Name, { props: {} }).catch(() => {});
+    } catch (_) {}
+  }
+
+  _renderLogView(id) {
+    const logId = this.Storages.Get(id, 'sypm_mgr_logid');
+    let proc = null;
+    try {
+      const registry = SyPM._loadRegistry();
+      proc = registry.find(p => p.id === logId);
+    } catch (_) {}
+
+    if (!proc) {
+      this.Text(id, ColorText.red(`Process ${logId} not found.`));
+      this.Button(id, { name: '← Back', props: { __sypm_back: 1 } });
+      return;
+    }
+
+    const isFrozen = this.Storages.Get(id, 'sypm_mgr_frozen') === true;
+    const frozenContentKey = 'sypm_mgr_frozen_content';
+
+    let content;
+    if (isFrozen) {
+      content = this.Storages.Get(id, frozenContentKey) || '(no content)';
+    } else {
+      content = this._readLogTail(proc.log);
+      this.Storages.Set(id, frozenContentKey, content);
+    }
+
+    const statusLabel = isFrozen
+      ? ColorText.brightYellow('❄️  frozen')
+      : ColorText.brightGreen('▶ live');
+
+    this.Text(id, `📋 ${ColorText.bold(proc.name)} ${ColorText.dim(`(PID ${proc.pid})`)} — ${statusLabel}`);
+    this.Text(id, '');
+
+    this.TextButton(id, `sypm_log_${logId}`, {
+      label: `Log tail`,
+      initialValue: content,
+      lines: 24,
+      editable: false
+    });
+
+    this.Buttons(id, [
+      {
+        name: isFrozen ? '▶ Unfreeze' : '⏸ Freeze',
+        props: { __sypm_freeze: 1 }
+      },
+      { name: '← Back', props: { __sypm_back: 1 } }
+    ]);
+  }
+
+  _readLogTail(logPath, maxBytes = 128 * 1024, maxLines = 300) {
+    try {
+      const stat = fs.statSync(logPath);
+      if (stat.size === 0) return '(empty log)';
+      const readBytes = Math.min(stat.size, maxBytes);
+      const buf = Buffer.alloc(readBytes);
+      const fd = fs.openSync(logPath, 'r');
+      try {
+        fs.readSync(fd, buf, 0, readBytes, stat.size - readBytes);
+      } finally {
+        try { fs.closeSync(fd); } catch (_) {}
+      }
+      let content = buf.toString('utf8');
+      const lines = content.split('\n');
+      if (lines.length > maxLines) content = lines.slice(-maxLines).join('\n');
+      return content || '(empty)';
+    } catch (e) {
+      return `(error reading log: ${e.message})`;
+    }
+  }
+}
+
 // --------------------------- AdminManager Class ---------------------------
 
 /**
@@ -24182,6 +24684,10 @@ this.HUD = new TerminalHUD({
     // via this.Emb() / GotoNow / any user code, regardless of which func
     // is the main func for this SyAPP instance.
     this.ProcessFuncs(SelfBuilder);
+    // Pre-load the SyPM manager func — the interface used by
+    // `node SyAPP.js --manage` to list / inspect / kill / connect-to
+    // every background instance spawned by `node SyAPP.js --bg`.
+    this.ProcessFuncs(SyPMManagerFunc);
 
     // ============================================================
     // EMB RETURN TARGETS
@@ -30761,6 +31267,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _streamMode = null
     let _streamPort = _STREAM_DEFAULT_PORT
     let _streamHost = _STREAM_DEFAULT_HOST
+    let _bgMode = false
+    let _manageMode = false
     const _plainArgs = []
 
     for (let i = 0; i < _rawCliArgs.length; i++) {
@@ -30789,6 +31297,10 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           }
         }
         i = j - 1
+      } else if (a === '--bg') {
+        _bgMode = true
+      } else if (a === '--manage') {
+        _manageMode = true
       } else {
         _plainArgs.push(a)
       }
@@ -30822,6 +31334,99 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         _startStreamingServer(app, _streamPort, _streamHost)
       }
       return app
+    }
+
+    // ------------------------------------------------------------------
+    // --bg : spawn a background SyPM-managed SyAPP with --server mode
+    // ------------------------------------------------------------------
+    const _runBackgroundSpawn = async (args) => {
+      const syappJsPath = path.isAbsolute(process.argv[1])
+        ? process.argv[1]
+        : path.resolve(process.cwd(), process.argv[1]);
+
+      if (!fs.existsSync(syappJsPath)) {
+        console.error(ColorText.brightRed(`❌ Cannot locate running SyAPP.js at: ${syappJsPath}`));
+        process.exit(1);
+      }
+
+      const targetParts = [];
+      const arg1 = args[0];
+      if (arg1) {
+        const looksLikeFile =
+          arg1.endsWith('.js') || arg1.endsWith('.mjs') || arg1.endsWith('.cjs') ||
+          arg1.endsWith('.json') || arg1.endsWith('.jsonl') ||
+          arg1.startsWith('./') || arg1.startsWith('../') || arg1.startsWith('/') ||
+          fs.existsSync(path.resolve(process.cwd(), arg1));
+
+        if (looksLikeFile) {
+          const absPath = path.isAbsolute(arg1)
+            ? arg1
+            : path.resolve(process.cwd(), arg1);
+          if (!fs.existsSync(absPath)) {
+            console.error(ColorText.brightRed(`❌ Target file not found: ${arg1}`));
+            process.exit(1);
+          }
+          targetParts.push(`"${absPath}"`);
+        } else {
+          // Assume a save name — pass through untouched. The child
+          // will load it via _loadSaveState().
+          targetParts.push(arg1);
+        }
+      }
+
+      let port;
+      try {
+        port = await SyPortLock.acquire(`syapp-bg-${process.pid}`);
+      } catch (e) {
+        console.error(ColorText.brightRed(`❌ Port allocation failed: ${e.message}`));
+        process.exit(1);
+      }
+
+      const name = `syapp-bg-${port}`;
+      const cmdParts = [process.execPath, `"${syappJsPath}"`, '--server', String(port), ...targetParts];
+      const cmd = cmdParts.join(' ');
+
+      try {
+        // Prune dead entries so uniqueNameLock does not trip over a
+        // stale `syapp-bg-<port>` from a previous run.
+        try { SyPM.cleanup(); } catch (_) {}
+
+        const entry = SyPM.exec(cmd, {
+          name,
+          workingDir: process.cwd(),
+          uniqueNameLock: true
+        });
+
+        // Hand the lock to the actual background child PID so stale
+        // detection tracks the real process owner.
+        SyPortLock.reassign(port, entry.pid, name);
+
+        console.log('');
+        console.log(ColorText.brightGreen('✅ SyAPP background process started'));
+        console.log(`   ${ColorText.brightWhite('Name:')} ${name}`);
+        console.log(`   ${ColorText.brightWhite('Port:')} ${port}`);
+        console.log(`   ${ColorText.brightWhite('PID:')}  ${entry.pid}`);
+        console.log(`   ${ColorText.brightWhite('Log:')}  ${entry.log}`);
+        console.log('');
+        console.log(`   ${ColorText.dim('Manage with:')} ${ColorText.brightYellow(`node ${path.basename(syappJsPath)} --manage`)}`);
+        console.log('');
+      } catch (e) {
+        console.error(ColorText.brightRed(`❌ Failed to spawn background process: ${e.message}`));
+        try { SyPortLock.release(port); } catch (_) {}
+        process.exit(1);
+      }
+
+      process.exit(0);
+    };
+
+    if (_manageMode) {
+      _bootApp(SyPMManagerFunc);
+      return;
+    }
+
+    if (_bgMode) {
+      await _runBackgroundSpawn(_plainArgs);
+      return;
     }
 
     const arg1 = _plainArgs[0];
