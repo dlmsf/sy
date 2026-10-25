@@ -25161,6 +25161,7 @@ this.HUD = new TerminalHUD({
         let resizeHandler = null;
         let streamReq = null;
         let response = null;
+        let myStreamId = null;
 
         const RETURN_HINT = '[Ctrl+C pop one level | Ctrl+B exit to local]';
         const drawReturnHint = () => {
@@ -25222,6 +25223,11 @@ this.HUD = new TerminalHUD({
               finish(new Error(`Stream HTTP ${res.statusCode}`));
               return;
             }
+            // Capture the server-assigned stream ID so a later Ctrl+C
+            // request can identify THIS client unambiguously. The
+            // server uses it to close only this client's stream —
+            // never every peer connected to the same host.
+            myStreamId = res.headers['x-stream-id'] || null;
 
             res.on('data', (chunk) => {
               try {
@@ -25271,9 +25277,18 @@ this.HUD = new TerminalHUD({
 
               if (sawCtrlC) {
                 try {
+                  // Include our server-assigned stream ID so the
+                  // remote closes ONLY our stream — not every stream
+                  // connected to it. Without this, two terminals
+                  // connected to the same `--bg` server would both
+                  // disconnect whenever either one pressed Ctrl+C.
+                  const ctrlBody = JSON.stringify({ streamId: myStreamId || '' });
                   const r = http.request(`${baseUrl}/ctrl-c`, {
                     method: 'POST',
-                    headers: { 'Content-Length': 0 }
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'Content-Length': Buffer.byteLength(ctrlBody)
+                    }
                   }, (res2) => {
                     if (res2.statusCode !== 200) {
                       try { res2.resume(); } catch (_) {}
@@ -25283,7 +25298,7 @@ this.HUD = new TerminalHUD({
                     try { res2.resume(); } catch (_) {}
                   });
                   r.on('error', () => { finish(null); });
-                  r.end();
+                  r.end(ctrlBody);
                 } catch (_) {
                   finish(null);
                 }
@@ -30956,8 +30971,29 @@ function _installCtrlC(syapp) {
     // ------------------------------------------------------------------
     if (syapp && syapp._remoteCtrlCRequest === true) {
       if (syapp._streamServer === true) {
-        // Server case: close client streams; never exit the process.
-        try { syapp._closeAllStreamClients(); } catch (_) {}
+        // Server case: close ONLY the requesting client's stream —
+        // never every connected peer's stream (that would disconnect
+        // every other terminal that happens to be connected to the
+        // same background instance) and never exit the process (the
+        // server must keep serving everyone else).
+        //
+        // The /ctrl-c handler recorded the requesting client's
+        // server-assigned stream ID in `_remoteCtrlCClientId`. We look
+        // up that exact client in `_streamClients` and close only its
+        // response. Every other client stays connected and keeps
+        // streaming this server's output undisturbed.
+        const targetId = syapp._remoteCtrlCClientId
+        if (targetId && syapp._streamClients) {
+          try {
+            for (const c of Array.from(syapp._streamClients)) {
+              if (c && c.id === targetId) {
+                try { c.res.end() } catch (_) {}
+                try { syapp._streamClients.delete(c) } catch (_) {}
+                break
+              }
+            }
+          } catch (_) {}
+        }
         return
       }
       // Non-server case: exit immediately (prompt-bypass).
@@ -31120,14 +31156,21 @@ function _startStreamingServer(syapp, port, host) {
 
     // ---------- /stream : host → client render data ----------
     if (pathname === '/stream' && req.method === 'GET') {
+      // Each stream gets a unique, server-assigned ID. It is returned
+      // to the client in an `X-Stream-Id` response header so that a
+      // later Ctrl+C request from THAT client can identify exactly
+      // which stream to close — without touching the streams of any
+      // other client that happens to be connected to this same host.
+      const streamId = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'Cache-Control': 'no-cache, no-store',
         'Connection': 'keep-alive',
-        'X-Accel-Buffering': 'no'
+        'X-Accel-Buffering': 'no',
+        'X-Stream-Id': streamId
       })
 
-      const client = { res, id: Date.now() + Math.random() }
+      const client = { res, id: streamId }
       clients.add(client)
 
       // Clear the client's terminal before the first real render byte.
@@ -31244,16 +31287,37 @@ function _startStreamingServer(syapp, port, host) {
     // `finally` — the HUD's async `ctrl+c` listener runs synchronously
     // up to its first await, so it always reads the flag while set.
     if (pathname === '/ctrl-c' && req.method === 'POST') {
-      try {
-        syapp._remoteCtrlCRequest = true;
-        stdin.emit('data', Buffer.from([0x03]));
-      } catch (_) {
-        // ignore
-      } finally {
-        try { syapp._remoteCtrlCRequest = false; } catch (_) {}
-      }
-      res.writeHead(200, { 'Content-Type': 'text/plain' })
-      res.end('OK')
+      let body = ''
+      req.on('data', c => { body += c })
+      req.on('end', () => {
+        // The requesting client includes its own `streamId` (the value
+        // it received in the `X-Stream-Id` header when it opened the
+        // `/stream` connection). That lets the `_installCtrlC` handler
+        // close ONLY this client's stream — every other client stays
+        // connected and keeps receiving output from this host.
+        let streamId = ''
+        try {
+          if (body) {
+            const parsed = JSON.parse(body)
+            if (parsed && typeof parsed.streamId === 'string') streamId = parsed.streamId
+          }
+        } catch (_) {}
+        try {
+          syapp._remoteCtrlCRequest = true
+          syapp._remoteCtrlCClientId = streamId
+          stdin.emit('data', Buffer.from([0x03]))
+        } catch (_) {
+          // ignore
+        } finally {
+          try { syapp._remoteCtrlCRequest = false } catch (_) {}
+          try { syapp._remoteCtrlCClientId = null } catch (_) {}
+        }
+        res.writeHead(200, { 'Content-Type': 'text/plain' })
+        res.end('OK')
+      })
+      req.on('error', () => {
+        try { res.writeHead(500); res.end('err') } catch (_) {}
+      })
       return
     }
 
