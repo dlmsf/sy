@@ -23580,6 +23580,66 @@ class HTTPRoutesStorage {
   }
 }
 
+// --------------------------- SyPMManagerFunc Helpers ---------------------------
+
+/**
+ * Truncate a background-process display name to fit the terminal width.
+ *
+ * Caps at `min(maxLen, max(20, termWidth - 10))` so that even a giant
+ * custom name created via `--bg --name "<very long string>"` never
+ * overflows the menu column. The default 130-char cap sits comfortably
+ * inside the 100-150 range requested for this view, while the
+ * `termWidth - 10` bound keeps the name visible on narrow terminals.
+ *
+ * @param {string} name - Raw process name
+ * @param {number} [maxLen=130] - Absolute character cap
+ * @returns {string} Truncated name (with a trailing … if cut)
+ * @private
+ */
+function _sypmDisplayName(name, maxLen = 130) {
+  const termW = stdout.columns || 80;
+  const effectiveMax = Math.min(maxLen, Math.max(20, termW - 10));
+  const s = String(name == null ? '' : name);
+  if (s.length <= effectiveMax) return s;
+  return s.slice(0, effectiveMax - 1) + '…';
+}
+
+/**
+ * Score how well a process name matches a search query.
+ *
+ * Returns 0 for "no match" so callers can filter by `score > 0`.
+ * Higher scores indicate stronger matches:
+ *   100 → case-insensitive exact match (the "absolute match" used to
+ *         focus the top entry)
+ *    80 → name starts with the query
+ *    60 → name contains the query as a substring
+ *   1-40 → token-based fuzzy match (proportional to query tokens found)
+ *
+ * @param {string} name
+ * @param {string} query
+ * @returns {number}
+ * @private
+ */
+function _sypmNameMatchScore(name, query) {
+  if (!query) return 0;
+  const n = String(name || '').toLowerCase();
+  const q = String(query).toLowerCase().trim();
+  if (!q) return 0;
+  if (n === q) return 100;
+  if (n.startsWith(q)) return 80;
+  if (n.includes(q)) return 60;
+
+  const qTokens = q.split(/[\s_\-]+/).filter(Boolean);
+  if (qTokens.length === 0) return 0;
+  const nTokens = n.split(/[\s_\-]+/).filter(Boolean);
+  let matched = 0;
+  for (const qt of qTokens) {
+    if (nTokens.some(nt => nt.includes(qt) || qt.includes(nt))) matched++;
+  }
+  if (matched > 0) return Math.round((matched / qTokens.length) * 40);
+  return 0;
+}
+
 // --------------------------- SyPMManagerFunc Class ---------------------------
 
 /**
@@ -23727,6 +23787,45 @@ class SyPMManagerFunc extends SyAPP_Func {
     }
 
     // ------------------------------------------------------------------
+    // SEARCH-BY-NAME FILTER
+    // ------------------------------------------------------------------
+    // A text field bound to `field_sypm_mgr_search`. When non-empty,
+    // the process list is filtered to name-similar entries and sorted
+    // so the closest match (exact match first) appears at the top.
+    // The first exact match is flagged with `_isExact` so it can be
+    // visually "focused" in the render pass below.
+    //
+    // Clearing the field (via ✕ Clear or by deleting the text) shows
+    // the full unfiltered list again.
+    // ------------------------------------------------------------------
+    const curProps = this.Builds.get(id)?.Session?.ActualProps || {};
+    const searchKey = 'field_sypm_mgr_search';
+
+    if (curProps.__sypm_clear_search) {
+      delete curProps.__sypm_clear_search;
+      this.Storages.Delete(id, searchKey);
+    }
+
+    const searchQuery = String(this.Storages.Get(id, searchKey) || '').trim();
+    const totalCount = list.length;
+
+    if (searchQuery) {
+      list = list
+        .map(p => ({ proc: p, score: _sypmNameMatchScore(p.name, searchQuery) }))
+        .filter(x => x.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map(x => x.proc);
+    }
+
+    // "Focus" the absolute match: since the list is sorted by score,
+    // an exact (case-insensitive) match is always at index 0.
+    if (searchQuery && list.length > 0) {
+      if (String(list[0].name || '').toLowerCase() === searchQuery.toLowerCase()) {
+        list[0]._isExact = true;
+      }
+    }
+
+    // ------------------------------------------------------------------
     // VIEW STYLE TOGGLE 🎨
     // ------------------------------------------------------------------
     // Two complete renderings are supported and switchable at runtime
@@ -23752,20 +23851,48 @@ class SyPMManagerFunc extends SyAPP_Func {
     const isCard = viewStyle === 'card';
 
     // ---------- Header ----------
+    const headerCount = searchQuery
+      ? `${list.length} of ${totalCount}`
+      : String(list.length);
+
     if (isCard) {
       this.TextButton(id, 'sypm_mgr_header', {
         label: 'Background Processes',
         initialValue:
-          `📦 SyAPP Background Processes (${list.length})\n` +
+          `📦 SyAPP Background Processes (${headerCount})\n` +
           'Click ▶ Enter to connect directly — Ctrl+C returns here.',
         lines: 4,
         editable: false
       });
     } else {
-      this.Button(id, { name: ColorText.brightCyan(`📦 SyAPP Background Processes (${list.length})`) });
+      this.Button(id, { name: ColorText.brightCyan(`📦 SyAPP Background Processes (${headerCount})`) });
       this.Button(id, { name: ColorText.dim('Click ▶ Enter to connect directly — Ctrl+C returns here.') });
       this.Button(id, { name: ' ' });
     }
+
+    // ------------------------------------------------------------------
+    // SEARCH FIELD
+    // ------------------------------------------------------------------
+    // Always visible so the search box is a stable presence across
+    // renders. When the query is non-empty, a "✕ Clear" button is
+    // added next to it.
+    // ------------------------------------------------------------------
+    this.Field(id, 'sypm_mgr_search', {
+      label: '🔍 Search by name',
+      initialValue: searchQuery,
+      maxWidth: 60,
+      onChange: (v) => {
+        this.Storages.Set(id, searchKey, String(v || ''));
+      }
+    });
+
+    if (searchQuery) {
+      this.Button(id, {
+        name: ColorText.dim(`✕ Clear search`),
+        props: { __sypm_clear_search: true }
+      });
+    }
+    this.Button(id, { name: ' ' });
 
     // ---------- Error banner ----------
     const lastError = this.Storages.Get(id, 'sypm_mgr_last_error');
@@ -23786,20 +23913,26 @@ class SyPMManagerFunc extends SyAPP_Func {
 
     // ---------- Empty state ----------
     if (list.length === 0) {
+      const noMatch = !!searchQuery;
       if (isCard) {
         this.TextButton(id, 'sypm_mgr_empty', {
-          label: 'No processes',
-          initialValue:
-            'No background processes running.\n' +
-            'Start one with:\n' +
-            '  node SyAPP.js --bg MyApp.js',
+          label: noMatch ? 'No matches' : 'No processes',
+          initialValue: noMatch
+            ? `No processes match "${searchQuery}".\nClear the search to see all.`
+            : ('No background processes running.\n' +
+               'Start one with:\n' +
+               '  node SyAPP.js --bg MyApp.js'),
           lines: 5,
           editable: false
         });
       } else {
-        this.Button(id, { name: ColorText.dim('No background processes running.') });
-        this.Button(id, { name: ColorText.dim('Start one with:') });
-        this.Button(id, { name: ColorText.brightYellow('  node SyAPP.js --bg MyApp.js') });
+        if (noMatch) {
+          this.Button(id, { name: ColorText.dim(`No processes match "${searchQuery}".`) });
+        } else {
+          this.Button(id, { name: ColorText.dim('No background processes running.') });
+          this.Button(id, { name: ColorText.dim('Start one with:') });
+          this.Button(id, { name: ColorText.brightYellow('  node SyAPP.js --bg MyApp.js') });
+        }
       }
       this.Button(id, { name: ' ' });
       this.Buttons(id, [
@@ -23832,6 +23965,13 @@ class SyPMManagerFunc extends SyAPP_Func {
                        : p.status === 'Dead' ? ColorText.red('● Dead')
                        : ColorText.dim(`● ${p.status}`);
 
+      // Truncate the display name so giant custom names never overflow
+      // the terminal. `_isExact` (set above for the closest search
+      // match) is surfaced as a 🎯 marker so the user immediately sees
+      // the absolute match that was typed.
+      const displayName = _sypmDisplayName(p.name);
+      const exactMarker = (p._isExact === true) ? ColorText.brightGreen('🎯 ') : '';
+
       if (isCard) {
         // ----- CARD STYLE instance block -----
         //
@@ -23840,8 +23980,8 @@ class SyPMManagerFunc extends SyAPP_Func {
         //   └──────────────────────────────────────┘
         //   📋 Log   ▶ Enter   ✕ Stop
         this.TextButton(id, `sypm_mgr_proc_${p.id}`, {
-          label: String(p.name),
-          initialValue: `${statusStr}   ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`,
+          label: displayName,
+          initialValue: `${exactMarker}${statusStr}   ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`,
           lines: 3,
           editable: false
         });
@@ -23854,7 +23994,7 @@ class SyPMManagerFunc extends SyAPP_Func {
         // Blank spacer BETWEEN instances (never before the first).
         if (idx > 0) this.Button(id, { name: ' ' });
         this.Button(id, {
-          name: `${statusStr} ${ColorText.bold(p.name)}  ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`
+          name: `${exactMarker}${statusStr} ${ColorText.bold(displayName)}  ${ColorText.dim(`PID ${p.pid} · port ${port || '?'}`)}`
         });
       }
 
@@ -31512,6 +31652,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _streamHost = _STREAM_DEFAULT_HOST
     let _bgMode = false
     let _manageMode = false
+    let _nameFlag = false        // --name present
+    let _customName = null       // explicit --name <value>
     const _plainArgs = []
 
     for (let i = 0; i < _rawCliArgs.length; i++) {
@@ -31544,6 +31686,30 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         _bgMode = true
       } else if (a === '--manage') {
         _manageMode = true
+      } else if (a === '--name') {
+        // NEW: --name support for --bg.
+        //
+        //   --name            → use the first positional argument AFTER
+        //                       the target file; if none exists, no name.
+        //   --name <value>    → use <value> as the name.
+        //
+        // A following token is consumed as the explicit value ONLY when
+        // it does NOT look like a target file / save name. This keeps
+        // `--name MyApp.js` working as "derive from the positional arg
+        // after it" (MyApp.js stays the target), while still allowing
+        // `--name custom MyApp.js` to set `custom` as the name.
+        _nameFlag = true
+        const next = _rawCliArgs[i + 1]
+        if (next && !next.startsWith('--')) {
+          const looksLikeFile =
+            /\.(js|mjs|cjs|json|jsonl)$/i.test(next) ||
+            next.startsWith('./') || next.startsWith('../') || next.startsWith('/') ||
+            fs.existsSync(path.resolve(process.cwd(), next))
+          if (!looksLikeFile) {
+            _customName = next
+            i++
+          }
+        }
       } else {
         _plainArgs.push(a)
       }
@@ -31639,7 +31805,32 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exit(1);
       }
 
-      const name = `syapp-bg-${port}`;
+      // NEW: resolve the display name for this background process.
+      //
+      //   --name           → first positional arg AFTER the target file
+      //                       (skipped when there is none)
+      //   --name <value>   → use <value>
+      //   (no --name)      → no custom name
+      //
+      // The registry name is always anchored at `syapp-bg-<port>` so
+      // that SyPMManagerFunc's name filter (`startsWith('syapp-bg-')`)
+      // and port extraction (`match(/syapp-bg-(\d+)/)`) keep working
+      // unchanged. A custom name, when present, is appended after the
+      // port (separated by a dash) and sanitized so it cannot break the
+      // name format or overflow storage.
+      let customName = _customName;
+      if (_nameFlag && customName === null && args.length > 1) {
+        customName = String(args[1]);
+      }
+
+      let name = `syapp-bg-${port}`;
+      if (customName) {
+        const sanitized = String(customName)
+          .replace(/[^a-zA-Z0-9_\- .]/g, '_')
+          .trim()
+          .slice(0, 200);
+        if (sanitized) name = `syapp-bg-${port}-${sanitized}`;
+      }
       const cmdParts = [process.execPath, `"${syappJsPath}"`, '--server', String(port), ...targetParts];
       const cmd = cmdParts.join(' ');
 
