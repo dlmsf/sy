@@ -18919,6 +18919,11 @@ function levenshteinDistance(str1, str2) {
 
       const defaults = {
         name: 'default',
+        // NEW: 'bg' = embedded func runs as a separate SyAPP --server
+        // process (default), 'normal' = embedded func runs inline in the
+        // same process (previous behaviour, kept 100% intact). Can be
+        // toggled at runtime from the Emb edit panel.
+        runMode: 'bg',
         filePath: undefined,
         code: undefined,
         funcClass: undefined,
@@ -18964,7 +18969,10 @@ function levenshteinDistance(str1, str2) {
         editUpText:      `${nsKey}_editUpText`,
         editDownText:    `${nsKey}_editDownText`,
         editBothText:    `${nsKey}_editBothText`,
-        resetDropdown:   `${nsKey}_resetDropdown`
+        resetDropdown:   `${nsKey}_resetDropdown`,
+        // NEW: background-run-mode props
+        toggleRunMode:   `${nsKey}_togglerunmode`,
+        restartBg:       `${nsKey}_restartbg`
       };
 
       // ------------------------------------------------------------------
@@ -19094,6 +19102,11 @@ function levenshteinDistance(str1, str2) {
               ? disk.saveMode
               : 'inline';
             if (Array.isArray(disk.args)) boot.args = disk.args.slice();
+            // NEW: restore persisted runMode (falls back to 'bg' when
+            // the disk record predates this feature).
+            if (disk.runMode === 'normal' || disk.runMode === 'bg') {
+              boot.runMode = disk.runMode;
+            }
             // Restore custom dropdown text/emoji from disk so a widget
             // whose label was edited keeps its label across restarts.
             if (disk.dropdown && typeof disk.dropdown === 'object') {
@@ -19160,6 +19173,22 @@ function levenshteinDistance(str1, str2) {
 
       if (typeof state.autoApplyArgToDropdown !== 'boolean') {
         state.autoApplyArgToDropdown = false;
+        this.Storages.Set(id, storageKey, state);
+      }
+
+      // NEW: ensure the runMode / bgProcess fields exist on state
+      // objects that predate this feature, without disturbing anything
+      // else that is already stored.
+      let __embStateMutated = false;
+      if (state.runMode !== 'bg' && state.runMode !== 'normal') {
+        state.runMode = 'bg';
+        __embStateMutated = true;
+      }
+      if (state.bgProcess === undefined) {
+        state.bgProcess = null;
+        __embStateMutated = true;
+      }
+      if (__embStateMutated) {
         this.Storages.Set(id, storageKey, state);
       }
 
@@ -19619,6 +19648,46 @@ function levenshteinDistance(str1, str2) {
         }
       }
 
+      // ---------------- Background-run-mode toggle ----------------
+      // Switches the embedded func between:
+      //   'bg'     — runs as a separate SyAPP --server process (default)
+      //   'normal' — runs inline in the same process (legacy behaviour)
+      //
+      // Switching to 'normal' tears down the live background process
+      // cleanly. Switching to 'bg' schedules a fresh spawn on the very
+      // next render pass — no manual restart required.
+      if (curProps[P.toggleRunMode]) {
+        delete curProps[P.toggleRunMode];
+        const nextMode = (state.runMode === 'bg') ? 'normal' : 'bg';
+
+        if (state.runMode === 'bg' && state.bgProcess && state.bgProcess.pid) {
+          _embKillBackgroundProcess(state.bgProcess);
+          state.bgProcess = null;
+        }
+
+        state.runMode = nextMode;
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+
+        this.Alert(id,
+          nextMode === 'bg'
+            ? '🔄 Run mode → Background (separate process)'
+            : '🔄 Run mode → Inline (same process)',
+          { duration: 2500 });
+      }
+
+      // ---------------- Manual background restart ----------------
+      if (curProps[P.restartBg]) {
+        delete curProps[P.restartBg];
+        if (state.bgProcess && state.bgProcess.pid) {
+          _embKillBackgroundProcess(state.bgProcess);
+          state.bgProcess = null;
+        }
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+        this.Alert(id, '↻ Background process restart scheduled', { duration: 2000 });
+      }
+
       // ------------------------------------------------------------------
       // DROPDOWN TEXT EDITING
       // ------------------------------------------------------------------
@@ -19730,6 +19799,97 @@ function levenshteinDistance(str1, str2) {
       if (curProps[P.enterFunc]) {
         delete curProps[P.enterFunc];
         if (state.source !== 'none') {
+          // ------------------------------------------------------------------
+          // BACKGROUND MODE — connect to the spawned --server process.
+          //
+          // In 'bg' mode the embedded func is ALREADY running as an
+          // external SyAPP `--server` process spawned by
+          // _embRunBackground. We therefore do NOT load the func into
+          // the local SyAPP.Funcs map — we simply stream the remote
+          // session via _runRemoteSession, exactly like the
+          // `--connect` CLI path.
+          //
+          // IMPORTANT: the class is resolved LOCALLY here. The outer
+          // `EmbClass` variable is declared with `let` further down in
+          // this method (in the "Resolve the embedded class" section)
+          // and is still in its temporal dead zone at this point —
+          // referencing it here throws:
+          //   ReferenceError: Cannot access 'EmbClass' before initialization
+          // ------------------------------------------------------------------
+          if (state.runMode === 'bg') {
+            let __bgEmbClass = null;
+            try {
+              __bgEmbClass = await this._embResolveClass(state, cfg);
+            } catch (_) { /* surfaced below as a null check */ }
+
+            if (!__bgEmbClass) {
+              this.Alert(id, '❌ Could not resolve embedded func for background run', { duration: 4000 });
+              return null;
+            }
+
+            const bg = await this._embRunBackground(id, __bgEmbClass, {
+              ...cfg,
+              args: Array.isArray(state.args) ? state.args.slice() : []
+            }, state, cfg);
+
+            if (bg && bg.port && this._syappInstance) {
+              const session = this.Builds.get(id)?.Session;
+              if (session) session.InAction = true;
+
+              try {
+                // Verify the remote is up before hijacking the terminal.
+                await this._syappInstance._verifyRemote(bg.port, 'localhost');
+              } catch (e) {
+                if (session) session.InAction = false;
+                state.error = `Background process not reachable: ${e.message || e}`;
+                this.Storages.Set(id, storageKey, state);
+                this.Alert(id, `❌ ${state.error}`, { duration: 5000 });
+                return null;
+              }
+
+              // Record activity so the inactivity sweeper does not kill
+              // the process while the user is inside it.
+              try {
+                bg.lastActivity = Date.now();
+                this.Storages.Set(id, storageKey, state);
+              } catch (_) {}
+
+              try {
+                // Enter the remote stream. Ctrl+C in the remote pops
+                // one layer / returns here. Ctrl+B exits to local.
+                await this._syappInstance._runRemoteSession(bg.port, 'localhost');
+              } catch (e) {
+                state.error = `Remote session error: ${e.message || e}`;
+                this.Storages.Set(id, storageKey, state);
+              } finally {
+                // Reset activity again so the timer restarts cleanly
+                // after the user leaves.
+                try {
+                  bg.lastActivity = Date.now();
+                  this.Storages.Set(id, storageKey, state);
+                } catch (_) {}
+
+                // Defer the local rebuild so the streaming teardown
+                // finishes writing its final bytes first.
+                setImmediate(() => {
+                  if (session) session.InAction = false;
+                  try {
+                    stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m');
+                  } catch (_) {}
+                  try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
+                  try {
+                    this._syappInstance.LoadScreen(this.Name, { props: { ...passProps } }).catch(() => {});
+                  } catch (_) {}
+                });
+              }
+              return null;
+            }
+
+            // Fallback: if _embRunBackground failed to produce a live
+            // process, fall through to the direct load path below so the
+            // user still reaches the embedded func.
+          }
+
           const cls = await this._embResolveClass(state, cfg);
           if (cls && this._syappInstance) {
             // Ensure the class is present in SyAPP.Funcs under a stable
@@ -20110,7 +20270,14 @@ function levenshteinDistance(str1, str2) {
             ...cfg,
             args: Array.isArray(state.args) ? state.args.slice() : []
           };
-          embedded = await this._embRunInline(id, EmbClass, runCfg);
+          // NEW: dispatch on the selected run mode.
+          //   'bg'     → spawn / reuse a tracked SyAPP --server process
+          //   'normal' → legacy inline render (same process)
+          if (state.runMode === 'bg') {
+            embedded = await this._embRunBackground(id, EmbClass, runCfg, state, cfg);
+          } else {
+            embedded = await this._embRunInline(id, EmbClass, runCfg);
+          }
         } catch (e) {
           state.error = e.message || String(e);
           this.Storages.Set(id, storageKey, state);
@@ -20323,6 +20490,45 @@ function levenshteinDistance(str1, str2) {
             props: { [P.saveAsPath]: true }
           }
         ]);
+
+        // ---------------- Run mode row ----------------
+        // 'bg' (default)     → separate --server process, Enter Func
+        //                       streams from it.
+        // 'normal'           → same process, Enter Func navigates
+        //                       directly to the embedded func (legacy).
+        const __isBg = state.runMode === 'bg';
+        const __bgAlive = !!(state.bgProcess && state.bgProcess.pid);
+        const __bgPort = state.bgProcess && state.bgProcess.port ? state.bgProcess.port : null;
+        const __bgHint = __isBg
+          ? (__bgAlive
+              ? ColorText.green(` (pid ${state.bgProcess.pid}${__bgPort ? ' · :' + __bgPort : ''})`)
+              : ColorText.dim(' (starting)'))
+          : '';
+
+        this.Text(id, ' ');
+        this.Text(id, ColorText.dim('Run mode:'));
+
+        this.Buttons(id, [
+          {
+            name: __isBg
+              ? ColorText.bgGreen(ColorText.black(' ✓ BG process ' + __bgHint))
+              : ColorText.dim('○ BG process'),
+            props: { [P.toggleRunMode]: true }
+          },
+          {
+            name: !__isBg
+              ? ColorText.bgGreen(ColorText.black(' ✓ Same process '))
+              : ColorText.dim('○ Same process'),
+            props: { [P.toggleRunMode]: true }
+          }
+        ]);
+
+        if (__isBg && __bgAlive) {
+          this.Button(id, {
+            name: ColorText.brightYellow('↻ Restart BG'),
+            props: { [P.restartBg]: true }
+          });
+        }
 
         const snippet = state.saveMode === 'inline'
           ? this._embSnippetInline(state, cfg)
@@ -21449,6 +21655,147 @@ function levenshteinDistance(str1, str2) {
       };
 
       register(instance);
+    };
+
+    /**
+     * Spawn (or reuse) a background SyAPP `--server` process that runs
+     * the embedded func as its own main func. This is the DEFAULT run
+     * mode for this.Emb().
+     *
+     * The spawned process is:
+     *   • registered with SyPM under a stable, Emb-namespaced name so
+     *     it appears in `node SyAPP.js --manage`,
+     *   • tracked in `state.bgProcess` (pid, port, spawnSourceKey,
+     *     lastActivity) so the next render can reuse it,
+     *   • killed cleanly on toggle to `normal`, on ✕ Clear, and on
+     *     every process-exit path (see _installCtrlC → cleanupTerminal
+     *     → _embKillAllBackgroundChildren),
+     *   • restarted automatically when `state.filePath` / `state.code`
+     *     changes (the spawnSourceKey mismatch triggers a fresh spawn),
+     *   • swept up by the inactivity timer if the user leaves it alone
+     *     for too long.
+     *
+     * @param {string} parentId - Parent Emb's session id
+     * @param {Function} EmbClass - Resolved embedded func class
+     * @param {Object} cfg - Emb config
+     * @param {Object} state - Live Emb state (mutable)
+     * @param {Object} parentCfg - Original Emb config object
+     * @returns {Promise<Object|null>} state.bgProcess, or null
+     * @private
+     */
+    this._embRunBackground = async (parentId, EmbClass, cfg, state, parentCfg) => {
+      const syapp = this._syappInstance;
+      if (!syapp) return null;
+
+      // ---------------- Reuse / restart existing process ----------------
+      const existing = state.bgProcess;
+      if (existing && existing.pid) {
+        let alive = false;
+        try { process.kill(existing.pid, 0); alive = true; } catch (_) { alive = false; }
+
+        if (alive) {
+          // Detect a source change. `filePath` is the strongest key;
+          // when only inline code is present, the first 512 chars are
+          // used as a stable content fingerprint.
+          const currentKey = state.filePath
+            ? `file:${state.filePath}`
+            : `code:${(state.code || '').slice(0, 512)}`;
+          if (existing.spawnSourceKey === currentKey) {
+            return existing; // reuse
+          }
+          // Source changed → restart immediately (auto-rebuild).
+          try { process.kill(existing.pid, 'SIGTERM'); } catch (_) {}
+          try { SyPM.kill(existing.pid); } catch (_) {}
+        }
+        state.bgProcess = null;
+      }
+
+      // ---------------- Resolve target file ----------------
+      let targetFile = state.filePath;
+      if (!targetFile || !fs.existsSync(targetFile)) {
+        if (state.code && state.code.trim()) {
+          const tmpDir = path.join(os.tmpdir(), 'syapp_emb_bg');
+          if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+          targetFile = path.join(
+            tmpDir,
+            `emb_${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}_${process.pid}_${Date.now()}.js`
+          );
+          let source = state.code;
+          if (!/\bexport\b/.test(source)) {
+            const clsM = source.match(/\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
+            if (clsM) source += `\nexport default ${clsM[1]};\n`;
+          }
+          fs.writeFileSync(targetFile, source, 'utf8');
+        } else {
+          return null;
+        }
+      }
+
+      // ---------------- Allocate port + spawn ----------------
+      let port;
+      try {
+        port = await SyPortLock.acquire(`syapp-emb-${process.pid}-${cfg.name || 'default'}`);
+      } catch (e) {
+        this.Alert(parentId, `❌ Port allocation failed: ${e.message}`, { duration: 4000 });
+        return null;
+      }
+
+      const syappJsPath = path.isAbsolute(process.argv[1])
+        ? process.argv[1]
+        : path.resolve(process.cwd(), process.argv[1]);
+
+      if (!fs.existsSync(syappJsPath)) {
+        SyPortLock.release(port);
+        this.Alert(parentId, '❌ Cannot locate running SyAPP.js to spawn child', { duration: 4000 });
+        return null;
+      }
+
+      const processName = `syapp-bg-${port}-emb-${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
+      const cmd = `${process.execPath} "${syappJsPath}" --server ${port} "${targetFile}"`;
+
+      try {
+        try { SyPM.cleanup(); } catch (_) {}
+        const entry = SyPM.exec(cmd, {
+          name: processName,
+          workingDir: process.cwd(),
+          uniqueNameLock: true
+        });
+        SyPortLock.reassign(port, entry.pid, processName);
+
+        const spawnSourceKey = state.filePath
+          ? `file:${state.filePath}`
+          : `code:${(state.code || '').slice(0, 512)}`;
+
+        state.bgProcess = {
+          pid: entry.pid,
+          port,
+          name: processName,
+          spawnSourceKey,
+          startedAt: Date.now(),
+          lastActivity: Date.now()
+        };
+        this.Storages.Set(parentId, `emb_${cfg.name}`, state);
+
+        // Give the child a moment to bind. Poll /info up to ~6 seconds.
+        let ready = false;
+        for (let i = 0; i < 20; i++) {
+          await new Promise(r => setTimeout(r, 300));
+          try {
+            await syapp._verifyRemote(port, 'localhost');
+            ready = true;
+            break;
+          } catch (_) { /* not yet */ }
+        }
+
+        if (!ready) {
+          this.Alert(parentId, `⚠️ Background started (pid ${entry.pid} · :${port}) — waiting for readiness`, { duration: 3000 });
+        }
+        return state.bgProcess;
+      } catch (e) {
+        SyPortLock.release(port);
+        this.Alert(parentId, `❌ Background spawn failed: ${e.message}`, { duration: 5000 });
+        return null;
+      }
     };
 
     /**
@@ -26585,6 +26932,11 @@ function _embDiskSave(outerFilePath, embName, storageEntry) {
       code: storageEntry && storageEntry.code ? storageEntry.code : null,
       source: storageEntry && storageEntry.source ? storageEntry.source : 'none',
       saveMode: storageEntry && storageEntry.saveMode ? storageEntry.saveMode : null,
+      // NEW: persist the run mode so a hard restart re-opens the widget
+      // in the same mode (default 'bg').
+      runMode: (storageEntry && (storageEntry.runMode === 'bg' || storageEntry.runMode === 'normal'))
+        ? storageEntry.runMode
+        : 'bg',
       args: (storageEntry && Array.isArray(storageEntry.args)) ? storageEntry.args : [],
       // Persist custom dropdown text/emoji so edits survive restarts,
       // matching the behaviour of `args` and the filePath/code pair.
@@ -31135,6 +31487,25 @@ function _installCtrlC(syapp) {
   // raw mode and detach stdin listeners BEFORE calling process.exit.
   // ------------------------------------------------------------------
   const cleanupTerminal = () => {
+    // ----------------------------------------------------------------
+    // EMB BACKGROUND PROCESS TREE CLEANUP
+    // ----------------------------------------------------------------
+    // Before this process dies, send SIGTERM to every child process
+    // spawned by a this.Emb() widget running in 'bg' mode. Because
+    // each child is itself a SyAPP process that registers the SAME
+    // exit handler (this function, via its own _installCtrlC), the
+    // SIGTERM cascades: main → child → grandchild → …
+    //
+    // This is what makes the recursive Emb chain unwind completely
+    // when the main process exits — including deep nesting of
+    // Emb-in-Emb-in-Emb via Enter Func → Ctrl+C chains.
+    // ----------------------------------------------------------------
+    try {
+      if (syapp) {
+        _embKillAllBackgroundChildren(syapp);
+      }
+    } catch (_) {}
+
     try {
       if (syapp && syapp.HUD) {
         try { syapp.HUD.cleanupMenuState && syapp.HUD.cleanupMenuState(); } catch (_) {}
@@ -31155,6 +31526,25 @@ function _installCtrlC(syapp) {
     try { stdin.removeAllListeners('data'); } catch (_) {}
     try { stdin.removeAllListeners('keypress'); } catch (_) {}
   };
+
+  // ------------------------------------------------------------------
+  // SIGTERM / SIGHUP handlers.
+  //
+  // Required for the recursive Emb chain: when a parent process kills
+  // one of its Emb background children with SIGTERM, that child MUST
+  // run its own cleanupTerminal (which in turn kills ITS children)
+  // before exiting — otherwise grandchildren are leaked. SIGKILL
+  // cannot be caught, so we always use SIGTERM for clean shutdown and
+  // reserve SyPM.kill (SIGKILL) only as a force-cleanup fallback.
+  // ------------------------------------------------------------------
+  process.on('SIGTERM', () => {
+    cleanupTerminal();
+    process.exit(0);
+  });
+  process.on('SIGHUP', () => {
+    cleanupTerminal();
+    process.exit(0);
+  });
 
   // OS-level SIGINT (e.g. Ctrl+C pressed outside raw-mode menus, or
   // Ctrl+C on the host's OWN local terminal when no menu is active).
@@ -31322,6 +31712,112 @@ function _installCtrlC(syapp) {
 
 const _STREAM_DEFAULT_PORT = 9000
 const _STREAM_DEFAULT_HOST = 'localhost'
+
+// ============================================================
+// EMB BACKGROUND PROCESS TREE — cleanup helpers
+// ============================================================
+// Every this.Emb() widget that runs in 'bg' mode spawns a tracked
+// SyAPP `--server` child. Those children may in turn run their OWN
+// Emb widgets that spawn grandchildren, and so on. The whole chain
+// MUST unwind when the main process exits — otherwise every Ctrl+C
+// leaves orphaned SyAPP processes behind.
+//
+// These helpers:
+//   1. Walk every registered SyAPP_Func's per-session storage and
+//      collect all live bgProcess records.
+//   2. Send SIGTERM (not SIGKILL) so each child's OWN exit handler
+//      runs and recursively kills its own grandchildren — this is
+//      what makes the cleanup work at arbitrary depth.
+//   3. Fall back to SyPM.kill for force-cleanup after a short grace
+//      period, so nothing is left behind even if a child hangs.
+//
+// The functions are defensive: they never throw, and they are safe
+// to call from any exit path (SIGINT / SIGTERM / SIGHUP / HUD
+// ctrl+c).
+// ============================================================
+
+/**
+ * Kill a single background process record (best-effort, never throws).
+ * Uses SIGTERM first so the child's own exit handler runs (which is
+ * what recursively kills its own grandchildren), then schedules a
+ * forced SyPM.kill as a safety net.
+ * @param {Object} bg - { pid, port, name }
+ * @private
+ */
+function _embKillBackgroundProcess(bg) {
+  if (!bg || !bg.pid) return;
+  try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+  if (bg.port) {
+    try { SyPortLock.release(bg.port); } catch (_) {}
+  }
+  // Force-cleanup fallback after the SIGTERM grace period.
+  setTimeout(() => {
+    try { SyPM.kill(bg.pid); } catch (_) {}
+  }, 1500);
+}
+
+/**
+ * Collect every live bgProcess record across EVERY SyAPP_Func instance
+ * attached to the given SyAPP. This is what lets the main process
+ * unwind the entire recursive Emb chain on exit.
+ *
+ * @param {SyAPP} syapp
+ * @returns {Array<{ func: SyAPP_Func, sessionId: string, key: string, bg: Object }>}
+ * @private
+ */
+function _embCollectAllBackgroundRecords(syapp) {
+  const records = [];
+  if (!syapp || !syapp.Funcs) return records;
+  for (const [, func] of syapp.Funcs) {
+    if (!func || !func.UserStorage) continue;
+    try {
+      for (const [sessionId, userData] of func.UserStorage) {
+        if (!userData || typeof userData !== 'object') continue;
+        for (const key of Object.keys(userData)) {
+          if (!key.startsWith('emb_')) continue;
+          const st = userData[key];
+          if (!st || typeof st !== 'object') continue;
+          if (!st.bgProcess || !st.bgProcess.pid) continue;
+          records.push({ func, sessionId, key, bg: st.bgProcess, state: st });
+        }
+      }
+    } catch (_) { /* skip malformed func */ }
+  }
+  return records;
+}
+
+/**
+ * Kill every live bgProcess record attached to the given SyAPP AND
+ * clear the records from each func's storage so a subsequent render
+ * starts fresh instead of trying to reuse a dead pid.
+ *
+ * This is the function called from every process-exit path (see
+ * _installCtrlC → cleanupTerminal). It is idempotent: running it
+ * twice is harmless.
+ *
+ * @param {SyAPP} syapp
+ * @returns {number} Number of processes signalled
+ * @private
+ */
+function _embKillAllBackgroundChildren(syapp) {
+  const records = _embCollectAllBackgroundRecords(syapp);
+  for (const { bg } of records) {
+    try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+    if (bg.port) {
+      try { SyPortLock.release(bg.port); } catch (_) {}
+    }
+  }
+  // Clear the records AFTER signalling so subsequent renders do not
+  // try to reuse a dead pid. Do this synchronously so the exit path
+  // does not race with the process shutting down.
+  for (const { func, sessionId, key, state } of records) {
+    try {
+      state.bgProcess = null;
+      func.Storages.Set(sessionId, key, state);
+    } catch (_) {}
+  }
+  return records.length;
+}
 
 /**
  * Start the streaming server that mirrors the host's terminal output
