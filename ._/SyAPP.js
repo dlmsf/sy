@@ -18986,7 +18986,7 @@ function levenshteinDistance(str1, str2) {
       // survives restarts by definition.
       //
       //   outerFilePath := the .js / .mjs / .cjs that SyAPP is
-      //                    currently executing (process.argv[2]).
+      //                    currently executing.
       //
       // Recovery order (most-specific wins):
       //   1. explicit disk record keyed by (outerFilePath, name)
@@ -18997,19 +18997,45 @@ function levenshteinDistance(str1, str2) {
       //      hint that the widget was once populated.
       //   3. cfg.funcClass / cfg.filePath / cfg.code (constructor args)
       //   4. 'none' → setup view
+      //
+      // CRITICAL FIX — NESTED EMB RECURSION:
+      // `process.argv[2]` is only the target file for a direct
+      // `node SyAPP.js <file>` launch. For a `--server` child spawned
+      // by a parent Emb (the default `runMode: 'bg'` flow), argv[2] is
+      // `'--server'`, NOT the target file — so the whole outerFilePath
+      // detection would silently fail, the disk mirror would never be
+      // read or written, and layer 3+ would stop saving. We therefore
+      // prefer `_syappInstance._mainSourceFile` (set by the CLI
+      // bootstrap for every file-loading launch, including --server
+      // children), and only fall back to argv / __BUILDER_EXPORT_TARGET.
       // ------------------------------------------------------------------
       let outerFilePath = null;
-      try {
-        const argvFile = process.argv[2];
-        if (typeof argvFile === 'string' &&
-            /\.(js|mjs|cjs)$/i.test(argvFile) &&
-            !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
-          const abs = path.isAbsolute(argvFile)
-            ? argvFile
-            : path.resolve(process.cwd(), argvFile);
-          if (fs.existsSync(abs)) outerFilePath = abs;
-        }
-      } catch (_) {}
+
+      // 1. SyAPP instance's _mainSourceFile (works for BOTH direct
+      //    launches AND `--server` child processes).
+      if (this._syappInstance &&
+          typeof this._syappInstance._mainSourceFile === 'string' &&
+          this._syappInstance._mainSourceFile &&
+          fs.existsSync(this._syappInstance._mainSourceFile)) {
+        outerFilePath = this._syappInstance._mainSourceFile;
+      }
+
+      // 2. process.argv[2] (direct launches only).
+      if (!outerFilePath) {
+        try {
+          const argvFile = process.argv[2];
+          if (typeof argvFile === 'string' &&
+              /\.(js|mjs|cjs)$/i.test(argvFile) &&
+              !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
+            const abs = path.isAbsolute(argvFile)
+              ? argvFile
+              : path.resolve(process.cwd(), argvFile);
+            if (fs.existsSync(abs)) outerFilePath = abs;
+          }
+        } catch (_) {}
+      }
+
+      // 3. __BUILDER_EXPORT_TARGET (set by `--edit`).
       if (!outerFilePath && typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET) {
         outerFilePath = __BUILDER_EXPORT_TARGET;
       }
@@ -22074,7 +22100,44 @@ function levenshteinDistance(str1, str2) {
      * @private
      */
     this._embSnippetInline = (state, cfg) => {
-      const raw = String(state.code || '').trim();
+      // ------------------------------------------------------------------
+      // RE-READ FROM DISK (recursive chain freshness fix)
+      // ------------------------------------------------------------------
+      // When the Emb is in inline mode AND has a live `filePath`, the
+      // file on disk is the AUTHORITATIVE current source — it may have
+      // been updated by a CHILD process (e.g. a nested Emb spawned by
+      // this widget, whose own SelfBuilder wrote its produced source
+      // back into this widget's outer file).
+      //
+      // Without this re-read, the parent's in-memory `state.code` stays
+      // frozen at whatever was captured at initial setup, and any edit
+      // made deep in the chain would be lost on the next Save to the
+      // host file (test.js). That is the direct cause of the
+      // "after 3rd layer it doesn't save in the file correctly" and
+      // "the entire chain must come up on restart" symptoms.
+      //
+      // We keep this conservative:
+      //   • Only applied when `state.filePath` exists on disk.
+      //   • Only accepted when the extracted class passes a basic
+      //     sanity check (still looks like `class X extends ...`).
+      //   • On failure, we fall back to the previous `state.code`.
+      //   • `state.code` is UPDATED in place so subsequent renders
+      //     and disk-save operations also see the fresh content.
+      // ------------------------------------------------------------------
+      let rawSource = String(state.code || '').trim();
+      if (state.filePath && fs.existsSync(state.filePath)) {
+        try {
+          const fileContent = fs.readFileSync(state.filePath, 'utf8');
+          const extracted = this._embExtractInlineClass(fileContent);
+          if (extracted && /\bclass\s+[A-Za-z_$][\w$]*\s+extends\b/.test(extracted)) {
+            rawSource = extracted;
+            state.code = extracted;
+          }
+        } catch (_) {
+          // Re-read failed — keep state.code as-is.
+        }
+      }
+      const raw = rawSource;
 
       if (!raw) {
         const lines = [
@@ -25228,6 +25291,30 @@ class SyAPP {
     this._userConfig = userConfig;
 
     /**
+     * Absolute path to the source file currently executing as this
+     * SyAPP instance's main func.
+     *
+     * Populated by the CLI bootstrap for file-loading mode — including
+     * `--server` child processes spawned by nested this.Emb() calls.
+     * Used by this.Emb() to resolve the "outer file" reliably even
+     * when `process.argv[2]` is a CLI flag (`--server`, `--bg`, …)
+     * rather than the target file.
+     *
+     * Without this, a `--server` child spawned as
+     *   `node SyAPP.js --server 9001 /tmp/emb2.mjs`
+     * would see `process.argv[2] === '--server'`, fail to resolve its
+     * own outer file, and consequently fail to write the nested Emb's
+     * source back into its host file — producing exactly the "3rd
+     * layer doesn't save" symptom.
+     *
+     * @type {string|null}
+     * @private
+     */
+    this._mainSourceFile = (userConfig && typeof userConfig._mainSourceFile === 'string')
+      ? userConfig._mainSourceFile
+      : null;
+
+    /**
      * Resolves once the SyAPP init process (if any) has fully finished.
      * Everything that must wait for init — the first LoadScreen, the
      * refresh loop, HTTP request handling — awaits this promise.
@@ -28261,20 +28348,34 @@ class SelfBuilder extends SyAPP_Func {
       // the widget can be recovered after a Ctrl+C and relaunch, even
       // though the in-memory session-keyed storage entry will be gone
       // the moment the process exits.
+      //
+      // NESTED EMB RECURSION FIX: in a `--server` child spawned by a
+      // parent this.Emb(), process.argv[2] is `'--server'`, not the
+      // target file. Prefer _syappInstance._mainSourceFile so the
+      // produced source can be recovered at ANY nesting depth.
       try {
         let outerFilePath = null;
-        if (typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET) {
+        if (this._syappInstance &&
+            typeof this._syappInstance._mainSourceFile === 'string' &&
+            this._syappInstance._mainSourceFile &&
+            fs.existsSync(this._syappInstance._mainSourceFile)) {
+          outerFilePath = this._syappInstance._mainSourceFile;
+        }
+        if (!outerFilePath && typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET) {
           outerFilePath = __BUILDER_EXPORT_TARGET;
-        } else {
-          const argvFile = process.argv[2];
-          if (typeof argvFile === 'string' &&
-              /\.(js|mjs|cjs)$/i.test(argvFile) &&
-              !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
-            const abs = path.isAbsolute(argvFile)
-              ? argvFile
-              : path.resolve(process.cwd(), argvFile);
-            if (fs.existsSync(abs)) outerFilePath = abs;
-          }
+        }
+        if (!outerFilePath) {
+          try {
+            const argvFile = process.argv[2];
+            if (typeof argvFile === 'string' &&
+                /\.(js|mjs|cjs)$/i.test(argvFile) &&
+                !/SyAPP\.(js|mjs|cjs)$/i.test(argvFile)) {
+              const abs = path.isAbsolute(argvFile)
+                ? argvFile
+                : path.resolve(process.cwd(), argvFile);
+              if (fs.existsSync(abs)) outerFilePath = abs;
+            }
+          } catch (_) {}
         }
         if (outerFilePath) {
           _embDiskSave(outerFilePath, `${caller.returnTo || '__unknown__'}::${caller.embName}`, {
@@ -31967,7 +32068,31 @@ function _embCollectAllBackgroundRecords(syapp) {
 function _embKillAllBackgroundChildren(syapp) {
   const records = _embCollectAllBackgroundRecords(syapp);
   for (const { bg } of records) {
-    try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+    // ------------------------------------------------------------------
+    // PROCESS-TREE SIGTERM (nested Emb cleanup fix)
+    // ------------------------------------------------------------------
+    // `bg.pid` is the PID of the SHELL that SyPM.exec spawned (via its
+    // PTY wrapper or monitor wrapper). The actual node process is a
+    // CHILD of that shell. Sending SIGTERM to the shell alone kills
+    // the wrapper but ORPHANS the node child — which is exactly the
+    // "process doesn't turn off when I finish the main process" and
+    // "orphaned Embs after Ctrl+C" symptom the user reported.
+    //
+    // The fix: send SIGTERM to EVERY descendant AND the shell. Each
+    // node child runs its own `process.on('SIGTERM', ...)` handler,
+    // which calls its OWN `_embKillAllBackgroundChildren()`, cascading
+    // the kill through the entire nested Emb tree at every depth.
+    // ------------------------------------------------------------------
+    try {
+      const allPids = SyPM._getAllChildPids(bg.pid);
+      for (const pid of allPids) {
+        try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+      }
+      try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+    } catch (_) {
+      // Fall back to signalling only the shell if the tree walk fails
+      try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+    }
     if (bg.port) {
       try { SyPortLock.release(bg.port); } catch (_) {}
     }
@@ -32970,7 +33095,16 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       // `_plainArgs.slice(1)` is precisely "everything after the
       // target file" — the correct `processArgs` value for every
       // invocation shape.
-      _bootApp(ExportedFunc, { processArgs: _plainArgs.slice(1) });
+      //
+      // `_mainSourceFile` is also supplied so that nested this.Emb()
+      // widgets (spawned as `--server <port> <file>` children) can
+      // resolve their "outer file" reliably — process.argv[2] is
+      // `'--server'` in those children, and without this hint the
+      // 3rd layer's save would silently fail.
+      _bootApp(ExportedFunc, {
+        processArgs: _plainArgs.slice(1),
+        _mainSourceFile: absolutePath
+      });
 
     } catch (err) {
       console.error(ColorText.brightRed(`❌ SyAPP runner: unexpected error while loading "${targetFile}":`));
