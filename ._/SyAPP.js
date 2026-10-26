@@ -14998,6 +14998,20 @@ function levenshteinDistance(str1, str2) {
     }) => {
       const storageKey = `dropdown-${name}`;
 
+      // Defensive guard: DropDown is invoked from inside an active
+      // Build() pass (via user code, this.Emb(), this.Connection(), …),
+      // where `this.Builds` is guaranteed to carry an entry for the
+      // current session. In the rare event that a concurrent Build has
+      // already torn that entry down (see the race described in the
+      // Emb() Ctrl+C return path), accessing `.Session` below would
+      // throw "Cannot read properties of undefined (reading 'Session')".
+      // Returning early keeps the parent render intact and avoids the
+      // crash entirely.
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.DropDown() Error - userBuild not found | BuildID: ${id}`);
+        return;
+      }
+
       config = {
         up_buttontext: 'Show More',
         down_buttontext: 'Hide',
@@ -19935,7 +19949,43 @@ function levenshteinDistance(str1, str2) {
                 // Defer the local rebuild so the streaming teardown
                 // finishes writing its final bytes first.
                 setImmediate(() => {
-                  if (session) session.InAction = false;
+                  // ------------------------------------------------------
+                  // CRITICAL: do NOT clear session.InAction here.
+                  //
+                  // The outer LoadScreen (which ran the parent build and
+                  // is about to complete) resets InAction on its own on
+                  // every exit path — success, wait_input, and the
+                  // catch(buildError) fallback. Clearing it here would
+                  // race with the refresh ticker:
+                  //
+                  //   1. Outer LoadScreen finishes → InAction = false.
+                  //   2. Refresh ticker fires → LoadScreen(refresh) sees
+                  //      InAction = false → sets true → Build starts.
+                  //   3. Our setImmediate runs → "session.InAction = false"
+                  //      forcibly clears the refresh's lock.
+                  //   4. Our LoadScreen(rebuild) starts → InAction = true
+                  //      → Build starts.
+                  //   5. Two Builds now run concurrently for the SAME
+                  //      session. Both call this.Builds.set(sessionId, …);
+                  //      the first to finish runs this.Builds.delete(),
+                  //      wiping the entry the other build still needs.
+                  //   6. The other build's next `this.Builds.get(id).Session`
+                  //      (inside Emb / DropDown / Page / …) throws:
+                  //         TypeError: Cannot read properties of undefined
+                  //         (reading 'Session')
+                  //
+                  // Which is exactly the "Internal error loading untitled"
+                  // crash that appeared when returning via Ctrl+C from a
+                  // nested this.Emb() chain.
+                  //
+                  // Without the reset: if the session is idle (normal
+                  // case), the LoadScreen below proceeds and rebuilds the
+                  // parent view. If the session is genuinely busy (a
+                  // refresh is mid-flight), LoadScreen no-ops — and that
+                  // refresh itself renders the parent view (session.
+                  // ActualPath is still the parent func). No rebuild is
+                  // lost either way.
+                  // ------------------------------------------------------
                   try {
                     stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m');
                   } catch (_) {}
