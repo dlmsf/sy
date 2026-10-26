@@ -19297,10 +19297,50 @@ function levenshteinDistance(str1, str2) {
 
       if (curProps[P.clear]) {
         delete curProps[P.clear];
+
+        // ------------------------------------------------------------------
+        // KILL THE RECURSIVE BACKGROUND PROCESS TREE FIRST.
+        //
+        // If this Emb was running in 'bg' mode (the default), its spawned
+        // SyAPP `--server` child — AND every Emb-nested child spawned
+        // INSIDE that child — must be killed before we reset the state and
+        // rewrite the host file. Without this, clicking "✕ Clear Emb" would
+        // leave the entire recursive chain of embedded processes running
+        // orphaned: they would keep serving stale views, keep holding their
+        // port locks, and keep counting against the process list.
+        //
+        // `_embKillBackgroundProcess` walks the ENTIRE process tree (shell
+        // → node child → grandchildren → …) and SIGTERMs each node from
+        // the deepest descendant upward. SIGTERM (not SIGKILL) is required
+        // because every node carries its own cleanup handler which calls
+        // `_embKillAllBackgroundChildren()` on its own SyAPP instance —
+        // cascading the kill through the recursive Emb chain at every
+        // depth automatically. A forced SyPM.kill safety net is scheduled
+        // 1.5s later for any process that ignores SIGTERM.
+        //
+        // The port lock is released immediately so another Emb (or a fresh
+        // re-spawn of this one) can claim the same port without waiting.
+        // ------------------------------------------------------------------
+        if (state.bgProcess && state.bgProcess.pid) {
+          try {
+            _embKillBackgroundProcess(state.bgProcess);
+          } catch (_) {
+            // Absolute fallback — should never be reached, but killing the
+            // shell is strictly better than leaving the chain running.
+            try { process.kill(state.bgProcess.pid, 'SIGTERM'); } catch (_) {}
+          }
+        }
+
         Object.assign(state, {
           source: 'none', filePath: null, code: null,
           saveMode: null, error: null, pickMode: false,
-          editPanel: false, args: []
+          editPanel: false, args: [],
+          // NEW: explicitly null out the bgProcess record so subsequent
+          // renders do not try to reuse the (now dead) process. Without
+          // this, the next render's `process.kill(existing.pid, 0)` would
+          // see the dead PID, trigger a fresh spawn, and the widget would
+          // silently resurrect the Emb the user just cleared.
+          bgProcess: null
         });
         this.Storages.Set(id, storageKey, state);
         this.FileManager.ClearSelection(id, pickerName);
@@ -32062,10 +32102,51 @@ const _STREAM_DEFAULT_HOST = 'localhost'
  */
 function _embKillBackgroundProcess(bg) {
   if (!bg || !bg.pid) return;
-  try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+
+  // ------------------------------------------------------------------
+  // WALK THE ENTIRE PROCESS TREE (recursive Emb chain kill).
+  //
+  // `bg.pid` is the PID of the SHELL wrapper that SyPM.exec spawned
+  // (its PTY wrapper or monitor wrapper). The actual node process is
+  // a CHILD of that shell, and any Emb-in-Emb children spawned by
+  // that node process are grandchildren, and so on.
+  //
+  // Sending SIGTERM to the shell alone kills the wrapper but ORPHANS
+  // the node child — which then keeps running (holding its port lock
+  // and serving stale views) until the OS reaps it. Worse, if the
+  // node child itself spawned nested Emb `--server` processes, those
+  // grandchildren survive too — the exact "orphaned Embs after
+  // Ctrl+C / Clear" symptom.
+  //
+  // The fix: walk every descendant via SyPM._getAllChildPids() and
+  // SIGTERM the deepest nodes FIRST, then work up to the shell.
+  // SIGTERM (not SIGKILL) is required because every node in the tree
+  // carries its own cleanup handler — `_installCtrlC`'s SIGTERM
+  // listener calls `_embKillAllBackgroundChildren()` on its own SyAPP
+  // instance — so the cascade unwinds the recursive Emb chain at
+  // EVERY depth automatically, no matter how deeply nested.
+  //
+  // The forced SyPM.kill (SIGKILL) safety net below catches any
+  // process that somehow ignored SIGTERM within the grace period.
+  // ------------------------------------------------------------------
+  try {
+    const descendants = SyPM._getAllChildPids(bg.pid);
+    for (const pid of descendants) {
+      try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+    }
+    try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+  } catch (_) {
+    // Absolute fallback: at minimum, kill the shell wrapper.
+    try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+  }
+
+  // Release the port lock IMMEDIATELY so another Emb (or a fresh
+  // re-spawn of this one) can claim the same port without waiting
+  // for the SIGTERM cascade to complete.
   if (bg.port) {
     try { SyPortLock.release(bg.port); } catch (_) {}
   }
+
   // Force-cleanup fallback after the SIGTERM grace period.
   setTimeout(() => {
     try { SyPM.kill(bg.pid); } catch (_) {}
