@@ -20263,19 +20263,49 @@ function levenshteinDistance(str1, str2) {
       // ------------------------------------------------------------------
       // Run the embedded build INLINE
       // ------------------------------------------------------------------
+      //
+      // Dispatch on the selected run mode:
+      //
+      //   • 'bg'     → ensure a tracked SyAPP --server process is running.
+      //                In bg mode this is AUTOMATIC on every render pass
+      //                that has a resolved source, not just when the user
+      //                clicks Enter Func. That makes:
+      //                  – after 📁 Pick File   → the bg process is
+      //                                          spawned immediately
+      //                                          (pre-warmed for Enter
+      //                                          Func);
+      //                  – after ✓ Finish &
+      //                    Return (Self Build) → the produced func's
+      //                                          changed source is
+      //                                          detected and the process
+      //                                          restarts;
+      //                  – after editing an arg → the changed args-key is
+      //                                          detected and the process
+      //                                          restarts.
+      //                `_embRunBackground` is idempotent (returns the
+      //                live process immediately when the source-key and
+      //                args-key are unchanged), so this is cheap on
+      //                idle refreshes. Readiness polling is skipped on
+      //                the auto-spawn path so the render is not blocked;
+      //                Enter Func still does the full check before
+      //                connecting.
+      //
+      //   • 'normal' → legacy inline render, still gated by
+      //                `cfg.autoRun` (unchanged behaviour).
+      // ------------------------------------------------------------------
       let embedded = null;
-      if (EmbClass && cfg.autoRun !== false) {
+      if (EmbClass) {
         try {
           const runCfg = {
             ...cfg,
             args: Array.isArray(state.args) ? state.args.slice() : []
           };
-          // NEW: dispatch on the selected run mode.
-          //   'bg'     → spawn / reuse a tracked SyAPP --server process
-          //   'normal' → legacy inline render (same process)
           if (state.runMode === 'bg') {
-            embedded = await this._embRunBackground(id, EmbClass, runCfg, state, cfg);
-          } else {
+            embedded = await this._embRunBackground(
+              id, EmbClass, runCfg, state, cfg,
+              { waitForReady: false }
+            );
+          } else if (cfg.autoRun !== false) {
             embedded = await this._embRunInline(id, EmbClass, runCfg);
           }
         } catch (e) {
@@ -21683,7 +21713,7 @@ function levenshteinDistance(str1, str2) {
      * @returns {Promise<Object|null>} state.bgProcess, or null
      * @private
      */
-    this._embRunBackground = async (parentId, EmbClass, cfg, state, parentCfg) => {
+    this._embRunBackground = async (parentId, EmbClass, cfg, state, parentCfg, options = {}) => {
       const syapp = this._syappInstance;
       if (!syapp) return null;
 
@@ -21694,12 +21724,15 @@ function levenshteinDistance(str1, str2) {
         try { process.kill(existing.pid, 0); alive = true; } catch (_) { alive = false; }
 
         if (alive) {
-          // Detect a source change. `filePath` is the strongest key;
-          // when only inline code is present, the first 512 chars are
-          // used as a stable content fingerprint.
+          // Detect a source or args change. `filePath` is the strongest
+          // key; when only inline code is present, the first 512 chars
+          // are used as a stable content fingerprint. `args` are folded
+          // into the key so that editing an arg (via the widget's own
+          // arg editor) triggers a fresh restart automatically.
+          const argsKey = JSON.stringify(Array.isArray(state.args) ? state.args : []);
           const currentKey = state.filePath
-            ? `file:${state.filePath}`
-            : `code:${(state.code || '').slice(0, 512)}`;
+            ? `file:${state.filePath}|args:${argsKey}`
+            : `code:${(state.code || '').slice(0, 512)}|args:${argsKey}`;
           if (existing.spawnSourceKey === currentKey) {
             return existing; // reuse
           }
@@ -21751,7 +21784,15 @@ function levenshteinDistance(str1, str2) {
       }
 
       const processName = `syapp-bg-${port}-emb-${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}`;
-      const cmd = `${process.execPath} "${syappJsPath}" --server ${port} "${targetFile}"`;
+      // Pass the Emb's args through to the spawned child so the child
+      // process receives them via processArgs (populated from
+      // `_plainArgs.slice(1)` in the child's CLI). Without this,
+      // restarting on an arg edit would be pointless — the child would
+      // keep using the old args forever.
+      const argsForCmd = Array.isArray(state.args)
+        ? state.args.map(a => JSON.stringify(String(a)))
+        : [];
+      const cmd = `${process.execPath} "${syappJsPath}" --server ${port} "${targetFile}"${argsForCmd.length > 0 ? ' ' + argsForCmd.join(' ') : ''}`;
 
       try {
         try { SyPM.cleanup(); } catch (_) {}
@@ -21762,9 +21803,10 @@ function levenshteinDistance(str1, str2) {
         });
         SyPortLock.reassign(port, entry.pid, processName);
 
+        const argsKey = JSON.stringify(Array.isArray(state.args) ? state.args : []);
         const spawnSourceKey = state.filePath
-          ? `file:${state.filePath}`
-          : `code:${(state.code || '').slice(0, 512)}`;
+          ? `file:${state.filePath}|args:${argsKey}`
+          : `code:${(state.code || '').slice(0, 512)}|args:${argsKey}`;
 
         state.bgProcess = {
           pid: entry.pid,
@@ -21776,19 +21818,27 @@ function levenshteinDistance(str1, str2) {
         };
         this.Storages.Set(parentId, `emb_${cfg.name}`, state);
 
-        // Give the child a moment to bind. Poll /info up to ~6 seconds.
-        let ready = false;
-        for (let i = 0; i < 20; i++) {
-          await new Promise(r => setTimeout(r, 300));
-          try {
-            await syapp._verifyRemote(port, 'localhost');
-            ready = true;
-            break;
-          } catch (_) { /* not yet */ }
-        }
+        // Give the child a moment to bind. Poll /info up to ~6 seconds
+        // when explicitly requested (e.g. from Enter Func, which MUST
+        // connect to the child immediately afterwards). Auto-spawn from
+        // the render cycle passes `waitForReady: false` so the render is
+        // not blocked by the readiness poll — the process is spawned
+        // synchronously and the next render (or the eventual Enter Func
+        // click) will do the full readiness check anyway.
+        if (options.waitForReady !== false) {
+          let ready = false;
+          for (let i = 0; i < 20; i++) {
+            await new Promise(r => setTimeout(r, 300));
+            try {
+              await syapp._verifyRemote(port, 'localhost');
+              ready = true;
+              break;
+            } catch (_) { /* not yet */ }
+          }
 
-        if (!ready) {
-          this.Alert(parentId, `⚠️ Background started (pid ${entry.pid} · :${port}) — waiting for readiness`, { duration: 3000 });
+          if (!ready) {
+            this.Alert(parentId, `⚠️ Background started (pid ${entry.pid} · :${port}) — waiting for readiness`, { duration: 3000 });
+          }
         }
         return state.bgProcess;
       } catch (e) {
