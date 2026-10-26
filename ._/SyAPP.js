@@ -19841,9 +19841,46 @@ function levenshteinDistance(str1, str2) {
                 await this._syappInstance._verifyRemote(bg.port, 'localhost');
               } catch (e) {
                 if (session) session.InAction = false;
-                state.error = `Background process not reachable: ${e.message || e}`;
+                // HARDENED error extraction. The previous form
+                //     `${e.message || e}`
+                // produced the unhelpful "[object Object]" message
+                // whenever `e` was anything other than a plain Error
+                // (a plain object rejection, a nested error from the
+                // underlying socket, etc.). We now prefer `e.message`,
+                // then `e.code`, then a safe JSON stringification, so
+                // the user always sees a concrete reason instead of
+                // "[object Object]".
+                let errMsg = 'Unknown error';
+                if (e) {
+                  if (typeof e.message === 'string' && e.message) errMsg = e.message;
+                  else if (typeof e === 'string') errMsg = e;
+                  else if (typeof e.code === 'string' || typeof e.code === 'number') errMsg = `[${e.code}]`;
+                  else {
+                    try { errMsg = JSON.stringify(e); }
+                    catch (_) { errMsg = 'Unknown error'; }
+                  }
+                }
+                // Append the child's log tail when the log file is
+                // readable. This is what makes a crashing child (e.g.
+                // "Cannot find module …", "SyAPP is not defined",
+                // "SyntaxError: …") visible in the HUD instead of
+                // silently looping on "waiting for readiness".
+                try {
+                  if (bg.log && fs.existsSync(bg.log)) {
+                    const logText = fs.readFileSync(bg.log, 'utf8').trim();
+                    if (logText) {
+                      const lines = logText.split('\n');
+                      const errLines = lines
+                        .filter(l => /error|cannot|not defined|syntax|fail/i.test(l))
+                        .slice(-3)
+                        .join('\n');
+                      if (errLines) errMsg += `\n${errLines.slice(0, 500)}`;
+                    }
+                  }
+                } catch (_) { /* log inspection is best-effort */ }
+                state.error = `Background process not reachable: ${errMsg}`;
                 this.Storages.Set(id, storageKey, state);
-                this.Alert(id, `❌ ${state.error}`, { duration: 5000 });
+                this.Alert(id, `❌ ${state.error}`, { duration: 6000 });
                 return null;
               }
 
@@ -21749,11 +21786,52 @@ function levenshteinDistance(str1, str2) {
         if (state.code && state.code.trim()) {
           const tmpDir = path.join(os.tmpdir(), 'syapp_emb_bg');
           if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+          // `.mjs` extension so Node treats this fallback temp file as
+          // ESM by extension — matches the produced file convention.
           targetFile = path.join(
             tmpDir,
-            `emb_${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}_${process.pid}_${Date.now()}.js`
+            `emb_${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}_${process.pid}_${Date.now()}.mjs`
           );
           let source = state.code;
+
+          // ------------------------------------------------------------------
+          // PREPEND THE SyAPP IMPORT WHEN IT IS NOT ALREADY PRESENT.
+          //
+          // state.code was normalised by _embExtractInlineClass, which
+          // STRIPS any `import SyAPP from ...` statement from the source.
+          // That is correct for inline rendering (the parent SyAPP module
+          // already has SyAPP in scope), but WRONG for a standalone temp
+          // file that the spawned `--server` child imports directly — the
+          // child sees `extends SyAPP.Func()` with `SyAPP` completely
+          // undefined and dies immediately with "SyAPP is not defined".
+          //
+          // The `import.meta.url` form is a fully-qualified file:// URL
+          // so it resolves identically from any temp directory and across
+          // process restarts.
+          //
+          // Only prepend when the code does not already carry an import
+          // for SyAPP — the user may have hand-pasted a snippet that
+          // includes one. The check mirrors the patterns used by
+          // _embExtractInlineClass so the two stay in sync.
+          // ------------------------------------------------------------------
+          const hasSyappImport =
+            /^import\s+SyAPP\b/m.test(source) ||
+            /^import\s*\{[^}]*\bSyAPP\b[^}]*\}\s*from\b/m.test(source) ||
+            /^import\s+SyAPP\s*,\s*\{[^}]*\}\s*from\b/m.test(source) ||
+            /^import\s+[\w$]+\s*,\s*\{\s*[^}]*\bSyAPP\b[^}]*\}\s*from\b/m.test(source);
+
+          if (!hasSyappImport) {
+            let syappUrl = null;
+            try { syappUrl = import.meta.url; }
+            catch (_) {
+              try { syappUrl = url.pathToFileURL(url.fileURLToPath(import.meta.url)).href; }
+              catch (__) { /* leave null */ }
+            }
+            if (syappUrl) {
+              source = `import SyAPP from ${JSON.stringify(syappUrl)};\n` + source;
+            }
+          }
+
           if (!/\bexport\b/.test(source)) {
             const clsM = source.match(/\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
             if (clsM) source += `\nexport default ${clsM[1]};\n`;
@@ -21812,6 +21890,11 @@ function levenshteinDistance(str1, str2) {
           pid: entry.pid,
           port,
           name: processName,
+          // Persist the log path so the "not reachable" error path below
+          // can surface the child's actual crash message to the user
+          // instead of a bare "[object Object]". SyPM.exec already
+          // returned this path as `entry.log`.
+          log: entry.log || null,
           spawnSourceKey,
           startedAt: Date.now(),
           lastActivity: Date.now()
@@ -27980,17 +28063,49 @@ class SelfBuilder extends SyAPP_Func {
     let producedPath = null;
     let producedCode = null;
     try {
+      // Use the ABSOLUTE file URL of this SyAPP module as the import
+      // target inside the produced file.
+      //
+      // The produced file is written to os.tmpdir()/syapp_emb_builds/,
+      // which is NOT a subdirectory of process.cwd(). The previous
+      // implementation used:
+      //
+      //     path.relative(process.cwd(), url.fileURLToPath(import.meta.url))
+      //
+      // …which produces a BARE specifier like "SyAPP.js" (no "./" prefix)
+      // whenever cwd matched the SyAPP.js directory, or a path relative to
+      // cwd (e.g. "../home/user/project/SyAPP.js") which is meaningless
+      // from inside /tmp. Either form fails to resolve when the produced
+      // file is imported directly by the spawned `--server` child — which
+      // is exactly what produced the endless
+      //   "⚠️ Background started (pid …) — waiting for readiness"
+      //   "❌ Background process not reachable: …"
+      // loop that only manifested through the Self Build flow. The Pick
+      // File flow was unaffected because the user's own file already
+      // carried a working import.
+      //
+      // `import.meta.url` is already a fully-qualified file:// URL, so it
+      // resolves identically from anywhere on disk and across reboots.
+      // The produced file is also written with a `.mjs` extension below,
+      // so Node treats it as ESM regardless of any package.json in /tmp —
+      // without that, the child would treat the .js temp file as CJS and
+      // reject every `import` statement as a syntax error.
       const relSyapp = (() => {
-        try {
-          return path.relative(process.cwd(), url.fileURLToPath(import.meta.url));
-        } catch (_) { return './SyAPP.js'; }
+        try { return import.meta.url; }
+        catch (_) {
+          try {
+            return url.pathToFileURL(url.fileURLToPath(import.meta.url)).href;
+          } catch (__) { return './SyAPP.js'; }
+        }
       })();
       producedCode = _genFuncJS(this.State, relSyapp);
 
       const outDir = path.join(os.tmpdir(), 'syapp_emb_builds');
       if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+      // `.mjs` so Node treats the produced file as ESM by extension —
+      // no package.json needed next to it, no CJS/ESM ambiguity.
       const outName = (this.State.funcName || 'EmbeddedFunc').replace(/[^A-Za-z0-9_$]/g, '') +
-                      '_' + Date.now().toString(36) + '.js';
+                      '_' + Date.now().toString(36) + '.mjs';
       producedPath = path.join(outDir, outName);
       fs.writeFileSync(producedPath, producedCode, 'utf8');
     } catch (e) {
