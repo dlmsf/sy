@@ -19990,6 +19990,23 @@ function levenshteinDistance(str1, str2) {
                 // finishes writing its final bytes first.
                 setImmediate(() => {
                   // ------------------------------------------------------
+                  // HUD MOUSE RESTORATION.
+                  //
+                  // `_runRemoteSession.finish()` has ALREADY called
+                  // `_restoreLocalHUDMouse(this)` — that re-attached
+                  // `HUD.handleMouseData` to stdin, re-enabled mouse
+                  // tracking at the byte level, and left
+                  // `isMouseEnabled = true` so the eventual menu
+                  // rebuild's `safeEnableMouseTracking()` is a no-op.
+                  //
+                  // Calling the helper once more here is harmless
+                  // (idempotent) and guarantees the same end state
+                  // even in the rare case where `_runRemoteSession`
+                  // threw before its internal `finish()` could run.
+                  // ------------------------------------------------------
+                  try { _restoreLocalHUDMouse(this._syappInstance); } catch (_) {}
+
+                  // ------------------------------------------------------
                   // CRITICAL: do NOT clear session.InAction here.
                   //
                   // The outer LoadScreen (which ran the parent build and
@@ -20026,10 +20043,6 @@ function levenshteinDistance(str1, str2) {
                   // ActualPath is still the parent func). No rebuild is
                   // lost either way.
                   // ------------------------------------------------------
-                  try {
-                    stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m');
-                  } catch (_) {}
-                  try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
                   try {
                     this._syappInstance.LoadScreen(this.Name, { props: { ...passProps } }).catch(() => {});
                   } catch (_) {}
@@ -24847,20 +24860,14 @@ class SyPMManagerFunc extends SyAPP_Func {
    * @private
    */
   _restoreAfterRemote(id, syapp, session, errorMessage) {
-    try {
-      stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h\x1b[0m');
-    } catch (_) {}
-    try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
-    try { stdin.pause(); } catch (_) {}
-
-    try {
-      if (syapp && syapp.HUD) {
-        syapp.HUD.isInMenu = false;
-        syapp.HUD.currentMenuState = null;
-        syapp.HUD.isMouseEnabled = false;
-        syapp.HUD.wheelAccumulator = 0;
-      }
-    } catch (_) {}
+    // ------------------------------------------------------------------
+    // Terminal / mouse restoration happens inside
+    // `_runRemoteSession.finish()` (via `_restoreLocalHUDMouse`). The
+    // helper is idempotent, so calling it once more here is a safe
+    // defensive fallback for the case where `_runRemoteSession`
+    // threw before its internal `finish()` could run.
+    // ------------------------------------------------------------------
+    try { _restoreLocalHUDMouse(syapp); } catch (_) {}
 
     try { this.Storages.Set(id, 'sypm_mgr_view', 'list'); } catch (_) {}
     try { this.Storages.Delete(id, 'sypm_mgr_logid'); } catch (_) {}
@@ -26054,7 +26061,7 @@ this.HUD = new TerminalHUD({
         let response = null;
         let myStreamId = null;
 
-        const RETURN_HINT = '[Ctrl+C pop one level | Ctrl+B exit to local]';
+        const RETURN_HINT = '[ 🖱 Click here or Ctrl+C: pop one level   |   Ctrl+B: exit to local ]';
         const drawReturnHint = () => {
           try {
             const rows = stdout.rows || 24;
@@ -26063,7 +26070,13 @@ this.HUD = new TerminalHUD({
               ? RETURN_HINT.slice(0, Math.max(0, cols - 1))
               : RETURN_HINT;
             const padded = text + ' '.repeat(Math.max(0, cols - text.length));
-            stdout.write(`\x1b7\x1b[${rows};1H\x1b[7m${padded}\x1b[0m\x1b8`);
+            // Re-enable mouse tracking + SGR mode on EVERY redraw so
+            // the bottom hint row stays clickable at all times. Some
+            // remote HUD states toggle mouse off as part of their own
+            // rendering; without this, the clickable area would
+            // silently disappear whenever the remote flipped mouse
+            // off — leaving the user without a way to click back.
+            stdout.write(`\x1b[?1000h\x1b[?1006h\x1b7\x1b[${rows};1H\x1b[7m${padded}\x1b[0m\x1b8`);
           } catch (_) {}
         };
 
@@ -26088,19 +26101,39 @@ this.HUD = new TerminalHUD({
             response = null;
           }
 
-          try {
-            stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l');
-          } catch (_) {}
+          // ------------------------------------------------------------------
+          // HUD MOUSE RESTORATION — SINGLE POINT OF TRUTH.
+          //
+          // This `finish()` runs for EVERY return path from a remote
+          // session, at EVERY nesting depth, and for EVERY caller:
+          //   • this.Connection()       — restoreLocalView
+          //   • this.Emb() bg mode      — enterFunc finally
+          //   • SyPMManagerFunc         — _restoreAfterRemote
+          //
+          // `_restoreLocalHUDMouse()` re-attaches
+          // `HUD.handleMouseData` to stdin, re-enables mouse
+          // tracking at the byte level, sets `HUD.isMouseEnabled =
+          // true` so the eventual menu rebuild's
+          // `safeEnableMouseTracking()` is a no-op (no duplicate
+          // listeners), and keeps raw mode + stdin.resume() ON so
+          // mouse events arriving before the rebuild are captured.
+          //
+          // The three callers above are now lean — they no longer
+          // touch the terminal at all, they only reset
+          // `session.InAction` and call `LoadScreen`. This is what
+          // makes the fix "general": no per-caller terminal-mangling
+          // paths are left that could disagree with each other.
+          // ------------------------------------------------------------------
+          try { _restoreLocalHUDMouse(this); } catch (_) {}
 
-          try { if (stdin.isRaw) stdin.setRawMode(false); } catch (_) {}
-          try { stdin.pause(); } catch (_) {}
-
+          // Clear the hint row and show the cursor so the eventual
+          // menu render starts from a clean visual state.
           try {
             const rows = stdout.rows || 24;
             const cols = stdout.columns || 80;
-            stdout.write(`\x1b7\x1b[${rows};1H${' '.repeat(cols)}\x1b8\x1b[0m\x1b[?25h\n`);
+            stdout.write(`\x1b7\x1b[${rows};1H${' '.repeat(cols)}\x1b8\x1b[?25h\n`);
           } catch (_) {
-            try { stdout.write('\x1b[0m\x1b[?25h\n'); } catch (_) {}
+            try { stdout.write('\x1b[?25h\n'); } catch (_) {}
           }
 
           resolve(err || null);
@@ -26154,11 +26187,130 @@ this.HUD = new TerminalHUD({
 
             try { stdin.setRawMode(true); } catch (_) {}
             try { stdin.resume(); } catch (_) {}
+            // Enable mouse tracking + SGR mode locally so the bottom
+            // hint row can be clicked with the mouse. drawReturnHint()
+            // re-issues this on every redraw, so the clickable area
+            // survives even if the remote's HUD toggles mouse off at
+            // some point during the session.
+            try { stdout.write('\x1b[?1000h\x1b[?1006h'); } catch (_) {}
+
+            // ------------------------------------------------------------------
+            // triggerCtrlC
+            // ------------------------------------------------------------------
+            // Factored out of the dataHandler so BOTH the raw Ctrl+C
+            // byte path (0x03) and the mouse-click-on-hint-row path
+            // call exactly the same code. This guarantees the two
+            // paths are strictly equivalent — same /ctrl-c POST, same
+            // stream-ID scoping, same finish() fallback on error.
+            // ------------------------------------------------------------------
+            const triggerCtrlC = () => {
+              try {
+                // Include our server-assigned stream ID so the
+                // remote closes ONLY our stream — not every stream
+                // connected to it. Without this, two terminals
+                // connected to the same `--bg` server would both
+                // disconnect whenever either one pressed Ctrl+C or
+                // clicked the hint row.
+                const ctrlBody = JSON.stringify({ streamId: myStreamId || '' });
+                const r = http.request(`${baseUrl}/ctrl-c`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(ctrlBody)
+                  }
+                }, (res2) => {
+                  if (res2.statusCode !== 200) {
+                    try { res2.resume(); } catch (_) {}
+                    finish(null);
+                    return;
+                  }
+                  try { res2.resume(); } catch (_) {}
+                });
+                r.on('error', () => { finish(null); });
+                r.end(ctrlBody);
+              } catch (_) {
+                finish(null);
+              }
+            };
+
+            // Input buffer to reassemble SGR mouse sequences that may
+            // arrive split across multiple `data` chunks (the terminal
+            // sends them as a single sequence, but the OS / stream can
+            // fragment them at arbitrary byte boundaries).
+            let inputBuffer = Buffer.alloc(0);
 
             dataHandler = (chunk) => {
+              inputBuffer = Buffer.concat([inputBuffer, chunk]);
+
+              // ------------------------------------------------------------------
+              // Extract and process complete SGR mouse sequences.
+              //
+              // A left-click PRESS on the RETURN HINT row (the very
+              // bottom line of the terminal, where `drawReturnHint()`
+              // renders the "Click here or Ctrl+C" label) is converted
+              // into a Ctrl+C action: it triggers `triggerCtrlC()`,
+              // which does the same /ctrl-c POST as a physical Ctrl+C
+              // keystroke. This pops one layer of the nested connection
+              // chain and returns the user to the local SyAPP UI, where
+              // the HUD re-enables mouse support for full mouse use.
+              //
+              // Every other byte — including mouse events aimed at the
+              // remote HUD, and any non-mouse input — is passed through
+              // unchanged, so the remote's own mouse interactions keep
+              // working exactly as before.
+              //
+              // SGR mouse format: \x1b[<button;x;yM (press) or m (release)
+              //                   1-based coordinates; button 0 = left.
+              // ------------------------------------------------------------------
+              const passthrough = [];
+              let i = 0;
+              const hintRow0 = (stdout.rows || 24) - 1;
+
+              while (i < inputBuffer.length) {
+                if (inputBuffer[i] === 0x1b &&
+                    i + 2 < inputBuffer.length &&
+                    inputBuffer[i + 1] === 0x5b &&
+                    inputBuffer[i + 2] === 0x3c) {
+                  const tail = inputBuffer.slice(i).toString('latin1');
+                  const sgrMatch = tail.match(/^\x1b\[<(\d+);(\d+);(\d+)([Mm])/);
+
+                  if (sgrMatch) {
+                    const button = parseInt(sgrMatch[1], 10);
+                    const y0 = parseInt(sgrMatch[3], 10) - 1;
+                    const eventType = sgrMatch[4];
+
+                    // Left-click PRESS on the bottom hint row → Ctrl+C.
+                    if (eventType === 'M' && button === 0 && y0 === hintRow0) {
+                      i += sgrMatch[0].length;
+                      triggerCtrlC();
+                      continue;
+                    }
+
+                    // Forward the complete mouse sequence unchanged.
+                    passthrough.push(Buffer.from(sgrMatch[0], 'latin1'));
+                    i += sgrMatch[0].length;
+                    continue;
+                  }
+
+                  // Partial SGR mouse prefix — wait for the rest of
+                  // the sequence to arrive in a subsequent chunk.
+                  if (/^\x1b\[<\d*(?:;\d*){0,2}$/.test(tail)) {
+                    break;
+                  }
+                }
+
+                passthrough.push(Buffer.from([inputBuffer[i]]));
+                i++;
+              }
+
+              inputBuffer = inputBuffer.slice(i);
+              const body = Buffer.concat(passthrough);
+              if (body.length === 0) return;
+
+              // Ctrl+C / Ctrl+B detection on the remaining bytes.
               let sawCtrlC = false;
-              for (let i = 0; i < chunk.length; i++) {
-                const b = chunk[i];
+              for (let j = 0; j < body.length; j++) {
+                const b = body[j];
                 if (b === 0x03) { sawCtrlC = true; }
                 else if (b === 0x02) {
                   finish(null);
@@ -26167,45 +26319,21 @@ this.HUD = new TerminalHUD({
               }
 
               if (sawCtrlC) {
-                try {
-                  // Include our server-assigned stream ID so the
-                  // remote closes ONLY our stream — not every stream
-                  // connected to it. Without this, two terminals
-                  // connected to the same `--bg` server would both
-                  // disconnect whenever either one pressed Ctrl+C.
-                  const ctrlBody = JSON.stringify({ streamId: myStreamId || '' });
-                  const r = http.request(`${baseUrl}/ctrl-c`, {
-                    method: 'POST',
-                    headers: {
-                      'Content-Type': 'application/json',
-                      'Content-Length': Buffer.byteLength(ctrlBody)
-                    }
-                  }, (res2) => {
-                    if (res2.statusCode !== 200) {
-                      try { res2.resume(); } catch (_) {}
-                      finish(null);
-                      return;
-                    }
-                    try { res2.resume(); } catch (_) {}
-                  });
-                  r.on('error', () => { finish(null); });
-                  r.end(ctrlBody);
-                } catch (_) {
-                  finish(null);
-                }
+                triggerCtrlC();
                 return;
               }
 
+              // Forward the remaining input to the remote.
               try {
                 const r = http.request(`${baseUrl}/input`, {
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/octet-stream',
-                    'Content-Length': chunk.length
+                    'Content-Length': body.length
                   }
                 });
                 r.on('error', () => {});
-                r.end(chunk);
+                r.end(body);
               } catch (_) {}
             };
             stdin.on('data', dataHandler);
@@ -32238,6 +32366,104 @@ function _embKillAllBackgroundChildren(syapp) {
     } catch (_) {}
   }
   return records.length;
+}
+
+/**
+ * Restore the local TerminalHUD's mouse support after a remote
+ * streaming session (`_runRemoteSession`) ends.
+ *
+ * WHY THIS EXISTS — and why it must run at EVERY depth of a nested
+ * connection chain:
+ *
+ *   • When the user clicks "Enter Func" on a Connection / Emb widget,
+ *     the HUD's `selectOption` runs `cleanupMenuState()` BEFORE the
+ *     action executes. That call detaches `HUD.handleMouseData` from
+ *     stdin and sets `HUD.isMouseEnabled = false`.
+ *
+ *   • The remote session then runs. Its own `dataHandler` temporarily
+ *     owns stdin.
+ *
+ *   • When the session ends (Ctrl+C, click on the bottom hint row, or
+ *     the remote closing its stream), the remote `dataHandler` is
+ *     removed — but `HUD.handleMouseData` is NOT automatically
+ *     re-attached.
+ *
+ *   • The caller's `LoadScreen` → `displayMenu` → `setupMenuState` →
+ *     `safeEnableMouseTracking` path IS supposed to re-attach it, but
+ *     that path is a NO-OP whenever `HUD.isMouseEnabled` happens to be
+ *     `true` (stale from a previous cycle), AND it never runs at all
+ *     when `session.InAction` is still `true` (which happens on the
+ *     main layer while the outer LoadScreen is unwinding).
+ *
+ *   Net result: after returning from a nested connection, the MAIN
+ *   layer's SyAPP_Func loses mouse support, while every intermediate
+ *   layer keeps it — because intermediate layers always end up
+ *   rebuilding their menu (their InAction is released cleanly by
+ *   their own `_runRemoteSession.finish()`), while the main layer
+ *   sometimes does not. This helper fixes it unconditionally.
+ *
+ * The helper is:
+ *   • IDEMPOTENT — repeated calls do not stack `handleMouseData`
+ *     listeners (`removeListener` before `on`).
+ *   • SAFE at any depth — a nested `--server` process calling it just
+ *     toggles its OWN HUD's state; the parent layer's HUD is
+ *     unaffected (each process has its own HUD instance).
+ *   • COMPATIBLE with the eventual menu rebuild — since the helper
+ *     leaves `isMouseEnabled = true`, the rebuild's
+ *     `safeEnableMouseTracking()` call is a harmless no-op, so no
+ *     duplicate listeners are ever created.
+ *
+ * @param {SyAPP} syapp - The SyAPP instance whose HUD should be
+ *                        restored.
+ * @private
+ */
+function _restoreLocalHUDMouse(syapp) {
+  try {
+    if (!syapp || !syapp.HUD) return;
+    const HUD = syapp.HUD;
+
+    // 1) Clear stale menu bookkeeping so the next rebuild starts from
+    //    a consistent baseline. `isInMenu = false` here is correct
+    //    for the "no menu active right now" state — the eventual
+    //    `setupMenuState()` will flip it back to `true` when a new
+    //    menu is built.
+    HUD.isInMenu = false;
+    HUD.currentMenuState = null;
+    HUD.wheelAccumulator = 0;
+    HUD.mouseEventBuffer = '';
+    try { HUD.resetClickState(); } catch (_) {}
+
+    // 2) Re-attach the HUD's mouse handler. removeListener-first
+    //    guarantees no duplicate listeners across multiple returns.
+    if (typeof HUD.handleMouseData === 'function') {
+      try { stdin.removeListener('data', HUD.handleMouseData); } catch (_) {}
+      try { stdin.on('data', HUD.handleMouseData); } catch (_) {}
+    }
+
+    // 3) Enable basic + button + SGR mouse tracking at the byte level
+    //    so the terminal starts sending SGR sequences to us
+    //    immediately — before the next menu build.
+    try {
+      stdout.write('\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h');
+    } catch (_) {}
+
+    // 4) Show the cursor and reset any stray SGR attributes.
+    try { stdout.write('\x1b[?25h\x1b[0m'); } catch (_) {}
+
+    // 5) Mark the HUD as enabled so the eventual
+    //    `safeEnableMouseTracking()` call is a harmless no-op
+    //    (prevents duplicate `handleMouseData` listeners).
+    HUD.isMouseEnabled = true;
+
+    // 6) Keep raw mode on and stdin flowing so mouse events arriving
+    //    between now and the menu rebuild are captured by the handler
+    //    we just attached (instead of being dropped or buffered by
+    //    the terminal driver).
+    try { if (!stdin.isRaw) stdin.setRawMode(true); } catch (_) {}
+    try { stdin.resume(); } catch (_) {}
+  } catch (_) {
+    // Never let terminal restoration itself crash the caller.
+  }
 }
 
 /**
