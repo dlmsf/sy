@@ -26061,6 +26061,139 @@ this.HUD = new TerminalHUD({
         let response = null;
         let myStreamId = null;
 
+        // NEW: path tree state. `currentPath` describes the chain from
+        // the local layer down to the deepest, and is rebuilt whenever
+        // the remote sends updated path info (via response header on
+        // connect, and via inline OSC markers on change).
+        let currentPath = [];
+        let treeSegments = [];
+        const localLabel = {
+          name: (this && this.MainFunc && this.MainFunc.Name) ? this.MainFunc.Name : 'Local',
+          type: 'local'
+        };
+
+        // NEW: defensive buffer for OSC path markers split across chunk
+        // boundaries (rare, but possible).
+        let pathMarkerBuffer = '';
+
+        // NEW: extract `\x1b]7000;<base64-json>\x07` path-update markers
+        // from a chunk and return the cleaned text + parsed paths.
+        const extractPathMarkers = (text) => {
+          const combined = pathMarkerBuffer + text;
+          const markers = [];
+          const cleaned = combined.replace(/\x1b\]7000;([A-Za-z0-9+/=]+)\x07/g, (_, b64) => {
+            try {
+              const p = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+              if (Array.isArray(p)) markers.push(p);
+            } catch (_) {}
+            return '';
+          });
+          const partial = cleaned.match(/\x1b\]7000;[A-Za-z0-9+/=]*$/);
+          if (partial) {
+            pathMarkerBuffer = partial[0];
+            return { cleaned: cleaned.slice(0, -partial[0].length), markers };
+          }
+          pathMarkerBuffer = '';
+          return { cleaned, markers };
+        };
+
+        // NEW: update the local tree path from a child's path array.
+        const updatePath = (childPath) => {
+          if (!Array.isArray(childPath)) return;
+          currentPath = [localLabel, ...childPath];
+        };
+
+        // NEW: emit a path-update marker to downstream clients. Only
+        // fires when this instance is a server with at least one
+        // connected client, so no escape bytes leak into a bare
+        // terminal or log.
+        const emitPathMarkerDownstream = () => {
+          if (!this._streamServer) return;
+          if (!this._streamClients || this._streamClients.size === 0) return;
+          try {
+            const selfLabel = {
+              name: (this && this.MainFunc && this.MainFunc.Name) ? this.MainFunc.Name : 'Server',
+              port: this._streamPort || null,
+              type: 'server'
+            };
+            const childPath = Array.isArray(this._activeChildPath) ? this._activeChildPath : [];
+            const fullPath = [selfLabel, ...childPath];
+            const b64 = Buffer.from(JSON.stringify(fullPath)).toString('base64');
+            const marker = `\x1b]7000;${b64}\x07`;
+            for (const c of this._streamClients) {
+              try { c.res.write(marker); } catch (_) {}
+            }
+          } catch (_) {}
+        };
+
+        // NEW: shorten a segment name so 3-5 layers fit on narrow
+        // terminals. Keeps an ellipsis when truncated.
+        const shortName = (name) => {
+          const s = String(name == null ? '?' : name);
+          if (s.length <= 8) return s;
+          return s.slice(0, 7) + '…';
+        };
+
+        // NEW: draw the path tree one row ABOVE the return hint. Never
+        // touches the hint row, so the "click to pop one level" area
+        // always stays fully visible and clickable.
+        //
+        // Each segment is rendered as `<shortName>:<port>` (port kept
+        // short — often the port IS the shortest unique discriminator).
+        // When the tree is too wide, the leftmost segments are dropped
+        // with a leading "… › " so the newest layers stay visible.
+        const drawPathTree = () => {
+          try {
+            if (currentPath.length < 2) return;
+            const rows = stdout.rows || 24;
+            const cols = stdout.columns || 80;
+            if (rows < 5) return;
+            const treeRow = rows - 1;
+
+            const SEP = '›';
+            const segs = currentPath.map((p, idx) => {
+              const nm = shortName(p.name);
+              const lbl = p.port ? `${nm}:${p.port}` : nm;
+              return { label: lbl, index: idx };
+            });
+
+            // Fit as many segments as possible starting from the
+            // DEEPEST (rightmost) so the newest layers survive.
+            const budget = Math.max(10, cols - 2);
+            const parts = [];
+            let used = 0;
+            let startIdx = segs.length;
+            for (let i = segs.length - 1; i >= 0; i--) {
+              const piece = (parts.length > 0 ? SEP.length : 0) + segs[i].label.length;
+              if (used + piece > budget && parts.length > 0) break;
+              parts.unshift(segs[i]);
+              used += piece;
+              startIdx = i;
+            }
+            const truncatedLeft = startIdx > 0;
+            const prefix = truncatedLeft ? '… ' + SEP : '';
+
+            let line = prefix + parts.map(s => s.label).join(SEP);
+            if (line.length > cols) line = line.slice(0, cols);
+
+            // Record clickable x-ranges for each visible segment.
+            treeSegments = [];
+            let x = prefix.length;
+            for (let i = 0; i < parts.length; i++) {
+              if (i > 0) x += SEP.length;
+              treeSegments.push({
+                index: parts[i].index,
+                startX: x,
+                endX: x + parts[i].label.length - 1
+              });
+              x += parts[i].label.length;
+            }
+
+            const padded = line + ' '.repeat(Math.max(0, cols - line.length));
+            stdout.write(`\x1b[?1000h\x1b[?1006h\x1b7\x1b[${treeRow};1H\x1b[36m${padded}\x1b[0m\x1b8`);
+          } catch (_) {}
+        };
+
         const RETURN_HINT = '[ 🖱 Click here or Ctrl+C: pop one level   |   Ctrl+B: exit to local ]';
         const drawReturnHint = () => {
           try {
@@ -26083,6 +26216,16 @@ this.HUD = new TerminalHUD({
         const finish = (err) => {
           if (done) return;
           done = true;
+
+          // NEW: if we were tracking a child path, clear it and notify
+          // any downstream clients that this layer is now empty. This
+          // is what makes the path tree shrink cleanly after a pop.
+          try {
+            if (this._activeChildPath) {
+              this._activeChildPath = null;
+              emitPathMarkerDownstream();
+            }
+          } catch (_) {}
 
           if (resizeHandler) {
             try { stdout.removeListener('resize', resizeHandler); } catch (_) {}
@@ -26153,10 +26296,43 @@ this.HUD = new TerminalHUD({
             // never every peer connected to the same host.
             myStreamId = res.headers['x-stream-id'] || null;
 
+            // NEW: read the initial path from the response header. The
+            // path describes the chain from the immediate server down
+            // to the deepest layer.
+            try {
+              const initialPathB64 = res.headers['x-syapp-path'];
+              if (initialPathB64) {
+                const childPath = JSON.parse(
+                  Buffer.from(initialPathB64, 'base64').toString('utf8')
+                );
+                if (Array.isArray(childPath)) {
+                  this._activeChildPath = childPath;
+                  updatePath(childPath);
+                  emitPathMarkerDownstream();
+                }
+              }
+            } catch (_) {}
+
             res.on('data', (chunk) => {
               try {
-                stdout.write(chunk);
+                // NEW: extract path-update markers from the chunk and
+                // forward the cleaned content to our own stdout. Markers
+                // that describe the CHILD's path are stripped here, so
+                // downstream clients only ever see OUR path.
+                const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+                const { cleaned, markers } = extractPathMarkers(text);
+
+                for (const childPath of markers) {
+                  try {
+                    this._activeChildPath = childPath;
+                    updatePath(childPath);
+                    emitPathMarkerDownstream();
+                  } catch (_) {}
+                }
+
+                if (cleaned) stdout.write(cleaned);
                 drawReturnHint();
+                drawPathTree();
               } catch (_) {}
             });
             res.on('end', () => finish(null));
@@ -26179,6 +26355,7 @@ this.HUD = new TerminalHUD({
                 r.on('error', () => {});
                 r.end(body);
                 drawReturnHint();
+                drawPathTree();
               } catch (_) {}
             };
             sendResize();
@@ -26279,10 +26456,37 @@ this.HUD = new TerminalHUD({
                     const y0 = parseInt(sgrMatch[3], 10) - 1;
                     const eventType = sgrMatch[4];
 
-                    // Left-click PRESS on the bottom hint row → Ctrl+C.
+                    // Left-click PRESS on the bottom hint row → pop
+                    // one layer (unchanged behaviour).
                     if (eventType === 'M' && button === 0 && y0 === hintRow0) {
                       i += sgrMatch[0].length;
                       triggerCtrlC();
+                      continue;
+                    }
+
+                    // NEW: left-click PRESS on the tree row (one row
+                    // above the hint) → pop directly to the clicked
+                    // layer. Number of /ctrl-c requests to send equals
+                    // the number of layers between the deepest and the
+                    // clicked one.
+                    const treeRow0 = hintRow0 - 1;
+                    if (eventType === 'M' && button === 0 && y0 === treeRow0 && treeSegments.length > 0) {
+                      const clickX = parseInt(sgrMatch[2], 10) - 1;
+                      const seg = treeSegments.find(s => clickX >= s.startX && clickX <= s.endX);
+                      if (seg) {
+                        const layersToPop = currentPath.length - 1 - seg.index;
+                        if (layersToPop > 0) {
+                          let sent = 0;
+                          const sendNext = () => {
+                            if (sent >= layersToPop || done) return;
+                            triggerCtrlC();
+                            sent++;
+                            if (sent < layersToPop) setTimeout(sendNext, 300);
+                          };
+                          sendNext();
+                        }
+                      }
+                      i += sgrMatch[0].length;
                       continue;
                     }
 
@@ -26339,6 +26543,7 @@ this.HUD = new TerminalHUD({
             stdin.on('data', dataHandler);
 
             drawReturnHint();
+            drawPathTree();
           });
 
           streamReq.on('error', (e) => finish(e));
@@ -32486,6 +32691,7 @@ function _startStreamingServer(syapp, port, host) {
   // (non-server case). A `--server` host must never kill itself.
   // ------------------------------------------------------------------
   syapp._streamServer = true
+  syapp._streamPort = port
 
   // ------------------------------------------------------------------
   // The set of currently connected `/stream` clients is stored on the
@@ -32539,12 +32745,26 @@ function _startStreamingServer(syapp, port, host) {
       // which stream to close — without touching the streams of any
       // other client that happens to be connected to this same host.
       const streamId = `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
+
+      // NEW: compute the path from THIS server down to the deepest
+      // layer, and ship it in an `X-Syapp-Path` header. The client
+      // uses it to render a clickable path tree.
+      const selfLabel = {
+        name: (syapp.MainFunc && syapp.MainFunc.Name) ? syapp.MainFunc.Name : 'Server',
+        port,
+        type: 'server'
+      }
+      const childPath = Array.isArray(syapp._activeChildPath) ? syapp._activeChildPath : []
+      const fullPath = [selfLabel, ...childPath]
+      const pathB64 = Buffer.from(JSON.stringify(fullPath)).toString('base64')
+
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'Cache-Control': 'no-cache, no-store',
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
-        'X-Stream-Id': streamId
+        'X-Stream-Id': streamId,
+        'X-Syapp-Path': pathB64
       })
 
       const client = { res, id: streamId }
