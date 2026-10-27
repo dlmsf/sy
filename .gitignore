@@ -21,6 +21,7 @@ bundle.output.js
 result
 result.txt
 struct
+struct.txt
 clipboard-config.json
 
 # Ubuntu cloud image downloads
