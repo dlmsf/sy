@@ -61,6 +61,31 @@ const CLUSTER_LOG_DIR = path.join(GLOBAL_BASE_DIR, 'cluster_logs');
  */
 const SCRIPTS_DIR = path.join(GLOBAL_BASE_DIR, 'scripts');
 
+/**
+ * Directory for persistent hard-delete kill-locks.
+ *
+ * Two kinds of locks live here:
+ *   • `<id>.lock`       — blocks a specific registry entry's monitor
+ *                         from restarting. Written synchronously by
+ *                         SyPM.hardKill() BEFORE any signal is sent,
+ *                         so a monitor cannot sneak a spawn cycle in
+ *                         between the SIGKILL and its own exit handler
+ *                         running.
+ *   • `name_<n>.lock`   — blocks ANY future spawn using that name.
+ *                         For Emb processes, a PORTLESS `emb-<name>`
+ *                         lock is written too, so a respawn under a
+ *                         brand-new port (which is exactly what the
+ *                         parent's `_embRunBackground` does when it
+ *                         sees a dead pid) is STILL blocked.
+ *
+ * These locks are the acid guarantee that a hard-delete sticks: the
+ * process can never come back until the operator explicitly unlocks
+ * the name from `--manage → 🔓 Unlock`.
+ *
+ * @constant {string}
+ */
+const LOCK_DIR = path.join(GLOBAL_BASE_DIR, 'locks');
+
 // Ensure global directories exist
 if (!fs.existsSync(GLOBAL_BASE_DIR)) {
     fs.mkdirSync(GLOBAL_BASE_DIR, { recursive: true });
@@ -76,6 +101,9 @@ if (!fs.existsSync(CLUSTER_LOG_DIR)) {
 }
 if (!fs.existsSync(SCRIPTS_DIR)) {
     fs.mkdirSync(SCRIPTS_DIR, { recursive: true });
+}
+if (!fs.existsSync(LOCK_DIR)) {
+    fs.mkdirSync(LOCK_DIR, { recursive: true });
 }
 if (!fs.existsSync(PROCESS_REGISTRY)) {
     fs.writeFileSync(PROCESS_REGISTRY, '[]', 'utf-8');
@@ -533,10 +561,12 @@ if (cluster.isMaster) {
         const escapedFilePath = filePath.replace(/'/g, "'\\''");
         const escapedLogPath = logPath.replace(/'/g, "'\\''");
         const escapedWorkingDir = workingDir ? workingDir.replace(/'/g, "'\\''") : '';
+        const escapedLockPath = path.join(LOCK_DIR, `${processId}.lock`).replace(/'/g, "'\\''");
 
         const scriptContent = `#!/usr/bin/env ${shell}
 
 PROCESS_ID='${processId}'
+LOCK_PATH='${escapedLockPath}'
 FILE_PATH='${escapedFilePath}'
 PROCESS_NAME='${processName}'
 LOG_PATH='${escapedLogPath}'
@@ -592,6 +622,17 @@ EOF
 }
 
 should_continue() {
+    # SYPM HARD-DELETE ACID LOCK — checked FIRST, before any registry
+    # or status logic. If a hardKill has been issued for this process,
+    # the "<id>.lock" file exists and NO restart is allowed. Because
+    # hardKill writes the lock SYNCHRONOUSLY before sending any signal,
+    # this check closes the race where a monitor could sneak a restart
+    # in between the SIGKILL and its own exit handler running.
+    if [ -f "$LOCK_PATH" ]; then
+        echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Hard-deleted (lock file present), exiting" >> "$LOG_PATH"
+        return 1
+    fi
+
     cat > /tmp/check_registry_$$.js << EOF
 const fs = require('fs');
 try {
@@ -1350,6 +1391,23 @@ exit $EXIT_CODE
             throw new Error('Command cannot be empty');
         }
 
+        // HARD-LOCK GUARD — refuse to spawn a hard-deleted name.
+        if (config.name && this._isNameHardLocked(config.name)) {
+            throw new Error(
+                `Process name "${config.name}" is hard-locked (previously hard-deleted). ` +
+                `Use --manage → 🔓 Unlock to allow respawn.`
+            );
+        }
+        if (config.name) {
+            const embName = this._extractEmbNameFromProcName(config.name);
+            if (embName && this._isNameHardLocked(`emb-${embName}`)) {
+                throw new Error(
+                    `Emb name "${embName}" is hard-locked (previously hard-deleted). ` +
+                    `Use --manage → 🔓 Unlock to allow respawn.`
+                );
+            }
+        }
+
         // Daemon idempotency: never create a second systemd/OpenRC unit for
         // the same name. Without this, every boot that re-invokes exec()
         // with daemon:true installs a duplicate service and the machine
@@ -1532,10 +1590,12 @@ exit $EXIT_CODE
         const escapedRegistryPath = PROCESS_REGISTRY.replace(/'/g, "'\\''");
         const escapedLogPath = logPath.replace(/'/g, "'\\''");
         const escapedWorkingDir = workingDir ? workingDir.replace(/'/g, "'\\''") : '';
+        const escapedLockPath = path.join(LOCK_DIR, `${processId}.lock`).replace(/'/g, "'\\''");
 
         const scriptContent = `#!/usr/bin/env ${shell}
 
 PROCESS_ID='${processId}'
+LOCK_PATH='${escapedLockPath}'
 COMMAND='${command.replace(/'/g, "'\\''")}'
 PROCESS_NAME='${processName}'
 LOG_PATH='${escapedLogPath}'
@@ -1593,6 +1653,12 @@ EOF
 }
 
 should_continue() {
+    # SYPM HARD-DELETE ACID LOCK — checked FIRST.
+    if [ -f "$LOCK_PATH" ]; then
+        echo "[\$(date +'%Y-%m-%d %H:%M:%S')] Hard-deleted (lock file present), exiting" >> "$LOG_PATH"
+        return 1
+    fi
+
     cat > /tmp/check_registry_$$.js << EOF
 const fs = require('fs');
 try {
@@ -1713,6 +1779,23 @@ main
      * @throws {Error} If file not found or working directory is invalid
      */
     static run(filepathOrCode, config = {}) {
+        // HARD-LOCK GUARD — same acid lock as SyPM.exec.
+        if (config.name && this._isNameHardLocked(config.name)) {
+            throw new Error(
+                `Process name "${config.name}" is hard-locked (previously hard-deleted). ` +
+                `Use --manage → 🔓 Unlock to allow respawn.`
+            );
+        }
+        if (config.name) {
+            const embName = this._extractEmbNameFromProcName(config.name);
+            if (embName && this._isNameHardLocked(`emb-${embName}`)) {
+                throw new Error(
+                    `Emb name "${embName}" is hard-locked (previously hard-deleted). ` +
+                    `Use --manage → 🔓 Unlock to allow respawn.`
+                );
+            }
+        }
+
         // Daemon idempotency: never create a second systemd/OpenRC unit for
         // the same name. This is what prevents the "various sydb processes
         // after reboot" symptom — the boot logic would otherwise install a
@@ -2068,6 +2151,455 @@ main
             return true;
         }
         return false;
+    }
+
+    // ==================================================================
+    // HARD-DELETE ACID LOCKS
+    //
+    //   ID-lock   (`<id>.lock`)          blocks ONE registry entry's monitor
+    //   NAME-lock (`name_<name>.lock`)   blocks ANY future spawn under that name
+    //
+    // For Emb processes a NAME-lock is written for BOTH:
+    //   • `syapp-bg-<port>-emb-<name>`  (port-specific)
+    //   • `emb-<name>`                  (PORTLESS — survives port change)
+    //
+    // The portless one is the primary guard: a hard-delete is permanent
+    // against the parent's auto-restart, regardless of which port the
+    // parent would otherwise claim on the next render tick.
+    // ==================================================================
+
+    static _idLockPath(id) {
+        return path.join(LOCK_DIR, `${id}.lock`);
+    }
+    static _writeIdLock(id, meta = {}) {
+        try {
+            if (!fs.existsSync(LOCK_DIR)) fs.mkdirSync(LOCK_DIR, { recursive: true });
+            fs.writeFileSync(this._idLockPath(id), JSON.stringify({
+                id, lockedAt: Date.now(), ...meta
+            }, null, 2));
+            return true;
+        } catch (_) { return false; }
+    }
+    static _isIdLocked(id) {
+        try { return fs.existsSync(this._idLockPath(id)); }
+        catch (_) { return false; }
+    }
+    static _removeIdLock(id) {
+        try {
+            const f = this._idLockPath(id);
+            if (fs.existsSync(f)) { fs.unlinkSync(f); return true; }
+        } catch (_) {}
+        return false;
+    }
+
+    static _hardNameLockPath(name) {
+        const safe = String(name || '').replace(/[^a-zA-Z0-9_\-.]/g, '_').slice(0, 160);
+        return path.join(LOCK_DIR, `name_${safe}.lock`);
+    }
+    static _writeHardNameLock(name, meta = {}) {
+        if (!name) return false;
+        try {
+            if (!fs.existsSync(LOCK_DIR)) fs.mkdirSync(LOCK_DIR, { recursive: true });
+            fs.writeFileSync(this._hardNameLockPath(name), JSON.stringify({
+                name, lockedAt: Date.now(), ...meta
+            }, null, 2));
+            return true;
+        } catch (_) { return false; }
+    }
+    /**
+     * Check whether a process name is hard-locked.
+     *
+     * NOTE: deliberately a DIFFERENT method than the built-in
+     * `_isNameLocked(processName, uniqueNameLock)` from the
+     * unique-name-lock feature. That one returns false unless a second
+     * boolean argument is passed, so calling IT with a single argument
+     * would silently return false and never block anything.
+     */
+    static _isNameHardLocked(name) {
+        if (!name) return false;
+        try { return fs.existsSync(this._hardNameLockPath(name)); }
+        catch (_) { return false; }
+    }
+    static _removeHardNameLock(name) {
+        if (!name) return false;
+        try {
+            const f = this._hardNameLockPath(name);
+            if (fs.existsSync(f)) { fs.unlinkSync(f); return true; }
+        } catch (_) {}
+        return false;
+    }
+
+    /**
+     * Extract the PORTLESS Emb name from `syapp-bg-<port>-emb-<name>`.
+     * @private
+     */
+    static _extractEmbNameFromProcName(name) {
+        if (!name) return null;
+        const m = String(name).match(/^syapp-bg-\d+-emb-(.+)$/);
+        return m ? m[1] : null;
+    }
+
+    /**
+     * List every NAME-lock on disk.
+     * @returns {Array<{name: string, lockedAt: number, file: string, originalId: string|null}>}
+     */
+    static listNameLocks() {
+        const out = [];
+        try {
+            if (!fs.existsSync(LOCK_DIR)) return out;
+            for (const f of fs.readdirSync(LOCK_DIR)) {
+                if (!f.startsWith('name_') || !f.endsWith('.lock')) continue;
+                const full = path.join(LOCK_DIR, f);
+                try {
+                    const j = JSON.parse(fs.readFileSync(full, 'utf8'));
+                    out.push({
+                        name: String(j.name || f.slice(5, -5)),
+                        lockedAt: Number(j.lockedAt) || 0,
+                        originalId: j.originalId || null,
+                        file: f
+                    });
+                } catch (_) {
+                    out.push({ name: f.slice(5, -5), lockedAt: 0, originalId: null, file: f });
+                }
+            }
+        } catch (_) {}
+        return out.sort((a, b) => (b.lockedAt || 0) - (a.lockedAt || 0));
+    }
+
+    /**
+     * Scan /proc (Linux) for processes whose command line matches the
+     * given RegExp. Returns `[{ pid, pgid, cmd }]`. On non-Linux this
+     * falls back to parsing `ps`.
+     *
+     * The `/proc` walk is what makes this robust against "unplugged"
+     * processes: it does not depend on the process tree being intact,
+     * on parentage, or on our own registry — it just looks at what is
+     * actually running right now.
+     *
+     * @private
+     */
+    static _scanProcesses(pattern) {
+        const results = [];
+        if (os.platform() === 'linux') {
+            try {
+                const pids = fs.readdirSync('/proc').filter(f => /^\d+$/.test(f));
+                for (const pidStr of pids) {
+                    const pid = parseInt(pidStr, 10);
+                    if (pid === process.pid) continue;
+                    let cmd = '';
+                    try {
+                        cmd = fs.readFileSync(`/proc/${pidStr}/cmdline`, 'utf8').replace(/\0/g, ' ').trim();
+                    } catch (_) { continue; }
+                    if (!cmd) continue;
+                    if (pattern && !pattern.test(cmd)) continue;
+                    let pgid = pid;
+                    try {
+                        const stat = fs.readFileSync(`/proc/${pidStr}/stat`, 'utf8');
+                        const cp = stat.lastIndexOf(')');
+                        if (cp > 0) {
+                            const rest = stat.slice(cp + 2).trim().split(' ');
+                            // rest[0]=state, rest[1]=ppid, rest[2]=pgrp
+                            const pg = parseInt(rest[2], 10);
+                            if (!isNaN(pg)) pgid = pg;
+                        }
+                    } catch (_) {}
+                    results.push({ pid, pgid, cmd });
+                }
+            } catch (_) {}
+        } else {
+            try {
+                const out = execSync('ps -eo pid,pgid,command 2>/dev/null', { encoding: 'utf8' });
+                for (const line of out.split('\n')) {
+                    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+                    if (!m) continue;
+                    const pid = parseInt(m[1], 10);
+                    if (pid === process.pid) continue;
+                    if (pattern && !pattern.test(m[3])) continue;
+                    results.push({ pid, pgid: parseInt(m[2], 10), cmd: m[3] });
+                }
+            } catch (_) {}
+        }
+        return results;
+    }
+
+    /**
+     * Every running `--server` process that is NOT in the registry.
+     * These are "unplugged" processes: orphaned from their tracked
+     * parent, invisible to `SyPM.list()`, unreachable from the UI.
+     */
+    static listOrphans() {
+        const registry = this._loadRegistry();
+        const registered = new Set();
+        for (const proc of registry) {
+            if (proc.pid) registered.add(proc.pid);
+            if (proc.monitorPid) registered.add(proc.monitorPid);
+        }
+        const all = this._scanProcesses(/SyAPP\.(?:js|mjs|cjs)\b.*--server\s+\d+/);
+        return all.filter(p => !registered.has(p.pid));
+    }
+
+    /**
+     * Kill every orphaned syapp process (not in the registry).
+     *
+     * This is the operator's escape hatch for the "impossible to kill,
+     * only fixable by reboot" bug: orphaned processes whose parent
+     * died mid-restart are still visible in /proc and can be killed by
+     * process GROUP here, regardless of parentage or registry state.
+     *
+     * @returns {number} Number of orphans killed
+     */
+    static killOrphans() {
+        const orphans = this.listOrphans();
+        if (orphans.length === 0) return 0;
+        let killed = 0;
+        const killedPgids = new Set();
+        for (const p of orphans) {
+            if (p.pgid && !killedPgids.has(p.pgid)) {
+                try { process.kill(-p.pgid, 'SIGKILL'); } catch (_) {}
+                killedPgids.add(p.pgid);
+            }
+            try { process.kill(p.pid, 'SIGKILL'); } catch (_) {}
+            killed++;
+        }
+        return killed;
+    }
+
+    /**
+     * Deep process-tree SIGKILL.
+     *
+     * `pgid` is the process GROUP ID. The wrapper is spawned
+     * `detached: true`, so its PID == its PGID. `kill -PGID` delivers
+     * SIGKILL to EVERY member of the group — including children that
+     * have been reparented to init after the leader died. This is what
+     * closes the "wrapper dead → pgrep -P wrapper returns nothing →
+     * orphaned node survives" hole.
+     *
+     * After the group kill, we also walk each root's descendants
+     * individually (defensive: catches any process that somehow left
+     * the group via setsid) and SIGKILL every PID.
+     *
+     * @private
+     * @param {Array<number>} roots  Root PIDs to walk
+     * @param {number|null}   pgid   Process group ID to kill (-pgid)
+     * @returns {number} Number of kill attempts
+     */
+    static _killDeep(roots, pgid = null) {
+        if (pgid && pgid > 0) {
+            try { process.kill(-pgid, 'SIGKILL'); } catch (_) {}
+        }
+        const collected = new Set();
+        for (const root of roots) {
+            if (!root) continue;
+            try {
+                for (const d of this._getAllChildPids(root)) collected.add(d);
+            } catch (_) {}
+            collected.add(root);
+        }
+        const ordered = [...collected].sort((a, b) => b - a);
+        let attempts = 0;
+        for (const p of ordered) {
+            try { process.kill(p, 'SIGKILL'); attempts++; } catch (_) {}
+        }
+        return attempts;
+    }
+
+    /**
+     * NUCLEAR FALLBACK — `pkill -9` by PORT.
+     *
+     * Kills ANY process whose command line matches `SyAPP.*--server <port>`,
+     * regardless of process group, parentage, or registry. Runs after
+     * the group kill as belt-and-braces: if a process somehow survived
+     * the group SIGKILL (e.g. it did setsid() itself), this catches it.
+     *
+     * The `SyAPP` prefix in the pattern makes it impossible to match a
+     * legitimate user process using the same port for a different
+     * server, and it never matches the `--manage` process itself
+     * (whose command line contains `--manage`, not `--server`).
+     *
+     * @private
+     */
+    static _pkillServerByPort(port) {
+        if (!port) return 0;
+        try {
+            execSync(`pkill -9 -f "SyAPP.*--server ${port}\\b" 2>/dev/null || true`);
+            return 1;
+        } catch (_) { return 0; }
+    }
+
+    /**
+     * HARD DELETE — kill a process from the root and prevent it from
+     * ever restarting under that registry ID OR that name.
+     *
+     * Order of operations (each step is critical):
+     *   1. Write the acid locks (id + name + portless emb-name).
+     *      SYNCHRONOUSLY, BEFORE any signal is sent.
+     *   2. Mark the registry entry 'dead' so a live monitor exits on
+     *      its next `should_continue` pass.
+     *   3. kill -PGID (process group) — catches the wrapper AND every
+     *      orphaned descendant in one shot.
+     *   4. Walk descendants + SIGKILL each (defensive).
+     *   5. pkill -9 -f "SyAPP.*--server <port>" — nuclear fallback.
+     *   6. Remove the registry entry.
+     *   7. Release the port lock.
+     *   8. Verify after 800ms; if anything is STILL alive, escalate
+     *      with pkill again.
+     *
+     * @static
+     * @param {string|number} pidOrId
+     * @param {{lockId?: boolean, lockName?: boolean}} [options]
+     *        Both default to true. Set to false for in-place restarts
+     *        (source edit) and exit cleanup (Ctrl+C), which must NOT
+     *        leave permanent locks behind.
+     * @returns {boolean} true when a matching registry entry was found
+     */
+    static hardKill(pidOrId, options = {}) {
+        if (pidOrId === undefined || pidOrId === null) return false;
+        const lockId = options.lockId !== false;
+        const lockName = options.lockName !== false;
+
+        const registry = this._loadRegistry();
+        const proc = registry.find(p =>
+            p.id === pidOrId ||
+            p.pid == pidOrId ||
+            p.monitorPid == pidOrId
+        );
+
+        if (!proc) {
+            // No registry entry — but if we got a numeric PID, still
+            // attempt a group + direct kill so a truly unplugged PID
+            // is terminated. (pkill by name is skipped because we do
+            // not know the command line.)
+            const numeric = (typeof pidOrId === 'number')
+                ? pidOrId
+                : parseInt(String(pidOrId), 10);
+            if (!isNaN(numeric) && numeric > 0) {
+                try { this._killDeep([numeric], numeric); } catch (_) {}
+            }
+            return false;
+        }
+
+        // ---------------- 1) ACID LOCKS ----------------
+        if (lockId) {
+            this._writeIdLock(proc.id, {
+                reason: 'hardKill',
+                pid: proc.pid,
+                monitorPid: proc.monitorPid,
+                name: proc.name,
+                timestamp: Date.now()
+            });
+        }
+        if (lockName && proc.name) {
+            this._writeHardNameLock(proc.name, {
+                reason: 'hardKill',
+                originalId: proc.id,
+                originalPid: proc.pid,
+                timestamp: Date.now()
+            });
+            const embName = this._extractEmbNameFromProcName(proc.name);
+            if (embName) {
+                this._writeHardNameLock(`emb-${embName}`, {
+                    reason: 'hardKill-emb',
+                    originalName: proc.name,
+                    originalId: proc.id,
+                    timestamp: Date.now()
+                });
+            }
+        }
+
+        // ---------------- 2) STATUS DEAD ----------------
+        proc.status = 'dead';
+        try { this._saveRegistry(registry); } catch (_) {}
+
+        // ---------------- 3) GROUP KILL ----------------
+        // The wrapper (and monitor, if any) was spawned detached, so
+        // pid == pgid. `kill -pgid` kills the ENTIRE tree.
+        const roots = [proc.monitorPid, proc.pid].filter(Boolean);
+        const pgid = proc.pid; // detached: pid == pgid
+        try { this._killDeep(roots, pgid); } catch (_) {}
+
+        // ---------------- 4) DAEMON CLEANUP ----------------
+        if (proc.config?.daemon) {
+            try { this._disableDaemon(proc.id); } catch (_) {}
+        }
+
+        // ---------------- 5) NUCLEAR PKILL ----------------
+        // Extract the port from the process name and kill ANY process
+        // matching `SyAPP...--server <port>`. This catches orphans
+        // that somehow escaped the group kill.
+        let port = null;
+        if (typeof proc.name === 'string') {
+            const m = proc.name.match(/syapp-bg-(\d+)/);
+            if (m) port = m[1];
+        }
+        if (port) {
+            try { this._pkillServerByPort(port); } catch (_) {}
+        }
+
+        // ---------------- 6) REGISTRY REMOVAL ----------------
+        try { this._removeFromRegistry(proc.id); } catch (_) {}
+
+        // ---------------- 7) PORT LOCK RELEASE ----------------
+        if (port) {
+            try { SyPortLock.release(parseInt(port, 10)); } catch (_) {}
+        }
+
+        // ---------------- 8) TEMP FILE CLEANUP ----------------
+        if (proc.isTempFile && proc.tempFilePath) {
+            try {
+                if (fs.existsSync(proc.tempFilePath)) fs.unlinkSync(proc.tempFilePath);
+            } catch (_) {}
+        }
+
+        // ---------------- 9) VERIFY + ESCALATE ----------------
+        // After a short grace period, re-check. Any survivor that
+        // ignored the group kill gets the pkill nuclear option again.
+        const sweepTimer = setTimeout(() => {
+            let anyAlive = false;
+            for (const root of roots) {
+                if (this._isPidAlive(root)) { anyAlive = true; break; }
+            }
+            if (anyAlive || (port && this._scanProcesses(new RegExp(`SyAPP.*--server ${port}\\b`)).length > 0)) {
+                for (const root of roots) {
+                    try { process.kill(-root, 'SIGKILL'); } catch (_) {}
+                    try { process.kill(root, 'SIGKILL'); } catch (_) {}
+                }
+                if (port) {
+                    try { this._pkillServerByPort(port); } catch (_) {}
+                }
+            }
+        }, 800);
+        if (sweepTimer.unref) sweepTimer.unref();
+
+        return true;
+    }
+
+    /**
+     * Sweep stale ID-locks (older than 1 hour, no matching registry
+     * entry). NAME locks are NEVER auto-removed — they encode the
+     * operator's explicit hard-delete intent.
+     * @private
+     */
+    static _cleanupOrphanedLocks() {
+        try {
+            if (!fs.existsSync(LOCK_DIR)) return 0;
+            const cutoff = Date.now() - 60 * 60 * 1000;
+            const ids = new Set(this._loadRegistry().map(p => p.id));
+            let removed = 0;
+            for (const f of fs.readdirSync(LOCK_DIR)) {
+                if (!f.endsWith('.lock')) continue;
+                if (f.startsWith('name_')) continue;
+                const full = path.join(LOCK_DIR, f);
+                try {
+                    const st = fs.statSync(full);
+                    if (st.mtimeMs >= cutoff) continue;
+                    const id = f.slice(0, -5);
+                    if (ids.has(id)) continue;
+                    fs.unlinkSync(full);
+                    removed++;
+                } catch (_) {}
+            }
+            return removed;
+        } catch (_) { return 0; }
     }
 
     /**
@@ -2725,6 +3257,11 @@ main
         } else {
             console.log('✓ No dead processes to clean up.');
         }
+
+        // Sweep stale ID-locks (name locks are NEVER auto-removed — they
+        // encode the operator's explicit hard-delete intent and must
+        // persist until manually unlocked).
+        try { this._cleanupOrphanedLocks(); } catch (_) {}
     }
 
     /**
@@ -21883,6 +22420,31 @@ function levenshteinDistance(str1, str2) {
       const syapp = this._syappInstance;
       if (!syapp) return null;
 
+      // ------------------------------------------------------------------
+      // ACID-LOCK GUARD — checked FIRST, before ANY reuse or spawn logic.
+      //
+      // If the operator hard-deleted this Emb via `--manage` 🔥, the
+      // portless `emb-<name>` lock is present. That lock MUST survive a
+      // port change, because the parent's auto-restart path calls this
+      // function on every render pass and would otherwise spawn a fresh
+      // child under a brand-new port the moment it saw the previous one
+      // was dead.
+      //
+      // IMPORTANT: cfg.name is normalized EXACTLY the way the spawn
+      // name is (see `processName = syapp-bg-<port>-emb-<normalized>`),
+      // so the lock key computed here is guaranteed identical to the
+      // one `hardKill` wrote from `proc.name`.
+      // ------------------------------------------------------------------
+      const embNameNormalized = String(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_');
+      const embLockName = `emb-${embNameNormalized}`;
+      if (SyPM._isNameHardLocked(embLockName)) {
+        if (state.bgProcess) {
+          state.bgProcess = null;
+          try { this.Storages.Set(parentId, `emb_${cfg.name}`, state); } catch (_) {}
+        }
+        return null;
+      }
+
       // ---------------- Reuse / restart existing process ----------------
       const existing = state.bgProcess;
       if (existing && existing.pid) {
@@ -21902,9 +22464,25 @@ function levenshteinDistance(str1, str2) {
           if (existing.spawnSourceKey === currentKey) {
             return existing; // reuse
           }
-          // Source changed → restart immediately (auto-rebuild).
-          try { process.kill(existing.pid, 'SIGTERM'); } catch (_) {}
-          try { SyPM.kill(existing.pid); } catch (_) {}
+          // Source/args change → HARD-RESTART the EXISTING process.
+          //
+          // `lockId: false, lockName: false` — an in-place restart must
+          // NOT write persistent locks. The dead monitor is terminated
+          // with SIGKILL, the registry entry is removed, and the NEXT
+          // render can spawn the new version normally.
+          try {
+            if (existing.id) {
+              SyPM.hardKill(existing.id, { lockId: false, lockName: false });
+            } else {
+              try {
+                const kids = SyPM._getAllChildPids(existing.pid);
+                for (const k of kids) { try { process.kill(k, 'SIGKILL'); } catch (_) {} }
+              } catch (_) {}
+              try { process.kill(-existing.pid, 'SIGKILL'); } catch (_) {}
+              try { process.kill(existing.pid, 'SIGKILL'); } catch (_) {}
+              try { SyPM.kill(existing.pid); } catch (_) {}
+            }
+          } catch (_) {}
         }
         state.bgProcess = null;
       }
@@ -22016,6 +22594,7 @@ function levenshteinDistance(str1, str2) {
           : `code:${(state.code || '').slice(0, 512)}|args:${argsKey}`;
 
         state.bgProcess = {
+          id: entry.id,
           pid: entry.pid,
           port,
           name: processName,
@@ -24408,18 +24987,33 @@ class SyPMManagerFunc extends SyAPP_Func {
         }
 
         // ---------- DELETE (single, confirmation-gated) ----------
-        // Clicking 🗑 only opens the inline confirmation for that row.
-        // Nothing is killed until the inline ✓ is clicked.
+        // 🗑 opens the inline confirmation. On confirm: HARD kill so
+        // the process dies AND stays dead — because a soft kill would
+        // simply be undone by the parent's auto-restart on the next
+        // render tick.
         if (curProps.__sypm_delete) {
           const procId = curProps.__sypm_delete;
           delete curProps.__sypm_delete;
-          setConfirm({ pid: procId });
+          setConfirm({ pid: procId, hard: true });
+        }
+
+        // ---------- HARD DELETE — same flow, explicit source ----------
+        if (curProps.__sypm_hard_delete) {
+          const procId = curProps.__sypm_hard_delete;
+          delete curProps.__sypm_hard_delete;
+          setConfirm({ pid: procId, hard: true });
         }
 
         // ---------- Bulk delete (confirmation-gated) ----------
         if (curProps.__sypm_bulk_delete) {
           delete curProps.__sypm_bulk_delete;
-          if (selected.length > 0) setConfirm({ bulk: selected.slice() });
+          if (selected.length > 0) setConfirm({ bulk: selected.slice(), hard: true });
+        }
+
+        // ---------- Bulk HARD delete ----------
+        if (curProps.__sypm_bulk_hard_delete) {
+          delete curProps.__sypm_bulk_hard_delete;
+          if (selected.length > 0) setConfirm({ bulk: selected.slice(), hard: true });
         }
 
         // ---------- Confirmation handlers ----------
@@ -24435,9 +25029,9 @@ class SyPMManagerFunc extends SyAPP_Func {
 
           try {
             if (pending.pid) {
-              // Kill if still alive, then remove the registry entry so
-              // no Dead/Stopped row is left behind.
-              try { SyPM.kill(pending.pid); } catch (_) {}
+              // Always HARD KILL — soft delete leave the process in a
+              // "stopped" state that the parent auto-restarts.
+              try { SyPM.hardKill(pending.pid); } catch (_) {}
               try { SyPM._removeFromRegistry(pending.pid); } catch (_) {}
               const idx = selected.indexOf(pending.pid);
               if (idx >= 0) {
@@ -24446,7 +25040,7 @@ class SyPMManagerFunc extends SyAPP_Func {
               }
             } else if (Array.isArray(pending.bulk) && pending.bulk.length > 0) {
               for (const pid of pending.bulk) {
-                try { SyPM.kill(pid); } catch (_) {}
+                try { SyPM.hardKill(pid); } catch (_) {}
                 try { SyPM._removeFromRegistry(pid); } catch (_) {}
               }
               selected = [];
@@ -24455,6 +25049,32 @@ class SyPMManagerFunc extends SyAPP_Func {
           } catch (_) {} finally {
             setConfirm(null);
           }
+        }
+
+        // ---------- Kill all orphans (unplugged) ----------
+        // Scans /proc for every `SyAPP --server` process not in the
+        // registry and hard-kills it. This is the operator's escape
+        // hatch for the "impossible to kill, only fixable by reboot"
+        // bug: orphaned processes are still visible in /proc and can
+        // be killed by process group here, regardless of parentage.
+        if (curProps.__sypm_kill_orphans) {
+          delete curProps.__sypm_kill_orphans;
+          let n = 0;
+          try { n = SyPM.killOrphans(); } catch (_) {}
+          try { this.Alert(id, `🔪 Killed ${n} orphan(s)`, { duration: 2000 }); } catch (_) {}
+        }
+
+        // ---------- Unlock a persisted hard-lock ----------
+        if (curProps.__sypm_unlock_name) {
+          const name = curProps.__sypm_unlock_name;
+          delete curProps.__sypm_unlock_name;
+          try { SyPM._removeHardNameLock(name); } catch (_) {}
+          try {
+            const registry = SyPM._loadRegistry();
+            const proc = registry.find(p => p.name === name);
+            if (proc) SyPM._removeIdLock(proc.id);
+          } catch (_) {}
+          try { this.Alert(id, `🔓 Unlocked "${name}"`, { duration: 2000 }); } catch (_) {}
         }
 
         // ---------- Misc ----------
@@ -24561,7 +25181,7 @@ class SyPMManagerFunc extends SyAPP_Func {
           confirm = null;
           this.Storages.Delete(id, confirmKey);
         } else if (stillValid.length !== confirm.bulk.length) {
-          confirm = { bulk: stillValid };
+          confirm = { bulk: stillValid, hard: confirm.hard };
           this.Storages.Set(id, confirmKey, confirm);
         }
       }
@@ -24622,6 +25242,10 @@ class SyPMManagerFunc extends SyAPP_Func {
           props: { __sypm_bulk_delete: 1 }
         },
         {
+          name: ColorText.bgRed(ColorText.brightYellow(` 🔥 Hard ${selected.length} `)),
+          props: { __sypm_bulk_hard_delete: 1 }
+        },
+        {
           name: allAlreadySelected ? '⊟ None' : '⊞ All',
           props: { __sypm_select_all: 1 }
         },
@@ -24631,9 +25255,12 @@ class SyPMManagerFunc extends SyAPP_Func {
         }
       ]);
     } else if (confirm && Array.isArray(confirm.bulk) && confirm.bulk.length > 0) {
+      const confirmLabel = confirm.hard
+        ? ` ✓ Hard Delete ${confirm.bulk.length}? `
+        : ` ✓ Delete ${confirm.bulk.length}? `;
       this.Buttons(id, [
         {
-          name: ColorText.bgRed(ColorText.brightWhite(` ✓ Delete ${confirm.bulk.length}? `)),
+          name: ColorText.bgRed(ColorText.brightWhite(confirmLabel)),
           props: { __sypm_confirm_yes: 1 }
         },
         {
@@ -24735,9 +25362,10 @@ class SyPMManagerFunc extends SyAPP_Func {
       // process (no-op if dead) AND removes the registry entry, so no
       // Dead/Stopped leftover survives the delete.
       if (isPending) {
+        const confirmLabel = confirm.hard ? ' ✓ Hard Delete? ' : ' ✓ Delete? ';
         this.Buttons(id, [
           {
-            name: ColorText.bgRed(ColorText.brightWhite(' ✓ Delete? ')),
+            name: ColorText.bgRed(ColorText.brightWhite(confirmLabel)),
             props: { __sypm_confirm_yes: 1 }
           },
           {
@@ -24760,7 +25388,12 @@ class SyPMManagerFunc extends SyAPP_Func {
             action: () => this._directConnect(id, port)
           });
         }
+        // 🗑 = hard delete (locks + kills + removes) — soft delete
+        //       leaves a "stopped" entry that the parent auto-restarts,
+        //       which is exactly the bug this is fixing.
+        // 🔥 = alias for the same hard-delete flow, kept for clarity.
         btns.push({ name: ColorText.red('🗑'), props: { __sypm_delete: p.id } });
+        btns.push({ name: ColorText.brightRed('🔥'), props: { __sypm_hard_delete: p.id } });
         this.Buttons(id, btns);
       }
 
@@ -24771,6 +25404,61 @@ class SyPMManagerFunc extends SyAPP_Func {
         this.Button(id, { name: ' ' });
       }
     }
+
+    // ---------- Persisted hard-locks ----------
+    // Lists every NAME lock on disk — including locks that outlived
+    // the process they were created for. Each entry can be unlocked,
+    // which re-enables spawning under that name.
+    try {
+      const locks = SyPM.listNameLocks();
+      if (locks.length > 0) {
+        this.Button(id, { name: ' ' });
+        this.Button(id, { name: ' ' });
+        this.Text(id, ColorText.brightYellow(
+          `🔒 Hard-locked names (${locks.length}) — respawns blocked until unlocked`
+        ));
+        for (const lock of locks) {
+          const lockLabel = _sypmDisplayName(lock.name, 40);
+          this.Buttons(id, [
+            { name: `🔒 ${lockLabel}`, props: {} },
+            {
+              name: ColorText.brightGreen('🔓 Unlock'),
+              props: { __sypm_unlock_name: lock.name }
+            }
+          ]);
+        }
+      }
+    } catch (_) {}
+
+    // ---------- Unplugged processes (not in registry) ----------
+    // Every running `SyAPP --server` process that is NOT in the
+    // registry. These are orphans from crashes / mid-restart failures
+    // / stale spawns. They cannot be reached from the UI, but they
+    // CAN be killed here — a single button nukes them all.
+    try {
+      const orphans = SyPM.listOrphans();
+      if (orphans.length > 0) {
+        this.Button(id, { name: ' ' });
+        this.Button(id, { name: ' ' });
+        this.Text(id, ColorText.brightRed(
+          `⚠ ${orphans.length} unplugged syapp process(es) — not in registry`
+        ));
+        for (const p of orphans) {
+          const portMatch = p.cmd.match(/--server\s+(\d+)/);
+          const pPort = portMatch ? portMatch[1] : '?';
+          this.Button(id, {
+            name: ColorText.dim(
+              `PID ${p.pid} · PGID ${p.pgid} · port ${pPort} · ` +
+              _sypmDisplayName(p.cmd, 45)
+            )
+          });
+        }
+        this.Button(id, {
+          name: ColorText.bgRed(ColorText.brightWhite(' 🔪 Kill All Unplugged ')),
+          props: { __sypm_kill_orphans: 1 }
+        });
+      }
+    } catch (_) {}
 
     // ---------- Footer ----------
     if (isCard) {
@@ -32195,6 +32883,25 @@ function _installCtrlC(syapp) {
       }
     } catch (_) {}
 
+    // ORPHANED-DESCENDANT SWEEP (last resort). Uses the LIVE process
+    // tree — every registry entry whose pid/monitorPid is a descendant
+    // of us gets hard-killed, regardless of what any storage record
+    // says. Catches "main killed but subprocess remains".
+    try {
+      if (syapp) {
+        _hardKillDescendants(syapp);
+      }
+    } catch (_) {}
+
+    // ORPHAN SWEEP — kill any `SyAPP --server` process in /proc that
+    // is not in the registry (an "unplugged" process). Runs on every
+    // exit so the operator does not have to reboot to clear them.
+    try {
+      if (syapp) {
+        SyPM.killOrphans();
+      }
+    } catch (_) {}
+
     try {
       if (syapp && syapp.HUD) {
         try { syapp.HUD.cleanupMenuState && syapp.HUD.cleanupMenuState(); } catch (_) {}
@@ -32434,53 +33141,45 @@ const _STREAM_DEFAULT_HOST = 'localhost'
  * @private
  */
 function _embKillBackgroundProcess(bg) {
-  if (!bg || !bg.pid) return;
+  if (!bg) return;
 
-  // ------------------------------------------------------------------
-  // WALK THE ENTIRE PROCESS TREE (recursive Emb chain kill).
+  // PREFERRED PATH — SyPM.hardKill(bg.id) with locks DISABLED.
   //
-  // `bg.pid` is the PID of the SHELL wrapper that SyPM.exec spawned
-  // (its PTY wrapper or monitor wrapper). The actual node process is
-  // a CHILD of that shell, and any Emb-in-Emb children spawned by
-  // that node process are grandchildren, and so on.
-  //
-  // Sending SIGTERM to the shell alone kills the wrapper but ORPHANS
-  // the node child — which then keeps running (holding its port lock
-  // and serving stale views) until the OS reaps it. Worse, if the
-  // node child itself spawned nested Emb `--server` processes, those
-  // grandchildren survive too — the exact "orphaned Embs after
-  // Ctrl+C / Clear" symptom.
-  //
-  // The fix: walk every descendant via SyPM._getAllChildPids() and
-  // SIGTERM the deepest nodes FIRST, then work up to the shell.
-  // SIGTERM (not SIGKILL) is required because every node in the tree
-  // carries its own cleanup handler — `_installCtrlC`'s SIGTERM
-  // listener calls `_embKillAllBackgroundChildren()` on its own SyAPP
-  // instance — so the cascade unwinds the recursive Emb chain at
-  // EVERY depth automatically, no matter how deeply nested.
-  //
-  // The forced SyPM.kill (SIGKILL) safety net below catches any
-  // process that somehow ignored SIGTERM within the grace period.
-  // ------------------------------------------------------------------
+  // This is the in-place teardown used by Emb's ✕ Clear button, the
+  // run-mode toggle and the manual Restart BG button. It kills the
+  // FULL tree (group SIGKILL + per-PID walk + pkill-by-port), removes
+  // the registry entry, releases the port lock and cleans up temp
+  // files — but does NOT write any persistent hard-delete locks. A
+  // subsequent render is free to spawn a new child under a fresh port.
+  if (bg.id) {
+    try {
+      SyPM.hardKill(bg.id, { lockId: false, lockName: false });
+      return;
+    } catch (_) {}
+  }
+
+  // FALLBACK PATH — bg.id missing (state created by an older SyAPP
+  // version, or a spawn that never got recorded in the registry).
+  if (!bg.pid) return;
+
+  // Group kill first (catches the whole tree even if the leader is dead)
+  try { process.kill(-bg.pid, 'SIGKILL'); } catch (_) {}
+  // Then descendants + direct
   try {
     const descendants = SyPM._getAllChildPids(bg.pid);
     for (const pid of descendants) {
-      try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+      try { process.kill(pid, 'SIGKILL'); } catch (_) {}
     }
-    try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+    try { process.kill(bg.pid, 'SIGKILL'); } catch (_) {}
   } catch (_) {
-    // Absolute fallback: at minimum, kill the shell wrapper.
-    try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+    try { process.kill(bg.pid, 'SIGKILL'); } catch (_) {}
   }
-
-  // Release the port lock IMMEDIATELY so another Emb (or a fresh
-  // re-spawn of this one) can claim the same port without waiting
-  // for the SIGTERM cascade to complete.
+  // Nuclear pkill by port
   if (bg.port) {
+    try { SyPM._pkillServerByPort(bg.port); } catch (_) {}
     try { SyPortLock.release(bg.port); } catch (_) {}
   }
-
-  // Force-cleanup fallback after the SIGTERM grace period.
+  // Last-resort kill for registry cleanup
   setTimeout(() => {
     try { SyPM.kill(bg.pid); } catch (_) {}
   }, 1500);
@@ -32507,7 +33206,7 @@ function _embCollectAllBackgroundRecords(syapp) {
           if (!key.startsWith('emb_')) continue;
           const st = userData[key];
           if (!st || typeof st !== 'object') continue;
-          if (!st.bgProcess || !st.bgProcess.pid) continue;
+          if (!st.bgProcess || (!st.bgProcess.pid && !st.bgProcess.id)) continue;
           records.push({ func, sessionId, key, bg: st.bgProcess, state: st });
         }
       }
@@ -32532,38 +33231,39 @@ function _embCollectAllBackgroundRecords(syapp) {
 function _embKillAllBackgroundChildren(syapp) {
   const records = _embCollectAllBackgroundRecords(syapp);
   for (const { bg } of records) {
-    // ------------------------------------------------------------------
-    // PROCESS-TREE SIGTERM (nested Emb cleanup fix)
-    // ------------------------------------------------------------------
-    // `bg.pid` is the PID of the SHELL that SyPM.exec spawned (via its
-    // PTY wrapper or monitor wrapper). The actual node process is a
-    // CHILD of that shell. Sending SIGTERM to the shell alone kills
-    // the wrapper but ORPHANS the node child — which is exactly the
-    // "process doesn't turn off when I finish the main process" and
-    // "orphaned Embs after Ctrl+C" symptom the user reported.
-    //
-    // The fix: send SIGTERM to EVERY descendant AND the shell. Each
-    // node child runs its own `process.on('SIGTERM', ...)` handler,
-    // which calls its OWN `_embKillAllBackgroundChildren()`, cascading
-    // the kill through the entire nested Emb tree at every depth.
-    // ------------------------------------------------------------------
+    // HARD KILL — lock-free. This is the exit-cascade path (Ctrl+C,
+    // SIGTERM, SIGHUP). It does NOT write any persistent locks, so a
+    // future SyAPP run reuses the same Emb names without needing an
+    // unlock first. The whole tree is SIGKILLed — group kill first,
+    // then per-PID walk, then pkill-by-port — so no orphaned node
+    // child survives a parent death. This is the fix for the
+    // "main process killed but subprocess remains" bug.
+    if (bg.id) {
+      try {
+        SyPM.hardKill(bg.id, { lockId: false, lockName: false });
+        continue;
+      } catch (_) {}
+    }
+
+    // Manual fallback for records missing an `id` (legacy state).
+    if (!bg.pid) continue;
+    try { process.kill(-bg.pid, 'SIGKILL'); } catch (_) {}
     try {
       const allPids = SyPM._getAllChildPids(bg.pid);
       for (const pid of allPids) {
-        try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+        try { process.kill(pid, 'SIGKILL'); } catch (_) {}
       }
-      try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+      try { process.kill(bg.pid, 'SIGKILL'); } catch (_) {}
     } catch (_) {
-      // Fall back to signalling only the shell if the tree walk fails
-      try { process.kill(bg.pid, 'SIGTERM'); } catch (_) {}
+      try { process.kill(bg.pid, 'SIGKILL'); } catch (_) {}
     }
     if (bg.port) {
+      try { SyPM._pkillServerByPort(bg.port); } catch (_) {}
       try { SyPortLock.release(bg.port); } catch (_) {}
     }
   }
   // Clear the records AFTER signalling so subsequent renders do not
-  // try to reuse a dead pid. Do this synchronously so the exit path
-  // does not race with the process shutting down.
+  // try to reuse a dead pid.
   for (const { func, sessionId, key, state } of records) {
     try {
       state.bgProcess = null;
@@ -32622,6 +33322,52 @@ function _embKillAllBackgroundChildren(syapp) {
  *                        restored.
  * @private
  */
+/**
+ * Orphaned-descendant sweep. Walks every registry entry whose pid or
+ * monitorPid is a LIVE descendant of the current process and hard-kills
+ * it (lock-free, exit-cleanup only).
+ *
+ * This is the last-resort cleanup that catches the "main process was
+ * killed but the subprocess remains" bug: when the parent SyAPP dies,
+ * its Emb children are normally cleaned up by
+ * `_embKillAllBackgroundChildren`, but a child whose storage record was
+ * lost (e.g. a mid-restart failure that nulled `state.bgProcess` while
+ * the child was still alive) is invisible to that path. The descendant
+ * sweep finds it via the LIVE process tree — completely decoupled from
+ * storage bookkeeping.
+ *
+ * @param {SyAPP} syapp
+ * @returns {number} Number of orphaned processes hard-killed
+ * @private
+ */
+function _hardKillDescendants(syapp) {
+  try {
+    const myPid = process.pid;
+    let descendants = [];
+    try { descendants = SyPM._getAllChildPids(myPid); } catch (_) {}
+    if (descendants.length === 0) return 0;
+
+    const descSet = new Set(descendants);
+    const registry = SyPM._loadRegistry();
+    let count = 0;
+    for (const proc of registry) {
+      if (!proc) continue;
+      const matchesDescendant =
+        (proc.pid && descSet.has(proc.pid)) ||
+        (proc.monitorPid && descSet.has(proc.monitorPid));
+      if (!matchesDescendant) continue;
+      try {
+        // No locks written — exit cleanup, not operator hard-delete.
+        SyPM.hardKill(proc.id, { lockId: false, lockName: false });
+        count++;
+      } catch (_) {}
+    }
+    return count;
+  } catch (_) {
+    return 0;
+  }
+}
+
 function _restoreLocalHUDMouse(syapp) {
   try {
     if (!syapp || !syapp.HUD) return;
