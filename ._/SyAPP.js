@@ -2384,9 +2384,32 @@ main
      * @returns {number} Number of kill attempts
      */
     static _killDeep(roots, pgid = null) {
-        if (pgid && pgid > 0) {
-            try { process.kill(-pgid, 'SIGKILL'); } catch (_) {}
-        }
+        // ------------------------------------------------------------------
+        // WALK DESCENDANTS FIRST — THEN KILL.
+        //
+        // Order matters. `process.kill(-pgid, 'SIGKILL')` kills the
+        // process group, which for a detached spawn covers the root
+        // process AND any children that stayed in the same process
+        // group. But grandchildren spawned by a CHILD via its own
+        // `detached: true` — which is exactly what nested this.Emb()
+        // produces (each layer is its own `syapp-bg-<port>` shell) —
+        // live in their OWN process group and are NOT killed by the
+        // root's group kill.
+        //
+        // They ARE reached by the per-PID walk — but only if that walk
+        // runs while their parent is still alive. If the group kill
+        // fires first, the child (and its immediate children) die, the
+        // grandchildren are reparented to init, and `pgrep -P <dead-
+        // child-pid>` returns nothing — so the grandchildren are
+        // silently missed.
+        //
+        // Reordering (walk → group kill → per-PID kill) closes this
+        // hole: the full descendant tree is captured while intact, and
+        // every captured PID is SIGKILL'd individually regardless of
+        // which process group it ended up in. This is what makes a
+        // single ✕ Clear (or any hardKill) collapse the ENTIRE nested
+        // recursive Emb chain — not just the root of it.
+        // ------------------------------------------------------------------
         const collected = new Set();
         for (const root of roots) {
             if (!root) continue;
@@ -2395,6 +2418,11 @@ main
             } catch (_) {}
             collected.add(root);
         }
+
+        if (pgid && pgid > 0) {
+            try { process.kill(-pgid, 'SIGKILL'); } catch (_) {}
+        }
+
         const ordered = [...collected].sort((a, b) => b - a);
         let attempts = 0;
         for (const p of ordered) {
@@ -2600,6 +2628,87 @@ main
             }
             return removed;
         } catch (_) { return 0; }
+    }
+
+    /**
+     * Remove every registry entry whose tracked PID(s) are no longer
+     * alive.
+     *
+     * Used at the end of process-exit cleanup and right after an Emb
+     * tree kill so the process list stays truly clean:
+     *
+     *   • A tree kill SIGKILLs every descendant, but the descendants'
+     *     OWN registry entries (created by their own `--server` SyAPP
+     *     instances) are orphaned — the parent that spawned them
+     *     never got a chance to run its exit handler.
+     *   • `SyPM.list()` marks dead rows as `status: 'dead'` but keeps
+     *     them until an explicit `--cleanup`. That residual noise is
+     *     exactly what the operator sees as "Dead rows after Ctrl+C".
+     *
+     * Daemons are intentionally skipped here: their liveness check
+     * requires shelling out to systemctl / rc-service, and pruning
+     * them would leave an orphaned init unit behind (since
+     * `_disableDaemon` needs sudo and could hang on an interactive
+     * password prompt). Daemon entries are handled by the next
+     * explicit `cleanup()` call. Emb background processes are never
+     * daemons, so this covers the operator's actual workflow.
+     *
+     * Never throws. Returns the number of pruned entries.
+     * @static
+     * @private
+     * @returns {number}
+     */
+    static _pruneDeadEntries() {
+        try {
+            const registry = this._loadRegistry();
+            if (!Array.isArray(registry) || registry.length === 0) return 0;
+            const alive = [];
+            let removed = 0;
+            for (const proc of registry) {
+                // Leave daemon entries alone — see docstring above.
+                if (proc.config?.daemon) {
+                    alive.push(proc);
+                    continue;
+                }
+
+                let isAlive = false;
+                try {
+                    if (proc.isAutoRestart && proc.monitorPid) {
+                        try { process.kill(proc.monitorPid, 0); isAlive = true; } catch (_) {}
+                        if (!isAlive) try { process.kill(proc.pid, 0); isAlive = true; } catch (_) {}
+                    } else if (proc.pid) {
+                        try { process.kill(proc.pid, 0); isAlive = true; } catch (_) {}
+                    }
+                } catch (_) {
+                    isAlive = false;
+                }
+
+                if (isAlive) {
+                    alive.push(proc);
+                } else {
+                    removed++;
+                    if (proc.isTempFile && proc.tempFilePath) {
+                        try { if (fs.existsSync(proc.tempFilePath)) fs.unlinkSync(proc.tempFilePath); } catch (_) {}
+                    }
+                    try {
+                        for (const f of [
+                            `monitor_${proc.id}.sh`,
+                            `monitor_cmd_${proc.id}.sh`,
+                            `pty_wrapper_${proc.id}.sh`
+                        ]) {
+                            const fp = path.join(LOG_DIR, f);
+                            if (fs.existsSync(fp)) fs.unlinkSync(fp);
+                        }
+                    } catch (_) {}
+                }
+            }
+            if (removed > 0) {
+                try { this._saveRegistry(alive); } catch (_) {}
+            }
+            return removed;
+        } catch (_) {
+            return 0;
+        }
     }
 
     /**
@@ -19868,6 +19977,29 @@ function levenshteinDistance(str1, str2) {
           }
         }
 
+        // ------------------------------------------------------------------
+        // PRUNE THE RESULTING DEAD ENTRIES.
+        //
+        // The tree kill above SIGKILLs every descendant of this Emb —
+        // including grandchildren at any nesting depth — but each dead
+        // descendant's OWN registry entry (created by its own --server
+        // SyAPP instance) is orphaned: the killed parent never got a
+        // chance to remove it. Without this prune, clicking ✕ Clear
+        // leaves a trail of "Dead" rows in --manage.
+        //
+        // Runs twice: once immediately (catches entries that were
+        // already dead before the Clear) and once after the hardKill
+        // escalation window (800ms) has had a chance to fully reap
+        // every SIGKILLed descendant.
+        // ------------------------------------------------------------------
+        try { SyPM._pruneDeadEntries(); } catch (_) {}
+        {
+          const __pruneTimer = setTimeout(() => {
+            try { SyPM._pruneDeadEntries(); } catch (_) {}
+          }, 1500);
+          if (__pruneTimer.unref) __pruneTimer.unref();
+        }
+
         Object.assign(state, {
           source: 'none', filePath: null, code: null,
           saveMode: null, error: null, pickMode: false,
@@ -25067,6 +25199,23 @@ class SyPMManagerFunc extends SyAPP_Func {
             }
           } catch (_) {} finally {
             setConfirm(null);
+            // ------------------------------------------------------------------
+            // PRUNE DESCENDANT REGISTRY ENTRIES.
+            //
+            // hardKill removes only the TARGET's registry entry — the
+            // descendants' own entries (created by their own --server
+            // SyAPP instances) stay orphaned. Prune both immediately
+            // (for entries that were already dead before this delete)
+            // and after the 800ms escalation window, so the process
+            // list is genuinely clean when this action completes.
+            // ------------------------------------------------------------------
+            try { SyPM._pruneDeadEntries(); } catch (_) {}
+            {
+              const __pruneTimer = setTimeout(() => {
+                try { SyPM._pruneDeadEntries(); } catch (_) {}
+              }, 1500);
+              if (__pruneTimer.unref) __pruneTimer.unref();
+            }
           }
         }
 
@@ -33061,6 +33210,15 @@ function _installCtrlC(syapp) {
         SyPM.killOrphans();
       }
     } catch (_) {}
+
+    // PRUNE DEAD REGISTRY ENTRIES — this is the piece that makes the
+    // process list truly clean after Ctrl+C. Without it, every killed
+    // descendant's own registry entry (created by its own --server
+    // SyAPP instance) stays in processes.json as a "Dead" row until
+    // the operator runs an explicit --cleanup. Runs synchronously,
+    // before process.exit, so the registry on disk is already clean
+    // the next time --manage reads it.
+    try { SyPM._pruneDeadEntries(); } catch (_) {}
 
     try {
       if (syapp && syapp.HUD) {
