@@ -27141,6 +27141,10 @@ this.HUD = new TerminalHUD({
         // with a leading "… › " so the newest layers stay visible.
         const drawPathTree = () => {
           try {
+            // Middle layers must NOT draw the path tree: it would
+            // stream up through the chain and overwrite the top
+            // layer's tree. See `isTopOfChain` above.
+            if (!isTopOfChain()) return;
             if (currentPath.length < 2) return;
             const rows = stdout.rows || 24;
             const cols = stdout.columns || 80;
@@ -27191,9 +27195,51 @@ this.HUD = new TerminalHUD({
           } catch (_) {}
         };
 
+        // ------------------------------------------------------------------
+        // TOP-OF-CHAIN DETECTION (nested-Emb terminal fluidity fix).
+        //
+        // When several SyAPP instances are chained via this.Emb() in 'bg'
+        // mode, each layer calls `_runRemoteSession` to proxy the layer
+        // below it. The TERMINAL at the top of the chain sees only ONE
+        // hint/path tree — but every layer's `drawReturnHint()` and
+        // `drawPathTree()` writes reach the top terminal (through the
+        // stream). Each write targets the same bottom rows, so N layers
+        // result in N overlapping full-row repaints per chunk of remote
+        // output.
+        //
+        // At 6-7 nesting levels the accumulated per-chunk draws cross
+        // the threshold where the terminal visibly flickers or becomes
+        // unresponsive (the reported "blinking / inutilizable" symptom).
+        //
+        // The fix: only the TOP of the streaming chain draws hint/path.
+        // "Top of chain" means the process whose stdout goes straight to
+        // a real user terminal — i.e., a process that is NOT currently
+        // being streamed FROM by an upstream layer. A `--server` process
+        // with at least one active client has an upstream layer watching
+        // it (via /stream) and MUST stay silent about hint/path: that
+        // upstream layer will draw its own single, clean copy.
+        //
+        // Note: the hint/path INFO itself still propagates through the
+        // chain via `emitPathMarkerDownstream()` — only the per-layer
+        // DRAW is suppressed. The top layer's hint/path therefore still
+        // reflects the FULL chain from its own view down to the deepest
+        // layer.
+        // ------------------------------------------------------------------
+        const isTopOfChain = () => {
+          return !(
+            this._streamServer &&
+            this._streamClients &&
+            this._streamClients.size > 0
+          );
+        };
+
         const RETURN_HINT = '[ 🖱 Click here or Ctrl+C: pop one level   |   Ctrl+B: exit to local ]';
         const drawReturnHint = () => {
           try {
+            // Middle layers must NOT draw the hint: it would stream up
+            // through the chain and overwrite the top layer's hint. See
+            // `isTopOfChain` above for the full rationale.
+            if (!isTopOfChain()) return;
             const rows = stdout.rows || 24;
             const cols = stdout.columns || 80;
             const text = RETURN_HINT.length > cols
@@ -27454,8 +27500,11 @@ this.HUD = new TerminalHUD({
                     const eventType = sgrMatch[4];
 
                     // Left-click PRESS on the bottom hint row → pop
-                    // one layer (unchanged behaviour).
-                    if (eventType === 'M' && button === 0 && y0 === hintRow0) {
+                    // one layer. Only the top of the chain intercepts:
+                    // middle layers don't draw the hint (see
+                    // `isTopOfChain` above), so they must NOT react to
+                    // clicks that were meant for the top layer's hint.
+                    if (isTopOfChain() && eventType === 'M' && button === 0 && y0 === hintRow0) {
                       i += sgrMatch[0].length;
                       triggerCtrlC();
                       continue;
@@ -27467,7 +27516,7 @@ this.HUD = new TerminalHUD({
                     // the number of layers between the deepest and the
                     // clicked one.
                     const treeRow0 = hintRow0 - 1;
-                    if (eventType === 'M' && button === 0 && y0 === treeRow0 && treeSegments.length > 0) {
+                    if (isTopOfChain() && eventType === 'M' && button === 0 && y0 === treeRow0 && treeSegments.length > 0) {
                       const clickX = parseInt(sgrMatch[2], 10) - 1;
                       const seg = treeSegments.find(s => clickX >= s.startX && clickX <= s.endX);
                       if (seg) {
