@@ -24951,6 +24951,25 @@ class SyPMManagerFunc extends SyAPP_Func {
           view = 'list';
         }
 
+        // Navigate to the "Hard-locks" page (previously rendered inline
+        // in the list view; now a dedicated page reachable from the
+        // footer nav button).
+        if (curProps.__sypm_view_locks) {
+          delete curProps.__sypm_view_locks;
+          this.Storages.Set(id, viewKey, 'locks');
+          setConfirm(null);
+          view = 'locks';
+        }
+
+        // Navigate to the "Unplugged processes" page (previously
+        // rendered inline in the list view; now a dedicated page).
+        if (curProps.__sypm_view_orphans) {
+          delete curProps.__sypm_view_orphans;
+          this.Storages.Set(id, viewKey, 'orphans');
+          setConfirm(null);
+          view = 'orphans';
+        }
+
         if (curProps.__sypm_freeze) {
           delete curProps.__sypm_freeze;
           const cur = this.Storages.Get(id, frozenKey) === true;
@@ -25110,6 +25129,16 @@ class SyPMManagerFunc extends SyAPP_Func {
 
         if (view === 'log') {
           this._renderLogView(id);
+          return;
+        }
+
+        if (view === 'locks') {
+          this._renderLocksView(id);
+          return;
+        }
+
+        if (view === 'orphans') {
+          this._renderOrphansView(id);
           return;
         }
 
@@ -25289,6 +25318,14 @@ class SyPMManagerFunc extends SyAPP_Func {
       this.Button(id, { name: ' ' });
     }
 
+    // Counts for the two nav buttons (computed here so they are
+    // available to BOTH the empty-state footer AND the normal footer).
+    // Best-effort: never let a counting failure break the list view.
+    let lockCount = 0;
+    let orphanCount = 0;
+    try { lockCount = SyPM.listNameLocks().length; } catch (_) {}
+    try { orphanCount = SyPM.listOrphans().length; } catch (_) {}
+
     // ---------- Empty state ----------
     if (list.length === 0) {
       const noMatch = !!searchQuery;
@@ -25314,7 +25351,9 @@ class SyPMManagerFunc extends SyAPP_Func {
         {
           name: ColorText.brightYellow(isCard ? '🎨 Card ▸ Row' : '🎨 Row ▸ Card'),
           props: { __sypm_toggle_style: 1 }
-        }
+        },
+        { name: ColorText.brightYellow(`🔒 Locks (${lockCount})`), props: { __sypm_view_locks: 1 } },
+        { name: ColorText.brightRed(`⚠ Unplugged (${orphanCount})`), props: { __sypm_view_orphans: 1 } }
       ]);
       return;
     }
@@ -25405,60 +25444,10 @@ class SyPMManagerFunc extends SyAPP_Func {
       }
     }
 
-    // ---------- Persisted hard-locks ----------
-    // Lists every NAME lock on disk — including locks that outlived
-    // the process they were created for. Each entry can be unlocked,
-    // which re-enables spawning under that name.
-    try {
-      const locks = SyPM.listNameLocks();
-      if (locks.length > 0) {
-        this.Button(id, { name: ' ' });
-        this.Button(id, { name: ' ' });
-        this.Text(id, ColorText.brightYellow(
-          `🔒 Hard-locked names (${locks.length}) — respawns blocked until unlocked`
-        ));
-        for (const lock of locks) {
-          const lockLabel = _sypmDisplayName(lock.name, 40);
-          this.Buttons(id, [
-            { name: `🔒 ${lockLabel}`, props: {} },
-            {
-              name: ColorText.brightGreen('🔓 Unlock'),
-              props: { __sypm_unlock_name: lock.name }
-            }
-          ]);
-        }
-      }
-    } catch (_) {}
-
-    // ---------- Unplugged processes (not in registry) ----------
-    // Every running `SyAPP --server` process that is NOT in the
-    // registry. These are orphans from crashes / mid-restart failures
-    // / stale spawns. They cannot be reached from the UI, but they
-    // CAN be killed here — a single button nukes them all.
-    try {
-      const orphans = SyPM.listOrphans();
-      if (orphans.length > 0) {
-        this.Button(id, { name: ' ' });
-        this.Button(id, { name: ' ' });
-        this.Text(id, ColorText.brightRed(
-          `⚠ ${orphans.length} unplugged syapp process(es) — not in registry`
-        ));
-        for (const p of orphans) {
-          const portMatch = p.cmd.match(/--server\s+(\d+)/);
-          const pPort = portMatch ? portMatch[1] : '?';
-          this.Button(id, {
-            name: ColorText.dim(
-              `PID ${p.pid} · PGID ${p.pgid} · port ${pPort} · ` +
-              _sypmDisplayName(p.cmd, 45)
-            )
-          });
-        }
-        this.Button(id, {
-          name: ColorText.bgRed(ColorText.brightWhite(' 🔪 Kill All Unplugged ')),
-          props: { __sypm_kill_orphans: 1 }
-        });
-      }
-    } catch (_) {}
+    // NOTE: the "hard-locks" and "unplugged processes" sections that
+    // previously rendered inline right here have MOVED to their own
+    // dedicated pages (see _renderLocksView / _renderOrphansView).
+    // The footer below exposes the two nav buttons that open them.
 
     // ---------- Footer ----------
     if (isCard) {
@@ -25475,8 +25464,179 @@ class SyPMManagerFunc extends SyAPP_Func {
       {
         name: ColorText.brightYellow(isCard ? '🎨 Card ▸ Row' : '🎨 Row ▸ Card'),
         props: { __sypm_toggle_style: 1 }
-      }
+      },
+      { name: ColorText.brightYellow(`🔒 Locks (${lockCount})`), props: { __sypm_view_locks: 1 } },
+      { name: ColorText.brightRed(`⚠ Unplugged (${orphanCount})`), props: { __sypm_view_orphans: 1 } }
     ]);
+  }
+
+  /**
+   * Render the dedicated "Hard-locks" page.
+   *
+   * Previously this content lived inline at the bottom of the list
+   * view. It is now its own page, reached via the footer nav button
+   * "🔒 Locks (N)" and dismissed via "← Back".
+   *
+   * Functionality is IDENTICAL to the old inline section:
+   *   • lists every NAME lock on disk,
+   *   • exposes "🔓 Unlock" per entry (same __sypm_unlock_name prop),
+   *   • on unlock, the storage entry is removed and the process name
+   *     becomes spawnable again.
+   *
+   * @private
+   */
+  _renderLocksView(id) {
+    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'card') ? 'card' : 'row';
+    const isCard = viewStyle === 'card';
+
+    let locks = [];
+    try {
+      locks = SyPM.listNameLocks();
+    } catch (e) {
+      this.Text(id, ColorText.red(`Error reading locks: ${e.message}`));
+      this.Button(id, { name: '← Back', props: { __sypm_back: 1 } });
+      return;
+    }
+
+    if (isCard) {
+      this.TextButton(id, 'sypm_mgr_locks_header', {
+        label: 'Hard-locks',
+        initialValue: `🔒 Hard-locked names (${locks.length})`,
+        lines: 3,
+        editable: false
+      });
+    } else {
+      this.Button(id, {
+        name: ColorText.brightYellow(`🔒 Hard-locked names (${locks.length})`)
+      });
+    }
+    this.Text(id, ColorText.dim('Respawns blocked until unlocked'));
+
+    if (locks.length === 0) {
+      if (isCard) {
+        this.TextButton(id, 'sypm_mgr_locks_empty', {
+          label: 'Empty',
+          initialValue: 'No hard-locked names.',
+          lines: 3,
+          editable: false
+        });
+      } else {
+        this.Button(id, { name: ColorText.dim('No hard-locked names.') });
+      }
+    } else {
+      this.Button(id, { name: ' ' });
+      for (const lock of locks) {
+        const lockLabel = _sypmDisplayName(lock.name, 40);
+        const lockTime = lock.lockedAt ? new Date(lock.lockedAt).toLocaleString() : 'unknown';
+
+        if (isCard) {
+          this.TextButton(id, `sypm_mgr_lock_${lock.file || lock.name}`, {
+            label: lockLabel,
+            initialValue: `locked at ${lockTime}`,
+            lines: 3,
+            editable: false
+          });
+        } else {
+          this.Button(id, {
+            name: `🔒 ${ColorText.bold(lockLabel)}  ${ColorText.dim(lockTime)}`
+          });
+        }
+        this.Button(id, {
+          name: ColorText.brightGreen('🔓 Unlock'),
+          props: { __sypm_unlock_name: lock.name }
+        });
+      }
+    }
+
+    this.Button(id, { name: ' ' });
+    this.Button(id, { name: '← Back', props: { __sypm_back: 1 } });
+  }
+
+  /**
+   * Render the dedicated "Unplugged processes" page.
+   *
+   * Previously this content lived inline at the bottom of the list
+   * view. It is now its own page, reached via the footer nav button
+   * "⚠ Unplugged (N)" and dismissed via "← Back".
+   *
+   * Functionality is IDENTICAL to the old inline section:
+   *   • scans /proc for every `SyAPP --server` process not in the
+   *     registry,
+   *   • lists each with PID / PGID / port / command preview,
+   *   • exposes the same "🔪 Kill All Unplugged" button (same
+   *     __sypm_kill_orphans prop).
+   *
+   * @private
+   */
+  _renderOrphansView(id) {
+    const viewStyle = (this.Storages.Get(id, 'sypm_mgr_view_style') === 'card') ? 'card' : 'row';
+    const isCard = viewStyle === 'card';
+
+    let orphans = [];
+    try {
+      orphans = SyPM.listOrphans();
+    } catch (e) {
+      this.Text(id, ColorText.red(`Error reading orphan list: ${e.message}`));
+      this.Button(id, { name: '← Back', props: { __sypm_back: 1 } });
+      return;
+    }
+
+    if (isCard) {
+      this.TextButton(id, 'sypm_mgr_orphans_header', {
+        label: 'Unplugged',
+        initialValue: `⚠ Unplugged processes (${orphans.length})`,
+        lines: 3,
+        editable: false
+      });
+    } else {
+      this.Button(id, {
+        name: ColorText.brightRed(`⚠ Unplugged processes (${orphans.length})`)
+      });
+    }
+    this.Text(id, ColorText.dim('Not in registry — kill to clear'));
+
+    if (orphans.length === 0) {
+      if (isCard) {
+        this.TextButton(id, 'sypm_mgr_orphans_empty', {
+          label: 'Empty',
+          initialValue: 'No unplugged processes.',
+          lines: 3,
+          editable: false
+        });
+      } else {
+        this.Button(id, { name: ColorText.dim('No unplugged processes.') });
+      }
+    } else {
+      this.Button(id, { name: ' ' });
+      for (const p of orphans) {
+        const portMatch = p.cmd.match(/--server\s+(\d+)/);
+        const pPort = portMatch ? portMatch[1] : '?';
+
+        if (isCard) {
+          this.TextButton(id, `sypm_mgr_orphan_${p.pid}`, {
+            label: `PID ${p.pid}`,
+            initialValue: `PGID ${p.pgid} · port ${pPort}\n${_sypmDisplayName(p.cmd, 60)}`,
+            lines: 3,
+            editable: false
+          });
+        } else {
+          this.Button(id, {
+            name: ColorText.dim(
+              `PID ${p.pid} · PGID ${p.pgid} · port ${pPort} · ` +
+              _sypmDisplayName(p.cmd, 45)
+            )
+          });
+        }
+      }
+      this.Button(id, { name: ' ' });
+      this.Button(id, {
+        name: ColorText.bgRed(ColorText.brightWhite(' 🔪 Kill All Unplugged ')),
+        props: { __sypm_kill_orphans: 1 }
+      });
+    }
+
+    this.Button(id, { name: ' ' });
+    this.Button(id, { name: '← Back', props: { __sypm_back: 1 } });
   }
 
   /**
