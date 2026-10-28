@@ -23,7 +23,7 @@ result.txt
 struct
 struct.txt
 clipboard-config.json
-
+*-pack.js
 # Ubuntu cloud image downloads
 alpine-cloudinit.qcow2.partial
 noble-server-cloudimg-amd64.img

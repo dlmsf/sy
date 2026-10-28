@@ -28,6 +28,30 @@ class ModuleBundler {
     this.moduleRegistry  = new Map();
     this.moduleCounter   = 0;
     this.debug           = options.debug === true;
+
+    /**
+     * Module specifiers / resolved paths / basenames to treat as EXTERNAL.
+     *
+     * Imports matching any entry in this list are:
+     *   • NOT recursively processed (`processModule` skips them),
+     *   • NOT inlined into the bundle,
+     *   • emitted as top-level ESM `import` statements at the top of
+     *     the generated bundle, so Node loads the referenced module
+     *     from its REAL on-disk path at runtime.
+     *
+     * This is what lets `SyAPP.Pack()` bundle a user app while keeping
+     * SyAPP's own ~20k lines of source out of the bundle (and out of
+     * every module's `__require` chain).
+     *
+     * Matching rules — any of these makes an import "ignored":
+     *   • exact match on the raw import specifier,
+     *   • exact match on the resolved absolute path,
+     *   • basename match — `"SyAPP.js"` matches `"./SyAPP.js"`,
+     *     `"../SyAPP.js"`, `"/abs/path/SyAPP.js"`, `"./._/SyAPP.js"`, …
+     *
+     * @type {Array<string>}
+     */
+    this.ignoreImports   = Array.isArray(options.ignoreImports) ? options.ignoreImports : [];
   }
 
   // ---------- Module type helpers ----------
@@ -36,6 +60,31 @@ class ModuleBundler {
     if (builtinModules.includes(cleanName)) return true;
     const base = cleanName.split('/')[0];
     return builtinModules.includes(base);
+  }
+
+  /**
+   * Returns true when the given import specifier matches one of
+   * `this.ignoreImports`. Ignored imports are never recursively
+   * processed or inlined into the bundle; they are emitted as
+   * top-level ESM imports instead (see `generateBundle`).
+   *
+   * @param {string} modulePath - Raw import specifier (e.g. "./SyAPP.js").
+   * @param {string} currentFilePath - File that contains the import.
+   * @returns {boolean}
+   */
+  isIgnoredImport(modulePath, currentFilePath) {
+    if (!this.ignoreImports || this.ignoreImports.length === 0) return false;
+    const resolved = this.isNativeModule(modulePath)
+      ? modulePath
+      : this.resolveModulePath(modulePath, currentFilePath);
+    for (const pattern of this.ignoreImports) {
+      if (typeof pattern !== 'string' || pattern.length === 0) continue;
+      if (modulePath === pattern) return true;
+      if (resolved === pattern) return true;
+      if (path.basename(resolved) === pattern) return true;
+      if (path.basename(modulePath) === pattern) return true;
+    }
+    return false;
   }
 
   // ---------- Line-anchored module-syntax stripping ----------
@@ -473,7 +522,13 @@ class ModuleBundler {
     }
 
     const originalContent = readFileSync(filePath, 'utf8');
-    const imports         = this.parseImports(originalContent);
+    const imports         = this.parseImports(originalContent).map(imp => ({
+      ...imp,
+      // Annotate each import with its ignore status once, so downstream
+      // logic (recursion, bundle generation) does not need to re-run
+      // the matcher on every pass.
+      ignored: this.isIgnoredImport(imp.modulePath, filePath)
+    }));
     const exports         = this.parseExports(originalContent);
 
     let cleanedContent = this.stripAllModuleSyntax(originalContent, imports);
@@ -496,6 +551,7 @@ class ModuleBundler {
 
     // Recurse into dependencies.
     for (const imp of imports) {
+      if (imp.ignored) continue; // Externally loaded — not bundled.
       if (!imp.isNative) {
         const resolved = this.resolveModulePath(imp.modulePath, filePath);
         this.processModule(resolved);
@@ -512,6 +568,77 @@ class ModuleBundler {
     const modules     = Array.from(this.processedModules.values());
     const entryModule = this.moduleRegistry.get(this.entryFile);
 
+    // ---------------------------------------------------------------
+    // Collect every UNIQUE ignored import across all bundled modules,
+    // keyed by RESOLVED ABSOLUTE PATH so the same external module
+    // reached through different relative specifiers is only loaded
+    // once. Each unique binding is emitted as a single top-level ESM
+    // import in the generated bundle.
+    //
+    // Ignored imports are NOT recursively processed and NOT inlined
+    // into the bundle. Instead, the bundle simply `import`s them at
+    // runtime from their real on-disk path (or their bare specifier
+    // for native modules). This keeps the bundle small (e.g. SyAPP's
+    // ~20k lines of source stay on disk and are loaded on demand) and
+    // keeps a single source of truth for those modules.
+    // ---------------------------------------------------------------
+    const ignoredImportsBySource = new Map(); // sourceUrl -> { default:Set, named:Map<alias,{original,alias}>, namespace:Set }
+    const ignoredSideEffects = new Set();     // sourceUrl for bare side-effect imports
+
+    for (const module of modules) {
+      for (const imp of module.imports) {
+        if (!imp.ignored) continue;
+
+        const absResolved = this.isNativeModule(imp.modulePath)
+          ? imp.modulePath
+          : this.resolveModulePath(imp.modulePath, module.path);
+        const sourceUrl = this.isNativeModule(imp.modulePath)
+          ? imp.modulePath
+          : url.pathToFileURL(absResolved).href;
+
+        if (imp.type === 'side-effect') {
+          ignoredSideEffects.add(sourceUrl);
+          continue;
+        }
+
+        if (!ignoredImportsBySource.has(sourceUrl)) {
+          ignoredImportsBySource.set(sourceUrl, {
+            default:   new Set(),
+            named:     new Map(), // alias -> { original, alias }
+            namespace: new Set()
+          });
+        }
+        const entry = ignoredImportsBySource.get(sourceUrl);
+
+        if (imp.defaultImport) entry.default.add(imp.defaultImport);
+        if (imp.namespaceImport) entry.namespace.add(imp.namespaceImport);
+        if (Array.isArray(imp.namedImports)) {
+          for (const n of imp.namedImports) {
+            const alias = n.alias || n.original;
+            entry.named.set(alias, { original: n.original, alias });
+          }
+        }
+      }
+    }
+
+    const ignoredImportStatements = [];
+    for (const [sourceUrl, entry] of ignoredImportsBySource) {
+      const q = JSON.stringify(sourceUrl);
+      for (const def of entry.default) {
+        ignoredImportStatements.push(`import ${def} from ${q};`);
+      }
+      for (const { original, alias } of entry.named.values()) {
+        const spec = original === alias ? original : `${original} as ${alias}`;
+        ignoredImportStatements.push(`import { ${spec} } from ${q};`);
+      }
+      for (const ns of entry.namespace) {
+        ignoredImportStatements.push(`import * as ${ns} from ${q};`);
+      }
+    }
+    for (const sourceUrl of ignoredSideEffects) {
+      ignoredImportStatements.push(`import ${JSON.stringify(sourceUrl)};`);
+    }
+
     let out = '';
     out += '// ========================================\n';
     out += '// Auto-generated bundle\n';
@@ -527,6 +654,17 @@ class ModuleBundler {
 
     out += "import { createRequire } from 'module';\n";
     out += "const __nativeRequire = createRequire(import.meta.url);\n\n";
+
+    // NEW: top-level ESM imports for every unique external (ignored)
+    // module collected above. These bindings are visible inside every
+    // emitted module function via closure, so the per-module import
+    // emission for ignored imports is simply skipped below.
+    if (ignoredImportStatements.length > 0) {
+      out += '// External (ignored) imports — loaded by Node at runtime\n';
+      for (const stmt of ignoredImportStatements) out += stmt + '\n';
+      out += '\n';
+    }
+
     out += 'const __modules = {};\n';
     out += 'const __moduleCache = {};\n';
     out += 'const __moduleExports = {};\n';
@@ -562,6 +700,7 @@ class ModuleBundler {
 
       // Emit the module's imports (as __require / __nativeRequire calls).
       for (const imp of module.imports) {
+        if (imp.ignored) continue; // Emitted as a top-level ESM import above
         if (imp.isNative) {
           if (imp.type === 'default') {
             out += `  var ${imp.defaultImport} = __nativeRequire('${imp.modulePath}');\n`;
@@ -29210,6 +29349,52 @@ this.HUD = new TerminalHUD({
   }
 
   /**
+   * Bundle a user file into a single self-contained .js string.
+   *
+   * The bundling pipeline:
+   *   1. `ModuleBundler` recursively resolves every non-native import
+   *      starting from `filePath`.
+   *   2. Every import matching `options.ignoreImports` (default:
+   *      `["SyAPP.js"]`) is treated as EXTERNAL — it is not inlined,
+   *      not recursively processed, and is instead emitted as a
+   *      top-level ESM `import` in the bundle so Node loads it from
+   *      its real path at runtime. This keeps SyAPP's source code out
+   *      of every produced bundle while preserving the `SyAPP.Func()`
+   *      reference in the user's code.
+   *   3. The final code is returned as a string (nothing is written
+   *      to disk — the CLI `--pack` flow handles that).
+   *
+   * The returned string is a valid ES module. Copy it into a `.js` /
+   * `.mjs` file and run it with `node file.js` (or import it as a
+   * SyAPP Func). Relative imports of the entry file (e.g.
+   * `./config.json`) resolve against the current working directory.
+   *
+   * @param {string} filePath - Path to the entry file (.js / .mjs / .cjs).
+   * @param {Object} [options] - Optional bundling options.
+   * @param {Array<string>} [options.ignoreImports=["SyAPP.js"]]
+   *        Import specifiers / resolved paths / basenames to exclude
+   *        from the bundle (loaded at runtime instead). Defaults to
+   *        `["SyAPP.js"]`, which is what the CLI `--pack` flow uses.
+   * @param {boolean} [options.debug=false] - Verbose bundler output.
+   * @returns {string} The generated bundle source.
+   * @throws {Error} If the entry file cannot be read or an import
+   *                 inside its graph fails to resolve.
+   */
+  static Pack(filePath, options = {}) {
+    const ignoreImports = Array.isArray(options.ignoreImports)
+      ? options.ignoreImports
+      : ['SyAPP.js'];
+
+    const bundler = new ModuleBundler(filePath, {
+      debug: options.debug === true,
+      ignoreImports
+    });
+
+    bundler.processModule(bundler.entryFile);
+    return bundler.generateBundle();
+  }
+
+  /**
    * Get the SyAPP_Func class
    * @returns {typeof SyAPP_Func}
    */
@@ -34918,6 +35103,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _streamHost = _STREAM_DEFAULT_HOST
     let _bgMode = false
     let _manageMode = false
+    let _packMode = false
     let _nameFlag = false        // --name present
     let _customName = null       // explicit --name <value>
     const _plainArgs = []
@@ -34952,6 +35138,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         _bgMode = true
       } else if (a === '--manage') {
         _manageMode = true
+      } else if (a === '--pack') {
+        _packMode = true
       } else if (a === '--name') {
         // NEW: --name support for --bg.
         //
@@ -34995,6 +35183,74 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         process.exit(1)
       }
       return
+    }
+
+    // ------------------------------------------------------------------
+    // --pack : bundle a user file into a single runnable .js file
+    // ------------------------------------------------------------------
+    //   node SyAPP.js --pack <file.js> [output.js]
+    //
+    // Default output name is derived from the Func class declared in
+    // the source file:
+    //
+    //   <FuncName>-pack.js   (written next to the source file)
+    //
+    // If no `class X extends ...` is found, the fallback is
+    // `untitled-pack.js`. Any existing output file is overwritten.
+    //
+    // The SyAPP import is EXCLUDED from the bundle (via the
+    // ModuleBundler's `ignoreImports` option) so the produced file is
+    // compact and simply imports SyAPP from its original path at
+    // runtime — no source duplication, one source of truth.
+    // ------------------------------------------------------------------
+    if (_packMode) {
+      const targetFile = _plainArgs[0];
+      const outputArg  = _plainArgs[1];
+
+      if (!targetFile) {
+        console.error(ColorText.brightRed(
+          '❌ Usage: node SyAPP.js --pack <file.js> [output.js]'
+        ));
+        process.exit(1);
+      }
+
+      const absFile = path.isAbsolute(targetFile)
+        ? targetFile
+        : path.resolve(process.cwd(), targetFile);
+
+      if (!fs.existsSync(absFile)) {
+        console.error(ColorText.brightRed(`❌ File not found: ${targetFile}`));
+        process.exit(1);
+      }
+
+      // Resolve the default output name from the Func class declared
+      // in the file (falls back to "untitled" when no class extends
+      // another class).
+      let funcName = 'untitled';
+      try {
+        const src = fs.readFileSync(absFile, 'utf8');
+        const m = src.match(/class\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
+        if (m) funcName = m[1];
+      } catch (_) { /* best-effort — fallback remains "untitled" */ }
+
+      const outPath = outputArg
+        ? (path.isAbsolute(outputArg) ? outputArg : path.resolve(process.cwd(), outputArg))
+        : path.resolve(path.dirname(absFile), `${funcName}-pack.js`);
+
+      try {
+        const bundled = SyAPP.Pack(absFile);
+        fs.writeFileSync(outPath, bundled, 'utf8');
+        console.log(ColorText.brightGreen(
+          `✅ Packed ${path.basename(absFile)} → ${outPath}`
+        ));
+        console.log(ColorText.dim(
+          `   ${bundled.split('\n').length} lines, ${Buffer.byteLength(bundled, 'utf8')} bytes`
+        ));
+      } catch (e) {
+        console.error(ColorText.brightRed(`❌ Pack failed: ${e.message}`));
+        process.exit(1);
+      }
+      return;
     }
 
     // Boot helper: creates the SyAPP instance, installs the SIGINT
