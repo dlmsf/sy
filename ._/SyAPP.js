@@ -22777,15 +22777,27 @@ function levenshteinDistance(str1, str2) {
     };
 
     /**
-     * Balanced-paren scanner — TEMPLATE-AGNOSTIC. Skips only string
-     * literals and comments. Backticks are PLAIN characters, which is
-     * what makes it work for calls nested inside other templates.
+     * Balanced-paren scanner — TEMPLATE-AWARE.
+     *
+     * Skips string literals, template literals AND comments. Template
+     * literal tracking is critical for the CLEAR / SAVE rewrite path:
+     * the host file contains the embedded func's source inside a
+     * `code: \`...\`` template with every backtick escaped as \`. If
+     * we did NOT track that template here, any `)` or `(` appearing as
+     * PLAIN TEXT inside the embedded source (e.g. `Hi :)`,
+     * `(see docs)`, `error: unexpected )`) would be counted as real
+     * parentheses, ending the outer `this.Emb(...)` scan too early —
+     * and producing an unbalanced (broken) file after Clear/Save.
+     *
+     * Backslash escapes inside the template skip two characters, so
+     * `\`` and `\${` never spuriously terminate / interpolate.
      * @private
      */
     this._embScanParenSimple = (src, openIdx) => {
       let i = openIdx;
       let depth = 0;
       let inStr = null;
+      let inTemplate = false;
       let inLineComment = false;
       let inBlockComment = false;
 
@@ -22800,7 +22812,13 @@ function levenshteinDistance(str1, str2) {
           if (c === inStr) inStr = null;
           i++; continue;
         }
+        if (inTemplate) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === '`') { inTemplate = false; i++; continue; }
+          i++; continue;
+        }
         if (c === '"' || c === "'") { inStr = c; i++; continue; }
+        if (c === '`') { inTemplate = true; i++; continue; }
         if (c === '/' && next === '/') { inLineComment = true; i += 2; continue; }
         if (c === '/' && next === '*') { inBlockComment = true; i += 2; continue; }
 
@@ -22812,6 +22830,58 @@ function levenshteinDistance(str1, str2) {
         i++;
       }
       return -1;
+    };
+
+    /**
+     * Structural-balance check for a whole source file.
+     *
+     * Returns true when every `(`, `{`, `[` is matched by the
+     * corresponding closing bracket — string literals, template
+     * literals and comments are correctly skipped (with backslash
+     * escapes handled), so text content inside `` `...` `` never
+     * affects the counters.
+     *
+     * Used by `_embReplaceExistingCall` as a last-line safety check:
+     * if a proposed rewrite would leave the file unbalanced (which
+     * would mean `Clear` / `Save` is about to produce a broken file),
+     * the write is refused and the file is left untouched.
+     *
+     * @private
+     */
+    this._embSourceLooksBalanced = (src) => {
+      let parens = 0, braces = 0, brackets = 0;
+      let inStr = null, inTemplate = false;
+      let inLine = false, inBlock = false;
+      let i = 0;
+      const n = String(src || '').length;
+      while (i < n) {
+        const c = src[i], nx = src[i + 1];
+        if (inLine) { if (c === '\n') inLine = false; i++; continue; }
+        if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i += 2; continue; } i++; continue; }
+        if (inStr) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === inStr) inStr = null;
+          i++; continue;
+        }
+        if (inTemplate) {
+          if (c === '\\') { i += 2; continue; }
+          if (c === '`') { inTemplate = false; i++; continue; }
+          i++; continue;
+        }
+        if (c === '"' || c === "'") { inStr = c; i++; continue; }
+        if (c === '`') { inTemplate = true; i++; continue; }
+        if (c === '/' && nx === '/') { inLine = true; i += 2; continue; }
+        if (c === '/' && nx === '*') { inBlock = true; i += 2; continue; }
+        if (c === '(') { parens++; i++; continue; }
+        if (c === ')') { parens--; i++; continue; }
+        if (c === '{') { braces++; i++; continue; }
+        if (c === '}') { braces--; i++; continue; }
+        if (c === '[') { brackets++; i++; continue; }
+        if (c === ']') { brackets--; i++; continue; }
+        i++;
+      }
+      return parens === 0 && braces === 0 && brackets === 0 &&
+             !inStr && !inTemplate && !inLine && !inBlock;
     };
 
     /**
@@ -23055,9 +23125,23 @@ function levenshteinDistance(str1, str2) {
 
       // -----------------------------------------------------------
       // Case 1: direct top-level match. Splice directly.
+      //
+      // SAFETY: verify that the resulting source is still
+      // structurally balanced. Even with the template-aware scanner
+      // above, a pathological edge case (e.g. an exotic regex literal
+      // with unbalanced character-class parentheses) could return a
+      // wrong boundary. In that case we bail out and let the caller
+      // report "could not find" instead of silently corrupting the
+      // file. If the ORIGINAL source was already imbalanced (per our
+      // checker), we allow the write — matching the pre-fix behaviour
+      // for those unusual files.
       // -----------------------------------------------------------
       if (found.hops.length === 0) {
-        return src.slice(0, found.targetCallStart) + plain + src.slice(found.targetCallEnd);
+        const result = src.slice(0, found.targetCallStart) + plain + src.slice(found.targetCallEnd);
+        if (!this._embSourceLooksBalanced(src) || this._embSourceLooksBalanced(result)) {
+          return result;
+        }
+        return null;
       }
 
       // -----------------------------------------------------------
@@ -23257,11 +23341,17 @@ function levenshteinDistance(str1, str2) {
         outerCallRaw.slice(0, outerOpenIdx + 1) +
         newOuterBody + ')';
 
-      return (
+      const result = (
         src.slice(0, outerHop.callStart) +
         newOuterCall +
         src.slice(outerHop.callEnd)
       );
+      // Same safety check as the direct case: refuse to write a
+      // rewrite that would leave the file structurally unbalanced.
+      if (!this._embSourceLooksBalanced(src) || this._embSourceLooksBalanced(result)) {
+        return result;
+      }
+      return null;
     };
 
     /**
@@ -29604,10 +29694,16 @@ function _embScanRunningFileForWidget(src, embName) {
     .replace(/\\`/g, '`')
     .replace(/\\\\/g, '\\');
 
+  // Template-aware paren scanner. Must match the behaviour of
+  // `_embScanParenSimple` (write path) so that the self-heal scan
+  // (read path) can still locate an Emb call whose `code:` field
+  // contains escaped backticks and unbalanced parens in its text
+  // (e.g. `Hi :)`). See `_embScanParenSimple` for the full rationale.
   const scanParenForSource = (source, openIdx) => {
     let i = openIdx;
     let depth = 0;
     let inStr = null;
+    let inTemplate = false;
     let inLineComment = false;
     let inBlockComment = false;
 
@@ -29622,7 +29718,13 @@ function _embScanRunningFileForWidget(src, embName) {
         if (c === inStr) inStr = null;
         i++; continue;
       }
+      if (inTemplate) {
+        if (c === '\\') { i += 2; continue; }
+        if (c === '`') { inTemplate = false; i++; continue; }
+        i++; continue;
+      }
       if (c === '"' || c === "'") { inStr = c; i++; continue; }
+      if (c === '`') { inTemplate = true; i++; continue; }
       if (c === '/' && next === '/') { inLineComment = true; i += 2; continue; }
       if (c === '/' && next === '*') { inBlockComment = true; i += 2; continue; }
 
