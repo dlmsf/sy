@@ -31177,20 +31177,39 @@ class SelfBuilder extends SyAPP_Func {
         this._pendingAction = null
       } else if (this._pendingAction === 'export') {
         const name = String(p.inputValue).trim()
-        if (name) {
-          try {
-            const target = this.ExportTarget
-              ? this.ExportTarget
-              : path.resolve(process.cwd(), name.endsWith('.js') ? name : name + '.js')
-            const dir = path.dirname(target)
-            let rel = path.relative(dir, url.fileURLToPath(import.meta.url))
-            if (!rel.startsWith('.')) rel = './' + rel
-            const js = _genFuncJS(S, rel)
-            fs.writeFileSync(target, js)
-            this.Alert(id, `📤 Exported: ${target}`, { duration: 3500 })
-          } catch (e) {
-            this.Alert(id, `❌ ${e.message}`, { duration: 4000 })
+        try {
+          let target
+          if (this.ExportTarget) {
+            // --edit mode: write back to the originally-edited file.
+            // This path is unchanged from the previous behaviour.
+            target = this.ExportTarget
+          } else {
+            // Determine the base name for the `-pack.js` output:
+            //   • typed name  → strip any trailing ".js" / "-pack" so
+            //                   the final name is always `<base>-pack.js`
+            //                   (never "-pack-pack.js")
+            //   • Enter only  → use the func/class name, matching what
+            //                   `node SyAPP.js --pack file.js` does by
+            //                   default (`<class>-pack.js`)
+            let baseName
+            if (name) {
+              baseName = name.replace(/\.js$/i, '').replace(/-pack$/i, '')
+            } else {
+              baseName = String(S.funcName || 'MyApp').replace(/[^A-Za-z0-9_$]/g, '') || 'MyApp'
+            }
+            if (!baseName) {
+              baseName = String(S.funcName || 'MyApp').replace(/[^A-Za-z0-9_$]/g, '') || 'MyApp'
+            }
+            target = path.resolve(process.cwd(), `${baseName}-pack.js`)
           }
+          const dir = path.dirname(target)
+          let rel = path.relative(dir, url.fileURLToPath(import.meta.url))
+          if (!rel.startsWith('.')) rel = './' + rel
+          const js = _genFuncJS(S, rel)
+          fs.writeFileSync(target, js)
+          this.Alert(id, `📤 Exported: ${target}`, { duration: 3500 })
+        } catch (e) {
+          this.Alert(id, `❌ ${e.message}`, { duration: 4000 })
         }
         this._pendingAction = null
       } else if (this._pendingAction === 'load') {
@@ -31491,7 +31510,12 @@ class SelfBuilder extends SyAPP_Func {
     if (p.__setAppName) { this._pendingAction = 'appName'; this.WaitInput(id, { question: 'App name: ', path: this.Name, props: passProps }); return }
     if (p.__save) { this._pendingAction = 'save'; this.WaitInput(id, { question: 'Save as: ', path: this.Name, props: passProps }); return }
     if (p.__load) { this._pendingAction = 'load'; this.WaitInput(id, { question: 'Load name: ', path: this.Name, props: passProps }); return }
-    if (p.__export) { this._pendingAction = 'export'; this.WaitInput(id, { question: 'Export file: ', path: this.Name, props: passProps }); return }
+    if (p.__export) {
+      this._pendingAction = 'export'
+      const defName = String(S.funcName || 'MyApp').replace(/[^A-Za-z0-9_$]/g, '') || 'MyApp'
+      this.WaitInput(id, { question: `Export file (Enter = ${defName}-pack.js): `, path: this.Name, props: passProps })
+      return
+    }
     if (p.__exit) { process.exit(0) }
   }
 
