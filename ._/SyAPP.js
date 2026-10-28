@@ -21562,75 +21562,69 @@ function levenshteinDistance(str1, str2) {
 
           const cls = await this._embResolveClass(state, cfg);
           if (cls && this._syappInstance) {
-            // Ensure the class is present in SyAPP.Funcs under a stable
-            // name. We use `cls.name` first (that is what the produced
-            // source declares), then fall back to cfg.name.
+            // Register the resolved class under the SAME Emb-namespaced
+            // unique name used by the file-picker / editFilePath /
+            // editCode paths (see the long comment in the file-picker
+            // registration). This is what makes the whole flow name-
+            // collision-safe: even when the embedded func's own app
+            // name matches the parent app's MainFunc.Name, the parent's
+            // `Funcs` entry is never touched, and ▶ Enter Func reaches
+            // the embedded func through this unique alias.
             let realName = (typeof cls.name === 'string' && cls.name) ? cls.name : null;
             let instance = null;
             try { instance = new cls(); } catch (_) {}
             if (instance && instance.Name) realName = instance.Name;
             if (!realName) realName = cfg.name;
 
-            // ALWAYS (re)register the freshly-resolved class.
-            //
-            // The produced embedded func always carries the SAME class
-            // name across edits (e.g. "EmbeddedFunc"). On the first
-            // Emb → Enter Func round the name is not yet in the Funcs
-            // map, so the registration was happening naturally. On any
-            // EDIT round the name already exists — and the previous
-            // `if (!Funcs.has(realName))` guard would then keep the
-            // stale, pre-edit instance in place, so Enter Func would
-            // navigate into the OLD content and the user would only
-            // see the new content after Ctrl+C and restart.
-            //
-            // Replacing the entry unconditionally is what makes edits
-            // visible IMMEDIATELY. Cross-render user state (Storages /
-            // Alerts) is preserved from the previous instance so the
-            // embedded func does not lose its own stored data.
+            const embUniqueName = `__emb_${cfg.name}__${realName}`;
+
+            // ALWAYS (re)register so edits are visible immediately.
+            // Cross-render user state (Storages / Alerts) is preserved
+            // from the previous instance so the embedded func does not
+            // lose its own stored data.
             const inst = instance || new cls();
             inst._syappInstance = this._syappInstance;
-            const previous = this._syappInstance.Funcs.get(realName);
+            const previous = this._syappInstance.Funcs.get(embUniqueName);
             if (previous) {
               if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
               if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
             }
-            this._syappInstance.Funcs.set(realName, inst);
+            this._syappInstance.Funcs.set(embUniqueName, inst);
 
-            // NEW: Register the func as embedded and ensure its
-            // SyAPPInit hook runs BEFORE LoadScreen navigates to it.
-            // Without this, Enter Func would load a func whose DB
-            // connection was never established, causing the classic
-            // "No active connection" error on the first Build().
-            // The call is awaited so the subsequent GotoNow → LoadScreen
-            // → Build() chain sees a fully-initialised func.
+            // Register the func as embedded and ensure its SyAPPInit
+            // hook runs BEFORE LoadScreen navigates to it. Without this,
+            // Enter Func would load a func whose DB connection was
+            // never established, causing the classic "No active
+            // connection" error on the first Build().
             try {
-              this._syappInstance._embRegisteredFuncs.add(realName);
+              this._syappInstance._embRegisteredFuncs.add(embUniqueName);
               await this._syappInstance._ensureEmbSyappInit(inst, {
                 embeddedIn: this.Name,
                 args: Array.isArray(state.args) ? state.args.slice() : []
               });
             } catch (_) { /* init failure never blocks Enter Func */ }
 
-            // NEW: Register the embedded func's Linked funcs so any
-            // button pointing to one of them by name (e.g.
-            // `path: 'otherfunc'`) navigates correctly via LoadScreen.
+            // Register the embedded func's Linked funcs so any button
+            // pointing to one of them by name (e.g. `path: 'otherfunc'`)
+            // navigates correctly via LoadScreen.
             try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
 
-            // Record the return target for this embedded func so its
-            // default "← Return" button knows where to go back to.
+            // Record the return target keyed by the SAME unique name
+            // LoadScreen will use as `targetFuncName`, so the injected
+            // "← Return" button resolves back to this parent func.
             this._syappInstance._embReturnTargets =
               this._syappInstance._embReturnTargets || new Map();
             const session = this.Builds.get(id)?.Session;
             if (session && session.UniqueID) {
               const existing = this._syappInstance._embReturnTargets.get(session.UniqueID) || {};
-              existing[realName] = {
+              existing[embUniqueName] = {
                 func: this.Name,
                 props: { ...(session.ActualProps || {}) }
               };
               this._syappInstance._embReturnTargets.set(session.UniqueID, existing);
             }
 
-            this.GotoNow(id, realName, { props: {} });
+            this.GotoNow(id, embUniqueName, { props: {} });
             return null;
           }
         }
@@ -21693,8 +21687,12 @@ function levenshteinDistance(str1, str2) {
           } catch (_) {}
           // Auto-register the class so ▶ Enter Func can navigate to it.
           //
-          // Always replace any previous registration with the freshly
-          // imported class, so a re-typed path/edited file is visible
+          // Uses the SAME Emb-namespaced unique name as the file-picker
+          // path (see the long comment there) so a name collision
+          // between the embedded func's app name and the parent app's
+          // MainFunc.Name can never overwrite the parent's `Funcs`
+          // entry. Always replace the previous registration of this
+          // widget so a re-typed path / edited file is visible
           // immediately instead of falling back to a stale instance.
           try {
             const cls = await this._embImportFile(v);
@@ -21706,14 +21704,13 @@ function levenshteinDistance(str1, str2) {
               if (realName) {
                 const inst = instance || new cls();
                 inst._syappInstance = this._syappInstance;
-                const previous = this._syappInstance.Funcs.get(realName);
+                const embUniqueName = `__emb_${cfg.name}__${realName}`;
+                const previous = this._syappInstance.Funcs.get(embUniqueName);
                 if (previous) {
                   if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
                   if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
                 }
-                this._syappInstance.Funcs.set(realName, inst);
-                // NEW: register the embedded func's Linked funcs so
-                // buttons pointing to them by name work correctly.
+                this._syappInstance.Funcs.set(embUniqueName, inst);
                 try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
               }
             }
@@ -21747,9 +21744,13 @@ function levenshteinDistance(str1, str2) {
           // Auto-register the inline code so ▶ Enter Func works with a
           // real funcname navigation (no synthetic lookup).
           //
-          // Always replace any previous registration with the freshly
-          // imported class, so re-pasted/edited inline code is visible
-          // immediately instead of falling back to a stale instance.
+          // Uses the SAME Emb-namespaced unique name as the file-picker
+          // path (see the long comment there) so a name collision
+          // between the embedded func's app name and the parent app's
+          // MainFunc.Name can never overwrite the parent's `Funcs`
+          // entry. Always replace the previous registration of this
+          // widget so re-pasted / edited inline code is visible
+          // immediately.
           try {
             const cls = await this._embImportCode(state.code);
             if (cls && this._syappInstance) {
@@ -21760,14 +21761,13 @@ function levenshteinDistance(str1, str2) {
               if (realName) {
                 const inst = instance || new cls();
                 inst._syappInstance = this._syappInstance;
-                const previous = this._syappInstance.Funcs.get(realName);
+                const embUniqueName = `__emb_${cfg.name}__${realName}`;
+                const previous = this._syappInstance.Funcs.get(embUniqueName);
                 if (previous) {
                   if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
                   if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
                 }
-                this._syappInstance.Funcs.set(realName, inst);
-                // NEW: register the embedded func's Linked funcs so
-                // buttons pointing to them by name work correctly.
+                this._syappInstance.Funcs.set(embUniqueName, inst);
                 try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
               }
             }
@@ -21878,11 +21878,28 @@ function levenshteinDistance(str1, str2) {
           } catch (_) {}
 
           // Auto-register the picked class so Enter Func can navigate
-          // to its real name immediately.
+          // to it immediately.
           //
-          // Always replace any previous registration so re-picking the
-          // same .js file (after editing it on disk) is visible without
-          // needing Ctrl+C + restart.
+          // ─── REGISTRATION NAME — CRITICAL FIX ───────────────────────
+          // The embedded func's `instance.Name` (its internal app name
+          // from `super("<name>", ...)`) can legitimately collide with
+          // the parent app's `MainFunc.Name` — for example, both
+          // default to "untitled" (the SelfBuilder default). Registering
+          // under that bare name OVERWRITES the parent's entry in
+          // `SyAPP.Funcs`, and every subsequent refresh tick's
+          // `LoadScreen(MainFunc.Name, ...)` then renders the EMBEDDED
+          // func instead of the parent. That is exactly the
+          // "it enters the func directly after I pick the file"
+          // symptom.
+          //
+          // We therefore register under an Emb-namespaced unique name
+          // (`__emb_<widgetName>__<realName>`). The parent's Funcs entry
+          // is never touched, no matter what name the picked file uses.
+          // ▶ Enter Func navigates to this same unique name via its
+          // fallback path, so the embedded func remains fully reachable.
+          // Always replace any previous registration of THIS widget so
+          // re-picking the same .js file (after editing it on disk) is
+          // visible without needing Ctrl+C + restart.
           try {
             const cls = await this._embImportFile(picked[0]);
             if (cls && this._syappInstance) {
@@ -21893,14 +21910,15 @@ function levenshteinDistance(str1, str2) {
               if (realName) {
                 const inst = instance || new cls();
                 inst._syappInstance = this._syappInstance;
-                const previous = this._syappInstance.Funcs.get(realName);
+                const embUniqueName = `__emb_${cfg.name}__${realName}`;
+                const previous = this._syappInstance.Funcs.get(embUniqueName);
                 if (previous) {
                   if (previous.UserStorage) inst.UserStorage = previous.UserStorage;
                   if (previous.AlertStorage) inst.AlertStorage = previous.AlertStorage;
                 }
-                this._syappInstance.Funcs.set(realName, inst);
-                // NEW: register the embedded func's Linked funcs so
-                // buttons pointing to them by name work correctly.
+                this._syappInstance.Funcs.set(embUniqueName, inst);
+                // Register the embedded func's Linked funcs so buttons
+                // pointing to them by name work correctly.
                 try { this._embRegisterLinkedFuncs(inst); } catch (_) {}
               }
             }
