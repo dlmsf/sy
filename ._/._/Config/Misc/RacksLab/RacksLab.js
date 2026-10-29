@@ -227,7 +227,55 @@ class RacksLab extends SyAPP.Func(){
                    
                   
                     this.Text(uid,'• Racks Lab / Config')
-                    this.Button(uid,'configtest')
+
+                    // ============================================================
+                    // DISTRO LIST — downloaded / existent distros
+                    // ============================================================
+                    this.Button(uid,' ')
+                    this.Text(uid, this.TextColor.cyan('• Available Distros'))
+
+                    let qemuDir = null
+                    try {
+                        const sysInfo = await Qemu.getSystemInfo()
+                        qemuDir = sysInfo?.script?.directory
+                    } catch (e) {}
+
+                    let alpineReady = false
+                    let ubuntuReady = false
+
+                    if (qemuDir && fs.existsSync(qemuDir)) {
+                        try {
+                            const entries = fs.readdirSync(qemuDir)
+                            for (const entry of entries) {
+                                const lower = entry.toLowerCase()
+
+                                if (entry.includes('-vm-')) {
+                                    if (lower.startsWith('alpine')) alpineReady = true
+                                    if (lower.startsWith('noble') || lower.startsWith('ubuntu')) ubuntuReady = true
+                                    continue
+                                }
+
+                                const isImage = lower.endsWith('.qcow2') || lower.endsWith('.img') || lower.endsWith('.iso') || lower.endsWith('.raw')
+                                if (!isImage) continue
+                                if (lower.includes('alpine')) alpineReady = true
+                                if (lower.includes('noble') || lower.includes('ubuntu')) ubuntuReady = true
+                            }
+                        } catch (e) {}
+                    }
+
+                    if (alpineReady) {
+                        this.Button(uid, this.TextColor.brightGreen('✓ Alpine') + this.TextColor.dim('  ·  downloaded & ready'))
+                    } else {
+                        this.Button(uid, this.TextColor.brightYellow('○ Alpine') + this.TextColor.dim('  ·  not downloaded'))
+                    }
+
+                    if (ubuntuReady) {
+                        this.Button(uid, this.TextColor.brightGreen('✓ Ubuntu') + this.TextColor.dim('  ·  downloaded & ready'))
+                    } else {
+                        this.Button(uid, this.TextColor.brightYellow('○ Ubuntu') + this.TextColor.dim('  ·  not downloaded'))
+                    }
+
+                    this.Button(uid,' ')
                     this.Button(uid,'<- Return',{props : {page : ''}})
                  })
 
