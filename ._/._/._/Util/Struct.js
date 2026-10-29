@@ -2599,39 +2599,102 @@ async function interactiveMode() {
     }
 
     // ========================================================
-    //  SELECTED FILES LIST view (NEW)
+    //  SELECTED FILES LIST view (INTERACTIVE)
     //
     //  Triggered by the `l` key from the main browser view.
-    //  Shows a clean preview of every currently selected file
+    //  Shows a clean list of every currently selected file
     //  (full absolute path) plus per-file tags for the parsed /
     //  reference-only state, per-file token counts, and the
     //  overall token total.
     //
+    //  NEW: the view is now INTERACTIVE - you can exclude a file
+    //  from the selection without leaving this clean list, then
+    //  re-include it if you change your mind.
+    //
+    //  Keys:
+    //    ↑/↓, PgUp/PgDn  -> navigate
+    //    Space           -> toggle selected/excluded for the
+    //                       file under the cursor (calls the
+    //                       SAME selectFile/deselectFile helpers
+    //                       used everywhere else - no selection
+    //                       logic is changed)
+    //    Enter / Esc     -> return to the file browser
+    //    b / B / q / Q   -> return to the file browser
+    //    l / L           -> return to the file browser
+    //
+    //  A "snapshot" of the files selected when the view opened is
+    //  kept stable so excluded files stay visible (shown as
+    //  excluded) and can be re-included with Space. Leaving the
+    //  view leaves the real selection exactly as toggled.
+    //
     //  Purely additive: does NOT touch selection logic, parsing,
-    //  search, or the generate flow. Leaves raw mode via the
-    //  same pattern used by the existing `f` and `I` handlers,
-    //  then restores it and re-attaches `onKeypress` when done.
+    //  search, or the generate flow. Uses the same raw-mode +
+    //  dedicated-key-handler pattern as the find-results view,
+    //  then restores onKeypress and redraws when done.
     // ========================================================
     async function showSelectedFilesList() {
-        // Temporarily leave raw mode so readline can prompt cleanly
-        // (identical pattern to the existing f/I handlers).
+        // Enter a dedicated raw-mode view (same pattern as find).
         process.stdin.removeListener('data', onKeypress);
-        process.stdin.setRawMode(false);
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
 
-        clearScreen();
+        // Stable snapshot of the files selected when the view opened.
+        // Toggling only calls selectFile/deselectFile; the snapshot
+        // itself never changes, so an excluded file stays visible here
+        // and can be re-included.
+        const snapshot = [...selectedFiles].sort();
 
-        console.log(`${BOLD}${GREEN}=== SELECTED FILES (${selectedFiles.size}) ===${RESET}`);
-        console.log(`${BOLD}${BLUE}Base directory:${RESET} ${YELLOW}${currentDirectory}${RESET}`);
-        console.log('─'.repeat(process.stdout.columns || 80));
+        let cursor = 0;
+        let scrollOffset = 0;
 
-        if (selectedFiles.size === 0) {
-            console.log(`\n${YELLOW}(no files selected)${RESET}`);
-        } else {
-            // Sorted for a stable, easy-to-scan preview.
-            const files = [...selectedFiles].sort();
+        const getMaxRows = () => {
+            const rows = process.stdout.rows || 24;
+            return Math.max(1, rows - 8);
+        };
 
-            files.forEach((file, idx) => {
-                const tokenCount = selectedTokenCounts.get(file) || 0;
+        const adjustScroll = (len) => {
+            const max = getMaxRows();
+
+            if (cursor < scrollOffset) scrollOffset = cursor;
+            if (cursor >= scrollOffset + max) scrollOffset = cursor - max + 1;
+
+            const maxScroll = Math.max(0, len - max);
+            if (scrollOffset > maxScroll) scrollOffset = maxScroll;
+            if (scrollOffset < 0) scrollOffset = 0;
+        };
+
+        const renderList = () => {
+            clearScreen();
+
+            const max = getMaxRows();
+            adjustScroll(snapshot.length);
+
+            const slice = snapshot.slice(scrollOffset, scrollOffset + max);
+            const stillSelected = snapshot.filter(f => selectedFiles.has(f)).length;
+            const excludedCount = snapshot.length - stillSelected;
+
+            console.log(`${BOLD}${GREEN}=== SELECTED FILES ===${RESET}`);
+            console.log(`${BOLD}${BLUE}Base directory:${RESET} ${YELLOW}${currentDirectory}${RESET}`);
+            console.log(
+                `${BOLD}In list: ${snapshot.length} | Still selected: ${stillSelected}${RESET}` +
+                (excludedCount > 0 ? ` | ${RED}Excluded: ${excludedCount}${RESET}` : '')
+            );
+            console.log('─'.repeat(process.stdout.columns || 80));
+            console.log(
+                `${BOLD}Keys:${RESET} ↑/↓ move, PgUp/PgDn page, ` +
+                `${RED}Space${RESET} exclude/include, ${GREEN}Enter/Esc${RESET} back`
+            );
+            console.log('─'.repeat(process.stdout.columns || 80));
+
+            if (snapshot.length === 0) {
+                console.log(`\n${YELLOW}(no files were selected when this view opened)${RESET}`);
+            }
+
+            slice.forEach((file, index) => {
+                const actualIndex = scrollOffset + index;
+                const isSelected = selectedFiles.has(file);
+                const prefix = isSelected ? `${GREEN}[✔]${RESET}` : `${RED}[✗]${RESET}`;
+
                 let tag = '';
 
                 if (parsedFiles.has(file)) {
@@ -2640,12 +2703,30 @@ async function interactiveMode() {
                     tag = ` ${YELLOW}[REF-ONLY]${RESET}`;
                 }
 
-                const number = String(idx + 1).padStart(3, ' ');
-                console.log(`  ${number}. ${file} ${BOLD}(${formatNumber(tokenCount)} tok)${RESET}${tag}`);
+                const tokenCount = selectedTokenCounts.get(file) || 0;
+                const tokenStr = isSelected
+                    ? `${BOLD}(${formatNumber(tokenCount)} tok)${RESET}`
+                    : `${MAGENTA}(excluded)${RESET}`;
+                const number = String(actualIndex + 1).padStart(3, ' ');
+                const line = `${prefix} ${number}. ${file} ${tokenStr}${tag}`;
+
+                if (actualIndex === cursor) {
+                    console.log(`${REVERSE}${line}${RESET}`);
+                } else {
+                    console.log(line);
+                }
             });
 
+            if (snapshot.length > max) {
+                const page = Math.floor(scrollOffset / max) + 1;
+                const totalPages = Math.ceil(snapshot.length / max);
+                console.log(`─ ${BOLD}${page}${RESET}/${totalPages} ${snapshot.length} items`);
+            }
+
             console.log('─'.repeat(process.stdout.columns || 80));
-            console.log(`${BOLD}Total: ${selectedFiles.size} file(s) | Tokens: ${formatNumber(totalTokens)}${RESET}`);
+            console.log(
+                `${BOLD}Total selected: ${selectedFiles.size} file(s) | Tokens: ${formatNumber(totalTokens)}${RESET}`
+            );
 
             if (parsedFiles.size > 0) {
                 console.log(`${MAGENTA}${parsedFiles.size} file(s) will be PARSED (filtered content).${RESET}`);
@@ -2653,16 +2734,79 @@ async function interactiveMode() {
             if (referenceOnlyFiles.size > 0) {
                 console.log(`${YELLOW}${referenceOnlyFiles.size} file(s) marked REFERENCE-ONLY (do not modify).${RESET}`);
             }
-        }
+        };
 
-        await askQuestion('\nPress Enter to return...');
+        return new Promise(resolve => {
+            const onListKeypress = async (key) => {
+                // ---------- navigation ----------
+                if (key === '\u001b[A') {
+                    if (cursor > 0) cursor--;
+                    renderList();
+                    return;
+                }
 
-        // Restore raw mode and re-attach the key handler exactly
-        // like the existing find/imports handlers do.
-        process.stdin.setRawMode(true);
-        process.stdin.resume();
-        process.stdin.on('data', onKeypress);
-        render();
+                if (key === '\u001b[B') {
+                    if (cursor < snapshot.length - 1) cursor++;
+                    renderList();
+                    return;
+                }
+
+                if (key === '\u001b[5~') {
+                    cursor = Math.max(0, cursor - getMaxRows());
+                    renderList();
+                    return;
+                }
+
+                if (key === '\u001b[6~') {
+                    cursor = Math.min(snapshot.length - 1, cursor + getMaxRows());
+                    renderList();
+                    return;
+                }
+
+                // ---------- toggle exclude/include under cursor ----------
+                // Reuses the SAME selectFile/deselectFile helpers used
+                // everywhere else - selection state, token totals, parsed
+                // cache and reference-only marks stay fully consistent.
+                if (key === ' ') {
+                    const file = snapshot[cursor];
+                    if (file) {
+                        if (selectedFiles.has(file)) {
+                            deselectFile(file);
+                        } else {
+                            await selectFile(file);
+                        }
+                    }
+                    renderList();
+                    return;
+                }
+
+                // ---------- return to the file browser ----------
+                if (
+                    key === '\r' || key === '\n' || key === '\u001b' ||
+                    key === 'b' || key === 'B' ||
+                    key === 'q' || key === 'Q' ||
+                    key === 'l' || key === 'L'
+                ) {
+                    process.stdin.removeListener('data', onListKeypress);
+                    resolve();
+                    return;
+                }
+
+                if (key === '\u0003') {
+                    cleanupAndExit(0);
+                }
+            };
+
+            process.stdin.on('data', onListKeypress);
+            renderList();
+        }).then(() => {
+            // Restore browser key handler and redraw - exactly like
+            // the existing find/imports handlers do when they return.
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
+        });
     }
 
     const onKeypress = async (key) => {
