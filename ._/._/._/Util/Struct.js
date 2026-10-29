@@ -110,6 +110,117 @@ function isJavaScriptFile(filePath) {
 }
 
 // ============================================================
+//  Import resolution helpers
+//
+//  These let the interactive browser auto-select files that a
+//  JavaScript/TypeScript file imports, recursively. They are
+//  purely additive: existing selection logic (selectFile,
+//  deselectFile, toggleFile, ...) is reused unchanged.
+// ============================================================
+
+// Extract every import/require/export-from specifier from JS source.
+// Handles:
+//   import X from '...' / import { ... } from '...' / import '...'
+//   import type { ... } from '...' (TS)
+//   export * from '...' / export { ... } from '...'
+//   const X = require('...')  (CommonJS)
+//   import('...') / require('...')  (dynamic)
+function extractImportSpecifiers(content) {
+    const specifiers = new Set();
+    let m;
+
+    // Static ES module imports (works across multi-line forms).
+    const staticImport = /^\s*import\s+(?:[\s\S]*?\s+from\s+)?['"]([^'"]+)['"]/gm;
+    while ((m = staticImport.exec(content)) !== null) specifiers.add(m[1]);
+
+    // Re-exports: export { X } from '...' / export * from '...'
+    const exportFrom = /^\s*export\s+(?:type\s+)?(?:\*|\{[\s\S]*?\})\s+from\s+['"]([^'"]+)['"]/gm;
+    while ((m = exportFrom.exec(content)) !== null) specifiers.add(m[1]);
+
+    // CommonJS require('...')
+    const requireCall = /\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    while ((m = requireCall.exec(content)) !== null) specifiers.add(m[1]);
+
+    // Dynamic import('...')
+    const dynamicImport = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+    while ((m = dynamicImport.exec(content)) !== null) specifiers.add(m[1]);
+
+    return [...specifiers];
+}
+
+// Resolve an import specifier relative to the importing file.
+// Returns an absolute path if a real file exists, otherwise null.
+// Bare specifiers (node_modules, package names) are skipped - we
+// cannot know where they live without the Node resolver.
+async function resolveImportSpecifier(specifier, fromFile) {
+    if (typeof specifier !== 'string' || specifier.length === 0) return null;
+
+    // Skip bare package specifiers - we can't resolve them safely.
+    if (!specifier.startsWith('.') && !specifier.startsWith('/')) {
+        return null;
+    }
+
+    const baseDir = path.dirname(fromFile);
+    const resolved = specifier.startsWith('/')
+        ? specifier
+        : path.resolve(baseDir, specifier);
+
+    const candidates = [resolved];
+
+    // If the specifier has no extension, try the standard JS/TS
+    // extensions and index files (same order Node/TS use).
+    if (!path.extname(resolved)) {
+        const exts = ['.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx', '.mts', '.cts', '.json'];
+        for (const ext of exts) candidates.push(resolved + ext);
+        for (const ext of exts) candidates.push(path.join(resolved, 'index' + ext));
+    }
+
+    for (const candidate of candidates) {
+        try {
+            const stat = await fs.stat(candidate);
+            if (stat.isFile()) return candidate;
+        } catch {
+            // Try the next candidate.
+        }
+    }
+
+    return null;
+}
+
+// Recursively collect a file and everything it imports.
+//   maxDepth = 0        -> only the file itself
+//   maxDepth = 1        -> the file + its direct imports (default)
+//   maxDepth = Infinity -> full import graph
+// Cycles are handled via the `visited` set (dedup + termination).
+async function collectImportedFiles(filePath, maxDepth, visited = new Set()) {
+    if (visited.has(filePath)) return [];
+    visited.add(filePath);
+
+    const collected = [filePath];
+
+    if (maxDepth <= 0) return collected;
+    if (!isJavaScriptFile(filePath)) return collected;
+
+    let content;
+    try {
+        content = await fs.readFile(filePath, 'utf8');
+    } catch {
+        return collected;
+    }
+
+    const specifiers = extractImportSpecifiers(content);
+
+    for (const spec of specifiers) {
+        const resolved = await resolveImportSpecifier(spec, filePath);
+        if (!resolved || visited.has(resolved)) continue;
+        const nested = await collectImportedFiles(resolved, maxDepth - 1, visited);
+        collected.push(...nested);
+    }
+
+    return collected;
+}
+
+// ============================================================
 //  Generate struct file from a list of absolute paths
 // ============================================================
 async function generateStruct(filePaths, outputFileName = 'struct', options = {}) {
@@ -1593,7 +1704,7 @@ async function interactiveMode() {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, f find, g gen, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, f find, g gen, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -2142,6 +2253,92 @@ async function interactiveMode() {
 
         if (key === 'A') {
             await toggleAllRecursivelyFromCurrentDirectory();
+            render();
+            return;
+        }
+
+        if (key === 'I') {
+            // Select a JS/TS file AND every file it imports (recursively).
+            // Prompts for depth; Enter = 1 layer (default), "all" = full graph.
+            // Reuses the exact same raw-mode toggling pattern as the
+            // existing `f` (find) handler, and calls the SAME selectFile()
+            // helper used everywhere else - no other logic is touched.
+            if (entries.length === 0 || cursorIndex < 0 || cursorIndex >= entries.length) {
+                render();
+                return;
+            }
+
+            const entry = entries[cursorIndex];
+
+            if (entry.isDirectory()) {
+                render();
+                return;
+            }
+
+            const fullPath = path.join(currentDirectory, entry.name);
+
+            if (!isJavaScriptFile(fullPath)) {
+                // Non-JS file: nothing to expand, just select it normally.
+                if (!selectedFiles.has(fullPath)) {
+                    await selectFile(fullPath);
+                }
+                render();
+                return;
+            }
+
+            // Temporarily leave raw mode so readline can prompt cleanly.
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+
+            console.log(`\n${YELLOW}${BOLD}=== SELECT WITH IMPORTS ===${RESET}`);
+            console.log(`File: ${path.basename(fullPath)}`);
+            console.log(`Selects the file and every file it imports (recursively).`);
+            console.log(`Depth 1 = direct imports only. Press Enter for default (1).`);
+            console.log(`Type "all" for the full import graph (unlimited depth).\n`);
+
+            const depthAnswer = await askQuestion('Import depth (default 1, or "all"):');
+
+            let maxDepth = 1;
+            const trimmedDepth = depthAnswer.trim().toLowerCase();
+
+            if (trimmedDepth === 'all') {
+                maxDepth = Infinity;
+            } else if (trimmedDepth !== '') {
+                const parsed = parseInt(trimmedDepth, 10);
+                if (!isNaN(parsed) && parsed >= 0) {
+                    maxDepth = parsed;
+                }
+            }
+
+            const depthLabel = maxDepth === Infinity ? 'all' : String(maxDepth);
+            console.log(`\nCollecting imports (depth: ${depthLabel})...`);
+
+            let importedFiles = [];
+
+            try {
+                importedFiles = await collectImportedFiles(fullPath, maxDepth);
+            } catch (err) {
+                console.log(`${RED}Error collecting imports: ${err.message}${RESET}`);
+            }
+
+            let newlySelected = 0;
+
+            for (const importedFile of importedFiles) {
+                if (!selectedFiles.has(importedFile)) {
+                    await selectFile(importedFile);
+                    newlySelected++;
+                }
+            }
+
+            console.log(
+                `${GREEN}✓ Found ${importedFiles.length} file(s), ` +
+                `added ${newlySelected} new selection(s).${RESET}`
+            );
+            await askQuestion('Press Enter to return...');
+
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
             render();
             return;
         }
