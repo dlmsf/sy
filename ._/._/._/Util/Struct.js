@@ -1704,7 +1704,7 @@ async function interactiveMode() {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, g gen, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, g gen, D gen-defaults, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -1779,7 +1779,7 @@ async function interactiveMode() {
     //                                   steps back; at the first step
     //                                   it exits the generate flow)
     // ========================================================
-    const askStepWithBack = (label, initialValue = '') => {
+    const askStepWithBack = (label, initialValue = '', defaultValue = null) => {
         return new Promise(resolve => {
             process.stdin.setRawMode(true);
             process.stdin.resume();
@@ -1799,7 +1799,11 @@ async function interactiveMode() {
             const finishValue = () => {
                 process.stdin.removeListener('data', onData);
                 process.stdout.write('\n');
-                resolve({ type: 'value', value: buffer.trim() });
+                const trimmed = buffer.trim();
+                const value = (trimmed === '' && defaultValue !== null)
+                    ? String(defaultValue)
+                    : trimmed;
+                resolve({ type: 'value', value });
             };
 
             const onData = (key) => {
@@ -1890,9 +1894,9 @@ async function interactiveMode() {
         let filesToParse = [];            // resolved js paths
         let refChoice = 'no';             // 'yes' | 'no'
         let filesToMarkRef = [];          // resolved selected paths
-        let includeInstructions = false;  // bool
+        let includeInstructions = true;   // bool (default: yes)
         let userDemand = '';              // string
-        let outputFormat = 'full';        // 'full' | 'tagged' | 'both'
+        let outputFormat = 'tagged';      // 'full' | 'tagged' | 'both' (default: tagged)
         let saveName = '';                // string
 
         // Which rows are currently part of the flow (some are conditional).
@@ -2082,7 +2086,8 @@ async function interactiveMode() {
                 case ROW.PARSE: {
                     res = await askStepWithBack(
                         `${BOLD}Parse JS files with CodeParser? (y/n):${RESET}`,
-                        parseChoice === 'yes' ? 'y' : 'n'
+                        '',
+                        'n'
                     );
                     if (res.type === 'back') { exitGenerate = true; break; }
 
@@ -2099,7 +2104,8 @@ async function interactiveMode() {
                 case ROW.PARSE_FILES: {
                     res = await askStepWithBack(
                         `${BOLD}Which files? (all | 1,3,5 | 2-4 | none):${RESET}`,
-                        filesToParse.length === 0 ? 'none' : filesToParse.map(f => jsFiles.indexOf(f) + 1).join(',')
+                        '',
+                        'none'
                     );
                     if (res.type === 'back') {
                         undoRowState(ROW.PARSE_FILES);
@@ -2155,7 +2161,8 @@ async function interactiveMode() {
                 case ROW.REF: {
                     res = await askStepWithBack(
                         `${BOLD}Mark files as reference-only? (y/n):${RESET}`,
-                        refChoice === 'yes' ? 'y' : 'n'
+                        '',
+                        'n'
                     );
                     if (res.type === 'back') {
                         // Leaving REF undoes any reference-only marks it created.
@@ -2179,7 +2186,8 @@ async function interactiveMode() {
                 case ROW.REF_FILES: {
                     res = await askStepWithBack(
                         `${BOLD}Which files reference-only? (all | 1,3,5 | 2-4 | none):${RESET}`,
-                        filesToMarkRef.length === 0 ? 'none' : filesToMarkRef.map(f => [...selectedFiles].indexOf(f) + 1).join(',')
+                        '',
+                        'none'
                     );
                     if (res.type === 'back') {
                         undoRowState(ROW.REF_FILES);
@@ -2216,7 +2224,8 @@ async function interactiveMode() {
                 case ROW.AI: {
                     res = await askStepWithBack(
                         `${BOLD}Add AI instructions? (y/n):${RESET}`,
-                        includeInstructions ? 'y' : 'n'
+                        '',
+                        'y'
                     );
                     if (res.type === 'back') {
                         // Stepping back from AI lands on the previous visible row.
@@ -2230,7 +2239,7 @@ async function interactiveMode() {
                     includeInstructions = (a === 'y' || a === 'yes');
                     if (!includeInstructions) {
                         userDemand = '';
-                        outputFormat = 'full';
+                        outputFormat = 'tagged';
                     }
                     currentRow = nextRow(ROW.AI);
                     break;
@@ -2239,7 +2248,7 @@ async function interactiveMode() {
                 case ROW.DEMAND: {
                     res = await askStepWithBack(
                         `${BOLD}AI request/demand:${RESET}`,
-                        userDemand
+                        ''
                     );
                     if (res.type === 'back') {
                         currentRow = prevRow(ROW.DEMAND);
@@ -2251,10 +2260,10 @@ async function interactiveMode() {
                 }
 
                 case ROW.FORMAT: {
-                    const currentFormatValue = outputFormat === 'tagged' ? '2' : outputFormat === 'both' ? '3' : '1';
                     res = await askStepWithBack(
                         `${BOLD}Output format (1/2/3):${RESET}`,
-                        currentFormatValue
+                        '',
+                        '2'
                     );
                     if (res.type === 'back') {
                         currentRow = prevRow(ROW.FORMAT);
@@ -2272,7 +2281,7 @@ async function interactiveMode() {
                 case ROW.SAVE: {
                     res = await askStepWithBack(
                         `${BOLD}Save session as (empty to skip):${RESET}`,
-                        saveName
+                        ''
                     );
                     if (res.type === 'back') {
                         currentRow = prevRow(ROW.SAVE);
@@ -2935,6 +2944,37 @@ async function interactiveMode() {
             process.stdin.resume();
             process.stdin.on('data', onKeypress);
             render();
+            return;
+        }
+
+        if (key === 'D') {
+            // NEW: generate the struct directly using the flow's DEFAULT
+            // values - no wizard, no parsing, AI instructions ON, output
+            // format = Tagged replacements. Intended as a fast shortcut.
+            if (selectedFiles.size === 0) {
+                render();
+                return;
+            }
+
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+
+            console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT (DEFAULT FLOW) ===${RESET}\n`);
+            console.log(`Selected files:  ${selectedFiles.size}`);
+            console.log(`AI instructions: yes`);
+            console.log(`Output format:   Tagged replacements`);
+            console.log(`Parsing:         skipped (default)`);
+            console.log(`Reference-only:  none (default)\n`);
+
+            await generateStruct([...selectedFiles], 'struct', {
+                includeInstructions: true,
+                userDemand: '',
+                outputFormat: 'tagged',
+                parsedFiles: new Map(),
+                referenceOnlyFiles: new Set(),
+            });
+
+            cleanupAndExit(0);
             return;
         }
 
