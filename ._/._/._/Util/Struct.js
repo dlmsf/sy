@@ -102,6 +102,76 @@ function generatePathEnforcement(filePaths, outputFormat) {
 }
 
 // ============================================================
+//  Generate the "100% WORKING CODE" safety warning block.
+//
+//  This is a REINFORCEMENT / ATTENTION message that is injected
+//  at the top of every AI instruction template. Its sole purpose
+//  is to make very explicit to the AI that the current codebase
+//  is fully functional and that any regression is unacceptable.
+//
+//  Purely additive: this function only returns a string. It does
+//  not touch any existing behavior anywhere.
+// ============================================================
+function generateSafetyWarning() {
+    const rule = '#'.repeat(78);
+    let warning = '';
+
+    warning += `${rule}\n`;
+    warning += `#\n`;
+    warning += `#  !!!   CRITICAL WARNING  -  THE CODE IS 100% WORKING   !!!\n`;
+    warning += `#\n`;
+    warning += `${rule}\n\n`;
+
+    warning += `THE EXISTING CODE IN THIS PROJECT IS 100% WORKING AND FULLY FUNCTIONAL.\n`;
+    warning += `Every feature, function, and behavior currently operates correctly, and the\n`;
+    warning += `user depends on it. Breaking or altering this working behavior is NOT\n`;
+    warning += `acceptable under any circumstance.\n\n`;
+
+    warning += `BEFORE YOU WRITE ANY SINGLE LINE OF CODE, INTERNALIZE THESE RULES:\n\n`;
+
+    warning += `1. SURGICAL CHANGES ONLY\n`;
+    warning += `   Apply ONLY the changes explicitly requested in the USER REQUEST above.\n`;
+    warning += `   Nothing more. Do not expand scope. Do not "improve" unrelated code.\n\n`;
+
+    warning += `2. DO NOT REFACTOR / RENAME / REORGANIZE\n`;
+    warning += `   Do NOT rename variables, functions, parameters, or files. Do NOT\n`;
+    warning += `   reorder imports, functions, or statements "for cleanliness". Do NOT\n`;
+    warning += `   reformat or change whitespace of code you were not asked to touch.\n\n`;
+
+    warning += `3. DO NOT REMOVE OR "SIMPLIFY" WORKING CODE\n`;
+    warning += `   Any line, branch, function, or check that works today MUST still work\n`;
+    warning += `   after your change. Never delete code because it "looks redundant".\n\n`;
+
+    warning += `4. DO NOT CHANGE EXISTING BEHAVIOR\n`;
+    warning += `   Preserve ALL existing: return values, error handling, edge cases,\n`;
+    warning += `   console output, side effects, defaults, and control flow - unless\n`;
+    warning += `   the request explicitly asks to change them.\n\n`;
+
+    warning += `5. NO NEW DEPENDENCIES OR ABSTRACTIONS\n`;
+    warning += `   Do NOT add packages, patterns, helpers, or layers the request did not\n`;
+    warning += `   ask for. Do NOT introduce changes nobody requested.\n\n`;
+
+    warning += `6. PRESERVE PUBLIC INTERFACES\n`;
+    warning += `   Function signatures, exported names, command-line flags, config keys,\n`;
+    warning += `   and any interface used by other files MUST remain compatible.\n\n`;
+
+    warning += `7. SMALLEST POSSIBLE DIFF\n`;
+    warning += `   If two solutions achieve the requested change, choose the one with the\n`;
+    warning += `   smaller and safer diff. Minimal change = maximum safety.\n\n`;
+
+    warning += `8. WHEN IN DOUBT, DO NOT TOUCH\n`;
+    warning += `   If you are not 100% certain that a modification is safe AND required,\n`;
+    warning += `   leave the existing code untouched. Never guess-destroy working code.\n\n`;
+
+    warning += `A change that "looks cleaner" but alters behavior is a REGRESSION, not\n`;
+    warning += `an improvement. Regressions break working software. That is a FAILURE.\n\n`;
+
+    warning += `${rule}\n\n`;
+
+    return warning;
+}
+
+// ============================================================
 //  Check if file is a JavaScript/TypeScript file
 // ============================================================
 function isJavaScriptFile(filePath) {
@@ -244,6 +314,11 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
         structContent += `Below are the current contents of the selected files.\n`;
         structContent += `Your task is to apply the following user request:\n\n`;
         structContent += `USER REQUEST:\n${userDemand}\n\n`;
+
+        // Reinforce to the AI that the codebase is 100% working and
+        // that any regression is unacceptable. Placed BEFORE the path
+        // enforcement / parsed files sections so the AI reads it first.
+        structContent += generateSafetyWarning();
 
         if (needsPathEnforcement) {
             structContent += generatePathEnforcement(filePaths, outputFormat);
