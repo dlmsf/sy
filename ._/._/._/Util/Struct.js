@@ -1704,7 +1704,7 @@ async function interactiveMode() {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, f find, g gen, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, g gen, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -2185,6 +2185,73 @@ async function interactiveMode() {
         });
     }
 
+    // ========================================================
+    //  SELECTED FILES LIST view (NEW)
+    //
+    //  Triggered by the `l` key from the main browser view.
+    //  Shows a clean preview of every currently selected file
+    //  (full absolute path) plus per-file tags for the parsed /
+    //  reference-only state, per-file token counts, and the
+    //  overall token total.
+    //
+    //  Purely additive: does NOT touch selection logic, parsing,
+    //  search, or the generate flow. Leaves raw mode via the
+    //  same pattern used by the existing `f` and `I` handlers,
+    //  then restores it and re-attaches `onKeypress` when done.
+    // ========================================================
+    async function showSelectedFilesList() {
+        // Temporarily leave raw mode so readline can prompt cleanly
+        // (identical pattern to the existing f/I handlers).
+        process.stdin.removeListener('data', onKeypress);
+        process.stdin.setRawMode(false);
+
+        clearScreen();
+
+        console.log(`${BOLD}${GREEN}=== SELECTED FILES (${selectedFiles.size}) ===${RESET}`);
+        console.log(`${BOLD}${BLUE}Base directory:${RESET} ${YELLOW}${currentDirectory}${RESET}`);
+        console.log('─'.repeat(process.stdout.columns || 80));
+
+        if (selectedFiles.size === 0) {
+            console.log(`\n${YELLOW}(no files selected)${RESET}`);
+        } else {
+            // Sorted for a stable, easy-to-scan preview.
+            const files = [...selectedFiles].sort();
+
+            files.forEach((file, idx) => {
+                const tokenCount = selectedTokenCounts.get(file) || 0;
+                let tag = '';
+
+                if (parsedFiles.has(file)) {
+                    tag = ` ${MAGENTA}[PARSED]${RESET}`;
+                } else if (referenceOnlyFiles.has(file)) {
+                    tag = ` ${YELLOW}[REF-ONLY]${RESET}`;
+                }
+
+                const number = String(idx + 1).padStart(3, ' ');
+                console.log(`  ${number}. ${file} ${BOLD}(${formatNumber(tokenCount)} tok)${RESET}${tag}`);
+            });
+
+            console.log('─'.repeat(process.stdout.columns || 80));
+            console.log(`${BOLD}Total: ${selectedFiles.size} file(s) | Tokens: ${formatNumber(totalTokens)}${RESET}`);
+
+            if (parsedFiles.size > 0) {
+                console.log(`${MAGENTA}${parsedFiles.size} file(s) will be PARSED (filtered content).${RESET}`);
+            }
+            if (referenceOnlyFiles.size > 0) {
+                console.log(`${YELLOW}${referenceOnlyFiles.size} file(s) marked REFERENCE-ONLY (do not modify).${RESET}`);
+            }
+        }
+
+        await askQuestion('\nPress Enter to return...');
+
+        // Restore raw mode and re-attach the key handler exactly
+        // like the existing find/imports handlers do.
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+        process.stdin.on('data', onKeypress);
+        render();
+    }
+
     const onKeypress = async (key) => {
         const maxEntries = getMaxEntries();
 
@@ -2254,6 +2321,12 @@ async function interactiveMode() {
         if (key === 'A') {
             await toggleAllRecursivelyFromCurrentDirectory();
             render();
+            return;
+        }
+
+        if (key === 'l' || key === 'L') {
+            // NEW: show a clean preview of all currently selected files.
+            await showSelectedFilesList();
             return;
         }
 
