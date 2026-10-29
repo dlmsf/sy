@@ -1764,6 +1764,75 @@ async function interactiveMode() {
     };
 
     // ========================================================
+    //  ONE-PAGE WIZARD key reader with LEFT-ARROW = BACK.
+    //
+    //  Used only inside the generate flow. Instead of printing a
+    //  fresh prompt each time, the whole wizard is rendered on a
+    //  single page and only the focused row is edited here.
+    //
+    //  Behavior:
+    //    * printable keys are appended to the current value and echoed
+    //    * Backspace removes the last character
+    //    * Enter submits the value   -> { type: 'value', value }
+    //    * LEFT ARROW                -> { type: 'back' }
+    //    * Ctrl+C                    -> { type: 'back' } (safe: caller
+    //                                   steps back; at the first step
+    //                                   it exits the generate flow)
+    // ========================================================
+    const askStepWithBack = (label, initialValue = '') => {
+        return new Promise(resolve => {
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.setEncoding('utf8');
+
+            let buffer = String(initialValue == null ? '' : initialValue);
+
+            // Print the label + current buffer on the current line.
+            process.stdout.write(`${label} ${buffer}`);
+
+            const finishBack = () => {
+                process.stdin.removeListener('data', onData);
+                process.stdout.write('\n');
+                resolve({ type: 'back' });
+            };
+
+            const finishValue = () => {
+                process.stdin.removeListener('data', onData);
+                process.stdout.write('\n');
+                resolve({ type: 'value', value: buffer.trim() });
+            };
+
+            const onData = (key) => {
+                if (key === '\u0003') { finishBack(); return; }
+
+                if (key === '\r' || key === '\n') { finishValue(); return; }
+
+                // LEFT ARROW - cascade back one step (single keypress).
+                if (key === '\u001b[D') { finishBack(); return; }
+
+                if (key === '\u007f' || key === '\b') {
+                    if (buffer.length > 0) {
+                        buffer = buffer.slice(0, -1);
+                        process.stdout.write('\b \b');
+                    }
+                    return;
+                }
+
+                // Ignore other escape sequences (up/down/right arrows, etc).
+                if (key.startsWith('\u001b')) return;
+
+                // Ignore non-printable control chars.
+                if (key.length === 1 && key.charCodeAt(0) < 32) return;
+
+                buffer += key;
+                process.stdout.write(key);
+            };
+
+            process.stdin.on('data', onData);
+        });
+    };
+
+    // ========================================================
     //  Generate flow - extracted so both the main menu and the
     //  find-results view can trigger it with the G key.
     // ========================================================
@@ -1779,42 +1848,290 @@ async function interactiveMode() {
         process.stdin.removeListener('data', onKeypress);
         process.stdin.setRawMode(false);
 
-        // STEP 1: Ask about parsing JavaScript files
+        // ============================================================
+        //  ONE-PAGE WIZARD + CASCADE BACK
+        //
+        //  The whole generate flow is rendered as a single page
+        //  (a form-like summary). Every prompt is a row on that page.
+        //
+        //  As you move through steps the page is REDRAWN, filling in
+        //  the rows behind you and highlighting the current row.
+        //
+        //  Pressing the LEFT ARROW KEY at any step moves the focus to
+        //  the PREVIOUS row - a true one-page cascade. The value of
+        //  the row you land on is editable again, and any state that
+        //  was applied by steps AFTER it is cleanly undone.
+        //
+        //  This keeps the excellent safety properties of the previous
+        //  versions (per-session undo, step-by-step back, exit at the
+        //  first row) while making the whole flow visible at once.
+        // ============================================================
         const jsFiles = [...selectedFiles].filter(isJavaScriptFile);
-        
-        if (jsFiles.length > 0) {
-            console.log(`\n${YELLOW}${BOLD}=== CODE PARSER OPTION ===${RESET}`);
-            console.log(`You have ${jsFiles.length} JavaScript/TypeScript file(s) selected.`);
-            console.log(`CodeParser can FILTER these files to include only selected parts.\n`);
-            
-            const parseAnswer = await askQuestion(`Do you want to parse any JavaScript files with CodeParser? (y/n):`);
-            
-            if (parseAnswer.toLowerCase() === 'y' || parseAnswer.toLowerCase() === 'yes') {
+
+        // Track what THIS session added so we can undo cleanly on "back".
+        const sessionParsedFiles = new Set();
+        const sessionRefFiles = new Set();
+
+        // The ordered list of "rows" in the wizard. Each row is a step.
+        // A row is only shown when its `visible()` returns true.
+        const ROW = {
+            PARSE: 'parse',
+            PARSE_FILES: 'parse-files',
+            REF: 'ref',
+            REF_FILES: 'ref-files',
+            AI: 'ai',
+            DEMAND: 'demand',
+            FORMAT: 'format',
+            SAVE: 'save',
+        };
+
+        // State driven by the wizard rows.
+        let parseChoice = 'no';           // 'yes' | 'no'
+        let filesToParse = [];            // resolved js paths
+        let refChoice = 'no';             // 'yes' | 'no'
+        let filesToMarkRef = [];          // resolved selected paths
+        let includeInstructions = false;  // bool
+        let userDemand = '';              // string
+        let outputFormat = 'full';        // 'full' | 'tagged' | 'both'
+        let saveName = '';                // string
+
+        // Which rows are currently part of the flow (some are conditional).
+        const visibleRows = () => {
+            const rows = [];
+            if (jsFiles.length > 0) {
+                rows.push(ROW.PARSE);
+                if (parseChoice === 'yes') rows.push(ROW.PARSE_FILES);
+            }
+            rows.push(ROW.REF);
+            if (refChoice === 'yes') rows.push(ROW.REF_FILES);
+            rows.push(ROW.AI);
+            if (includeInstructions) {
+                rows.push(ROW.DEMAND);
+                rows.push(ROW.FORMAT);
+            }
+            rows.push(ROW.SAVE);
+            return rows;
+        };
+
+        // The step that should be focused AFTER the given one, based on
+        // the current state. Used when Enter is pressed on a row.
+        const nextRow = (current) => {
+            const rows = visibleRows();
+            const idx = rows.indexOf(current);
+            if (idx === -1) return rows[rows.length - 1];
+            return rows[Math.min(idx + 1, rows.length - 1)];
+        };
+
+        // The step that should be focused BEFORE the given one, based on
+        // the current state. Used when Left Arrow is pressed on a row.
+        // Returns null when we are already at the first row.
+        const prevRow = (current) => {
+            const rows = visibleRows();
+            const idx = rows.indexOf(current);
+            if (idx <= 0) return null;
+            return rows[idx - 1];
+        };
+
+        // Undo any state that was ADDED while sitting on the given row,
+        // so stepping back leaves no trace from that row's actions.
+        const undoRowState = (fromRow) => {
+            if (fromRow === ROW.PARSE_FILES) {
+                // Undo parsing done in this session when re-editing this row.
+                for (const f of sessionParsedFiles) parsedFiles.delete(f);
+                sessionParsedFiles.clear();
+            }
+            if (fromRow === ROW.REF_FILES) {
+                // Undo reference-only marks done in this session.
+                for (const f of sessionRefFiles) referenceOnlyFiles.delete(f);
+                sessionRefFiles.clear();
+            }
+        };
+
+        // Format a row's current value for the summary display.
+        const rowValueText = (row) => {
+            switch (row) {
+                case ROW.PARSE:
+                    return jsFiles.length === 0 ? '(skipped - no JS files)' : (parseChoice === 'yes' ? 'yes' : 'no');
+                case ROW.PARSE_FILES:
+                    return filesToParse.length === 0
+                        ? 'none'
+                        : filesToParse.map(f => path.basename(f)).join(', ');
+                case ROW.REF:
+                    return refChoice === 'yes' ? 'yes' : 'no';
+                case ROW.REF_FILES:
+                    return filesToMarkRef.length === 0
+                        ? 'none'
+                        : filesToMarkRef.map(f => path.basename(f)).join(', ');
+                case ROW.AI:
+                    return includeInstructions ? 'yes' : 'no';
+                case ROW.DEMAND:
+                    return userDemand || '(empty)';
+                case ROW.FORMAT:
+                    if (outputFormat === 'tagged') return 'Tagged replacements';
+                    if (outputFormat === 'both') return 'Both';
+                    return 'Full files';
+                case ROW.SAVE:
+                    return saveName || '(empty)';
+                default:
+                    return '';
+            }
+        };
+
+        // Human-readable label for a row.
+        const rowLabelText = (row) => {
+            switch (row) {
+                case ROW.PARSE: return 'Parse JS files with CodeParser?';
+                case ROW.PARSE_FILES: return '  Which files to parse?';
+                case ROW.REF: return 'Mark files as reference-only?';
+                case ROW.REF_FILES: return '  Which files are reference-only?';
+                case ROW.AI: return 'Add AI instructions?';
+                case ROW.DEMAND: return '  AI request/demand:';
+                case ROW.FORMAT: return '  Output format:';
+                case ROW.SAVE: return 'Save session as (empty to skip):';
+                default: return '';
+            }
+        };
+
+        // Render the entire wizard page with the focused row highlighted.
+        const renderWizardPage = (focusedRow) => {
+            clearScreen();
+
+            console.log(`${BOLD}${GREEN}=== GENERATE STRUCT ===${RESET}`);
+            console.log(`${BOLD}${BLUE}Step-by-step wizard${RESET}  ${MAGENTA}(← Left Arrow = back one step, Enter = confirm)${RESET}`);
+            console.log('─'.repeat(process.stdout.columns || 80));
+            console.log(`${BOLD}Selected:${RESET} ${selectedFiles.size} file(s) | ${BOLD}Tokens:${RESET} ${formatNumber(totalTokens)}`);
+            console.log('─'.repeat(process.stdout.columns || 80));
+
+            const rows = visibleRows();
+
+            // Compute the index of the focused row so we can color it.
+            const focusedIdx = rows.indexOf(focusedRow);
+
+            rows.forEach((row, idx) => {
+                const label = rowLabelText(row);
+                const value = rowValueText(row);
+
+                // Rows before focus are "done", rows after are "future".
+                let statusIcon;
+                let statusColor;
+                if (idx < focusedIdx) {
+                    statusIcon = '✔';
+                    statusColor = GREEN;
+                } else if (idx === focusedIdx) {
+                    statusIcon = '▶';
+                    statusColor = YELLOW;
+                } else {
+                    statusIcon = '·';
+                    statusColor = MAGENTA;
+                }
+
+                const line = `${statusColor}[${statusIcon}]${RESET} ${label} ${BOLD}${value}${RESET}`;
+
+                if (idx === focusedIdx) {
+                    console.log(`${REVERSE}${line}${RESET}`);
+                } else if (idx < focusedIdx) {
+                    console.log(line);
+                } else {
+                    // Dim future rows a bit (use plain text, color only icon).
+                    console.log(`${line}`);
+                }
+            });
+
+            console.log('─'.repeat(process.stdout.columns || 80));
+
+            if (focusedIdx === 0) {
+                console.log(`${MAGENTA}At the first step. Left Arrow cancels generate and returns to file selection.${RESET}`);
+            }
+        };
+
+        // Main loop - drives the one-page wizard.
+        // `currentRow` is the row currently being edited.
+        // A special value of `null` means the wizard is done / exiting.
+        let currentRow = jsFiles.length > 0 ? ROW.PARSE : ROW.REF;
+        let exitGenerate = false;
+        let generated = false;
+
+        while (!exitGenerate && !generated) {
+            renderWizardPage(currentRow);
+
+            // Show contextual hints for the row about to be edited.
+            if (currentRow === ROW.PARSE_FILES) {
                 console.log(`\n${BOLD}JavaScript files available for parsing:${RESET}`);
                 jsFiles.forEach((file, idx) => {
                     const alreadyParsed = parsedFiles.has(file) ? ' (already parsed)' : '';
                     console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyParsed}`);
                 });
-                
-                const fileChoice = await askQuestion(`\nWhich files? (all | 1,3,5 | 2-4 | none):`);
-                
-                if (fileChoice.toLowerCase() !== 'none' && fileChoice.trim() !== '') {
-                    let filesToParse = [];
-                    
-                    if (fileChoice.toLowerCase() === 'all') {
-                        filesToParse = jsFiles;
-                    } else {
-                        const indexes = parseIndexes(fileChoice, jsFiles.length);
-                        filesToParse = indexes.map(idx => jsFiles[idx]);
+            } else if (currentRow === ROW.REF_FILES) {
+                console.log(`\n${BOLD}Selected files:${RESET}`);
+                const allSelected = [...selectedFiles];
+                allSelected.forEach((file, idx) => {
+                    const alreadyRef = referenceOnlyFiles.has(file) ? ' (already marked)' : '';
+                    console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyRef}`);
+                });
+            } else if (currentRow === ROW.FORMAT) {
+                console.log(`\n  ${BOLD}1${RESET} = Full files   ${BOLD}2${RESET} = Tagged replacements   ${BOLD}3${RESET} = Both`);
+                if (parsedFiles.size > 0) {
+                    console.log(`  ${YELLOW}💡 You have parsed files - option 2 (Tagged) works better.${RESET}`);
+                }
+            }
+
+            // Ask this row's question (single-line, ← = back).
+            let res;
+
+            switch (currentRow) {
+                case ROW.PARSE: {
+                    res = await askStepWithBack(
+                        `${BOLD}Parse JS files with CodeParser? (y/n):${RESET}`,
+                        parseChoice === 'yes' ? 'y' : 'n'
+                    );
+                    if (res.type === 'back') { exitGenerate = true; break; }
+
+                    const a = res.value.toLowerCase();
+                    parseChoice = (a === 'y' || a === 'yes') ? 'yes' : 'no';
+                    if (parseChoice === 'no') {
+                        filesToParse = [];
+                        undoRowState(ROW.PARSE_FILES);
                     }
-                    
+                    currentRow = nextRow(ROW.PARSE);
+                    break;
+                }
+
+                case ROW.PARSE_FILES: {
+                    res = await askStepWithBack(
+                        `${BOLD}Which files? (all | 1,3,5 | 2-4 | none):${RESET}`,
+                        filesToParse.length === 0 ? 'none' : filesToParse.map(f => jsFiles.indexOf(f) + 1).join(',')
+                    );
+                    if (res.type === 'back') {
+                        undoRowState(ROW.PARSE_FILES);
+                        currentRow = prevRow(ROW.PARSE_FILES);
+                        break;
+                    }
+
+                    const a = res.value.toLowerCase();
+                    if (a === 'none' || a === '') {
+                        filesToParse = [];
+                    } else if (a === 'all') {
+                        filesToParse = [...jsFiles];
+                    } else {
+                        const indexes = parseIndexes(res.value, jsFiles.length);
+                        filesToParse = indexes.map(i => jsFiles[i]);
+                    }
+
+                    // Run the parser NOW for each chosen file (this row's action).
+                    // Because undoRowState(ROW.PARSE_FILES) is called when we
+                    // step back OR before re-applying, this remains idempotent.
                     for (const filePath of filesToParse) {
+                        // Skip files already parsed in THIS session (avoids
+                        // re-opening the menu if the user just presses Enter
+                        // again after tweaking the index list).
+                        if (sessionParsedFiles.has(filePath) && parsedFiles.has(filePath)) continue;
+
                         console.log(`\n${YELLOW}${'='.repeat(50)}${RESET}`);
                         console.log(`${YELLOW}=== Parsing: ${path.basename(filePath)} ===${RESET}`);
                         console.log(`${YELLOW}${'='.repeat(50)}${RESET}`);
-                        
+
                         const parseResult = await runParserMenu(filePath);
-                        
+
                         if (parseResult) {
                             const originalContent = await fs.readFile(filePath, 'utf8');
                             parsedFiles.set(filePath, {
@@ -1824,104 +2141,188 @@ async function interactiveMode() {
                                 stats: parseResult.stats,
                                 notes: parseResult.notes,
                                 validation: parseResult.validation,
-                                // Persisted so the saved session can re-parse
-                                // against the LATEST disk content on load.
-                                selection: parseResult.selection
+                                selection: parseResult.selection,
                             });
+                            sessionParsedFiles.add(filePath);
                             console.log(`\n${GREEN}✓ ${path.basename(filePath)} parsed successfully${RESET}`);
                         }
                     }
+
+                    currentRow = nextRow(ROW.PARSE_FILES);
+                    break;
+                }
+
+                case ROW.REF: {
+                    res = await askStepWithBack(
+                        `${BOLD}Mark files as reference-only? (y/n):${RESET}`,
+                        refChoice === 'yes' ? 'y' : 'n'
+                    );
+                    if (res.type === 'back') {
+                        // Leaving REF undoes any reference-only marks it created.
+                        undoRowState(ROW.REF_FILES);
+                        const prev = prevRow(ROW.REF);
+                        if (prev === null) { exitGenerate = true; break; }
+                        currentRow = prev;
+                        break;
+                    }
+
+                    const a = res.value.toLowerCase();
+                    refChoice = (a === 'y' || a === 'yes') ? 'yes' : 'no';
+                    if (refChoice === 'no') {
+                        filesToMarkRef = [];
+                        undoRowState(ROW.REF_FILES);
+                    }
+                    currentRow = nextRow(ROW.REF);
+                    break;
+                }
+
+                case ROW.REF_FILES: {
+                    res = await askStepWithBack(
+                        `${BOLD}Which files reference-only? (all | 1,3,5 | 2-4 | none):${RESET}`,
+                        filesToMarkRef.length === 0 ? 'none' : filesToMarkRef.map(f => [...selectedFiles].indexOf(f) + 1).join(',')
+                    );
+                    if (res.type === 'back') {
+                        undoRowState(ROW.REF_FILES);
+                        currentRow = prevRow(ROW.REF_FILES);
+                        break;
+                    }
+
+                    const a = res.value.toLowerCase();
+                    const allSelected = [...selectedFiles];
+                    if (a === 'none' || a === '') {
+                        filesToMarkRef = [];
+                    } else if (a === 'all') {
+                        filesToMarkRef = [...allSelected];
+                    } else {
+                        const indexes = parseIndexes(res.value, allSelected.length);
+                        filesToMarkRef = indexes.map(i => allSelected[i]);
+                    }
+
+                    // Apply marks for this row's choice. Undo first so that
+                    // pressing Enter again after editing the list is clean.
+                    undoRowState(ROW.REF_FILES);
+                    for (const filePath of filesToMarkRef) {
+                        referenceOnlyFiles.add(filePath);
+                        sessionRefFiles.add(filePath);
+                    }
+                    if (filesToMarkRef.length > 0) {
+                        console.log(`\n${GREEN}Marked ${filesToMarkRef.length} file(s) as reference-only.${RESET}`);
+                    }
+
+                    currentRow = nextRow(ROW.REF_FILES);
+                    break;
+                }
+
+                case ROW.AI: {
+                    res = await askStepWithBack(
+                        `${BOLD}Add AI instructions? (y/n):${RESET}`,
+                        includeInstructions ? 'y' : 'n'
+                    );
+                    if (res.type === 'back') {
+                        // Stepping back from AI lands on the previous visible row.
+                        const prev = prevRow(ROW.AI);
+                        if (prev === null) { exitGenerate = true; break; }
+                        currentRow = prev;
+                        break;
+                    }
+
+                    const a = res.value.toLowerCase();
+                    includeInstructions = (a === 'y' || a === 'yes');
+                    if (!includeInstructions) {
+                        userDemand = '';
+                        outputFormat = 'full';
+                    }
+                    currentRow = nextRow(ROW.AI);
+                    break;
+                }
+
+                case ROW.DEMAND: {
+                    res = await askStepWithBack(
+                        `${BOLD}AI request/demand:${RESET}`,
+                        userDemand
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.DEMAND);
+                        break;
+                    }
+                    userDemand = res.value;
+                    currentRow = nextRow(ROW.DEMAND);
+                    break;
+                }
+
+                case ROW.FORMAT: {
+                    const currentFormatValue = outputFormat === 'tagged' ? '2' : outputFormat === 'both' ? '3' : '1';
+                    res = await askStepWithBack(
+                        `${BOLD}Output format (1/2/3):${RESET}`,
+                        currentFormatValue
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.FORMAT);
+                        break;
+                    }
+
+                    if (res.value === '2') outputFormat = 'tagged';
+                    else if (res.value === '3') outputFormat = 'both';
+                    else outputFormat = 'full';
+
+                    currentRow = nextRow(ROW.FORMAT);
+                    break;
+                }
+
+                case ROW.SAVE: {
+                    res = await askStepWithBack(
+                        `${BOLD}Save session as (empty to skip):${RESET}`,
+                        saveName
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.SAVE);
+                        break;
+                    }
+                    saveName = res.value;
+
+                    // Now generate the struct file using the collected state.
+                    console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
+
+                    await generateStruct([...selectedFiles], 'struct', {
+                        includeInstructions,
+                        userDemand,
+                        outputFormat,
+                        parsedFiles,
+                        referenceOnlyFiles,
+                    });
+
+                    if (saveName) {
+                        // Serialize only the parser SELECTIONS - the actual parsed
+                        // content is regenerated from disk when the save is loaded,
+                        // so edits made to the files afterwards are picked up.
+                        const parsedState = {};
+                        for (const [filePath, info] of parsedFiles.entries()) {
+                            parsedState[filePath] = {
+                                selection: info.selection || null,
+                            };
+                        }
+
+                        await saveState({
+                            version: 1,
+                            files: [...selectedFiles],
+                            includeInstructions,
+                            userDemand,
+                            outputFormat,
+                            parsed: parsedState,
+                            referenceOnly: [...referenceOnlyFiles],
+                        }, saveName);
+                    }
+
+                    generated = true;
+                    break;
                 }
             }
-        } else {
-            console.log(`\n${YELLOW}No JavaScript files selected - skipping parser option.${RESET}`);
         }
 
-        // STEP 1.5: Ask about reference-only files (NEW)
-        console.log(`\n${YELLOW}${BOLD}=== REFERENCE-ONLY SELECTION ===${RESET}`);
-        const refAnswer = await askQuestion(`Do you want to mark any of the selected files as reference/context only (not to be modified)? (y/n):`);
-        if (refAnswer.toLowerCase() === 'y' || refAnswer.toLowerCase() === 'yes') {
-            console.log(`\n${BOLD}Selected files:${RESET}`);
-            const allSelected = [...selectedFiles];
-            allSelected.forEach((file, idx) => {
-                const alreadyRef = referenceOnlyFiles.has(file) ? ' (already marked)' : '';
-                console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyRef}`);
-            });
-            
-            const refChoice = await askQuestion(`\nWhich files should be reference-only? (all | 1,3,5 | 2-4 | none):`);
-            if (refChoice.toLowerCase() !== 'none' && refChoice.trim() !== '') {
-                let filesToMark = [];
-                
-                if (refChoice.toLowerCase() === 'all') {
-                    filesToMark = allSelected;
-                } else {
-                    const indexes = parseIndexes(refChoice, allSelected.length);
-                    filesToMark = indexes.map(idx => allSelected[idx]);
-                }
-                
-                for (const filePath of filesToMark) {
-                    referenceOnlyFiles.add(filePath);
-                }
-                console.log(`\n${GREEN}Marked ${filesToMark.length} file(s) as reference-only.${RESET}`);
-            }
-        }
-
-        // STEP 2: Ask about AI instructions
-        const includeInstrAnswer = await askQuestion(`\nDo you want to add AI instructions? (y/n):`);
-        const includeInstructions = includeInstrAnswer.toLowerCase() === 'y' || includeInstrAnswer.toLowerCase() === 'yes';
-
-        let userDemand = '';
-        let outputFormat = 'full';
-
-        if (includeInstructions) {
-            userDemand = await askQuestion('Enter your request/demand for the AI (single line):');
-            const formatAnswer = await askQuestion('Output format - (1) Full files, (2) Tagged replacements, (3) Both:');
-            if (formatAnswer === '2') {
-                outputFormat = 'tagged';
-            } else if (formatAnswer === '3') {
-                outputFormat = 'both';
-            } else {
-                outputFormat = 'full';
-            }
-            
-            if (parsedFiles.size > 0 && outputFormat === 'full') {
-                console.log(`\n${YELLOW}💡 Tip: You have parsed files. Tagged format (option 2) works better${RESET}`);
-                console.log(`${YELLOW}   because the parsed content is a filtered subset of the actual file.${RESET}`);
-            }
-        }
-
-        // STEP 3: Generate the struct file with options (including referenceOnlyFiles)
-        await generateStruct([...selectedFiles], 'struct', {
-            includeInstructions,
-            userDemand,
-            outputFormat,
-            parsedFiles,
-            referenceOnlyFiles,
-        });
-
-        // STEP 4: Ask if save session state (files + options + parsing)
-        const saveName = await askQuestion('\nSave session (files + options + parsing)? Enter a filename (or leave empty to skip):');
-
-        if (saveName) {
-            // Serialize only the parser SELECTIONS - the actual parsed
-            // content is regenerated from disk when the save is loaded,
-            // so edits made to the files afterwards are picked up.
-            const parsedState = {};
-            for (const [filePath, info] of parsedFiles.entries()) {
-                parsedState[filePath] = {
-                    selection: info.selection || null,
-                };
-            }
-
-            await saveState({
-                version: 1,
-                files: [...selectedFiles],
-                includeInstructions,
-                userDemand,
-                outputFormat,
-                parsed: parsedState,
-                referenceOnly: [...referenceOnlyFiles],
-            }, saveName);
+        if (exitGenerate) {
+            // Cascade back out of generate. The caller will restore the
+            // correct key handler and re-render (browser or find results).
+            return;
         }
 
         cleanupAndExit(0);
@@ -2158,12 +2559,15 @@ async function interactiveMode() {
 
                     process.stdin.removeListener('data', onFindKeypress);
 
-                    // handleGenerate() will exit the process when it completes.
+                    // handleGenerate() exits the process on normal completion.
+                    // If the user cascades all the way back from the first
+                    // wizard row, it returns early so we hand control back to
+                    // the caller, which restores the browser view.
                     await handleGenerate();
 
-                    // Safety net - reached only if handleGenerate() returns
-                    // early (e.g. user abort) without exiting.
-                    process.stdin.on('data', onKeypress);
+                    // Resolve so showFindResultsView returns; the caller
+                    // (the `f` handler) re-attaches onKeypress and renders
+                    // the file browser for us.
                     resolve();
                     return;
                 }
@@ -2523,6 +2927,14 @@ async function interactiveMode() {
 
         if (key === 'g' || key === 'G') {
             await handleGenerate();
+            // If we reach here, the user cascaded all the way back from the
+            // first wizard row. handleGenerate() returned early instead of
+            // exiting the process, so restore the browser key handler and
+            // redraw.
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
             return;
         }
 
