@@ -52,6 +52,24 @@ class ModuleBundler {
      * @type {Array<string>}
      */
     this.ignoreImports   = Array.isArray(options.ignoreImports) ? options.ignoreImports : [];
+
+    /**
+     * Optional URL override for the SyAPP.js import in the generated bundle.
+     *
+     * When set, any ignored import whose basename is `SyAPP.js` is emitted
+     * pointing at THIS URL — typically the file:// URL of the SyAPP.js
+     * module that is currently executing `node SyAPP.js --pack` — instead
+     * of the path resolved relative to the importing file.
+     *
+     * This makes every packed bundle import the SAME global SyAPP.js that
+     * produced it, regardless of where the user's source file (or any of
+     * its dependencies) happened to keep its own copy of SyAPP.js.
+     *
+     * @type {string|null}
+     */
+    this.syappRuntimeUrl = (typeof options.syappRuntimeUrl === 'string' && options.syappRuntimeUrl.length > 0)
+      ? options.syappRuntimeUrl
+      : null;
   }
 
   // ---------- Module type helpers ----------
@@ -84,6 +102,24 @@ class ModuleBundler {
       if (path.basename(resolved) === pattern) return true;
       if (path.basename(modulePath) === pattern) return true;
     }
+    return false;
+  }
+
+  /**
+   * Return true when the given import refers to SyAPP.js.
+   *
+   * Used by `generateBundle` to decide whether to substitute the
+   * file-resolved SyAPP.js path with the global runtime SyAPP.js URL
+   * captured by `syappRuntimeUrl`.
+   *
+   * @param {string} modulePath   - Raw import specifier (e.g. "./SyAPP.js")
+   * @param {string} resolvedPath - Absolute resolved path
+   * @returns {boolean}
+   * @private
+   */
+  _isSyappImport(modulePath, resolvedPath) {
+    if (path.basename(String(modulePath || '')) === 'SyAPP.js') return true;
+    if (resolvedPath && path.basename(String(resolvedPath)) === 'SyAPP.js') return true;
     return false;
   }
 
@@ -592,9 +628,18 @@ class ModuleBundler {
         const absResolved = this.isNativeModule(imp.modulePath)
           ? imp.modulePath
           : this.resolveModulePath(imp.modulePath, module.path);
-        const sourceUrl = this.isNativeModule(imp.modulePath)
-          ? imp.modulePath
-          : url.pathToFileURL(absResolved).href;
+        let sourceUrl;
+        if (this.isNativeModule(imp.modulePath)) {
+          sourceUrl = imp.modulePath;
+        } else if (this.syappRuntimeUrl && this._isSyappImport(imp.modulePath, absResolved)) {
+          // Use the runtime SyAPP.js URL (the one currently executing
+          // `node SyAPP.js --pack`) instead of the path resolved relative
+          // to the importing file. Every packed bundle therefore imports
+          // the SAME global SyAPP.js that produced it.
+          sourceUrl = this.syappRuntimeUrl;
+        } else {
+          sourceUrl = url.pathToFileURL(absResolved).href;
+        }
 
         if (imp.type === 'side-effect') {
           ignoredSideEffects.add(sourceUrl);
@@ -29566,7 +29611,13 @@ this.HUD = new TerminalHUD({
 
     const bundler = new ModuleBundler(filePath, {
       debug: options.debug === true,
-      ignoreImports
+      ignoreImports,
+      // Pass the file:// URL of the SyAPP.js that is currently running
+      // this `--pack` command. The bundler uses it to make every packed
+      // bundle import the SAME global SyAPP.js that produced it, instead
+      // of resolving the import relative to the user's source file (which
+      // may point at a stale local copy of SyAPP.js).
+      syappRuntimeUrl: options.syappRuntimeUrl || import.meta.url
     });
 
     bundler.processModule(bundler.entryFile);
