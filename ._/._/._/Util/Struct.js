@@ -646,6 +646,24 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
 `;
             structContent += `portions are shown below.\n
 `;
+            structContent += `CRITICAL RULE - SURGICAL REPLACEMENTS (DO NOT CROSS CONTAINERS):\n`;
+            structContent += `The parsed content below is a FILTERED/CUT view of the original file, so it is
+`;
+            structContent += `NOT contiguous with the real file on disk. Every replacement MUST stay inside a
+`;
+            structContent += `single main class / interface / enum:\n`;
+            structContent += `  - A single [ORIGINAL-START]/[/ORIGINAL-END] block must NEVER start inside one
+`;
+            structContent += `    class/interface/enum and end inside another.\n`;
+            structContent += `  - NEVER include a container's closing brace together with the next container's opening.\n`;
+            structContent += `  - If a change touches multiple classes/interfaces, emit a SEPARATE
+`;
+            structContent += `    [NEW-REPLACE-START] block for EACH container (and per member when possible).\n`;
+            structContent += `  - Keep the ORIGINAL block as small and as unique as possible.\n`;
+            structContent += `This prevents a wide replacement from cutting or merging unrelated
+`;
+            structContent += `classes/interfaces in the actual (unfiltered) file.\n
+`;
             for (const [filePath, info] of parsedFiles.entries()) {
                 structContent += `  PARSED FILE: ${filePath}\n`;
                 structContent += `  Original size: ${formatNumber(info.originalSize)} bytes | Parsed size: ${formatNumber(info.parsedSize)} bytes
