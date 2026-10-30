@@ -21478,7 +21478,30 @@ function levenshteinDistance(str1, str2) {
               try {
                 // Enter the remote stream. Ctrl+C in the remote pops
                 // one layer / returns here. Ctrl+B exits to local.
-                await this._syappInstance._runRemoteSession(bg.port, 'localhost');
+                //
+                // NESTED-EMB FIX — _runRemoteSession NEVER rejects.
+                // It resolves with either `null` (clean close) or an
+                // Error. The previous code only handled rejections via
+                // `catch`, so a stream that ended with an error (e.g.
+                // a grandchild on Alpine whose first frame never
+                // reached the parent because its HUD was still booting,
+                // or whose /stream connection dropped before data
+                // arrived) was SILENTLY swallowed: `state.error` stayed
+                // null, `finish()` restored the parent view, and the
+                // user saw the parent menu again after clicking Enter
+                // Func — the exact "cannot enter 2nd layer" symptom
+                // reported on Alpine for nested this.Emb() chains.
+                // Ubuntu happened to be fast enough that the first
+                // frame always arrived, hiding the bug.
+                //
+                // Capture and inspect the RESOLVED value so a stream
+                // failure surfaces as a user-visible error instead of
+                // a silent return to the parent view.
+                const __embStreamError = await this._syappInstance._runRemoteSession(bg.port, 'localhost');
+                if (__embStreamError) {
+                  state.error = `Remote session ended: ${__embStreamError.message || __embStreamError}`;
+                  this.Storages.Set(id, storageKey, state);
+                }
               } catch (e) {
                 state.error = `Remote session error: ${e.message || e}`;
                 this.Storages.Set(id, storageKey, state);
@@ -34975,13 +34998,46 @@ function _startStreamingServer(syapp, port, host) {
       // Ubuntu in the rare case where the host happens to be a
       // --server. Redraw the CURRENT menu in place instead — no
       // LoadScreen, no rebuild loop, no unbounded button growth.
+      // NESTED-EMB FIX — RETRY THE INITIAL REDRAW.
+      // ------------------------------------------------------------
+      // In the nested this.Emb() chain (main → child → grandchild …),
+      // the caller (e.g. the child) connects to our /stream almost
+      // immediately after spawning us. On Alpine the grandchild's
+      // initial LoadScreen can take longer than 100 ms — especially
+      // with several nesting levels, because every layer adds its own
+      // boot cost, and Alpine (no PTY, patched console.clear, patched
+      // setRawMode) runs measurably slower than Ubuntu. If
+      // `currentMenuState` is not set yet when the single 100 ms timer
+      // fires, `renderMenu()` is skipped and the caller receives NO
+      // bytes at all. Its `_runRemoteSession` then sits waiting on an
+      // empty stream, and the user sees the parent view with no error
+      // — the "cannot enter 2nd layer" symptom.
+      //
+      // We now retry the initial render until `currentMenuState`
+      // becomes available (or until a hard cap of ~5 s). Each retry
+      // only fires when the state is genuinely not ready yet, so a
+      // healthy Ubuntu host (where 100 ms is more than enough) sees
+      // EXACTLY one render, identical to the previous behaviour.
       setTimeout(() => {
-        try {
-          if (syapp && syapp.HUD && syapp.HUD.currentMenuState &&
-              typeof syapp.HUD.currentMenuState.renderMenu === 'function') {
-            syapp.HUD.currentMenuState.renderMenu();
+        const __embTryRenderMenu = () => {
+          try {
+            if (syapp && syapp.HUD && syapp.HUD.currentMenuState &&
+                typeof syapp.HUD.currentMenuState.renderMenu === 'function') {
+              syapp.HUD.currentMenuState.renderMenu();
+              return true;
+            }
+          } catch (_) {}
+          return false;
+        };
+        if (__embTryRenderMenu()) return;
+        let __embAttempts = 0;
+        const __embRetry = setInterval(() => {
+          __embAttempts++;
+          if (__embTryRenderMenu() || __embAttempts >= 25) {
+            try { clearInterval(__embRetry); } catch (_) {}
           }
-        } catch (_) {}
+        }, 200);
+        try { if (__embRetry.unref) __embRetry.unref(); } catch (_) {}
       }, 100)
 
       return
