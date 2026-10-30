@@ -23703,7 +23703,21 @@ function levenshteinDistance(str1, str2) {
           }
 
           if (!ready) {
-            this.Alert(parentId, `⚠️ Background started (pid ${entry.pid} · :${port}) — waiting for readiness`, { duration: 3000 });
+            // DIAGNOSTIC — read the child's log tail so a failure is
+            // actionable instead of a silent "waiting for readiness".
+            let _logTail = '';
+            try {
+              if (entry.log && fs.existsSync(entry.log)) {
+                const _logContent = fs.readFileSync(entry.log, 'utf8');
+                const _lines = _logContent.split('\n').filter(l => l.trim());
+                const _errLines = _lines.filter(l => /error|throw|cannot|not defined|fail|syntax|refused|econnrefused/i.test(l));
+                _logTail = (_errLines.length > 0 ? _errLines : _lines).slice(-6).join('\n');
+              }
+            } catch (_) {}
+            const _msg = _logTail
+              ? `⚠️ Background started (pid ${entry.pid} · :${port}) — not responding. Log tail:\n${_logTail.slice(0, 500)}`
+              : `⚠️ Background started (pid ${entry.pid} · :${port}) — waiting for readiness`;
+            this.Alert(parentId, _msg, { duration: 8000 });
           }
         }
         return state.bgProcess;
@@ -25692,7 +25706,7 @@ class NotFounded extends SyAPP_Func {
  * Error handler
  * @extends SyAPP_Func
  */
-class Error extends SyAPP_Func {
+class ErrorFunc extends SyAPP_Func {
   constructor() {
     super(
       'error',
@@ -27598,6 +27612,31 @@ this.HUD = new TerminalHUD({
     // ------------------------------------------------------------------
     let __resizeDebounce = null;
     stdout.on('resize', () => {
+      // ------------------------------------------------------------------
+      // ALPINE FIX — NEVER rebuild the app from a streaming-server resize.
+      // ------------------------------------------------------------------
+      // On Alpine the child runs without a PTY. When a remote client
+      // connects (via /stream), the streaming server patches
+      // stdout.columns / stdout.rows to the client's size and calls
+      // renderMenu() to redraw in place. If the child were ALSO to run
+      // a full LoadScreen rebuild on the synthetic resize event, the
+      // menu would be re-emitted through the stream, generating another
+      // full screen on the client's terminal — and because that new
+      // screen itself provokes another resize from the client, the
+      // cycle becomes an unbounded rebuild loop. That is the second
+      // mechanism of the "generating more and more buttons" symptom.
+      //
+      // The fix: skip the rebuild entirely when this process is a
+      // --server host. The HUD is already rendering at the patched
+      // dimensions, and the next refresh tick (or keypress) re-renders
+      // at the correct width without a full LoadScreen.
+      //
+      // On Ubuntu this process is not a --server (the parent runs with
+      // a PTY), so the original rebuild behaviour is preserved
+      // byte-for-byte.
+      // ------------------------------------------------------------------
+      if (this._streamServer === true) return;
+
       if (__resizeDebounce) clearTimeout(__resizeDebounce);
       __resizeDebounce = setTimeout(() => {
         __resizeDebounce = null;
@@ -27695,7 +27734,7 @@ this.HUD = new TerminalHUD({
 
     this.ProcessFuncs(this.MainFunc.Func);
     this.ProcessFuncs(NotFounded);
-    this.ProcessFuncs(Error);
+    this.ProcessFuncs(ErrorFunc);
     // Pre-load the SelfBuilder as a built-in func, exactly like NotFounded
     // and Error above. This guarantees `__selfbuilder__` is ALWAYS reachable
     // via this.Emb() / GotoNow / any user code, regardless of which func
@@ -27877,7 +27916,14 @@ this.HUD = new TerminalHUD({
      */
     this._verifyRemote = (port, host) => {
       return new Promise((resolve, reject) => {
-        const baseUrl = `http://${host}:${port}`;
+        // ALPINE FIX — IPv4-only localhost resolution. Alpine's
+        // /etc/hosts lists ::1 before 127.0.0.1, so 'localhost'
+        // resolves to IPv6 while the streaming server binds 0.0.0.0
+        // (IPv4-only). Forcing 127.0.0.1 aligns resolution with bind.
+        // Also uses globalThis.Error explicitly so the local error
+        // Func class (ErrorFunc) can never shadow the runtime Error.
+        const _resolvedHost = (host === 'localhost' || host === '::1') ? '127.0.0.1' : host;
+        const baseUrl = `http://${_resolvedHost}:${port}`;
         let done = false;
         const finish = (err, info) => {
           if (done) return;
@@ -27887,7 +27933,7 @@ this.HUD = new TerminalHUD({
         };
 
         const timer = setTimeout(() => {
-          finish(new Error(`Connection timeout to ${host}:${port}`));
+          finish(new globalThis.Error(`Connection timeout to ${host}:${port}`));
         }, 5000);
         try { if (timer.unref) timer.unref(); } catch (_) {}
 
@@ -27897,7 +27943,7 @@ this.HUD = new TerminalHUD({
             if (res.statusCode !== 200) {
               try { res.resume(); } catch (_) {}
               clearTimeout(timer);
-              finish(new Error(`Remote returned HTTP ${res.statusCode}`));
+              finish(new globalThis.Error(`Remote returned HTTP ${res.statusCode}`));
               return;
             }
             let body = '';
@@ -27909,31 +27955,31 @@ this.HUD = new TerminalHUD({
                 if (info && (info.app === 'SyAPP Streaming Server' || info.status === 'ok')) {
                   finish(null, info);
                 } else {
-                  finish(new Error(`Remote at ${host}:${port} is not a SyAPP streaming server`));
+                  finish(new globalThis.Error(`Remote at ${host}:${port} is not a SyAPP streaming server`));
                 }
               } catch (_) {
-                finish(new Error(`Remote at ${host}:${port} returned invalid response`));
+                finish(new globalThis.Error(`Remote at ${host}:${port} returned invalid response`));
               }
             });
             res.on('error', (e) => {
               clearTimeout(timer);
-              finish(new Error(`Response error: ${e.message}`));
+              finish(new globalThis.Error(`Response error: ${e.message}`));
             });
           });
         } catch (e) {
           clearTimeout(timer);
-          finish(new Error(`Cannot reach ${host}:${port}: ${e.message}`));
+          finish(new globalThis.Error(`Cannot reach ${host}:${port}: ${e.message}`));
           return;
         }
 
         req.on('error', (e) => {
           clearTimeout(timer);
-          finish(new Error(`Cannot reach ${host}:${port}: ${e.message}`));
+          finish(new globalThis.Error(`Cannot reach ${host}:${port}: ${e.message}`));
         });
         req.on('timeout', () => {
           clearTimeout(timer);
           try { req.destroy(); } catch (_) {}
-          finish(new Error(`Connection timeout to ${host}:${port}`));
+          finish(new globalThis.Error(`Connection timeout to ${host}:${port}`));
         });
       });
     };
@@ -27993,7 +28039,9 @@ this.HUD = new TerminalHUD({
      */
     this._runRemoteSession = (port, host) => {
       return new Promise((resolve) => {
-        const baseUrl = `http://${host}:${port}`;
+        // ALPINE FIX — IPv4-only localhost (same reasoning as _verifyRemote).
+        const _resolvedHost = (host === 'localhost' || host === '::1') ? '127.0.0.1' : host;
+        const baseUrl = `http://${_resolvedHost}:${port}`;
         let done = false;
         let dataHandler = null;
         let resizeHandler = null;
@@ -34919,8 +34967,21 @@ function _startStreamingServer(syapp, port, host) {
 
       // Force a redraw so this client immediately sees the current
       // screen instead of waiting for the next navigation/refresh.
+      //
+      // ALPINE FIX — do NOT emit `stdout.emit('resize')` here. On a
+      // --server host that event is now ignored anyway (see the
+      // _streamServer guard in the SyAPP constructor), so emitting it
+      // would be a no-op on Alpine AND could still trigger a rebuild on
+      // Ubuntu in the rare case where the host happens to be a
+      // --server. Redraw the CURRENT menu in place instead — no
+      // LoadScreen, no rebuild loop, no unbounded button growth.
       setTimeout(() => {
-        try { stdout.emit('resize') } catch (_) {}
+        try {
+          if (syapp && syapp.HUD && syapp.HUD.currentMenuState &&
+              typeof syapp.HUD.currentMenuState.renderMenu === 'function') {
+            syapp.HUD.currentMenuState.renderMenu();
+          }
+        } catch (_) {}
       }, 100)
 
       return
@@ -35403,6 +35464,81 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     // so --server works uniformly for the SelfBuilder, JSON viewer,
     // save loader and user-file loader paths.
     const _bootApp = (FuncClass, extraConfig = {}) => {
+      // ------------------------------------------------------------------
+      // ALPINE FIX (part 1) — patch stdin.setRawMode for --server children.
+      // ------------------------------------------------------------------
+      // --server children are spawned with stdio:'ignore', so stdin is
+      // NOT a TTY. HUD.setupMenuState() calls stdin.setRawMode(true),
+      // which throws on non-TTY streams. That throw propagates out of
+      // displayMenu() → LoadScreen catch → LoadScreen('error') →
+      // displayMenu() → throws → … an infinite microtask loop that
+      // starves the event loop and makes /info time out.
+      //
+      // On Ubuntu the child runs under `script -q -c …` (real PTY) so
+      // stdin IS a TTY → original setRawMode runs → behaviour unchanged.
+      // On Alpine we no-op when stdin is not a TTY → event loop stays
+      // responsive.
+      // ------------------------------------------------------------------
+      if (_streamMode === 'server') {
+        try {
+          const _origSRM = (typeof stdin.setRawMode === 'function') ? stdin.setRawMode : null;
+          const _newSRM = function (mode) {
+            try {
+              if (_origSRM && stdin.isTTY) return _origSRM.call(stdin, mode);
+            } catch (_) {}
+            return this;
+          };
+          try {
+            Object.defineProperty(stdin, 'setRawMode', {
+              configurable: true,
+              writable: true,
+              value: _newSRM
+            });
+          } catch (_) {
+            try { stdin.setRawMode = _newSRM; } catch (_) {}
+          }
+        } catch (_) {}
+      }
+
+      // ------------------------------------------------------------------
+      // ALPINE FIX (part 2 — THE FLOOD FIX) — patch console.clear().
+      // ------------------------------------------------------------------
+      // Node's console.clear() is a NO-OP when stdout.isTTY is false:
+      //
+      //   clear() {
+      //     if (this._stdout.isTTY) {
+      //       this[kWriteToConsole]('\x1b[2J\x1b[0f', 'clear');
+      //     }
+      //   }
+      //
+      // On Ubuntu the child runs under a PTY, stdout.isTTY is true, and
+      // each HUD renderMenu() clears the screen before redrawing — so
+      // the visible screen always shows exactly ONE menu.
+      //
+      // On Alpine the child runs with stdout redirected to a log file,
+      // stdout.isTTY is false, and console.clear() does literally
+      // nothing. Every renderMenu() (once per refresh tick — 2/sec —
+      // plus every input-driven rebuild) APPENDS a fresh full menu on
+      // top of the previous one. Within a few seconds the visible
+      // screen is stacked with dozens of duplicate button rows. That is
+      // the "generating more and more buttons without stop" symptom,
+      // and it is also why the bottom hint row + path tree get visually
+      // overwritten — the terminal scrollback is pushing them down.
+      //
+      // The patch below restores the correct behaviour on Alpine by
+      // writing the exact same escape sequence console.clear() would
+      // have written if stdout had been a TTY. On Ubuntu the branch is
+      // skipped entirely (`stdout.isTTY` is true) so behaviour is
+      // byte-for-byte identical.
+      // ------------------------------------------------------------------
+      if (_streamMode === 'server' && !stdout.isTTY) {
+        try {
+          console.clear = function () {
+            try { stdout.write('\x1b[2J\x1b[0f'); } catch (_) {}
+          };
+        } catch (_) {}
+      }
+
       const app = new SyAPP(FuncClass, extraConfig)
       _installCtrlC(app)
       if (_streamMode === 'server') {
