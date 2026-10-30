@@ -600,7 +600,7 @@ async function collectImportedFiles(filePath, maxDepth, visited = new Set()) {
 // ============================================================
 //  Generate struct file from a list of absolute paths
 // ============================================================
-async function generateStruct(filePaths, outputFileName = 'struct', options = {}) {
+async function generateStruct(filePaths, outputFileName = 'struct.txt', options = {}) {
     const {
         includeInstructions = false,
         userDemand = '',
@@ -1018,7 +1018,7 @@ async function regenerateFromState(state) {
         }
     }
 
-    await generateStruct(existingFiles, 'struct', {
+    await generateStruct(existingFiles, 'struct.txt', {
         includeInstructions,
         userDemand,
         outputFormat,
@@ -2781,7 +2781,7 @@ async function interactiveMode() {
                     // Now generate the struct file using the collected state.
                     console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
 
-                    await generateStruct([...selectedFiles], 'struct', {
+                    await generateStruct([...selectedFiles], 'struct.txt', {
                         includeInstructions,
                         userDemand,
                         outputFormat,
@@ -3068,7 +3068,7 @@ async function interactiveMode() {
                     console.log(`Parsing:         skipped (default)`);
                     console.log(`Reference-only:  none (default)\n`);
 
-                    await generateStruct([...selectedFiles], 'struct', {
+                    await generateStruct([...selectedFiles], 'struct.txt', {
                         includeInstructions: true,
                         userDemand: '',
                         outputFormat: 'tagged',
@@ -3133,7 +3133,7 @@ async function interactiveMode() {
 
                     console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
 
-                    await generateStruct([...selectedFiles], 'struct', {
+                    await generateStruct([...selectedFiles], 'struct.txt', {
                         includeInstructions: true,
                         userDemand: userDemand.trim(),
                         outputFormat: 'tagged',
@@ -3666,7 +3666,7 @@ async function interactiveMode() {
             console.log(`Parsing:         skipped (default)`);
             console.log(`Reference-only:  none (default)\n`);
 
-            await generateStruct([...selectedFiles], 'struct', {
+            await generateStruct([...selectedFiles], 'struct.txt', {
                 includeInstructions: true,
                 userDemand: '',
                 outputFormat: 'tagged',
@@ -3733,7 +3733,7 @@ async function interactiveMode() {
             console.log(`Reference-only:  none
 `);
 
-            await generateStruct([...selectedFiles], 'struct', {
+            await generateStruct([...selectedFiles], 'struct.txt', {
                 includeInstructions: true,
                 userDemand: userDemand.trim(),
                 outputFormat: 'tagged',
