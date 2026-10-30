@@ -116,7 +116,7 @@ function openTextEditor(initialText = '', titleText = 'USER REQUEST') {
             out.push(`${BOLD}${GREEN}=== ${titleText} (editor) ===${RESET}` + CRLF);
             out.push(
                 `${BOLD}Line ${row + 1}/${lines.length}  Col ${col + 1}${RESET}  ` +
-                `${MAGENTA}Ctrl+S${RESET} save & continue   ${MAGENTA}Esc${RESET} cancel` + CRLF
+                `${MAGENTA}Ctrl+X${RESET} save & continue   ${MAGENTA}Esc${RESET} cancel` + CRLF
             );
             out.push(sep + CRLF);
 
@@ -184,7 +184,7 @@ function openTextEditor(initialText = '', titleText = 'USER REQUEST') {
 
         const onData = (key) => {
             if (key === '\x03') { cancel(); return; }
-            if (key === '\x13') { saveValue(); return; }
+            if (key === '\x18') { saveValue(); return; }
             if (key === '\x0f') { saveValue(); return; }
             if (key === '\x01') { col = 0; render(); return; }
             if (key === '\x05') { col = lines[row].length; render(); return; }
@@ -607,6 +607,7 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
         outputFormat = 'full',
         parsedFiles = null,
         referenceOnlyFiles = new Set(),  // NEW: set of paths marked as reference-only
+        deepthinkInstruction = false,    // NEW: opt-in deep-thinking <thinking> instruction
     } = options;
 
     let structContent = '';
@@ -625,6 +626,25 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
         // USER REQUEST now starts on the same line as the label.
         structContent += `USER REQUEST: ${userDemand}\n
 `;
+
+        // DEEP-THINKING INSTRUCTION: only emitted when the user enabled
+        // the "deepthink" step in the customize wizard. Default is OFF.
+        if (deepthinkInstruction) {
+            structContent += `${'-'.repeat(50)}\n`;
+            structContent += `DEEP THINKING INSTRUCTION
+`;
+            structContent += `${'-'.repeat(50)}\n
+`;
+            structContent += `Before you start solving, think EXTREMELY deeply about how to solve the task.\n`;
+            structContent += `Put ALL of your internal reasoning inside the <thinking> ... </thinking> tags.\n`;
+            structContent += `First open the <thinking> tag, think extremely deeply about how to solve it,\n`;
+            structContent += `then close the tag with </thinking> BEFORE you generate the actual response.\n`;
+            structContent += `The <thinking>...</thinking> block must come first, and the real answer
+`;
+            structContent += `must come after the closing </thinking> tag.\n`;
+            structContent += `${'-'.repeat(50)}\n
+`;
+        }
 
         // Reinforce to the AI that the codebase is 100% working and
         // that any regression is unacceptable. Placed BEFORE the path
@@ -901,6 +921,7 @@ async function loadState(saveName) {
                 outputFormat: parsed.outputFormat || 'full',
                 parsed: parsed.parsed && typeof parsed.parsed === 'object' ? parsed.parsed : {},
                 referenceOnly: Array.isArray(parsed.referenceOnly) ? parsed.referenceOnly : [],
+                deepthinkInstruction: !!parsed.deepthinkInstruction,
             };
         }
     } catch {
@@ -920,6 +941,7 @@ async function loadState(saveName) {
         outputFormat: 'full',
         parsed: {},
         referenceOnly: [],
+        deepthinkInstruction: false,
     };
 }
 
@@ -940,6 +962,7 @@ async function regenerateFromState(state) {
         outputFormat = 'full',
         parsed = {},
         referenceOnly = [],
+        deepthinkInstruction = false,
     } = state;
 
     const existingFiles = [];
@@ -1024,6 +1047,7 @@ async function regenerateFromState(state) {
         outputFormat,
         parsedFiles,
         referenceOnlyFiles,
+        deepthinkInstruction,
     });
 }
 
@@ -2367,6 +2391,7 @@ async function interactiveMode() {
             AI: 'ai',
             DEMAND: 'demand',
             FORMAT: 'format',
+            DEEPTHINK: 'deepthink',
             SAVE: 'save',
         };
 
@@ -2378,6 +2403,7 @@ async function interactiveMode() {
         let includeInstructions = true;   // bool (default: yes)
         let userDemand = '';              // string (may be multi-line)
         let outputFormat = 'tagged';      // 'full' | 'tagged' | 'both' | 'codeonly' (default: tagged)
+        let deepthinkInstruction = false; // bool (default: OFF - user must opt in)
         let saveName = '';                // string
 
         // Which rows are currently part of the flow (some are conditional).
@@ -2393,6 +2419,7 @@ async function interactiveMode() {
             if (includeInstructions) {
                 rows.push(ROW.DEMAND);
                 rows.push(ROW.FORMAT);
+                rows.push(ROW.DEEPTHINK);
             }
             rows.push(ROW.SAVE);
             return rows;
@@ -2462,6 +2489,8 @@ async function interactiveMode() {
                     if (outputFormat === 'both') return 'Both';
                     if (outputFormat === 'codeonly') return 'Full code only (no tags)';
                     return 'Full files';
+                case ROW.DEEPTHINK:
+                    return deepthinkInstruction ? 'yes' : 'no';
                 case ROW.SAVE:
                     return saveName || '(empty)';
                 default:
@@ -2479,6 +2508,7 @@ async function interactiveMode() {
                 case ROW.AI: return 'Add AI instructions?';
                 case ROW.DEMAND: return '  AI request/demand:';
                 case ROW.FORMAT: return '  Output format:';
+                case ROW.DEEPTHINK: return '  Add deep-thinking <thinking> instruction?';
                 case ROW.SAVE: return 'Save session as (empty to skip):';
                 default: return '';
             }
@@ -2565,6 +2595,10 @@ async function interactiveMode() {
                 if (parsedFiles.size > 0) {
                     console.log(`  ${YELLOW}💡 You have parsed files - option 2 (Tagged) works better.${RESET}`);
                 }
+            } else if (currentRow === ROW.DEEPTHINK) {
+                console.log(`\n  ${BOLD}When enabled${RESET}, an instruction is added telling the AI to`);
+                console.log(`  think EXTREMELY deeply, wrapping all reasoning in ${MAGENTA}<thinking> ... </thinking>${RESET}`);
+                console.log(`  tags BEFORE generating the actual response. ${YELLOW}Default: no (off).${RESET}`);
             }
 
             // Ask this row's question (single-line, ← = back).
@@ -2728,6 +2762,7 @@ async function interactiveMode() {
                     if (!includeInstructions) {
                         userDemand = '';
                         outputFormat = 'tagged';
+                        deepthinkInstruction = false;
                     }
                     currentRow = nextRow(ROW.AI);
                     break;
@@ -2767,6 +2802,24 @@ async function interactiveMode() {
                     break;
                 }
 
+                case ROW.DEEPTHINK: {
+                    res = await askStepWithBack(
+                        `${BOLD}Add deep-thinking <thinking> instruction? (y/n):${RESET}`,
+                        '',
+                        'n'
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.DEEPTHINK);
+                        break;
+                    }
+
+                    const a = res.value.toLowerCase();
+                    deepthinkInstruction = (a === 'y' || a === 'yes');
+
+                    currentRow = nextRow(ROW.DEEPTHINK);
+                    break;
+                }
+
                 case ROW.SAVE: {
                     res = await askStepWithBack(
                         `${BOLD}Save session as (empty to skip):${RESET}`,
@@ -2787,6 +2840,7 @@ async function interactiveMode() {
                         outputFormat,
                         parsedFiles,
                         referenceOnlyFiles,
+                        deepthinkInstruction,
                     });
 
                     if (saveName) {
@@ -2808,6 +2862,7 @@ async function interactiveMode() {
                             outputFormat,
                             parsed: parsedState,
                             referenceOnly: [...referenceOnlyFiles],
+                            deepthinkInstruction,
                         }, saveName);
                     }
 
