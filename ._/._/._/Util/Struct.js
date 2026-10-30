@@ -1779,7 +1779,7 @@ async function interactiveMode() {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, g gen, D gen-defaults, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, G gen, C customize, R gen+request, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -1912,19 +1912,26 @@ async function interactiveMode() {
     };
 
     // ========================================================
-    //  Generate flow - extracted so both the main menu and the
-    //  find-results view can trigger it with the G key.
+    //  Generate flow (CUSTOMIZE WIZARD) - extracted so both the
+    //  main menu and the find-results view can trigger it with
+    //  the C key.
     // ========================================================
     async function handleGenerate() {
+        // Detach the browser key handler FIRST, even on the early
+        // "no files selected" return path. This prevents a duplicate
+        // listener from being attached when the wizard is invoked
+        // repeatedly without any files selected (listener-accumulation
+        // bug). Removing a non-attached listener is a no-op, so this
+        // is safe when called from the find-results view too.
+        process.stdin.removeListener('data', onKeypress);
+
         if (selectedFiles.size === 0) {
             console.log('\nNo files selected.');
             render();
             return;
         }
 
-        // Temporarily disable raw mode for interactive prompts
-        // REMOVE the keypress listener but DO NOT pause stdin
-        process.stdin.removeListener('data', onKeypress);
+        // Temporarily disable raw mode for interactive prompts.
         process.stdin.setRawMode(false);
 
         // ============================================================
@@ -2435,7 +2442,9 @@ async function interactiveMode() {
     //    ] or + or =     -> increase temperature (looser)
     //    a               -> select all currently visible
     //    n               -> unselect all currently visible
-    //    G (or g)        -> proceed to generate (calls handleGenerate)
+    //    G               -> generate directly (defaults, no wizard)
+    //    C               -> enter customize wizard
+    //    R               -> generate asking only for USER REQUEST
     //    B (or Esc)      -> return to the normal browser
     //    Ctrl+C          -> quit
     // ========================================================
@@ -2523,7 +2532,7 @@ async function interactiveMode() {
             console.log(
                 `${BOLD}Keys:${RESET} ↑/↓ move, PgUp/PgDn page, Space toggle, ` +
                 `${YELLOW}[${RESET}/${YELLOW}]${RESET} temp, a all, n none, ` +
-                `${GREEN}G${RESET} generate, ${YELLOW}B${RESET} back`
+                `${GREEN}G${RESET} gen, ${YELLOW}C${RESET} customize, ${MAGENTA}R${RESET} request, ${YELLOW}B${RESET} back`
             );
             console.log('─'.repeat(process.stdout.columns || 80));
 
@@ -2634,8 +2643,37 @@ async function interactiveMode() {
                     return;
                 }
 
-                // ---------- generate ----------
+                // ---------- generate (direct, default values) ----------
                 if (key === 'g' || key === 'G') {
+                    if (selectedFiles.size === 0) {
+                        renderFind(visible);
+                        return;
+                    }
+
+                    process.stdin.removeListener('data', onFindKeypress);
+                    process.stdin.setRawMode(false);
+
+                    console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
+                    console.log(`Selected files:  ${selectedFiles.size}`);
+                    console.log(`AI instructions: yes`);
+                    console.log(`Output format:   Tagged replacements`);
+                    console.log(`Parsing:         skipped (default)`);
+                    console.log(`Reference-only:  none (default)\n`);
+
+                    await generateStruct([...selectedFiles], 'struct', {
+                        includeInstructions: true,
+                        userDemand: '',
+                        outputFormat: 'tagged',
+                        parsedFiles: new Map(),
+                        referenceOnlyFiles: new Set(),
+                    });
+
+                    cleanupAndExit(0);
+                    return;
+                }
+
+                // ---------- customize (full wizard) ----------
+                if (key === 'c' || key === 'C') {
                     if (selectedFiles.size === 0) {
                         renderFind(visible);
                         return;
@@ -2653,6 +2691,48 @@ async function interactiveMode() {
                     // (the `f` handler) re-attaches onKeypress and renders
                     // the file browser for us.
                     resolve();
+                    return;
+                }
+
+                // ---------- generate with USER REQUEST only ----------
+                if (key === 'r' || key === 'R') {
+                    if (selectedFiles.size === 0) {
+                        renderFind(visible);
+                        return;
+                    }
+
+                    process.stdin.removeListener('data', onFindKeypress);
+                    process.stdin.setRawMode(false);
+
+                    console.log(`\n${GREEN}${BOLD}=== GENERATE WITH USER REQUEST ===${RESET}\n`);
+                    console.log(`Selected files:  ${selectedFiles.size}`);
+                    console.log(`AI instructions: yes`);
+                    console.log(`Output format:   Tagged replacements`);
+                    console.log(`Parsing:         skipped`);
+                    console.log(`Reference-only:  none\n`);
+
+                    const userDemand = await askQuestion('Enter USER REQUEST:');
+
+                    if (!userDemand || userDemand.trim() === '') {
+                        console.log(`\n${YELLOW}Empty request - cancelling.${RESET}`);
+                        process.stdin.setRawMode(true);
+                        process.stdin.resume();
+                        process.stdin.on('data', onFindKeypress);
+                        renderFind(visible);
+                        return;
+                    }
+
+                    console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
+
+                    await generateStruct([...selectedFiles], 'struct', {
+                        includeInstructions: true,
+                        userDemand: userDemand.trim(),
+                        outputFormat: 'tagged',
+                        parsedFiles: new Map(),
+                        referenceOnlyFiles: new Set(),
+                    });
+
+                    cleanupAndExit(0);
                     return;
                 }
 
@@ -3154,22 +3234,14 @@ async function interactiveMode() {
         }
 
         if (key === 'g' || key === 'G') {
-            await handleGenerate();
-            // If we reach here, the user cascaded all the way back from the
-            // first wizard row. handleGenerate() returned early instead of
-            // exiting the process, so restore the browser key handler and
-            // redraw.
-            process.stdin.setRawMode(true);
-            process.stdin.resume();
-            process.stdin.on('data', onKeypress);
-            render();
-            return;
-        }
-
-        if (key === 'D') {
-            // NEW: generate the struct directly using the flow's DEFAULT
-            // values - no wizard, no parsing, AI instructions ON, output
-            // format = Tagged replacements. Intended as a fast shortcut.
+            // DEFAULT: generate the struct directly using the flow's
+            // DEFAULT values - no wizard, no parsing, AI instructions ON,
+            // output format = Tagged replacements. This is the old D key
+            // behaviour, now on G.
+            //
+            // Safe with no files selected: just render and return, no
+            // listener is ever detached/re-attached here, so repeated
+            // presses cannot accumulate duplicate listeners.
             if (selectedFiles.size === 0) {
                 render();
                 return;
@@ -3178,7 +3250,7 @@ async function interactiveMode() {
             process.stdin.removeListener('data', onKeypress);
             process.stdin.setRawMode(false);
 
-            console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT (DEFAULT FLOW) ===${RESET}\n`);
+            console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
             console.log(`Selected files:  ${selectedFiles.size}`);
             console.log(`AI instructions: yes`);
             console.log(`Output format:   Tagged replacements`);
@@ -3188,6 +3260,64 @@ async function interactiveMode() {
             await generateStruct([...selectedFiles], 'struct', {
                 includeInstructions: true,
                 userDemand: '',
+                outputFormat: 'tagged',
+                parsedFiles: new Map(),
+                referenceOnlyFiles: new Set(),
+            });
+
+            cleanupAndExit(0);
+            return;
+        }
+
+        if (key === 'c' || key === 'C') {
+            // CUSTOMIZE: enter the full wizard (the old G behaviour).
+            await handleGenerate();
+            // If we reach here, the user cascaded all the way back from the
+            // first wizard row (or the wizard exited early because no files
+            // were selected). handleGenerate() already detached the handler
+            // at its start, so reattach once and redraw.
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
+            return;
+        }
+
+        if (key === 'r' || key === 'R') {
+            // GENERATE + USER REQUEST: skip the entire wizard, only ask
+            // for the USER REQUEST text, then generate with default values
+            // (AI instructions ON, tagged output, no parsing, no ref-only).
+            if (selectedFiles.size === 0) {
+                render();
+                return;
+            }
+
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+
+            console.log(`\n${GREEN}${BOLD}=== GENERATE WITH USER REQUEST ===${RESET}\n`);
+            console.log(`Selected files:  ${selectedFiles.size}`);
+            console.log(`AI instructions: yes`);
+            console.log(`Output format:   Tagged replacements`);
+            console.log(`Parsing:         skipped`);
+            console.log(`Reference-only:  none\n`);
+
+            const userDemand = await askQuestion('Enter USER REQUEST:');
+
+            if (!userDemand || userDemand.trim() === '') {
+                console.log(`\n${YELLOW}Empty request - cancelling.${RESET}`);
+                process.stdin.setRawMode(true);
+                process.stdin.resume();
+                process.stdin.on('data', onKeypress);
+                render();
+                return;
+            }
+
+            console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
+
+            await generateStruct([...selectedFiles], 'struct', {
+                includeInstructions: true,
+                userDemand: userDemand.trim(),
                 outputFormat: 'tagged',
                 parsedFiles: new Map(),
                 referenceOnlyFiles: new Set(),
