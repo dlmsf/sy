@@ -35749,6 +35749,55 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       return;
     }
 
+    // --- `node SyAPP.js clean` : remove every *-pack file in cwd ---
+    //
+    // Removes the bundles produced by `node SyAPP.js --pack <file>` (which
+    // writes `<FuncName>-pack.js`) from the CURRENT WORKING DIRECTORY.
+    // Only regular files are touched — directories are skipped — and each
+    // removal is reported individually so the operator sees exactly what
+    // was deleted. The pattern accepts both `<name>-pack` (literal
+    // `*-pack`) and `<name>-pack.<ext>` (which is what --pack actually
+    // emits), plus the `.pack` / `.pack.<ext>` variants for robustness.
+    if (arg1 === 'clean') {
+      const cleanDir = process.cwd();
+      let entries = [];
+      try {
+        entries = fs.readdirSync(cleanDir);
+      } catch (e) {
+        console.error(ColorText.brightRed(`❌ Cannot read directory: ${cleanDir} — ${e.message}`));
+        process.exit(1);
+      }
+
+      const matches = entries.filter(name => {
+        if (!/-pack(\.|$)/i.test(name) && !/\.pack(\.|$)/i.test(name)) return false;
+        try {
+          return fs.statSync(path.join(cleanDir, name)).isFile();
+        } catch (_) {
+          return false;
+        }
+      });
+
+      if (matches.length === 0) {
+        console.log(ColorText.dim(`Nothing to clean in ${cleanDir}`));
+        return;
+      }
+
+      let removed = 0;
+      for (const name of matches) {
+        const full = path.join(cleanDir, name);
+        try {
+          fs.unlinkSync(full);
+          removed++;
+          console.log(ColorText.dim('  • ') + ColorText.brightGreen('✓') + ' ' + name);
+        } catch (e) {
+          console.error(ColorText.red(`  ✗ ${name}: ${e.message}`));
+        }
+      }
+
+      console.log(ColorText.brightGreen(`\n🧹 Cleaned ${removed}/${matches.length} *-pack file(s) from ${cleanDir}`));
+      return;
+    }
+
     // --- `node SyAPP.js --edit <file>` or `node SyAPP.js <file> --edit` ---
     let editMode = false;
     let editTarget = null;
