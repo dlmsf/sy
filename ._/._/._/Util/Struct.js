@@ -19,6 +19,15 @@ const RED = '\x1b[31m';
 const MAGENTA = '\x1b[35m';
 
 // ============================================================
+//  CR + LF helpers (built at runtime, never written as the
+//  two-character backslash escape sequence in source, so no
+//  text-processing step can ever split a string literal).
+// ============================================================
+const CR = String.fromCharCode(13);
+const LF = String.fromCharCode(10);
+const CRLF = CR + LF;
+
+// ============================================================
 //  Helper: clear screen and move cursor to top-left
 // ============================================================
 function clearScreen() {
@@ -31,6 +40,255 @@ function clearScreen() {
 // ============================================================
 function formatNumber(value) {
     return value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+// ============================================================
+//  ROBUST MULTI-LINE TEXT EDITOR (nano-like)
+//
+//  Pure vanilla Node.js - no external libraries.
+//  Used to capture the USER REQUEST text: multi-line editing,
+//  full arrow-key navigation, Home/End, PgUp/PgDn,
+//  Backspace/Delete, and paste support (including multi-line).
+//
+//  Resolves to:
+//    { type: 'save',   value: <string> }  when the user confirms
+//    { type: 'cancel' }                   when the user cancels
+//
+//  Self-contained: manages raw mode itself and always restores
+//  the previous raw-mode state on exit.
+// ============================================================
+function openTextEditor(initialText = '', titleText = 'USER REQUEST') {
+    return new Promise((resolve) => {
+        const originalRawMode = !!process.stdin.isRaw;
+
+        let lines = String(initialText == null ? '' : initialText).split('\n');
+        if (lines.length === 0) lines = [''];
+
+        let row = lines.length - 1;
+        let col = lines[row].length;
+        let scrollTop = 0;
+        let hScroll = 0;
+
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+        process.stdin.setEncoding('utf8');
+
+        const getSize = () => {
+            const totalRows = process.stdout.rows || 24;
+            const totalCols = process.stdout.columns || 80;
+            const textHeight = Math.max(1, totalRows - 5);
+            return { totalRows, totalCols, textHeight };
+        };
+
+        const clampCursor = () => {
+            if (row < 0) row = 0;
+            if (row > lines.length - 1) row = lines.length - 1;
+            const lineLen = lines[row].length;
+            if (col < 0) col = 0;
+            if (col > lineLen) col = lineLen;
+        };
+
+        const adjustScroll = () => {
+            const { textHeight } = getSize();
+            if (row < scrollTop) scrollTop = row;
+            if (row >= scrollTop + textHeight) scrollTop = row - textHeight + 1;
+            if (scrollTop < 0) scrollTop = 0;
+        };
+
+        const adjustHScroll = () => {
+            const { totalCols } = getSize();
+            if (col < hScroll) hScroll = col;
+            if (col >= hScroll + totalCols) hScroll = col - totalCols + 1;
+            if (hScroll < 0) hScroll = 0;
+        };
+
+        const render = () => {
+            clampCursor();
+            adjustScroll();
+            adjustHScroll();
+
+            const { totalCols, textHeight } = getSize();
+            const sep = '─'.repeat(totalCols);
+            const out = [];
+
+            out.push('\x1b[2J\x1b[H');
+
+            out.push(`${BOLD}${GREEN}=== ${titleText} (editor) ===${RESET}` + CRLF);
+            out.push(
+                `${BOLD}Line ${row + 1}/${lines.length}  Col ${col + 1}${RESET}  ` +
+                `${MAGENTA}Ctrl+S${RESET} save & continue   ${MAGENTA}Esc${RESET} cancel` + CRLF
+            );
+            out.push(sep + CRLF);
+
+            for (let i = 0; i < textHeight; i++) {
+                const lineIdx = scrollTop + i;
+                if (lineIdx < lines.length) {
+                    let text = lines[lineIdx];
+                    if (hScroll > 0) text = text.slice(hScroll);
+                    if (text.length > totalCols) text = text.slice(0, totalCols);
+                    out.push(text + CRLF);
+                } else {
+                    out.push(CRLF);
+                }
+            }
+
+            out.push(sep + CRLF);
+            out.push(
+                `${BOLD}↑↓←→ move  Home/End  PgUp/PgDn  Enter newline  ` +
+                `Backspace/Del  (paste supported)${RESET}`
+            );
+
+            process.stdout.write(out.join(''));
+
+            const screenRow = 4 + (row - scrollTop);
+            const screenCol = (col - hScroll) + 1;
+            process.stdout.write(`\x1b[${screenRow};${screenCol}H`);
+        };
+
+        const cleanupAndResolve = (result) => {
+            process.stdin.removeListener('data', onData);
+            process.stdout.removeListener('resize', onResize);
+            process.stdout.write('\x1b[2J\x1b[H');
+            process.stdin.setRawMode(originalRawMode);
+            resolve(result);
+        };
+
+        const saveValue = () => cleanupAndResolve({ type: 'save', value: lines.join('\n') });
+        const cancel = () => cleanupAndResolve({ type: 'cancel' });
+
+        const onResize = () => { render(); };
+
+        const insertText = (rawText) => {
+            const text = rawText.split(CRLF).join(LF).split(CR).join(LF);
+            if (text.length === 0) return;
+
+            const parts = text.split('\n');
+
+            if (parts.length === 1) {
+                const line = lines[row];
+                lines[row] = line.slice(0, col) + text + line.slice(col);
+                col += text.length;
+                return;
+            }
+
+            const before = lines[row].slice(0, col);
+            const after = lines[row].slice(col);
+            const block = [before + parts[0]];
+            for (let i = 1; i < parts.length - 1; i++) block.push(parts[i]);
+            block.push(parts[parts.length - 1] + after);
+
+            lines.splice(row, 1, ...block);
+            row = row + (block.length - 1);
+            col = parts[parts.length - 1].length;
+        };
+
+        const onData = (key) => {
+            if (key === '\x03') { cancel(); return; }
+            if (key === '\x13') { saveValue(); return; }
+            if (key === '\x0f') { saveValue(); return; }
+            if (key === '\x01') { col = 0; render(); return; }
+            if (key === '\x05') { col = lines[row].length; render(); return; }
+
+            if (key === '\x1b[A' || key === '\x1bOA') {
+                if (row > 0) row--;
+                render(); return;
+            }
+            if (key === '\x1b[B' || key === '\x1bOB') {
+                if (row < lines.length - 1) row++;
+                render(); return;
+            }
+            if (key === '\x1b[C' || key === '\x1bOC') {
+                if (col < lines[row].length) {
+                    col++;
+                } else if (row < lines.length - 1) {
+                    row++;
+                    col = 0;
+                }
+                render(); return;
+            }
+            if (key === '\x1b[D' || key === '\x1bOD') {
+                if (col > 0) {
+                    col--;
+                } else if (row > 0) {
+                    row--;
+                    col = lines[row].length;
+                }
+                render(); return;
+            }
+            if (key === '\x1b[H' || key === '\x1b[1~' || key === '\x1bOH') {
+                col = 0; render(); return;
+            }
+            if (key === '\x1b[F' || key === '\x1b[4~' || key === '\x1bOF') {
+                col = lines[row].length; render(); return;
+            }
+            if (key === '\x1b[5~') {
+                const { textHeight } = getSize();
+                row = Math.max(0, row - textHeight);
+                render(); return;
+            }
+            if (key === '\x1b[6~') {
+                const { textHeight } = getSize();
+                row = Math.min(lines.length - 1, row + textHeight);
+                render(); return;
+            }
+            if (key === '\x1b[3~') {
+                const line = lines[row];
+                if (col < line.length) {
+                    lines[row] = line.slice(0, col) + line.slice(col + 1);
+                } else if (row < lines.length - 1) {
+                    lines[row] = line + lines[row + 1];
+                    lines.splice(row + 1, 1);
+                }
+                render(); return;
+            }
+
+            if (key === '\x1b') { cancel(); return; }
+            if (key.startsWith('\x1b')) { return; }
+
+            if (key === '\r' || key === '\n') {
+                const line = lines[row];
+                const before = line.slice(0, col);
+                const after = line.slice(col);
+                lines[row] = before;
+                lines.splice(row + 1, 0, after);
+                row++;
+                col = 0;
+                render(); return;
+            }
+
+            if (key === '\x7f' || key === '\x08') {
+                if (col > 0) {
+                    const line = lines[row];
+                    lines[row] = line.slice(0, col - 1) + line.slice(col);
+                    col--;
+                } else if (row > 0) {
+                    const prevLen = lines[row - 1].length;
+                    lines[row - 1] = lines[row - 1] + lines[row];
+                    lines.splice(row, 1);
+                    row--;
+                    col = prevLen;
+                }
+                render(); return;
+            }
+
+            let insert = '';
+            for (let i = 0; i < key.length; i++) {
+                const ch = key[i];
+                const code = ch.charCodeAt(0);
+                if (ch === '\t' || ch === '\n' || (code >= 32 && code !== 127)) {
+                    insert += ch;
+                }
+            }
+            if (insert.length === 0) { return; }
+
+            insertText(insert);
+            render();
+        };
+
+        process.stdout.on('resize', onResize);
+        process.stdin.on('data', onData);
+        render();
+    });
 }
 
 // ============================================================
@@ -69,9 +327,12 @@ function generatePathEnforcement(filePaths, outputFormat) {
     
     let enforcement = '';
     enforcement += `${'-'.repeat(50)}\n`;
-    enforcement += `CRITICAL PATH PRESERVATION ENFORCEMENT\n`;
-    enforcement += `${'-'.repeat(50)}\n\n`;
-    enforcement += `The following file paths contain directory names starting with "._":\n\n`;
+    enforcement += `CRITICAL PATH PRESERVATION ENFORCEMENT
+`;
+    enforcement += `${'-'.repeat(50)}\n
+`;
+    enforcement += `The following file paths contain directory names starting with "._":\n
+`;
     
     specialPaths.forEach(filePath => {
         enforcement += `  ACTUAL PATH: ${filePath}\n`;
@@ -83,20 +344,36 @@ function generatePathEnforcement(filePaths, outputFormat) {
     enforcement += `3. "._/" is NOT the same as "./" - they are completely different directories.\n`;
     enforcement += `4. NEVER convert "._/" to "./" or "././" - this will point to a NON-EXISTENT file.\n`;
     enforcement += `5. Copy the path character by character, preserving every "._/" exactly.\n`;
-    enforcement += `6. If you see "/._/._/._/", write "/._/._/._/" - not "/././._/" or any other variation.\n\n`;
+    enforcement += `6. If you see "/._/._/._/", write "/._/._/._/" - not "/././._/" or any other variation.\n
+`;
     
     if (outputFormat === 'tagged' || outputFormat === 'both') {
         enforcement += `SPECIFIC EXAMPLE FOR TAGGED OUTPUT:\n`;
-        enforcement += `  WRONG: PATH='${specialPaths[0].replace(/\._\//g, './')}'  ← THIS WILL FAIL\n`;
-        enforcement += `  CORRECT: PATH='${specialPaths[0]}'  ← THIS IS REQUIRED\n\n`;
-        enforcement += `When generating [CODEREPLACER-START] tags, the PATH attribute must be\n`;
-        enforcement += `copied EXACTLY from the FILE: header. Verify each character before output.\n\n`;
+        enforcement += `  WRONG: PATH='${specialPaths[0].replace(/\._\//g, './')}'  ← THIS WILL FAIL
+`;
+        enforcement += `  CORRECT: PATH='${specialPaths[0]}'  ← THIS IS REQUIRED
+
+`;
+        enforcement += `When generating [CODEREPLACER-START] tags, the PATH attribute must be
+`;
+        enforcement += `copied EXACTLY from the FILE: header. Verify each character before output.\n
+`;
+    } else if (outputFormat === 'codeonly') {
+        enforcement += `SPECIFIC EXAMPLE FOR FULL-CODE OUTPUT:\n`;
+        enforcement += `  WRONG: FILE: ${specialPaths[0].replace(/\._\//g, './')}\n`;
+        enforcement += `  CORRECT: FILE: ${specialPaths[0]}\n
+`;
+        enforcement += `When writing the FILE: header for each full-code block, the path must be
+`;
+        enforcement += `copied EXACTLY from the FILE: header above. Verify each character before output.\n
+`;
     }
     
     enforcement += `VERIFICATION CHECK:\n`;
     enforcement += `Before outputting any path, compare it character by character with the FILE: header.\n`;
     enforcement += `If they don't match exactly, you have made an error and must correct it.\n`;
-    enforcement += `${'-'.repeat(50)}\n\n`;
+    enforcement += `${'-'.repeat(50)}\n
+`;
     
     return enforcement;
 }
@@ -120,53 +397,83 @@ function generateSafetyWarning() {
     warning += `#\n`;
     warning += `#  !!!   CRITICAL WARNING  -  THE CODE IS 100% WORKING   !!!\n`;
     warning += `#\n`;
-    warning += `${rule}\n\n`;
+    warning += `${rule}\n
+`;
 
     warning += `THE EXISTING CODE IN THIS PROJECT IS 100% WORKING AND FULLY FUNCTIONAL.\n`;
-    warning += `Every feature, function, and behavior currently operates correctly, and the\n`;
-    warning += `user depends on it. Breaking or altering this working behavior is NOT\n`;
-    warning += `acceptable under any circumstance.\n\n`;
+    warning += `Every feature, function, and behavior currently operates correctly, and the
+`;
+    warning += `user depends on it. Breaking or altering this working behavior is NOT
+`;
+    warning += `acceptable under any circumstance.\n
+`;
 
-    warning += `BEFORE YOU WRITE ANY SINGLE LINE OF CODE, INTERNALIZE THESE RULES:\n\n`;
+    warning += `BEFORE YOU WRITE ANY SINGLE LINE OF CODE, INTERNALIZE THESE RULES:\n
+`;
 
-    warning += `1. SURGICAL CHANGES ONLY\n`;
+    warning += `1. SURGICAL CHANGES ONLY
+`;
     warning += `   Apply ONLY the changes explicitly requested in the USER REQUEST above.\n`;
-    warning += `   Nothing more. Do not expand scope. Do not "improve" unrelated code.\n\n`;
+    warning += `   Nothing more. Do not expand scope. Do not "improve" unrelated code.\n
+`;
 
-    warning += `2. DO NOT REFACTOR / RENAME / REORGANIZE\n`;
-    warning += `   Do NOT rename variables, functions, parameters, or files. Do NOT\n`;
-    warning += `   reorder imports, functions, or statements "for cleanliness". Do NOT\n`;
-    warning += `   reformat or change whitespace of code you were not asked to touch.\n\n`;
+    warning += `2. DO NOT REFACTOR / RENAME / REORGANIZE
+`;
+    warning += `   Do NOT rename variables, functions, parameters, or files. Do NOT
+`;
+    warning += `   reorder imports, functions, or statements "for cleanliness". Do NOT
+`;
+    warning += `   reformat or change whitespace of code you were not asked to touch.\n
+`;
 
-    warning += `3. DO NOT REMOVE OR "SIMPLIFY" WORKING CODE\n`;
-    warning += `   Any line, branch, function, or check that works today MUST still work\n`;
-    warning += `   after your change. Never delete code because it "looks redundant".\n\n`;
+    warning += `3. DO NOT REMOVE OR "SIMPLIFY" WORKING CODE
+`;
+    warning += `   Any line, branch, function, or check that works today MUST still work
+`;
+    warning += `   after your change. Never delete code because it "looks redundant".\n
+`;
 
-    warning += `4. DO NOT CHANGE EXISTING BEHAVIOR\n`;
+    warning += `4. DO NOT CHANGE EXISTING BEHAVIOR
+`;
     warning += `   Preserve ALL existing: return values, error handling, edge cases,\n`;
-    warning += `   console output, side effects, defaults, and control flow - unless\n`;
-    warning += `   the request explicitly asks to change them.\n\n`;
+    warning += `   console output, side effects, defaults, and control flow - unless
+`;
+    warning += `   the request explicitly asks to change them.\n
+`;
 
-    warning += `5. NO NEW DEPENDENCIES OR ABSTRACTIONS\n`;
-    warning += `   Do NOT add packages, patterns, helpers, or layers the request did not\n`;
-    warning += `   ask for. Do NOT introduce changes nobody requested.\n\n`;
+    warning += `5. NO NEW DEPENDENCIES OR ABSTRACTIONS
+`;
+    warning += `   Do NOT add packages, patterns, helpers, or layers the request did not
+`;
+    warning += `   ask for. Do NOT introduce changes nobody requested.\n
+`;
 
-    warning += `6. PRESERVE PUBLIC INTERFACES\n`;
+    warning += `6. PRESERVE PUBLIC INTERFACES
+`;
     warning += `   Function signatures, exported names, command-line flags, config keys,\n`;
-    warning += `   and any interface used by other files MUST remain compatible.\n\n`;
+    warning += `   and any interface used by other files MUST remain compatible.\n
+`;
 
-    warning += `7. SMALLEST POSSIBLE DIFF\n`;
-    warning += `   If two solutions achieve the requested change, choose the one with the\n`;
-    warning += `   smaller and safer diff. Minimal change = maximum safety.\n\n`;
+    warning += `7. SMALLEST POSSIBLE DIFF
+`;
+    warning += `   If two solutions achieve the requested change, choose the one with the
+`;
+    warning += `   smaller and safer diff. Minimal change = maximum safety.\n
+`;
 
-    warning += `8. WHEN IN DOUBT, DO NOT TOUCH\n`;
+    warning += `8. WHEN IN DOUBT, DO NOT TOUCH
+`;
     warning += `   If you are not 100% certain that a modification is safe AND required,\n`;
-    warning += `   leave the existing code untouched. Never guess-destroy working code.\n\n`;
+    warning += `   leave the existing code untouched. Never guess-destroy working code.\n
+`;
 
-    warning += `A change that "looks cleaner" but alters behavior is a REGRESSION, not\n`;
-    warning += `an improvement. Regressions break working software. That is a FAILURE.\n\n`;
+    warning += `A change that "looks cleaner" but alters behavior is a REGRESSION, not
+`;
+    warning += `an improvement. Regressions break working software. That is a FAILURE.\n
+`;
 
-    warning += `${rule}\n\n`;
+    warning += `${rule}\n
+`;
 
     return warning;
 }
@@ -307,13 +614,17 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
 
     if (includeInstructions) {
         structContent += `${'='.repeat(50)}\n`;
-        structContent += `AI INSTRUCTIONS\n`;
+        structContent += `AI INSTRUCTIONS
+`;
         structContent += `${'='.repeat(50)}\n`;
 
         structContent += `You are an AI assistant helping with code modifications.\n`;
         structContent += `Below are the current contents of the selected files.\n`;
-        structContent += `Your task is to apply the following user request:\n\n`;
-        structContent += `USER REQUEST:\n${userDemand}\n\n`;
+        structContent += `Your task is to apply the following user request:\n
+`;
+        // USER REQUEST now starts on the same line as the label.
+        structContent += `USER REQUEST: ${userDemand}\n
+`;
 
         // Reinforce to the AI that the codebase is 100% working and
         // that any regression is unacceptable. Placed BEFORE the path
@@ -326,51 +637,81 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
 
         if (parsedFiles && parsedFiles.size > 0) {
             structContent += `${'!'.repeat(50)}\n`;
-            structContent += `⚠️  WARNING: PARSED FILES DETECTED\n`;
-            structContent += `${'!'.repeat(50)}\n\n`;
+            structContent += `⚠️  WARNING: PARSED FILES DETECTED
+`;
+            structContent += `${'!'.repeat(50)}\n
+`;
             structContent += `The following files have been PARSED using CodeParser.\n`;
-            structContent += `This means their content has been FILTERED - only selected\n`;
-            structContent += `portions are shown below.\n\n`;
+            structContent += `This means their content has been FILTERED - only selected
+`;
+            structContent += `portions are shown below.\n
+`;
             for (const [filePath, info] of parsedFiles.entries()) {
                 structContent += `  PARSED FILE: ${filePath}\n`;
-                structContent += `  Original size: ${formatNumber(info.originalSize)} bytes | Parsed size: ${formatNumber(info.parsedSize)} bytes\n`;
-                structContent += `  Stats: ${info.stats.containers} containers, ${info.stats.functions} functions, ${info.stats.totalMembers} members\n`;
+                structContent += `  Original size: ${formatNumber(info.originalSize)} bytes | Parsed size: ${formatNumber(info.parsedSize)} bytes
+`;
+                structContent += `  Stats: ${info.stats.containers} containers, ${info.stats.functions} functions, ${info.stats.totalMembers} members
+`;
                 if (info.notes && info.notes.length > 0) {
                     structContent += `  Notes:\n`;
                     info.notes.forEach(note => structContent += `    • ${note}\n`);
                 }
                 structContent += `\n`;
             }
-            structContent += `IMPORTANT: When making replacements in these files, use the\n`;
-            structContent += `[CODEREPLACER] tagged format. The parsed content shown is a\n`;
-            structContent += `FILTERED version - the actual file on disk contains MORE code\n`;
-            structContent += `than what is shown. Replacements must target the EXACT original\n`;
-            structContent += `text in the actual file.\n\n`;
-            structContent += `${'!'.repeat(50)}\n\n`;
+            if (outputFormat === 'codeonly') {
+                structContent += `IMPORTANT: For this task, output FULL CODE ONLY.\n`;
+                structContent += `Do NOT use the [CODEREPLACER] tag schema. Do NOT abbreviate.\n`;
+                structContent += `The parsed content shown is a FILTERED version - the actual
+`;
+                structContent += `file on disk contains MORE code than what is shown. Your full-code
+`;
+                structContent += `output must reflect the complete file as it should be after changes.\n
+`;
+            } else {
+                structContent += `IMPORTANT: When making replacements in these files, use the
+`;
+                structContent += `[CODEREPLACER] tagged format. The parsed content shown is a
+`;
+                structContent += `FILTERED version - the actual file on disk contains MORE code
+`;
+                structContent += `than what is shown. Replacements must target the EXACT original
+`;
+                structContent += `text in the actual file.\n
+`;
+            }
+            structContent += `${'!'.repeat(50)}\n
+`;
         }
 
         // NEW: mention reference-only files in instructions
         if (referenceOnlyFiles.size > 0) {
             structContent += `${'*'.repeat(50)}\n`;
-            structContent += `ℹ️  REFERENCE-ONLY FILES\n`;
-            structContent += `${'*'.repeat(50)}\n\n`;
+            structContent += `ℹ️  REFERENCE-ONLY FILES
+`;
+            structContent += `${'*'.repeat(50)}\n
+`;
             structContent += `The following files are provided for CONTEXT ONLY.\n`;
             structContent += `DO NOT modify them, do not propose changes to them.\n`;
-            structContent += `Use them only to understand the surrounding code.\n\n`;
+            structContent += `Use them only to understand the surrounding code.\n
+`;
             for (const refFile of referenceOnlyFiles) {
                 structContent += `  REFERENCE ONLY: ${refFile}\n`;
             }
-            structContent += `\n${'*'.repeat(50)}\n\n`;
+            structContent += `\n${'*'.repeat(50)}\n
+`;
         }
 
         if (outputFormat === 'full') {
-            structContent += `OUTPUT FORMAT: FULL FILES\n`;
+            structContent += `OUTPUT FORMAT: FULL FILES
+`;
             structContent += `Provide the complete new content for EVERY file that requires changes.\n`;
             structContent += `Do not abbreviate or omit any parts. Output each file's entire content.\n`;
-            structContent += `Use the same file path headers as provided below.\n\n`;
+            structContent += `Use the same file path headers as provided below.\n
+`;
         } else if (outputFormat === 'tagged') {
             structContent += `OUTPUT FORMAT: TAGGED REPLACEMENTS (CODEREPLACER)\n`;
-            structContent += `Use the following tag structure to specify replacements within files:\n\n`;
+            structContent += `Use the following tag structure to specify replacements within files:\n
+`;
             structContent += `[CODEREPLACER-START]\n`;
             structContent += `PATH='<absolute path to file>'\n`;
             structContent += `[NEW-REPLACE-START]\n`;
@@ -381,36 +722,74 @@ async function generateStruct(filePaths, outputFileName = 'struct', options = {}
             structContent += `<replacement text>\n`;
             structContent += `[/REPLACE-END]\n`;
             structContent += `[/NEW-REPLACE-END]\n`;
-            structContent += `[/CODEREPLACER-END]\n\n`;
+            structContent += `[/CODEREPLACER-END]\n
+`;
             structContent += `You can include multiple [NEW-REPLACE-START] blocks for multiple replacements in the same file.\n`;
             structContent += `Ensure the original text exactly matches the file content (including whitespace).\n`;
             structContent += `CRITICAL: In PATH='...', copy the path EXACTLY from the FILE: header.\n`;
-            structContent += `Verify each character matches before outputting.\n\n`;
+            structContent += `Verify each character matches before outputting.\n
+`;
             structContent += `CRITICAL RULE - STANDALONE REPLACEMENTS:\n`;
             structContent += `EVERY response with [CODEREPLACER] tags must be COMPLETE and STANDALONE.\n`;
             structContent += `Treat each response as if it will be applied to a FRESH copy of the original files.\n`;
-            structContent += `You must include ALL replacements needed to fully implement the user's request - even if\n`;
-            structContent += `you previously provided them in an earlier message. NEVER reference or rely on\n`;
-            structContent += `previous responses. Imagine the user has just run 'git restore .' before applying your\n`;
+            structContent += `You must include ALL replacements needed to fully implement the user's request - even if
+`;
+            structContent += `you previously provided them in an earlier message. NEVER reference or rely on
+`;
+            structContent += `previous responses. Imagine the user has just run 'git restore .' before applying your
+`;
             structContent += `tags. If a replacement depends on another replacement, INCLUDE BOTH in the same response.\n`;
-            structContent += `A response containing only partial or incremental changes is INVALID and will fail.\n\n`;
+            structContent += `A response containing only partial or incremental changes is INVALID and will fail.\n
+`;
         } else if (outputFormat === 'both') {
-            structContent += `OUTPUT FORMAT: BOTH FULL FILES AND TAGGED REPLACEMENTS\n`;
+            structContent += `OUTPUT FORMAT: BOTH FULL FILES AND TAGGED REPLACEMENTS
+`;
             structContent += `You may provide either full file contents or tagged replacements, as appropriate.\n`;
             structContent += `For each file, decide which method is cleaner and use that.\n`;
             structContent += `Clearly separate the two approaches if mixed.\n`;
-            structContent += `CRITICAL: Regardless of format, preserve the exact path in all outputs.\n\n`;
+            structContent += `CRITICAL: Regardless of format, preserve the exact path in all outputs.\n
+`;
             structContent += `CRITICAL RULE - STANDALONE REPLACEMENTS:\n`;
             structContent += `EVERY response with [CODEREPLACER] tags must be COMPLETE and STANDALONE.\n`;
             structContent += `Treat each response as if it will be applied to a FRESH copy of the original files.\n`;
-            structContent += `You must include ALL replacements needed to fully implement the user's request - even if\n`;
-            structContent += `you previously provided them in an earlier message. NEVER reference or rely on\n`;
-            structContent += `previous responses. Imagine the user has just run 'git restore .' before applying your\n`;
+            structContent += `You must include ALL replacements needed to fully implement the user's request - even if
+`;
+            structContent += `you previously provided them in an earlier message. NEVER reference or rely on
+`;
+            structContent += `previous responses. Imagine the user has just run 'git restore .' before applying your
+`;
             structContent += `tags. If a replacement depends on another replacement, INCLUDE BOTH in the same response.\n`;
-            structContent += `A response containing only partial or incremental changes is INVALID and will fail.\n\n`;
+            structContent += `A response containing only partial or incremental changes is INVALID and will fail.\n
+`;
+        } else if (outputFormat === 'codeonly') {
+            structContent += `OUTPUT FORMAT: FULL CODE ONLY (NO TAGS, NO ABBREVIATIONS)\n`;
+            structContent += `Provide the complete, entire code for EVERY file that requires changes.\n`;
+            structContent += `You MUST NOT use the [CODEREPLACER] tag schema or any other tag/replacement format.\n`;
+            structContent += `Output only the raw, full source code for each file.\n
+`;
+            structContent += `STRICT RULES - THE FOLLOWING ARE STRICTLY FORBIDDEN:\n`;
+            structContent += `- Do NOT use any tag schema (no [CODEREPLACER], no [ORIGINAL-START], etc.).\n`;
+            structContent += `- Do NOT abbreviate the code in ANY way.\n`;
+            structContent += `- Do NOT use placeholders such as "...", "// ...", "// existing code",\n`;
+            structContent += `  "// rest is unchanged", "/* unchanged */", "// same as before", "// unchanged"\n`;
+            structContent += `  or any equivalent shortcut.\n`;
+            structContent += `- Do NOT summarize, truncate, or skip any part of the code.\n`;
+            structContent += `- Do NOT write things like "code continues here" or "(unchanged)".\n`;
+            structContent += `- Do NOT write only the modified portions - you MUST write EVERY line.\n`;
+            structContent += `- Output the ENTIRE file from the first line to the last line, in full.\n`;
+            structContent += `- Include all imports, comments, functions, classes, and everything else.\n
+`;
+            structContent += `For each file, start the code block with the exact same file path header
+`;
+            structContent += `as provided below (FILE: <path>) so it is clear which code belongs to which file.\n
+`;
+            structContent += `CRITICAL: The output MUST be complete, runnable, unabbreviated code.\n`;
+            structContent += `Any abbreviation or omission makes the response INVALID and it will fail.\n
+`;
         }
 
-        structContent += `${'='.repeat(50)}\n\n`;
+        structContent += `${'='.repeat(50)}\n
+`;
     }
 
     for (const filePath of filePaths) {
@@ -1539,7 +1918,8 @@ async function runParserMenu(filePath) {
         
         console.log(`${BOLD}─── CODE PARSER QUICK MENU ───${RESET}`);
         console.log(`File: ${path.basename(filePath)}`);
-        console.log(`Stats: ${summary.totalLines} lines | ${summary.containers} containers | ${summary.functions} functions | ${summary.totalMembers} members\n`);
+        console.log(`Stats: ${summary.totalLines} lines | ${summary.containers} containers | ${summary.functions} functions | ${summary.totalMembers} members
+`);
         
         console.log(`Quick options:`);
         console.log(`  1. Include ALL containers (classes/interfaces/enums)`);
@@ -1779,7 +2159,7 @@ async function interactiveMode() {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, G gen, C customize, R gen+request, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, G gen, C customize, P gen+request, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -1948,9 +2328,10 @@ async function interactiveMode() {
         //  the row you land on is editable again, and any state that
         //  was applied by steps AFTER it is cleanly undone.
         //
-        //  This keeps the excellent safety properties of the previous
-        //  versions (per-session undo, step-by-step back, exit at the
-        //  first row) while making the whole flow visible at once.
+        //  The AI REQUEST/DEMAND row instead opens the robust multi-
+        //  line text editor (openTextEditor). Cancelling that editor
+        //  (Esc / Ctrl+C) behaves exactly like pressing LEFT ARROW:
+        //  it steps back to the previous row.
         // ============================================================
         const jsFiles = [...selectedFiles].filter(isJavaScriptFile);
 
@@ -1977,8 +2358,8 @@ async function interactiveMode() {
         let refChoice = 'no';             // 'yes' | 'no'
         let filesToMarkRef = [];          // resolved selected paths
         let includeInstructions = true;   // bool (default: yes)
-        let userDemand = '';              // string
-        let outputFormat = 'tagged';      // 'full' | 'tagged' | 'both' (default: tagged)
+        let userDemand = '';              // string (may be multi-line)
+        let outputFormat = 'tagged';      // 'full' | 'tagged' | 'both' | 'codeonly' (default: tagged)
         let saveName = '';                // string
 
         // Which rows are currently part of the flow (some are conditional).
@@ -2050,11 +2431,18 @@ async function interactiveMode() {
                         : filesToMarkRef.map(f => path.basename(f)).join(', ');
                 case ROW.AI:
                     return includeInstructions ? 'yes' : 'no';
-                case ROW.DEMAND:
-                    return userDemand || '(empty)';
+                case ROW.DEMAND: {
+                    if (!userDemand) return '(empty)';
+                    const demandLines = userDemand.split('\n');
+                    const firstLine = demandLines[0];
+                    return demandLines.length > 1
+                        ? `${firstLine}  [${demandLines.length} lines]`
+                        : firstLine;
+                }
                 case ROW.FORMAT:
                     if (outputFormat === 'tagged') return 'Tagged replacements';
                     if (outputFormat === 'both') return 'Both';
+                    if (outputFormat === 'codeonly') return 'Full code only (no tags)';
                     return 'Full files';
                 case ROW.SAVE:
                     return saveName || '(empty)';
@@ -2155,7 +2543,7 @@ async function interactiveMode() {
                     console.log(`  ${idx + 1}. ${path.basename(file)}${alreadyRef}`);
                 });
             } else if (currentRow === ROW.FORMAT) {
-                console.log(`\n  ${BOLD}1${RESET} = Full files   ${BOLD}2${RESET} = Tagged replacements   ${BOLD}3${RESET} = Both`);
+                console.log(`\n  ${BOLD}1${RESET} = Full files   ${BOLD}2${RESET} = Tagged replacements   ${BOLD}3${RESET} = Both   ${BOLD}4${RESET} = Full code only (no tags, no abbreviations)`);
                 if (parsedFiles.size > 0) {
                     console.log(`  ${YELLOW}💡 You have parsed files - option 2 (Tagged) works better.${RESET}`);
                 }
@@ -2328,22 +2716,22 @@ async function interactiveMode() {
                 }
 
                 case ROW.DEMAND: {
-                    res = await askStepWithBack(
-                        `${BOLD}AI request/demand:${RESET}`,
-                        ''
-                    );
-                    if (res.type === 'back') {
+                    // Robust nano-like multi-line editor for the user request.
+                    // Cancelling (Esc / Ctrl+C) behaves like Left Arrow:
+                    // it steps back to the previous row.
+                    const editResult = await openTextEditor(userDemand || '', 'AI REQUEST/DEMAND');
+                    if (editResult.type === 'cancel') {
                         currentRow = prevRow(ROW.DEMAND);
                         break;
                     }
-                    userDemand = res.value;
+                    userDemand = editResult.value;
                     currentRow = nextRow(ROW.DEMAND);
                     break;
                 }
 
                 case ROW.FORMAT: {
                     res = await askStepWithBack(
-                        `${BOLD}Output format (1/2/3):${RESET}`,
+                        `${BOLD}Output format (1/2/3/4):${RESET}`,
                         '',
                         '2'
                     );
@@ -2354,6 +2742,7 @@ async function interactiveMode() {
 
                     if (res.value === '2') outputFormat = 'tagged';
                     else if (res.value === '3') outputFormat = 'both';
+                    else if (res.value === '4') outputFormat = 'codeonly';
                     else outputFormat = 'full';
 
                     currentRow = nextRow(ROW.FORMAT);
@@ -2444,7 +2833,8 @@ async function interactiveMode() {
     //    n               -> unselect all currently visible
     //    G               -> generate directly (defaults, no wizard)
     //    C               -> enter customize wizard
-    //    R               -> generate asking only for USER REQUEST
+    //    P               -> generate asking only for USER REQUEST
+    //                       (captured in the robust multi-line editor)
     //    B (or Esc)      -> return to the normal browser
     //    Ctrl+C          -> quit
     // ========================================================
@@ -2532,7 +2922,7 @@ async function interactiveMode() {
             console.log(
                 `${BOLD}Keys:${RESET} ↑/↓ move, PgUp/PgDn page, Space toggle, ` +
                 `${YELLOW}[${RESET}/${YELLOW}]${RESET} temp, a all, n none, ` +
-                `${GREEN}G${RESET} gen, ${YELLOW}C${RESET} customize, ${MAGENTA}R${RESET} request, ${YELLOW}B${RESET} back`
+                `${GREEN}G${RESET} gen, ${YELLOW}C${RESET} customize, ${MAGENTA}P${RESET} request, ${YELLOW}B${RESET} back`
             );
             console.log('─'.repeat(process.stdout.columns || 80));
 
@@ -2694,29 +3084,30 @@ async function interactiveMode() {
                     return;
                 }
 
-                // ---------- generate with USER REQUEST only ----------
-                if (key === 'r' || key === 'R') {
+                // ---------- generate with USER REQUEST only (P key) ----------
+                if (key === 'p' || key === 'P') {
                     if (selectedFiles.size === 0) {
                         renderFind(visible);
                         return;
                     }
 
                     process.stdin.removeListener('data', onFindKeypress);
-                    process.stdin.setRawMode(false);
 
-                    console.log(`\n${GREEN}${BOLD}=== GENERATE WITH USER REQUEST ===${RESET}\n`);
-                    console.log(`Selected files:  ${selectedFiles.size}`);
-                    console.log(`AI instructions: yes`);
-                    console.log(`Output format:   Tagged replacements`);
-                    console.log(`Parsing:         skipped`);
-                    console.log(`Reference-only:  none\n`);
+                    // Open the robust multi-line editor for the request.
+                    // The editor manages raw mode itself and restores it
+                    // on exit, so no raw-mode toggling is needed here.
+                    const editResult = await openTextEditor('', 'USER REQUEST');
 
-                    const userDemand = await askQuestion('Enter USER REQUEST:');
+                    if (editResult.type === 'cancel') {
+                        process.stdin.on('data', onFindKeypress);
+                        renderFind(visible);
+                        return;
+                    }
+
+                    const userDemand = editResult.value;
 
                     if (!userDemand || userDemand.trim() === '') {
                         console.log(`\n${YELLOW}Empty request - cancelling.${RESET}`);
-                        process.stdin.setRawMode(true);
-                        process.stdin.resume();
                         process.stdin.on('data', onFindKeypress);
                         renderFind(visible);
                         return;
@@ -3283,37 +3674,46 @@ async function interactiveMode() {
             return;
         }
 
-        if (key === 'r' || key === 'R') {
+        if (key === 'p' || key === 'P') {
             // GENERATE + USER REQUEST: skip the entire wizard, only ask
-            // for the USER REQUEST text, then generate with default values
-            // (AI instructions ON, tagged output, no parsing, no ref-only).
+            // for the USER REQUEST text (via the robust multi-line editor),
+            // then generate with default values (AI instructions ON,
+            // tagged output, no parsing, no ref-only).
+            //
+            // This used to be the R key. Now it is the P key.
             if (selectedFiles.size === 0) {
                 render();
                 return;
             }
 
             process.stdin.removeListener('data', onKeypress);
-            process.stdin.setRawMode(false);
+
+            // Open the robust multi-line editor. It manages raw mode
+            // itself and restores the previous state on exit.
+            const editResult = await openTextEditor('', 'USER REQUEST');
+
+            if (editResult.type === 'cancel') {
+                process.stdin.on('data', onKeypress);
+                render();
+                return;
+            }
+
+            const userDemand = editResult.value;
+
+            if (!userDemand || userDemand.trim() === '') {
+                console.log(`\n${YELLOW}Empty request - cancelling.${RESET}`);
+                process.stdin.on('data', onKeypress);
+                render();
+                return;
+            }
 
             console.log(`\n${GREEN}${BOLD}=== GENERATE WITH USER REQUEST ===${RESET}\n`);
             console.log(`Selected files:  ${selectedFiles.size}`);
             console.log(`AI instructions: yes`);
             console.log(`Output format:   Tagged replacements`);
             console.log(`Parsing:         skipped`);
-            console.log(`Reference-only:  none\n`);
-
-            const userDemand = await askQuestion('Enter USER REQUEST:');
-
-            if (!userDemand || userDemand.trim() === '') {
-                console.log(`\n${YELLOW}Empty request - cancelling.${RESET}`);
-                process.stdin.setRawMode(true);
-                process.stdin.resume();
-                process.stdin.on('data', onKeypress);
-                render();
-                return;
-            }
-
-            console.log(`\n${GREEN}${BOLD}=== GENERATING STRUCT ===${RESET}\n`);
+            console.log(`Reference-only:  none
+`);
 
             await generateStruct([...selectedFiles], 'struct', {
                 includeInstructions: true,
