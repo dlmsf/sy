@@ -21,7 +21,8 @@ class ClipboardMonitor {
         this.tagRestrictMode = false;
         this.config = {
             profiles: {},
-            interval: 1000
+            interval: 1000,
+            defaultNewProfile: true
         };
         this.rl = readline.createInterface({
             input: process.stdin,
@@ -105,6 +106,26 @@ class ClipboardMonitor {
                 console.log(`✓ Default configuration created at ${this.configPath}`);
             } else {
                 console.error('Error loading config:', error);
+            }
+        }
+
+        // Ensure the persistent default "new" profile exists (unless disabled via config).
+        if (this.config.defaultNewProfile !== false) {
+            if (!this.config.profiles) this.config.profiles = {};
+            if (!this.config.profiles.new) {
+                this.config.profiles.new = {
+                    outputFile: "result",
+                    commands: [
+                        "git restore .",
+                        "codereplacer",
+                        "bash install.sh -ru"
+                    ],
+                    defaultBg: true,
+                    defaultTag: true,
+                    defaultNotify: true
+                };
+                await this.saveConfig();
+                console.log('✓ Default profile "new" created.');
             }
         }
     }
