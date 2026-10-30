@@ -30814,6 +30814,14 @@ class SelfBuilder extends SyAPP_Func {
     if (!Array.isArray(initial.hiddenMethods)) initial.hiddenMethods = []
     if (typeof initial.pinnedTopSeparator !== 'string') initial.pinnedTopSeparator = 'line'
     if (typeof initial.pinnedBottomSeparator !== 'string') initial.pinnedBottomSeparator = 'line'
+    // NEW: View Test Mode (default ON).
+    //   ON  → clicking the toolbar's "👁 View" button runs the produced
+    //         func in a tracked SyAPP --server child and streams it,
+    //         exactly like this.Emb()'s ▶ Enter Func.
+    //   OFF → legacy behaviour: the toolbar just flips to view mode
+    //         inline (no process, no connection).
+    // Toggled from the ⚙ Config menu's FIRST entry.
+    if (typeof initial.testMode !== 'boolean') initial.testMode = true
     this.State = initial
     this.Editing = true
     this.EditItemId = null
@@ -30861,6 +30869,22 @@ class SelfBuilder extends SyAPP_Func {
     // restores cleanly and each Emb / Self-Build session is fully
     // independent from every other one — at ANY depth.
     this._embStateStack = []
+
+    // NEW: View Test Mode runtime tracking.
+    //   _sbTestPending → set by _processActions when the "👁 View" button
+    //                    is clicked with test mode ON; _renderSelf awaits
+    //                    _sbRunTest when it sees this flag.
+    //   _sbTestState   → the ONE tracked test child:
+    //                      { pid, port, id, name, log, key }
+    //                    `key` is the content-hashed source fingerprint,
+    //                    so an unchanged canvas re-attaches to the SAME
+    //                    live child (instant, no kill, no spawn, no wait).
+    //   _sbTestActive  → re-entrancy lock. At most ONE live test stream
+    //                    at a time, so a stray double click can never
+    //                    spawn a second child or open a second stream.
+    this._sbTestPending = false
+    this._sbTestState = null
+    this._sbTestActive = false
   }
 
   _embResolveReturnSaveMode(caller) {
@@ -31223,6 +31247,383 @@ class SelfBuilder extends SyAPP_Func {
     }
   }
 
+  // ==================================================================
+  // VIEW TEST MODE
+  //
+  // The produced func runs in a tracked SyAPP `--server` child and its
+  // session is streamed — exactly the observable behaviour of
+  // this.Emb()'s ▶ Enter Func, but with three hardenings that remove
+  // every known source of a spontaneous disconnect / crash:
+  //
+  // (A) CONTENT-HASHED SOURCE PATH + SELF-MANAGED SPAWN.
+  //     The temp .mjs name is a hash of the produced source. Because
+  //     `_sbTestState.key` is that same fingerprint:
+  //       • unchanged canvas → SAME key → the already-running child is
+  //         reused. NO spawn, NO kill, NO readiness wait — entering
+  //         view mode is instantaneous.
+  //       • changed canvas → exactly ONE restart, and the old child is
+  //         stopped GRACEFULLY (SyPM.kill + SIGTERM), never with
+  //         SIGKILL. That is what removes the
+  //         "Command exited with code: 137" message: 137 is SIGKILL,
+  //         a graceful stop reports 143 and lets the child run its own
+  //         cleanup handler.
+  //
+  //     We deliberately do NOT go through `_embRunBackground` here.
+  //     Its hard-restart branch calls SyPM.hardKill(...) (SIGKILL) and,
+  //     on its fallback path, escalates through `process.kill(-pid)` —
+  //     a PROCESS-GROUP kill. With recycled PIDs that is unsafe, and it
+  //     is precisely the trigger for both the 137 and the occasional
+  //     lost session.
+  //
+  // (B) HUD STDIN DETACHED BEFORE THE HAND-OVER.
+  //     Same pattern already proven by _openTextEditor /
+  //     _openCellsEditor / _openFlowEditor. A still-attached HUD keeps
+  //     reading the bytes meant for the stream, can call LoadScreen /
+  //     cleanupMenuState and remove the stream's dataHandler — the
+  //     remote view then freezes and looks like it aborted by itself.
+  //
+  // (C) SILENT RETRY ON AN INSTANTLY-CLOSED STREAM.
+  //     /stream can accept before the child's first frame exists and
+  //     then close ~200 ms later with no error. That is a boot race,
+  //     not a user action, so we re-verify the child and re-attach
+  //     ONCE instead of dumping the user back into the editor.
+  //
+  // Every failure path surfaces a concrete Alert (including the child's
+  // own log tail) and the `finally` block always releases the lock and
+  // restores the terminal.
+  // ==================================================================
+
+  /**
+   * Stop the tracked test child, GRACEFULLY.
+   *
+   * Never uses SIGKILL and never touches a process group: only the
+   * EXACT pid we recorded ourselves is signalled, and never our own or
+   * our parent's pid. Safe against PID reuse.
+   * @private
+   */
+  _sbTestStop = () => {
+    const st = this._sbTestState
+    if (!st || typeof st !== 'object') return
+
+    const pid = st.pid
+    const port = st.port
+    const name = st.name
+
+    st.pid = null
+    st.port = null
+    st.id = null
+    st.name = null
+    st.log = null
+    st.key = null
+
+    if (pid && pid !== process.pid && pid !== process.ppid) {
+      // SyPM owns the monitor — let it detach the entry first, then ask
+      // the OS politely. Two independent graceful paths, both guarded.
+      try { SyPM.kill(pid) } catch (_) {}
+      try { process.kill(pid, 'SIGTERM') } catch (_) {}
+    }
+    if (name) {
+      try { if (typeof SyPM.removeEntry === 'function') SyPM.removeEntry(name) } catch (_) {}
+    }
+    if (port) {
+      try { SyPortLock.release(port) } catch (_) {}
+    }
+  }
+
+  /**
+   * Run the produced func in a background `--server` child and stream
+   * its session. Blocking, like this.Emb()'s ▶ Enter Func.
+   *
+   * @param {string} id - User/build ID
+   * @returns {Promise<void>}
+   * @private
+   */
+  _sbRunTest = async (id) => {
+    const syapp = this._syappInstance
+    if (!syapp) return
+
+    // --- Re-entrancy lock -------------------------------------------
+    if (this._sbTestActive) {
+      this.Alert(id, '⏳ Test already running — press Ctrl+C to return first.', { duration: 3000 })
+      return
+    }
+    this._sbTestActive = true
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+
+    // Is this the pid we recorded, still alive? Never treat EPERM as
+    // dead, and NEVER let a self/parent pid sneak through.
+    const _alive = (pid) => {
+      if (!pid) return false
+      if (pid === process.pid || pid === process.ppid) return false
+      try { process.kill(pid, 0); return true } catch (_) { return false }
+    }
+
+    // Best-effort diagnostic tail of the child's log.
+    const _logTail = (logPath, limit = 6) => {
+      try {
+        if (!logPath || !fs.existsSync(logPath)) return ''
+        const content = fs.readFileSync(logPath, 'utf8')
+        const lines = content.split('\n').filter(l => l.trim())
+        if (lines.length === 0) return ''
+        const errs = lines.filter(l =>
+          /error|throw|cannot|not defined|fail|syntax|refused|econnrefused|unhandled|exception/i.test(l)
+        )
+        return (errs.length > 0 ? errs : lines).slice(-limit).join('\n').slice(0, 600)
+      } catch (_) { return '' }
+    }
+
+    let showLoading = false
+
+    try {
+      // ---------- 1) Generate the produced func source ----------
+      const relSyapp = (() => {
+        try { return import.meta.url }
+        catch (_) {
+          try { return url.pathToFileURL(url.fileURLToPath(import.meta.url)).href }
+          catch (__) { return './SyAPP.js' }
+        }
+      })()
+      const producedCode = _genFuncJS(this.State, relSyapp)
+
+      // ---------- 2) Write to a CONTENT-HASHED temp path ----------
+      const outDir = path.join(os.tmpdir(), 'syapp_selfbuilder_test')
+      if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true })
+
+      const srcHash = createHash('sha1').update(producedCode).digest('hex').slice(0, 12)
+      const baseName = (this.State.funcName || 'SelfBuilderTest')
+        .replace(/[^A-Za-z0-9_$]/g, '') || 'SelfBuilderTest'
+      const producedPath = path.join(outDir, `${baseName}_${srcHash}.mjs`)
+
+      // Only rewrite when the bytes differ — keeps mtime stable and
+      // avoids needless disk churn on repeated identical clicks.
+      let needsWrite = true
+      try {
+        if (fs.existsSync(producedPath)) {
+          needsWrite = fs.readFileSync(producedPath, 'utf8') !== producedCode
+        }
+      } catch (_) {}
+      if (needsWrite) fs.writeFileSync(producedPath, producedCode, 'utf8')
+
+      // ---------- 3) Tracked-child state ----------
+      if (!this._sbTestState || typeof this._sbTestState !== 'object') {
+        this._sbTestState = { pid: null, port: null, id: null, name: null, log: null, key: null }
+      }
+      const st = this._sbTestState
+      const wantKey = `file:${producedPath}`
+
+      // ---------- 4) Fast path — is the child already live? ----------
+      // A hit means "reuse, zero cost": no spawn, no kill, no wait.
+      // This is what makes repeated View clicks fluid.
+      const reuse = !!(st.pid && st.key === wantKey && _alive(st.pid))
+
+      if (!reuse) {
+        showLoading = true
+        try {
+          stdout.write('\x1b[?25l\x1b[2J\x1b[H')
+          stdout.write(ColorText.cyan('\n  ⏳ Building & starting the test process…\n'))
+          stdout.write(ColorText.dim('     Generating your func and booting a SyAPP --server child…\n'))
+        } catch (_) {}
+
+        // Stop the previous child GRACEFULLY. This runs at most ONCE per
+        // real edit — never per click — and never with SIGKILL, so the
+        // old child exits 143 (clean), not 137.
+        try { this._sbTestStop() } catch (_) {}
+        await sleep(120)
+
+        // Resolve the running SyAPP.js to spawn the child from.
+        const syappJsPath = (() => {
+          try {
+            const a1 = process.argv[1]
+            if (typeof a1 === 'string' && a1) {
+              const abs = path.isAbsolute(a1) ? a1 : path.resolve(process.cwd(), a1)
+              if (fs.existsSync(abs)) return abs
+            }
+          } catch (_) {}
+          try {
+            if (this._syappInstance && typeof this._syappInstance._mainSourceFile === 'string') {
+              return null // not SyAPP.js itself — fall through
+            }
+          } catch (_) {}
+          return null
+        })()
+
+        const runtimeJs = syappJsPath || (() => {
+          try {
+            const a1 = process.argv[1]
+            if (typeof a1 === 'string' && a1) {
+              return path.isAbsolute(a1) ? a1 : path.resolve(process.cwd(), a1)
+            }
+          } catch (_) {}
+          return null
+        })()
+
+        if (!runtimeJs || !fs.existsSync(runtimeJs)) {
+          this.Alert(id, '❌ Cannot locate the running SyAPP.js to spawn the test child', { duration: 6000 })
+          return
+        }
+
+        // Allocate a port.
+        let port
+        try {
+          port = await SyPortLock.acquire(`syapp-sbtest-${process.pid}`)
+        } catch (e) {
+          this.Alert(id, `❌ Port allocation failed: ${e.message}`, { duration: 5000 })
+          return
+        }
+
+        const processName = `syapp-bg-${port}-sbtest`
+        const cmd = `${process.execPath} "${runtimeJs}" --server ${port} "${producedPath}"`
+
+        // Spawn.
+        try {
+          try { SyPM.cleanup() } catch (_) {}
+          const entry = SyPM.exec(cmd, {
+            name: processName,
+            workingDir: process.cwd(),
+            uniqueNameLock: true
+          })
+          try { SyPortLock.reassign(port, entry.pid, processName) } catch (_) {}
+
+          st.pid = entry.pid
+          st.port = port
+          st.id = entry.id
+          st.name = processName
+          st.log = entry.log || null
+          st.key = wantKey
+        } catch (e) {
+          try { SyPortLock.release(port) } catch (_) {}
+          this.Alert(id, `❌ Could not spawn test process: ${e.message}`, { duration: 6000 })
+          return
+        }
+
+        // ---------- 5) Readiness poll (the loading / wait) ----------
+        let ready = false
+        for (let i = 0; i < 25; i++) {
+          await sleep(240)
+          if (!_alive(st.pid)) break
+          try {
+            await syapp._verifyRemote(port, 'localhost')
+            ready = true
+            break
+          } catch (_) { /* not yet */ }
+        }
+
+        if (!ready) {
+          const tail = _logTail(st.log)
+          this.Alert(id,
+            tail
+              ? `❌ Test process did not become ready:\n${tail}`
+              : '❌ Test process did not become ready in time. Press 👁 View to retry.',
+            { duration: 8000 })
+          try { this._sbTestStop() } catch (_) {}
+          return
+        }
+      }
+
+      // ---------- 6) Settle window ----------
+      // Confirm the child survived its FIRST render. Opening a stream to
+      // a child that is still booting (or already dying) is the classic
+      // source of a socket that closes ~0.2s later with no error.
+      await sleep(200)
+      if (!_alive(st.pid)) {
+        const tail = _logTail(st.log)
+        this.Alert(id,
+          tail
+            ? `❌ Test process exited during startup:\n${tail}`
+            : '❌ Test process exited during startup (check the produced func).',
+          { duration: 8000 })
+        try { this._sbTestStop() } catch (_) {}
+        return
+      }
+
+      const testPort = st.port
+      const testPid = st.pid
+      const testLog = st.log
+
+      // ---------- 7) Detach the parent HUD's stdin ----------
+      // Prevents the still-attached HUD from consuming the bytes the
+      // stream needs and from tearing the stream's dataHandler down
+      // mid-session. `_runRemoteSession.finish()` calls
+      // `_restoreLocalHUDMouse()` and the next LoadScreen re-attaches
+      // the keypress handlers, so this is symmetric on every exit path.
+      const hud = syapp.HUD
+      if (hud) {
+        try { stdout.write('\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l') } catch (_) {}
+        try { stdin.removeListener('data', hud.handleMouseData) } catch (_) {}
+        try { hud.isMouseEnabled = false } catch (_) {}
+      }
+      try { stdin.removeAllListeners('keypress') } catch (_) {}
+
+      // ---------- 8) Stream, with ONE silent retry ----------
+      let streamErr = null
+      let silentRetryUsed = false
+      let elapsed = 0
+
+      while (true) {
+        const startedAt = Date.now()
+        try {
+          streamErr = await syapp._runRemoteSession(testPort, 'localhost')
+        } catch (e) {
+          streamErr = e
+        } finally {
+          try { if (st) st.lastActivity = Date.now() } catch (_) {}
+        }
+        elapsed = Date.now() - startedAt
+
+        const aliveNow = _alive(testPid)
+        const cleanShortClose = (!streamErr && elapsed < 700)
+
+        if (cleanShortClose && aliveNow && !silentRetryUsed) {
+          silentRetryUsed = true
+          await sleep(350)
+          if (!_alive(testPid)) break
+          try {
+            await syapp._verifyRemote(testPort, 'localhost')
+          } catch (_) { break }
+          continue // re-attach: the user sees ONE continuous session
+        }
+        break
+      }
+
+      // Small settle so the child's final bytes flush and the rebuilt
+      // menu paints over a clean screen (no leftover fragments).
+      await sleep(120)
+
+      // ---------- 9) Post-mortem — never return silently ----------
+      const aliveAfterStream = _alive(testPid)
+
+      if (!aliveAfterStream) {
+        const tail = _logTail(testLog)
+        this.Alert(id,
+          tail
+            ? `⚠ Test process exited — connection closed.\n${tail}`
+            : '⚠ Test process exited — connection closed. Press 👁 View to restart.',
+          { duration: 8000 })
+        try { this._sbTestStop() } catch (_) {}
+      } else if (streamErr) {
+        this.Alert(id,
+          `⚠ Remote session ended: ${streamErr.message || streamErr}`,
+          { duration: 6000 })
+      } else if (elapsed < 500) {
+        this.Alert(id,
+          '⚠ Connection closed almost immediately — press 👁 View to retry.',
+          { duration: 4500 })
+      }
+    } finally {
+      this._sbTestActive = false
+      // Restore the cursor if we showed the loading frame and never
+      // handed the terminal to the stream.
+      if (showLoading) {
+        try { stdout.write('\x1b[?25h') } catch (_) {}
+      }
+      // Idempotent safety net for the early-return paths above.
+      // `_runRemoteSession.finish()` already restored the HUD mouse
+      // layer on every real stream exit.
+      try { _restoreLocalHUDMouse(syapp) } catch (_) {}
+    }
+  }
+
   _nid() { return `it_${Date.now().toString(36)}_${++this._idSeq}` }
 
   _embArgsEqual(a, b) {
@@ -31538,7 +31939,48 @@ class SelfBuilder extends SyAPP_Func {
       return
     }
 
-    if (p.__toggleEdit) { this.Editing = !this.Editing; this.EditItemId = null }
+    // View Test Mode toggle (⚙ Config → FIRST entry).
+    if (p.__toggleTestMode) {
+      this.State.testMode = (this.State.testMode === false)
+      // Leaving test mode also stops the tracked child gracefully, so no
+      // orphan `--server` process is left serving a stale view.
+      if (!this.State.testMode) {
+        try { this._sbTestStop() } catch (_) {}
+      }
+      this.Alert(id,
+        this.State.testMode
+          ? '✓ View Test Mode: background process'
+          : '○ View Test Mode: inline (legacy)',
+        { duration: 2200 })
+    }
+
+    if (p.__toggleEdit) {
+      // `willBeViewing` is true when we are currently in EDIT mode and
+      // the user clicked the "👁 View" button.
+      const willBeViewing = this.Editing === true
+      const testMode = this.State.testMode !== false
+
+      this.EditItemId = null
+
+      if (willBeViewing && testMode) {
+        // NEW: View Test Mode — mirror this.Emb()'s ▶ Enter Func:
+        // run the produced func in a tracked SyAPP --server child and
+        // stream its session. _renderSelf awaits _sbRunTest (blocking,
+        // like Emb's Enter Func) so the child's view replaces a clean
+        // terminal instead of racing the HUD flush, and any failure
+        // surfaces as an alert while the terminal is properly restored.
+        //
+        // IMPORTANT: `Editing` is deliberately NOT flipped here. The
+        // "view" is the remote stream — the builder itself stays in
+        // EDIT mode so that, once the stream returns, the toolbar still
+        // shows "👁 View" and ONE click re-attaches / restarts the
+        // process (never forcing the user through "✎ Edit" first).
+        this._sbTestPending = true
+      } else {
+        // Legacy inline toggle (test mode OFF, or returning from view).
+        this.Editing = !this.Editing
+      }
+    }
 
     // EMB mode: finish and return to the caller Emb.
     if (p.__embFinish) {
@@ -32214,6 +32656,25 @@ class SelfBuilder extends SyAPP_Func {
     this._processActions(id, props)
     if (this.Builds.get(id)?.WaitInput) return
 
+    // NEW: View Test Mode — see _processActions. Blocking, like
+    // this.Emb()'s ▶ Enter Func: the produced func runs in a tracked
+    // background --server child and its session is streamed until the
+    // user returns (Ctrl+C pops one layer, Ctrl+B exits to local).
+    if (this._sbTestPending) {
+      this._sbTestPending = false
+      try {
+        await this._sbRunTest(id)
+      } catch (e) {
+        this.Alert(id, `❌ Test failed: ${e.message || e}`, { duration: 5000 })
+      } finally {
+        // Always come back to EDIT mode. The "view" was the remote
+        // stream — the user must not need a second click through
+        // "✎ Edit" to reach the "👁 View" button again.
+        this.Editing = true
+        this.EditItemId = null
+      }
+    }
+
     // Capture the LIVE State reference AFTER every possible mutation
     // above. Both the EMB-mode recovery block and `_processActions`'
     // 'load' case can reassign `this.State`. Reading it earlier left
@@ -32555,6 +33016,28 @@ class SelfBuilder extends SyAPP_Func {
     const perPage = this._getItemsPerPage()
     const all = _sbDiscoverMethods()
     const hiddenSet = this._getHiddenSet()
+
+    // ------------------------------------------------------------------
+    // FIRST config entry — View Test Mode.
+    //
+    //   ON  (default) → the toolbar's "👁 View" button runs the produced
+    //                   func in a tracked SyAPP --server child and
+    //                   streams it, exactly like this.Emb()'s
+    //                   ▶ Enter Func. Clicking View again with NO canvas
+    //                   changes re-attaches to the SAME live child
+    //                   (instant). Changing anything restarts it once,
+    //                   gracefully, with the new code.
+    //   OFF           → legacy inline toggle (no process, no connection).
+    //                   Any running test child is stopped.
+    // ------------------------------------------------------------------
+    const testMode = this.State.testMode !== false
+    this.Button(id, {
+      name: testMode
+        ? ColorText.bgGreen(ColorText.black(' ✓ View Test Mode: background process '))
+        : ColorText.dim('○ View Test Mode: inline (legacy)'),
+      props: { __toggleTestMode: 1 },
+      pinnedTop: true
+    })
 
     // Each config entry gets its OWN line, matching the layout of the
     // method-visibility list below. This guarantees "Items per page"
