@@ -13230,6 +13230,12 @@ this.DropDownManager = {
         showMessages: false,
         itemsPerPage: 5,
         filter: null,
+        // Optional: when true, a discreet "Dir" toggle appears inside the
+        // browser's own dropdown UI. Turning it ON makes directories
+        // selectable (their path is added to the returned array) and
+        // exposes a "Select current" button for the folder being viewed.
+        // Default `false` keeps the historical navigation-only behaviour.
+        selectDirectories: false,
         icons: {
           folder: '📁',
           file: '📄',
@@ -13237,7 +13243,9 @@ this.DropDownManager = {
           openFolder: '📂',
           back: '⬆️',
           error: '❌',
-          clear: '🗑️'
+          clear: '🗑️',
+          selectDir: '🎯',
+          dirSelected: '📌'
         }
       };
 
@@ -13254,11 +13262,19 @@ this.DropDownManager = {
           selectedFiles: [],
           currentPath: finalConfig.startPath,
           currentPage: 0,
-          totalPages: 1
+          totalPages: 1,
+          dirSelectMode: false
         });
       }
 
       const storage = this.Storages.Get(id, storageKey);
+
+      // Backward-compat: entries created before this option existed need
+      // the new field seeded so toggling works on the very first click.
+      if (storage.dirSelectMode === undefined) {
+        storage.dirSelectMode = false;
+        this.Storages.Set(id, storageKey, storage);
+      }
       
       if (finalConfig.displayName !== undefined && storage.displayName !== finalConfig.displayName) {
         storage.displayName = finalConfig.displayName;
@@ -13311,6 +13327,16 @@ this.DropDownManager = {
         delete this.Builds.get(id).Session.ActualProps[clearProp];
       }
 
+      // Toggle the directory-selection mode. This handler is only
+      // reachable through the discreet "Dir" button that appears in the
+      // browser's own controls row when `selectDirectories: true`.
+      const toggleDirModeProp = `${storageKey}_toggleDirMode`;
+      if (currentProps[toggleDirModeProp]) {
+        storage.dirSelectMode = !storage.dirSelectMode;
+        this.Storages.Set(id, storageKey, storage);
+        delete this.Builds.get(id).Session.ActualProps[toggleDirModeProp];
+      }
+
       const currentPath = storage.currentPath;
       
       const getDisplayName = () => {
@@ -13318,6 +13344,9 @@ this.DropDownManager = {
           return storage.displayName;
         } else {
           const folderName = path.basename(currentPath) || currentPath;
+          if (finalConfig.selectDirectories) {
+            return `Select: ${folderName}`;
+          }
           return `Browse: ${folderName}`;
         }
       };
@@ -13334,7 +13363,7 @@ this.DropDownManager = {
       if (finalConfig.showMessages) {
         this.Text(id, `${finalConfig.icons.openFolder} ${currentPath}`);
         if (storage.selectedFiles.length > 0) {
-          this.Text(id, `${finalConfig.icons.selected} ${storage.selectedFiles.length} file(s) selected`);
+          this.Text(id, `${finalConfig.icons.selected} ${storage.selectedFiles.length} item(s) selected`);
         }
       }
 
@@ -13383,7 +13412,12 @@ this.DropDownManager = {
         
         const parentItems = items.filter(i => i.isParent);
         const directories = items.filter(i => i.isDirectory && !i.isParent).sort((a, b) => a.name.localeCompare(b.name));
-        const files = items.filter(i => !i.isDirectory).sort((a, b) => a.name.localeCompare(b.name));
+        // NEW: When directoriesOnly is enabled, files are excluded from
+        // the listing entirely (nothing to select, nothing to page
+        // through) — keeps pagination counts accurate too.
+        const files = finalConfig.directoriesOnly
+          ? []
+          : items.filter(i => !i.isDirectory).sort((a, b) => a.name.localeCompare(b.name));
         const sortedItems = [...parentItems, ...directories, ...files];
         
         const totalPages = Math.max(1, Math.ceil(sortedItems.length / finalConfig.itemsPerPage));
@@ -13426,18 +13460,55 @@ this.DropDownManager = {
           for (const item of pageItems) {
             if (item.isDirectory) {
               const hasSelectedContent = storage.selectedFiles.some(f => f.startsWith(item.path + path.sep));
-              
-              let icon = item.isParent ? finalConfig.icons.back : 
-                       (hasSelectedContent ? finalConfig.icons.selected : finalConfig.icons.folder);
-              
-              this.Button(id, {
-                name: `${icon} ${item.name}${hasSelectedContent && !item.isParent ? ' (has selected)' : ''}`,
-                path: this.Name,
-                props: { 
-                  [navigateProp]: item.path,
-                  page: currentProps.page 
-                }
-              });
+              const isDirSelected = storage.selectedFiles.includes(item.path);
+
+              // Directory-selection mode: when the caller enabled
+              // `selectDirectories` AND the user toggled the mode ON,
+              // each non-parent directory gets an explicit "select" action
+              // (adds its path to the result array) alongside a small
+              // "→" navigation button so browsing still works.
+              //
+              // Outside this mode the original navigation-only behaviour
+              // is preserved byte-for-byte.
+              if (!item.isParent && finalConfig.selectDirectories && storage.dirSelectMode) {
+                this.Buttons(id, [
+                  {
+                    name: `${isDirSelected ? finalConfig.icons.dirSelected : finalConfig.icons.folder} ${item.name}${isDirSelected ? ' (selected)' : ''}`,
+                    path: this.Name,
+                    props: {
+                      [selectProp]: item.path,
+                      page: currentProps.page
+                    }
+                  },
+                  {
+                    name: '→',
+                    path: this.Name,
+                    props: {
+                      [navigateProp]: item.path,
+                      page: currentProps.page
+                    }
+                  }
+                ]);
+              } else {
+                let icon;
+                if (item.isParent) icon = finalConfig.icons.back;
+                else if (isDirSelected) icon = finalConfig.icons.dirSelected;
+                else if (hasSelectedContent) icon = finalConfig.icons.selected;
+                else icon = finalConfig.icons.folder;
+
+                let suffix = '';
+                if (!item.isParent && hasSelectedContent) suffix += ' (has selected)';
+                if (!item.isParent && isDirSelected) suffix += ' (dir)';
+
+                this.Button(id, {
+                  name: `${icon} ${item.name}${suffix}`,
+                  path: this.Name,
+                  props: { 
+                    [navigateProp]: item.path,
+                    page: currentProps.page 
+                  }
+                });
+              }
             } else {
               const isSelected = storage.selectedFiles.includes(item.path);
               const icon = isSelected ? finalConfig.icons.selected : finalConfig.icons.file;
@@ -13453,7 +13524,7 @@ this.DropDownManager = {
             }
           }
           
-          if (totalPages > 1 || storage.selectedFiles.length > 0) {
+          if (totalPages > 1 || storage.selectedFiles.length > 0 || finalConfig.selectDirectories) {
             this.Button(id, { name: ' ' });
             
             const controlButtons = [];
@@ -13478,6 +13549,39 @@ this.DropDownManager = {
                   page: currentProps.page 
                 }
               });
+            }
+
+            // Discreet toggle for directory-selection mode. Only rendered
+            // when the caller explicitly requested the capability via
+            // `selectDirectories: true`. Dim when off, highlighted when on.
+            if (finalConfig.selectDirectories) {
+              controlButtons.push({
+                name: storage.dirSelectMode
+                  ? ColorText.brightYellow(`${finalConfig.icons.selectDir} Dir ✓`)
+                  : ColorText.dim(`${finalConfig.icons.selectDir} Dir`),
+                path: this.Name,
+                props: {
+                  [toggleDirModeProp]: true,
+                  page: currentProps.page
+                }
+              });
+
+              // One-shot "select the folder I am currently viewing"
+              // action, visible only while in directory-select mode so
+              // the default UI is untouched.
+              if (storage.dirSelectMode) {
+                const isCurrentSelected = storage.selectedFiles.includes(currentPath);
+                controlButtons.push({
+                  name: isCurrentSelected
+                    ? ColorText.brightGreen(`${finalConfig.icons.dirSelected} Current (selected)`)
+                    : `${finalConfig.icons.dirSelected} Select current`,
+                  path: this.Name,
+                  props: {
+                    [selectProp]: currentPath,
+                    page: currentProps.page
+                  }
+                });
+              }
             }
             
             if (storage.selectedFiles.length > 0) {
@@ -13513,7 +13617,9 @@ this.DropDownManager = {
         
         if (finalConfig.showMessages && storage.selectedFiles.length > 0) {
           this.Text(id, '');
-          this.Text(id, '📋 Selected Files:');
+          this.Text(id, (finalConfig.selectDirectories || finalConfig.directoriesOnly)
+            ? '📋 Selected Items:'
+            : '📋 Selected Files:');
           storage.selectedFiles.forEach((filePath, index) => {
             const relativePath = path.relative(finalConfig.startPath, filePath);
             this.Text(id, `  ${index + 1}. ${relativePath}`);
@@ -13530,6 +13636,24 @@ this.DropDownManager = {
         
         const dropdownName = `${storageKey}_browser`;
         await this.DropDown(id, dropdownName, async () => {
+          // NEW: Even in the error state, allow selecting the current
+          // folder when selectDirectories is enabled. A previously
+          // valid folder that became temporarily unreadable can still
+          // be a legitimate selection target.
+          if (finalConfig.selectDirectories) {
+            const isCurrentSelected = storage.selectedFiles.includes(currentPath);
+            const curIcon = isCurrentSelected ? finalConfig.icons.selected : finalConfig.icons.openFolder;
+            const curName = path.basename(currentPath) || currentPath;
+            this.Button(id, {
+              name: `${curIcon} Select folder: ${curName}`,
+              path: this.Name,
+              props: { 
+                [selectProp]: currentPath,
+                page: currentProps.page 
+              }
+            });
+          }
+          
           this.Text(id, `${finalConfig.icons.error} Error reading directory:`);
           this.Text(id, error.message);
           
@@ -13728,6 +13852,40 @@ this.DropDownManager = {
         const storageKey = `fileBrowser_${instanceName}`;
         const storage = this.Storages.Get(id, storageKey);
         return storage?.displayName || `Browse: ${path.basename(storage?.currentPath || '')}`;
+      },
+
+      /**
+       * Get only the selected paths that point to directories.
+       * Useful when `selectDirectories: true` was used and the caller
+       * wants to distinguish directories from files (e.g. to create
+       * files inside the selected folder).
+       *
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {Array<string>} Selected paths that are directories
+       */
+      GetSelectedDirectories: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        const files = storage?.selectedFiles || [];
+        return files.filter(f => {
+          try { return fs.statSync(f).isDirectory(); } catch (_) { return false; }
+        });
+      },
+
+      /**
+       * Get only the selected paths that point to files.
+       * @param {string} id - User/build ID
+       * @param {string} [instanceName='fileBrowser'] - Instance name used in this.File()
+       * @returns {Array<string>} Selected paths that are files
+       */
+      GetSelectedFilesOnly: (id, instanceName = 'fileBrowser') => {
+        const storageKey = `fileBrowser_${instanceName}`;
+        const storage = this.Storages.Get(id, storageKey);
+        const files = storage?.selectedFiles || [];
+        return files.filter(f => {
+          try { return fs.statSync(f).isFile(); } catch (_) { return false; }
+        });
       }
     };
 
@@ -30416,7 +30574,13 @@ function _sbMakeItemForMethod(methodName, id) {
     case 'setpage':
       return { ...base, page: '' }
     case 'file':
-      return { ...base, config: {} }
+      return {
+        ...base,
+        config: {
+          name: `file_${id}`,
+          selectDirectories: false
+        }
+      }
     case 'json':
       return { ...base, config: {} }
     case 'args':
@@ -31608,6 +31772,24 @@ class SelfBuilder extends SyAPP_Func {
       if (it) it[prop] = !it[prop]
     }
 
+    // Toggle a boolean flag nested inside the item's `config` object.
+    // Used by the File widget's pinned editor to toggle
+    // selectDirectories / directoriesOnly without forcing the user to
+    // hand-edit the JSON config. Format: `<itemId>::<flag>`.
+    if (p.__toggleConfigFlag) {
+      const [iid, flag] = String(p.__toggleConfigFlag).split('::')
+      const it = this._findItem(iid)
+      if (it) {
+        if (!it.config || typeof it.config !== 'object' || Array.isArray(it.config)) it.config = {}
+        it.config[flag] = !it.config[flag]
+        // Turning on directoriesOnly implicitly enables selectDirectories
+        // so the folder "Select" buttons appear immediately.
+        if (flag === 'directoriesOnly' && it.config.directoriesOnly) {
+          it.config.selectDirectories = true
+        }
+      }
+    }
+
     // Cycle a page's pin position (bottom ↔ top). Used by the page
     // editor's "Pin Position" button.
     if (p.__cyclePinPosition) {
@@ -32665,9 +32847,17 @@ class SelfBuilder extends SyAPP_Func {
         case 'setpage':
           this.Button(id, { name: `📄 SetPage: ${it.page || '?'}`, props: {} })
           break
-        case 'file':
-          this.Button(id, { name: `📁 File`, props: {} })
-          break
+        case 'file': {
+          // Render the REAL this.File() widget — its dropdown, its
+          // internal navigation, its file/directory selection — so that
+          // a File item behaves exactly like a hand-written call. The
+          // config object carries the user's options (name,
+          // selectDirectories, directoriesOnly, filter, etc.).
+          const fileCfg = { ...(it.config || {}) };
+          if (!fileCfg.name) fileCfg.name = `file_${it.id}`;
+          await this.File(id, fileCfg);
+          break;
+        }
         case 'json':
           this.Button(id, { name: `🔍 JSON`, props: {} })
           break
@@ -33142,9 +33332,26 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('page', 'Page', 'string')
         break
 
-      case 'file':
-        mkProp('config', 'Config', 'json')
-        break
+      case 'file': {
+        mkProp('config', 'Config (JSON)', 'json');
+        // NEW: Easy toggles for the two directory-selection flags so
+        // the user can switch the widget into directory mode from the
+        // pinned editor without hand-editing JSON.
+        {
+          const fileCfg = it.config || {};
+          propButtons.push({
+            name: `${fileCfg.selectDirectories ? ColorText.green('✓') : ColorText.dim('○')} Select Directories`,
+            props: { __toggleConfigFlag: `${it.id}::selectDirectories` },
+            pinned: true
+          });
+          propButtons.push({
+            name: `${fileCfg.directoriesOnly ? ColorText.green('✓') : ColorText.dim('○')} Directories Only`,
+            props: { __toggleConfigFlag: `${it.id}::directoriesOnly` },
+            pinned: true
+          });
+        }
+        break;
+      }
 
       case 'json':
         mkProp('config', 'Config', 'json')
@@ -33965,8 +34172,14 @@ function _sbCallToItem(call, sessionVar) {
         config: cfg
       };
     }
-    case 'File':
-      return { type: 'file', config: {} }
+    case 'File': {
+      // Parse the config object so the round-trip from a produced file
+      // (e.g. one already containing `selectDirectories: true`) back
+      // into the SelfBuilder preserves every option.
+      const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {};
+      if (cfg === null) return null;
+      return { type: 'file', config: cfg };
+    }
     case 'JSON':
       return { type: 'json', config: {} }
     case 'Grid': {
