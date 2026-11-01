@@ -389,6 +389,203 @@ function generatePathEnforcement(filePaths, outputFormat) {
 //  Purely additive: this function only returns a string. It does
 //  not touch any existing behavior anywhere.
 // ============================================================
+// ============================================================
+//  DEEP-THINKING INSTRUCTION BUILDER
+//
+//  Produces the <thinking> enforcement block injected into the
+//  struct when the user enables the "deepthink" step.
+//
+//  The block is parameterized by `thinkingBudget` (the requested
+//  number of thinking tokens) and `strategy` (the reasoning
+//  style the AI must follow). The real-time token counter inside
+//  the instruction is derived from the budget so the AI always
+//  has a quantitative floor plus periodic self-audit lines.
+//
+//  Purely additive: this only returns a string. No existing
+//  behavior anywhere is modified.
+// ============================================================
+function generateDeepThinkInstruction(thinkingBudget = 4000, strategy = 'auto') {
+    // Sanitize the budget. Anything invalid falls back to the
+    // historical default of 4000 tokens (about one full minute).
+    let budget = parseInt(thinkingBudget, 10);
+    if (!Number.isFinite(budget) || budget <= 0) budget = 4000;
+
+    // Rough token estimate: ~4 characters per token. This is the
+    // same ratio used elsewhere in this file for size -> tokens.
+    const approxChars = budget * 4;
+
+    // The token counter must audit frequently on small budgets and
+    // less frequently on large ones, so the number of audit lines
+    // stays reasonable (roughly every 5-8% of the budget).
+    const auditEvery = Math.max(200, Math.round(budget / 15));
+
+    // Human-readable strategy description. 'auto' means the AI must
+    // pick the single strategy that best fits the user request and
+    // stick with it for the whole thinking block.
+    const STRATEGY_LABELS = {
+        auto: 'AUTO - choose the single best strategy for THIS request and stick with it',
+        socratic: 'SOCRATIC SELF-INTERROGATION - drive the reasoning with logical self-questions about the problem',
+        adversarial: 'ADVERSARIAL - actively try to falsify your own plan, then repair it',
+        decomposition: 'DECOMPOSITION - split the problem into the smallest verifiable parts and reason about each',
+        invariant: 'INVARIANT-FOCUSED - identify invariants and prove the plan preserves them',
+        counterexample: 'COUNTEREXAMPLE-HUNTING - find the smallest input/state that breaks each assumption',
+        custom: 'CUSTOM - follow the custom strategy text provided by the user (see below)',
+    };
+
+    const strategyLabel = STRATEGY_LABELS[strategy] || STRATEGY_LABELS.auto;
+
+    const rule = '-'.repeat(50);
+    let out = '';
+
+    out += `${rule}\n`;
+    out += `DEEP THINKING INSTRUCTION\n`;
+    out += `${rule}\n\n`;
+
+    out += `Before you start solving, think EXTREMELY deeply about how to solve the task.\n`;
+    out += `Put ALL of your internal reasoning inside the <thinking> ... </thinking> tags.\n`;
+    out += `First open the <thinking> tag, think extremely deeply about how to solve it,\n`;
+    out += `then close the tag with </thinking> BEFORE you generate the actual response.\n`;
+    out += `The <thinking>...</thinking> block must come first, and the real answer\n`;
+    out += `must come after the closing </thinking> tag.\n`;
+    out += `${rule}\n\n`;
+
+    out += `QUANTITATIVE OBJECTIVE - THE <thinking> BLOCK MUST BE LARGE:\n`;
+    out += `The <thinking> block is NOT a short note. It is a full, long, exhaustive\n`;
+    out += `reasoning session. Its size is measured in TOKENS, and it has a HARD\n`;
+    out += `MINIMUM BUDGET that you MUST reach before you are allowed to close the\n`;
+    out += `tag and start the real answer.\n\n`;
+    out += `   *** HARD FLOOR: ${budget.toLocaleString('en-US')} TOKENS OF <thinking> CONTENT ***\n`;
+    out += `   *** (about ${approxChars.toLocaleString('en-US')} characters) ***\n\n`;
+    out += `If you believe you are done before reaching this budget, you are NOT done.\n`;
+    out += `You have only skimmed the surface. Keep going until the budget is met.\n`;
+    out += `If you "run out of things to think about", that is a SIGNAL you are still\n`;
+    out += `at the surface - dig deeper. NEVER pad with filler or repetition: use the\n`;
+    out += `entire budget on REAL, ADDITIONAL logical analysis. The budget is a FLOOR,\n`;
+    out += `not a ceiling. Stopping early is a FAILURE.\n`;
+    out += `${rule}\n\n`;
+
+    out += `REQUIRED STRATEGY (the ONLY strategy to use in this block):\n`;
+    out += `  ${strategyLabel}\n\n`;
+    out += `Do NOT branch into multiple alternative strategies in parallel. Run ONE\n`;
+    out += `continuous, deepening line of reasoning. Every step must be a real\n`;
+    out += `logical probe about THIS problem, and every answer must open the next,\n`;
+    out += `deeper probe. Keep drilling until the token budget is exhausted.\n`;
+    out += `${rule}\n\n`;
+
+    out += `REQUIRED STRUCTURE INSIDE <thinking>:\n`;
+    out += `  STEP 0 - CHALLENGE INVENTORY: open with an explicit inventory of the\n`;
+    out += `           LOGICAL challenge. What is genuinely difficult here? Where can\n`;
+    out += `           reasoning go wrong? Which assumptions are you silently making?\n`;
+    out += `           Which parts of the request are ambiguous or in logical tension?\n`;
+    out += `  STEP 1..N - DEEP REASONING CHAIN: run a LONG chain in this exact form:\n`;
+    out += `             Q: <a logical question about the problem>\n`;
+    out += `             A: <concrete answer + what it implies + the next question it opens>\n`;
+    out += `             Q: <next logical question, deeper than the previous one>\n`;
+    out += `             A: <concrete answer + implications + next question>\n`;
+    out += `             ... continue for the whole budget ...\n\n`;
+    out += `WHAT MAKES A GOOD QUESTION (invent your own, specific to THIS task):\n`;
+    out += `  * "What is the exact logical precondition for X to be valid?"\n`;
+    out += `  * "If assumption Y is false, which parts of the plan collapse?"\n`;
+    out += `  * "What is the smallest counterexample to my current plan?"\n`;
+    out += `  * "Does requirement A logically contradict requirement B?"\n`;
+    out += `  * "Which invariant must hold before AND after the change?"\n`;
+    out += `  * "Which untouched code path could logically depend on the line I will change?"\n`;
+    out += `  * "What is the difference between what the user SAID and what the user\n`;
+    out += `     logically NEEDS?"\n`;
+    out += `  * "What would falsify the answer I just gave?"\n`;
+    out += `  * "What second-order effect does this change have on the rest of the flow?"\n`;
+    out += `  * "What am I implicitly assuming that I have not verified?"\n\n`;
+    out += `HARD RULES FOR THE DEEP REASONING CHAIN:\n`;
+    out += `  - Each answer MUST be substantive (no one-liners).\n`;
+    out += `  - Each question MUST open a genuinely new logical angle. Repeating a\n`;
+    out += `    previous question in new words is forbidden.\n`;
+    out += `  - The chain MUST drill specifically into the LOGICAL problems inside\n`;
+    out += `    the challenge - contradictions, hidden assumptions, edge conditions,\n`;
+    out += `    invariants, boundaries, and failure modes.\n`;
+    out += `  - MANDATORY TOKEN SELF-AUDIT: every ~${auditEvery.toLocaleString('en-US')} tokens, insert\n`;
+    out += `    a single self-audit line:\n`;
+    out += `      "PROGRESS: ~N tokens used, ~M tokens still required to reach the ${budget.toLocaleString('en-US')} floor."\n`;
+    out += `    Then CONTINUE the chain. This audit makes early stopping visible and\n`;
+    out += `    forbidden. The count is OBLIGATORY: a thinking block that never emits\n`;
+    out += `    a PROGRESS line is INVALID.\n`;
+    out += `  - After the last reasoning pair, write an explicit CONCLUSION paragraph\n`;
+    out += `    that answers: "Given everything above, what is the single correct,\n`;
+    out += `    minimal, and safest plan?" This conclusion is REQUIRED before\n`;
+    out += `    </thinking>.\n`;
+    out += `${rule}\n\n`;
+
+    out += `SELF-CHECK BEFORE CLOSING THE TAG (all must be YES):\n`;
+    out += `  - Did I complete the CHALLENGE INVENTORY (Step 0)?\n`;
+    out += `  - Did I emit at least one PROGRESS self-audit line every ~${auditEvery.toLocaleString('en-US')} tokens?\n`;
+    out += `  - Is the <thinking> block at least ${budget.toLocaleString('en-US')} tokens long overall?\n`;
+    out += `  - Did I write the final CONCLUSION paragraph?\n\n`;
+    out += `If ANY answer is "no", DO NOT close the tag. Continue the chain.\n`;
+    out += `A thinking block that stops early is INVALID and must be extended.\n`;
+    out += `${rule}\n\n`;
+
+    return out;
+}
+
+// ============================================================
+//  DEEP-THINK OPTIONS - display metadata for the picker.
+//
+//  These are shown in the wizard when the user enables the
+//  deep-thinking step. Each preset maps to a token budget.
+//  There is also a "custom" option which routes the user into
+//  the multi-line text editor (like the USER REQUEST step) so
+//  they can type their own token count, and a "custom strategy"
+//  option which routes them into the same editor to describe
+//  the reasoning strategy they want the AI to use.
+// ============================================================
+const DEEPTHINK_TOKEN_PRESETS = [
+    { key: '1', label: '3.000 tokens',   budget: 3000 },
+    { key: '2', label: '10.000 tokens',  budget: 10000 },
+    { key: '3', label: '30.000 tokens',  budget: 30000 },
+    { key: '4', label: '100.000 tokens', budget: 100000 },
+    { key: '5', label: '500.000 tokens', budget: 500000 },
+    { key: '6', label: 'Custom budget (type a number)', budget: null },
+];
+
+const DEEPTHINK_STRATEGY_PRESETS = [
+    { key: '1', label: 'Auto (AI picks the best fit)',           strategy: 'auto' },
+    { key: '2', label: 'Socratic self-interrogation',            strategy: 'socratic' },
+    { key: '3', label: 'Adversarial (try to falsify your plan)', strategy: 'adversarial' },
+    { key: '4', label: 'Decomposition (smallest verifiable parts)', strategy: 'decomposition' },
+    { key: '5', label: 'Invariant-focused',                      strategy: 'invariant' },
+    { key: '6', label: 'Counterexample-hunting',                 strategy: 'counterexample' },
+    { key: '7', label: 'Custom strategy (type your own)',        strategy: 'custom' },
+];
+
+// Parse a user-typed token budget with strict validation.
+// Accepts plain digits, optionally with dot/space/comma thousand
+// separators (e.g. "10.000", "10 000", "10,000"). Returns a
+// positive integer or null if the input is not a valid number.
+function parseCustomTokenBudget(raw) {
+    if (raw == null) return null;
+
+    const cleaned = String(raw)
+        .trim()
+        .replace(/[.\s,]/g, '');
+
+    if (!/^\d+$/.test(cleaned)) return null;
+
+    const value = parseInt(cleaned, 10);
+    if (!Number.isFinite(value) || value <= 0) return null;
+
+    return value;
+}
+
+// ============================================================
+//  Generate the "100% WORKING CODE" safety warning block.
+//
+//  This is a REINFORCEMENT / ATTENTION message that is injected
+//  at the top of every AI instruction template. Its sole purpose
+//  is to make very explicit to the AI that the current codebase
+//  is fully functional and that any regression is unacceptable.
+//
+//  Purely additive: this function only returns a string. It does
+//  not touch any existing behavior anywhere.
+// ============================================================
 function generateSafetyWarning() {
     const rule = '#'.repeat(78);
     let warning = '';
@@ -608,6 +805,9 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
         parsedFiles = null,
         referenceOnlyFiles = new Set(),  // NEW: set of paths marked as reference-only
         deepthinkInstruction = false,    // NEW: opt-in deep-thinking <thinking> instruction
+        deepthinkBudget = 4000,          // NEW: token budget for the <thinking> block
+        deepthinkStrategy = 'auto',      // NEW: reasoning strategy ('auto'|'socratic'|...|'custom')
+        deepthinkCustomStrategy = '',    // NEW: free-text strategy when deepthinkStrategy === 'custom'
     } = options;
 
     let structContent = '';
@@ -629,21 +829,20 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
 
         // DEEP-THINKING INSTRUCTION: only emitted when the user enabled
         // the "deepthink" step in the customize wizard. Default is OFF.
+        // The block is fully parameterized by the chosen token budget
+        // and reasoning strategy, and - when a custom strategy was
+        // typed - embeds the user's own strategy text so the AI follows
+        // it verbatim.
         if (deepthinkInstruction) {
-            structContent += `${'-'.repeat(50)}\n`;
-            structContent += `DEEP THINKING INSTRUCTION
-`;
-            structContent += `${'-'.repeat(50)}\n
-`;
-            structContent += `Before you start solving, think EXTREMELY deeply about how to solve the task.\n`;
-            structContent += `Put ALL of your internal reasoning inside the <thinking> ... </thinking> tags.\n`;
-            structContent += `First open the <thinking> tag, think extremely deeply about how to solve it,\n`;
-            structContent += `then close the tag with </thinking> BEFORE you generate the actual response.\n`;
-            structContent += `The <thinking>...</thinking> block must come first, and the real answer
-`;
-            structContent += `must come after the closing </thinking> tag.\n`;
-            structContent += `${'-'.repeat(50)}\n
-`;
+            structContent += generateDeepThinkInstruction(deepthinkBudget, deepthinkStrategy);
+
+            if (deepthinkStrategy === 'custom' && deepthinkCustomStrategy && deepthinkCustomStrategy.trim()) {
+                structContent += `${'-'.repeat(50)}\n`;
+                structContent += `CUSTOM STRATEGY (follow this exactly)\n`;
+                structContent += `${'-'.repeat(50)}\n\n`;
+                structContent += deepthinkCustomStrategy.trim() + '\n\n';
+                structContent += `${'-'.repeat(50)}\n\n`;
+            }
         }
 
         // Reinforce to the AI that the codebase is 100% working and
@@ -942,6 +1141,9 @@ async function loadState(saveName) {
         parsed: {},
         referenceOnly: [],
         deepthinkInstruction: false,
+        deepthinkBudget: 4000,
+        deepthinkStrategy: 'auto',
+        deepthinkCustomStrategy: '',
     };
 }
 
@@ -963,6 +1165,9 @@ async function regenerateFromState(state) {
         parsed = {},
         referenceOnly = [],
         deepthinkInstruction = false,
+        deepthinkBudget = 4000,
+        deepthinkStrategy = 'auto',
+        deepthinkCustomStrategy = '',
     } = state;
 
     const existingFiles = [];
@@ -1048,6 +1253,9 @@ async function regenerateFromState(state) {
         parsedFiles,
         referenceOnlyFiles,
         deepthinkInstruction,
+        deepthinkBudget,
+        deepthinkStrategy,
+        deepthinkCustomStrategy,
     });
 }
 
@@ -2392,6 +2600,9 @@ async function interactiveMode() {
             DEMAND: 'demand',
             FORMAT: 'format',
             DEEPTHINK: 'deepthink',
+            DEEPTHINK_TOKENS: 'deepthink-tokens',
+            DEEPTHINK_STRATEGY: 'deepthink-strategy',
+            DEEPTHINK_CUSTOM: 'deepthink-custom',
             SAVE: 'save',
         };
 
@@ -2404,6 +2615,9 @@ async function interactiveMode() {
         let userDemand = '';              // string (may be multi-line)
         let outputFormat = 'tagged';      // 'full' | 'tagged' | 'both' | 'codeonly' (default: tagged)
         let deepthinkInstruction = false; // bool (default: OFF - user must opt in)
+        let deepthinkBudget = 4000;       // int  (default: 4000 tokens ~= one minute)
+        let deepthinkStrategy = 'auto';   // string ('auto'|'socratic'|...|'custom')
+        let deepthinkCustomStrategy = ''; // string (only used when strategy === 'custom')
         let saveName = '';                // string
 
         // Which rows are currently part of the flow (some are conditional).
@@ -2420,6 +2634,13 @@ async function interactiveMode() {
                 rows.push(ROW.DEMAND);
                 rows.push(ROW.FORMAT);
                 rows.push(ROW.DEEPTHINK);
+                if (deepthinkInstruction) {
+                    rows.push(ROW.DEEPTHINK_TOKENS);
+                    rows.push(ROW.DEEPTHINK_STRATEGY);
+                    if (deepthinkStrategy === 'custom') {
+                        rows.push(ROW.DEEPTHINK_CUSTOM);
+                    }
+                }
             }
             rows.push(ROW.SAVE);
             return rows;
@@ -2491,6 +2712,19 @@ async function interactiveMode() {
                     return 'Full files';
                 case ROW.DEEPTHINK:
                     return deepthinkInstruction ? 'yes' : 'no';
+                case ROW.DEEPTHINK_TOKENS:
+                    return `${formatNumber(deepthinkBudget)} tokens`;
+                case ROW.DEEPTHINK_STRATEGY:
+                    return deepthinkStrategy;
+                case ROW.DEEPTHINK_CUSTOM:
+                    if (!deepthinkCustomStrategy) return '(empty)';
+                    {
+                        const sLines = deepthinkCustomStrategy.split('\n');
+                        const sFirst = sLines[0];
+                        return sLines.length > 1
+                            ? `${sFirst}  [${sLines.length} lines]`
+                            : sFirst;
+                    }
                 case ROW.SAVE:
                     return saveName || '(empty)';
                 default:
@@ -2509,6 +2743,9 @@ async function interactiveMode() {
                 case ROW.DEMAND: return '  AI request/demand:';
                 case ROW.FORMAT: return '  Output format:';
                 case ROW.DEEPTHINK: return '  Add deep-thinking <thinking> instruction?';
+                case ROW.DEEPTHINK_TOKENS: return '    Thinking token budget:';
+                case ROW.DEEPTHINK_STRATEGY: return '    Thinking strategy:';
+                case ROW.DEEPTHINK_CUSTOM: return '    Custom strategy text:';
                 case ROW.SAVE: return 'Save session as (empty to skip):';
                 default: return '';
             }
@@ -2599,6 +2836,24 @@ async function interactiveMode() {
                 console.log(`\n  ${BOLD}When enabled${RESET}, an instruction is added telling the AI to`);
                 console.log(`  think EXTREMELY deeply, wrapping all reasoning in ${MAGENTA}<thinking> ... </thinking>${RESET}`);
                 console.log(`  tags BEFORE generating the actual response. ${YELLOW}Default: no (off).${RESET}`);
+            } else if (currentRow === ROW.DEEPTHINK_TOKENS) {
+                console.log(`\n  ${BOLD}Pick a thinking token budget:${RESET}`);
+                DEEPTHINK_TOKEN_PRESETS.forEach(p => {
+                    if (p.budget === null) {
+                        console.log(`  ${BOLD}${p.key}${RESET} = ${p.label}`);
+                    } else {
+                        const mark = (deepthinkBudget === p.budget) ? `${GREEN} (current)${RESET}` : '';
+                        console.log(`  ${BOLD}${p.key}${RESET} = ${p.label}${mark}`);
+                    }
+                });
+                console.log(`\n  ${MAGENTA}Tip:${RESET} ~4.000 tokens is about one full minute of continuous thinking.`);
+            } else if (currentRow === ROW.DEEPTHINK_STRATEGY) {
+                console.log(`\n  ${BOLD}Pick a reasoning strategy:${RESET}`);
+                DEEPTHINK_STRATEGY_PRESETS.forEach(p => {
+                    const mark = (deepthinkStrategy === p.strategy) ? `${GREEN} (current)${RESET}` : '';
+                    console.log(`  ${BOLD}${p.key}${RESET} = ${p.label}${mark}`);
+                });
+                console.log(`\n  ${MAGENTA}Auto${RESET} lets the AI select the single strategy that best fits your request.`);
             }
 
             // Ask this row's question (single-line, ← = back).
@@ -2815,8 +3070,130 @@ async function interactiveMode() {
 
                     const a = res.value.toLowerCase();
                     deepthinkInstruction = (a === 'y' || a === 'yes');
+                    if (!deepthinkInstruction) {
+                        // Reset the deep-think sub-state when disabled so a
+                        // later re-enable starts from clean defaults.
+                        deepthinkBudget = 4000;
+                        deepthinkStrategy = 'auto';
+                        deepthinkCustomStrategy = '';
+                    }
 
                     currentRow = nextRow(ROW.DEEPTHINK);
+                    break;
+                }
+
+                case ROW.DEEPTHINK_TOKENS: {
+                    res = await askStepWithBack(
+                        `${BOLD}Thinking tokens (1-6, or type a number):${RESET}`,
+                        '',
+                        '1'
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.DEEPTHINK_TOKENS);
+                        break;
+                    }
+
+                    const raw = (res.value || '').trim();
+
+                    // Preset keys take priority.
+                    const preset = DEEPTHINK_TOKEN_PRESETS.find(p => p.key === raw);
+                    if (preset && preset.budget !== null) {
+                        deepthinkBudget = preset.budget;
+                        currentRow = nextRow(ROW.DEEPTHINK_TOKENS);
+                        break;
+                    }
+
+                    // Custom budget path: either the user pressed "6" or
+                    // they typed a raw number directly. Validate strictly.
+                    if (preset && preset.budget === null || /^[\d.,\s]+$/.test(raw)) {
+                        // If they typed a raw number, validate it directly.
+                        let parsedBudget = null;
+
+                        if (/^[\d.,\s]+$/.test(raw) && raw !== '') {
+                            parsedBudget = parseCustomTokenBudget(raw);
+                        }
+
+                        if (parsedBudget === null) {
+                            // Route to the multi-line editor for a clean
+                            // custom entry, exactly like the USER REQUEST
+                            // step collects its text.
+                            const editRes = await openTextEditor(
+                                String(deepthinkBudget),
+                                'THINKING TOKEN BUDGET'
+                            );
+
+                            if (editRes.type === 'cancel') {
+                                currentRow = ROW.DEEPTHINK_TOKENS;
+                                break;
+                            }
+
+                            parsedBudget = parseCustomTokenBudget(editRes.value);
+                        }
+
+                        if (parsedBudget === null) {
+                            console.log(`\n${RED}✗ Invalid token budget. Enter a positive whole number (e.g. 25000).${RESET}`);
+                            currentRow = ROW.DEEPTHINK_TOKENS;
+                            break;
+                        }
+
+                        deepthinkBudget = parsedBudget;
+                        currentRow = nextRow(ROW.DEEPTHINK_TOKENS);
+                        break;
+                    }
+
+                    // Nothing valid was entered - stay on this row.
+                    console.log(`\n${RED}✗ Invalid choice. Pick 1-6 or type a positive number.${RESET}`);
+                    currentRow = ROW.DEEPTHINK_TOKENS;
+                    break;
+                }
+
+                case ROW.DEEPTHINK_STRATEGY: {
+                    res = await askStepWithBack(
+                        `${BOLD}Strategy (1-7):${RESET}`,
+                        '',
+                        '1'
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.DEEPTHINK_STRATEGY);
+                        break;
+                    }
+
+                    const key = (res.value || '').trim();
+                    const preset = DEEPTHINK_STRATEGY_PRESETS.find(p => p.key === key);
+
+                    if (!preset) {
+                        console.log(`\n${RED}✗ Invalid choice. Pick a number 1-7.${RESET}`);
+                        currentRow = ROW.DEEPTHINK_STRATEGY;
+                        break;
+                    }
+
+                    deepthinkStrategy = preset.strategy;
+                    if (deepthinkStrategy !== 'custom') {
+                        // Leaving custom mode clears any previously typed
+                        // custom strategy text so it cannot silently leak
+                        // into a non-custom run.
+                        deepthinkCustomStrategy = '';
+                    }
+
+                    currentRow = nextRow(ROW.DEEPTHINK_STRATEGY);
+                    break;
+                }
+
+                case ROW.DEEPTHINK_CUSTOM: {
+                    // Route into the multi-line text editor - EXACTLY the
+                    // same collection step as the USER REQUEST row. This
+                    // lets the user freely write the strategy the AI must
+                    // follow inside <thinking>.
+                    const editRes = await openTextEditor(
+                        deepthinkCustomStrategy || '',
+                        'CUSTOM THINKING STRATEGY'
+                    );
+                    if (editRes.type === 'cancel') {
+                        currentRow = prevRow(ROW.DEEPTHINK_CUSTOM);
+                        break;
+                    }
+                    deepthinkCustomStrategy = editRes.value;
+                    currentRow = nextRow(ROW.DEEPTHINK_CUSTOM);
                     break;
                 }
 
@@ -2841,6 +3218,9 @@ async function interactiveMode() {
                         parsedFiles,
                         referenceOnlyFiles,
                         deepthinkInstruction,
+                        deepthinkBudget,
+                        deepthinkStrategy,
+                        deepthinkCustomStrategy,
                     });
 
                     if (saveName) {
@@ -2863,6 +3243,9 @@ async function interactiveMode() {
                             parsed: parsedState,
                             referenceOnly: [...referenceOnlyFiles],
                             deepthinkInstruction,
+                            deepthinkBudget,
+                            deepthinkStrategy,
+                            deepthinkCustomStrategy,
                         }, saveName);
                     }
 
