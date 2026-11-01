@@ -419,6 +419,21 @@ function generateDeepThinkInstruction(thinkingBudget = 4000, strategy = 'auto') 
     // stays reasonable (roughly every 5-8% of the budget).
     const auditEvery = Math.max(200, Math.round(budget / 15));
 
+    // --- Deterministic token ledger constants ---
+    // Fixed, project-wide conversion ratio: 4 characters = 1 token.
+    // This is the ONLY conversion the AI is allowed to use inside the
+    // TOKEN COUNTING LEDGER - it removes all guesswork.
+    const CHARS_PER_TOKEN = 4;
+    // Character equivalent of one audit interval (exposed in the
+    // ledger format so every PROGRESS line is machine-checkable).
+    const auditEveryChars = auditEvery * CHARS_PER_TOKEN;
+    // Verified-close target: the final ledger must PROVE at least this
+    // many tokens before </thinking> is allowed. The 5% buffer makes
+    // the hard floor bulletproof against residual counting error (a
+    // slightly conservative over-target guarantees the floor is met).
+    const closingTargetTokens = Math.ceil(budget * 1.05);
+    const closingTargetChars = closingTargetTokens * CHARS_PER_TOKEN;
+
     // Human-readable strategy description. 'auto' means the AI must
     // pick the single strategy that best fits the user request and
     // stick with it for the whole thinking block.
@@ -454,6 +469,15 @@ function generateDeepThinkInstruction(thinkingBudget = 4000, strategy = 'auto') 
     out += `reasoning session. Its size is measured in TOKENS, and it has a HARD\n`;
     out += `MINIMUM BUDGET that you MUST reach before you are allowed to close the\n`;
     out += `tag and start the real answer.\n\n`;
+
+    out += `  *** THE VERY FIRST LINE INSIDE <thinking> MUST BE THE LEDGER ANCHOR. ***\n`;
+    out += `  It is NOT optional. It is NOT "if you remember". It is the literal\n`;
+    out += `  first thing after <thinking> opens, before any reasoning:\n\n`;
+    out += `      PROGRESS #0 | segment_chars: 0 | total_chars: 0 | tokens: 0/${CHARS_PER_TOKEN} | remaining: ${budget.toLocaleString('en-US')}\n\n`;
+    out += `  This anchors the counter at 0 so there is NEVER a moment where the\n`;
+    out += `  thinking process runs without an active counter. Every subsequent\n`;
+    out += `  segment continues from #0. A <thinking> block whose first line is\n`;
+    out += `  not PROGRESS #0 is INVALID.\n\n`;
     out += `   *** HARD FLOOR: ${budget.toLocaleString('en-US')} TOKENS OF <thinking> CONTENT ***\n`;
     out += `   *** (about ${approxChars.toLocaleString('en-US')} characters) ***\n\n`;
     out += `If you believe you are done before reaching this budget, you are NOT done.\n`;
@@ -502,24 +526,118 @@ function generateDeepThinkInstruction(thinkingBudget = 4000, strategy = 'auto') 
     out += `  - The chain MUST drill specifically into the LOGICAL problems inside\n`;
     out += `    the challenge - contradictions, hidden assumptions, edge conditions,\n`;
     out += `    invariants, boundaries, and failure modes.\n`;
-    out += `  - MANDATORY TOKEN SELF-AUDIT: every ~${auditEvery.toLocaleString('en-US')} tokens, insert\n`;
-    out += `    a single self-audit line:\n`;
-    out += `      "PROGRESS: ~N tokens used, ~M tokens still required to reach the ${budget.toLocaleString('en-US')} floor."\n`;
-    out += `    Then CONTINUE the chain. This audit makes early stopping visible and\n`;
-    out += `    forbidden. The count is OBLIGATORY: a thinking block that never emits\n`;
-    out += `    a PROGRESS line is INVALID.\n`;
+    out += `  - MANDATORY TOKEN LEDGER: every ~${auditEvery.toLocaleString('en-US')} tokens\n`;
+    out += `    (about ${auditEveryChars.toLocaleString('en-US')} characters) you MUST emit ONE\n`;
+    out += `    PROGRESS ledger line in the EXACT format defined in the\n`;
+    out += `    "TOKEN COUNTING LEDGER" section below. Then CONTINUE the chain.\n`;
+    out += `    The ledger is OBLIGATORY: a thinking block that never emits a\n`;
+    out += `    PROGRESS line is INVALID. Every number in the ledger must be\n`;
+    out += `    DERIVED from real character counts - never estimated, never\n`;
+    out += `    invented, never copied from a previous line.\n`;
+    out += `  - CONTINUITY: every PROGRESS line MUST continue the running total\n`;
+    out += `    from the previous PROGRESS line (starting from PROGRESS #0).\n`;
+    out += `    Skipping the anchor (#0) or jumping to a later segment number\n`;
+    out += `    without the intermediate PROGRESS lines is INVALID.\n`;
     out += `  - After the last reasoning pair, write an explicit CONCLUSION paragraph\n`;
     out += `    that answers: "Given everything above, what is the single correct,\n`;
     out += `    minimal, and safest plan?" This conclusion is REQUIRED before\n`;
     out += `    </thinking>.\n`;
     out += `${rule}\n\n`;
 
+    out += `${rule}\n`;
+    out += `TOKEN COUNTING LEDGER (BULLETPROOF - READ EVERY LINE)\n`;
+    out += `${rule}\n\n`;
+
+    out += `The token count is NOT an estimate. It is a deterministic ledger\n`;
+    out += `built from REAL character counts of the text you actually wrote.\n`;
+    out += `Follow this protocol EXACTLY. Any deviation makes the thinking\n`;
+    out += `block INVALID.\n\n`;
+
+    out += `FIXED UNIT (no exceptions):\n`;
+    out += `  1 token = ${CHARS_PER_TOKEN} characters. This is the ONLY conversion you may use.\n`;
+    out += `  Do NOT invent another ratio. Do NOT round to "nice" numbers.\n\n`;
+
+    out += `THE LEDGER ANCHOR (mandatory first line inside <thinking>):\n`;
+    out += `  Before ANY reasoning, the FIRST line inside <thinking> MUST be:\n`;
+    out += `      PROGRESS #0 | segment_chars: 0 | total_chars: 0 | tokens: 0/${CHARS_PER_TOKEN} | remaining: ${budget.toLocaleString('en-US')}\n`;
+    out += `  This guarantees the counter is active from the very first moment.\n`;
+    out += `  PROGRESS #0 does NOT close or interrupt the thinking - it just\n`;
+    out += `  opens the ledger and then you continue reasoning normally.\n`;
+    out += `  A thinking block without this anchor is INVALID.\n\n`;
+
+    out += `SEGMENT COUNTING:\n`;
+    out += `  A "segment" is all the text you wrote since the previous PROGRESS\n`;
+    out += `  line (or since PROGRESS #0 for the very first real segment).\n`;
+    out += `  To count a segment, tally the length (in characters) of EVERY\n`;
+    out += `  line you wrote in it. This is a real, physical count of your own\n`;
+    out += `  output - never a guess. Add the line lengths together to get Ck.\n\n`;
+
+    out += `PROGRESS LINE FORMAT (exact - do not paraphrase):\n`;
+    out += `  PROGRESS #k | segment_chars: Ck | total_chars: Tk | tokens: Tk/${CHARS_PER_TOKEN} | remaining: ${budget.toLocaleString('en-US')} - Tk/${CHARS_PER_TOKEN}\n`;
+    out += `  Where Tk = T(k-1) + Ck and T0 = 0 (from PROGRESS #0). Every line\n`;
+    out += `  must be internally consistent: Tk MUST equal T(k-1) + Ck. If it\n`;
+    out += `  does not, you have made an arithmetic error - recount the segment\n`;
+    out += `  from scratch.\n\n`;
+
+    out += `RUNNING-TOTAL RULE:\n`;
+    out += `  The total_chars number in every PROGRESS line must be STRICTLY\n`;
+    out += `  GREATER than the previous line's total_chars (each segment adds\n`;
+    out += `  real text). If a new PROGRESS line shows the same or a smaller\n`;
+    out += `  total, you have failed to count - STOP and recount that segment.\n\n`;
+
+    out += `FINAL LEDGER (mandatory, emitted AFTER the last reasoning pair\n`;
+    out += `AND BEFORE the final CONCLUSION paragraph):\n`;
+    out += `  === TOKEN LEDGER FINAL ===\n`;
+    out += `  segment_0: 0 chars\n`;
+    out += `  segment_1: C1 chars\n`;
+    out += `  segment_2: C2 chars\n`;
+    out += `  ...\n`;
+    out += `  segment_n: Cn chars\n`;
+    out += `  TOTAL_CHARS: T = C1 + C2 + ... + Cn\n`;
+    out += `  TOTAL_TOKENS: T / ${CHARS_PER_TOKEN}\n`;
+    out += `  FLOOR: ${budget.toLocaleString('en-US')} tokens\n`;
+    out += `  CLOSING_TARGET: ${closingTargetTokens.toLocaleString('en-US')} tokens (= ${closingTargetChars.toLocaleString('en-US')} chars)\n`;
+    out += `  STATUS: PASS if TOTAL_TOKENS >= ${closingTargetTokens.toLocaleString('en-US')}, otherwise FAIL\n`;
+    out += `  === END LEDGER ===\n\n`;
+
+    out += `VERIFICATION OF THE FINAL LEDGER:\n`;
+    out += `  - T MUST equal the sum of every segment's Ck. Recount if not.\n`;
+    out += `  - TOTAL_TOKENS MUST equal T divided by ${CHARS_PER_TOKEN}, using the\n`;
+    out += `    actual arithmetic. Do not approximate.\n`;
+    out += `  - STATUS is PASS ONLY when TOTAL_TOKENS >= ${closingTargetTokens.toLocaleString('en-US')}.\n\n`;
+
+    out += `CLOSING GATE (this is absolute):\n`;
+    out += `  - If STATUS = FAIL: you MUST NOT write </thinking>. Continue with\n`;
+    out += `    more reasoning pairs, emit additional PROGRESS lines, then emit\n`;
+    out += `    a NEW final ledger that recomputes T and re-evaluates STATUS.\n`;
+    out += `    Repeat until STATUS = PASS.\n`;
+    out += `  - If STATUS = PASS: you MAY write the CONCLUSION paragraph and\n`;
+    out += `    then close the tag with </thinking>.\n\n`;
+
+    out += `ANTI-HALLUCINATION RULES FOR NUMBERS:\n`;
+    out += `  - Never write a number you did not compute from real character\n`;
+    out += `    counts of text you actually generated in this block.\n`;
+    out += `  - Never reuse a number from a previous PROGRESS line without\n`;
+    out += `    adding the new segment's Ck to it.\n`;
+    out += `  - If you are unsure of an exact count, count CONSERVATIVELY\n`;
+    out += `    (undercount). Undercounting forces you to keep generating\n`;
+    out += `    until the verified total safely passes CLOSING_TARGET -\n`;
+    out += `    which is exactly the bulletproof behavior we want.\n`;
+    out += `  - A ledger with any invented, estimated, or inconsistent number\n`;
+    out += `    is INVALID. The thinking block is INVALID. The response FAILS.\n`;
+    out += `${rule}\n\n`;
+
     out += `SELF-CHECK BEFORE CLOSING THE TAG (all must be YES):\n`;
+    out += `  - Is PROGRESS #0 the literal FIRST line inside <thinking>?\n`;
     out += `  - Did I complete the CHALLENGE INVENTORY (Step 0)?\n`;
-    out += `  - Did I emit at least one PROGRESS self-audit line every ~${auditEvery.toLocaleString('en-US')} tokens?\n`;
-    out += `  - Is the <thinking> block at least ${budget.toLocaleString('en-US')} tokens long overall?\n`;
+    out += `  - Did I emit a PROGRESS ledger line every ~${auditEvery.toLocaleString('en-US')} tokens?\n`;
+    out += `  - Is every PROGRESS line internally consistent (Tk = T(k-1) + Ck)?\n`;
+    out += `  - Is the running total strictly increasing on every PROGRESS line?\n`;
+    out += `  - Did I emit the FINAL LEDGER with STATUS = PASS?\n`;
+    out += `  - Is FINAL_LEDGER.TOTAL_TOKENS >= ${closingTargetTokens.toLocaleString('en-US')}?\n`;
     out += `  - Did I write the final CONCLUSION paragraph?\n\n`;
-    out += `If ANY answer is "no", DO NOT close the tag. Continue the chain.\n`;
+    out += `If ANY answer is "no", DO NOT close the tag. Continue the chain\n`;
+    out += `and re-emit the FINAL LEDGER.\n`;
     out += `A thinking block that stops early is INVALID and must be extended.\n`;
     out += `${rule}\n\n`;
 
