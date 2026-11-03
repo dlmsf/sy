@@ -36086,6 +36086,76 @@ async function _connectStreamingHost(port, host) {
   })
 }
 
+/**
+ * Mirror a `.js` file into a `.mjs` file inside a temp directory that is
+ * marked as ESM (via a generated package.json with `{ type: "module" }`),
+ * rewriting every RELATIVE import specifier to an absolute `file://` URL
+ * so it still resolves from the ORIGINAL directory.
+ *
+ * This is used by the CLI's direct-run path when the target file uses ESM
+ * syntax (`import` / `export` / `import.meta` / top-level await) but sits
+ * OUTSIDE the package.json module scope — in which case Node treats the
+ * `.js` file as CommonJS and fails with:
+ *
+ *   SyntaxError: Cannot use import statement outside a module
+ *
+ * Importing the mirror instead lets the file run as ESM without touching
+ * its original location or its package.json. This is exactly the flow
+ * needed by Self Build output files, which always carry ESM syntax but
+ * may be dropped anywhere on disk.
+ *
+ * @param {string} absolutePath - Absolute path to the source .js file.
+ * @returns {string} Absolute path to the mirrored .mjs file.
+ * @private
+ */
+function _syappCreateEsmMirror(absolutePath) {
+  const source = fs.readFileSync(absolutePath, 'utf8');
+  const srcDir = path.dirname(absolutePath);
+  const mirrorRoot = path.join(os.tmpdir(), 'syapp_cli_esm_mirror');
+  if (!fs.existsSync(mirrorRoot)) fs.mkdirSync(mirrorRoot, { recursive: true });
+
+  // A package.json with `type: "module"` makes Node treat every `.js`
+  // file inside the mirror tree as ESM. We still emit `.mjs` below, so
+  // the extension alone would be enough — but this package.json is cheap
+  // insurance for any nested `.js` that ends up in the mirror tree in
+  // the future.
+  const pkgPath = path.join(mirrorRoot, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    fs.writeFileSync(pkgPath, JSON.stringify({ type: 'module' }, null, 2), 'utf8');
+  }
+
+  // One subdirectory per source file, keyed by a hash of the absolute
+  // path so no two mirrors collide.
+  const hash = createHash('sha1').update(absolutePath).digest('hex').slice(0, 16);
+  const mirrorDir = path.join(mirrorRoot, hash);
+  if (!fs.existsSync(mirrorDir)) fs.mkdirSync(mirrorDir, { recursive: true });
+
+  const baseName = path.basename(absolutePath).replace(/\.(js|mjs|cjs)$/i, '.mjs');
+  const mirrorFile = path.join(mirrorDir, baseName);
+
+  // Rewrite ONLY relative import specifiers so they resolve from the
+  // ORIGINAL directory, not from the mirror directory. Bare package
+  // names, absolute paths and `file:` URLs resolve identically from
+  // anywhere, so they are left untouched.
+  const rewriteSpecifier = (spec) => {
+    if (!spec) return spec;
+    if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+    const absTarget = path.resolve(srcDir, spec);
+    return url.pathToFileURL(absTarget).href;
+  };
+
+  const mirrorSource = source
+    .replace(/(\bfrom\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+      return kw + q + rewriteSpecifier(spec) + q;
+    })
+    .replace(/(\bimport\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+      return kw + q + rewriteSpecifier(spec) + q;
+    });
+
+  fs.writeFileSync(mirrorFile, mirrorSource, 'utf8');
+  return mirrorFile;
+}
+
 // If this file is run directly, execute the CLI with HTTP disabled by default.
 //
 // Usage:
@@ -36779,13 +36849,57 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       // Dynamically import the user's file. This preserves ALL of its own
       // imports (relative and bare), its full module graph, and any
       // SyAPP_Func subclasses it declares.
+      //
+      // ESM SCOPE FALLBACK — a `.js` file that sits OUTSIDE a package.json
+      // that declares `"type": "module"` is treated by Node as CommonJS.
+      // If that file uses ESM syntax (`import` / `export` / `import.meta`
+      // / top-level await) — which is exactly what every Self Build
+      // output file does — the direct import fails with one of:
+      //
+      //   SyntaxError: Cannot use import statement outside a module
+      //   SyntaxError: Unexpected token 'export'
+      //   SyntaxError: Cannot use 'import.meta' outside a module
+      //   SyntaxError: await is only valid in async functions
+      //
+      // For those SPECIFIC errors we transparently mirror the file into a
+      // temp `.mjs` (with a generated `package.json` marking the mirror
+      // tree as ESM) and retry the import. This lets
+      // `node SyAPP.js MyApp.js` just work, regardless of where MyApp.js
+      // lives on disk. Any other import error (a real syntax error in the
+      // source, a missing dependency, an explicit throw, etc.) is
+      // surfaced unchanged — the mirror step would not help those and
+      // would only obscure the real message.
       let importedModule;
       try {
         importedModule = await import(fileUrl);
       } catch (importErr) {
-        console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
-        console.error(importErr);
-        process.exit(1);
+        const errMsg = String((importErr && importErr.message) || '');
+        const isEsmScopeError =
+          /Cannot use import statement outside a module/i.test(errMsg) ||
+          /Unexpected token 'export'/i.test(errMsg) ||
+          /Cannot use 'import\.meta' outside a module/i.test(errMsg) ||
+          /await is only valid in async functions/i.test(errMsg);
+
+        if (isEsmScopeError && absolutePath.toLowerCase().endsWith('.js')) {
+          try {
+            const mirrorPath = _syappCreateEsmMirror(absolutePath);
+            const mirrorUrl = url.pathToFileURL(mirrorPath).href;
+            importedModule = await import(mirrorUrl);
+            console.log(ColorText.dim(
+              `ℹ️  Loaded "${targetFile}" via ESM mirror — file was outside the package.json module scope`
+            ));
+          } catch (mirrorErr) {
+            console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
+            console.error(importErr);
+            console.error(ColorText.brightRed(`❌ ESM mirror retry also failed:`));
+            console.error(mirrorErr);
+            process.exit(1);
+          }
+        } else {
+          console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
+          console.error(importErr);
+          process.exit(1);
+        }
       }
 
       // ------------------------------------------------------------------
