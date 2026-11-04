@@ -1266,6 +1266,33 @@ async function loadState(saveName) {
 }
 
 // ============================================================
+//  Save the fixed "last" state (always overwritten - only one
+//  "last" exists at any time). Used by `node Struct.js last` to
+//  resume the most recent generation / customize flow.
+// ============================================================
+async function saveLastState(state) {
+    try {
+        const savePath = path.join(os.tmpdir(), 'struct_last.json');
+        await fs.writeFile(savePath, JSON.stringify(state, null, 2), 'utf8');
+    } catch {
+        // "last" is best-effort - never abort a generation.
+    }
+}
+
+// ============================================================
+//  Load the fixed "last" state. Returns null when nothing has
+//  been saved yet (or the file cannot be read/parsed).
+// ============================================================
+async function loadLastState() {
+    try {
+        const savePath = path.join(os.tmpdir(), 'struct_last.json');
+        return JSON.parse(await fs.readFile(savePath, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+// ============================================================
 //  Regenerate struct from a saved session state.
 //  - Reads the LATEST file contents from disk (files may have
 //    been edited since the save).
@@ -2391,7 +2418,7 @@ async function runParserMenu(filePath) {
 // ============================================================
 //  Interactive file/directory navigation & selection
 // ============================================================
-async function interactiveMode() {
+async function interactiveMode(initialState = null) {
     const originalRawMode = process.stdin.isRaw;
 
     process.stdin.setRawMode(true);
@@ -2408,6 +2435,9 @@ async function interactiveMode() {
     const parsedFiles = new Map();
     const referenceOnlyFiles = new Set();  // NEW: set for reference-only files
     let totalTokens = 0;
+
+    let pendingWizardResume = null;
+    let pendingPromptResume = null;
 
     function getMaxEntries() {
         const terminalRows = process.stdout.rows || 24;
@@ -2928,6 +2958,53 @@ async function interactiveMode() {
         let exitGenerate = false;
         let generated = false;
 
+        // ============================================================
+        //  RESUME from a pending wizard state (set by `node Struct.js last`).
+        //  Restores all wizard answers and jumps to the last flow step.
+        // ============================================================
+        if (pendingWizardResume) {
+            const resume = pendingWizardResume;
+            pendingWizardResume = null;
+
+            if (resume.parseChoice === 'yes') {
+                parseChoice = 'yes';
+                filesToParse = [...parsedFiles.keys()];
+                for (const f of filesToParse) sessionParsedFiles.add(f);
+            }
+            if (resume.refChoice === 'yes') {
+                refChoice = 'yes';
+                filesToMarkRef = [...referenceOnlyFiles];
+                for (const f of filesToMarkRef) sessionRefFiles.add(f);
+            }
+
+            if (initialState) {
+                if (typeof initialState.includeInstructions === 'boolean') {
+                    includeInstructions = initialState.includeInstructions;
+                }
+                if (typeof initialState.userDemand === 'string') {
+                    userDemand = initialState.userDemand;
+                }
+                if (typeof initialState.outputFormat === 'string') {
+                    outputFormat = initialState.outputFormat;
+                }
+                if (typeof initialState.deepthinkInstruction === 'boolean') {
+                    deepthinkInstruction = initialState.deepthinkInstruction;
+                }
+                if (Number.isFinite(initialState.deepthinkBudget) && initialState.deepthinkBudget > 0) {
+                    deepthinkBudget = initialState.deepthinkBudget;
+                }
+                if (typeof initialState.deepthinkStrategy === 'string') {
+                    deepthinkStrategy = initialState.deepthinkStrategy;
+                }
+                if (typeof initialState.deepthinkCustomStrategy === 'string') {
+                    deepthinkCustomStrategy = initialState.deepthinkCustomStrategy;
+                }
+            }
+
+            // The saved wizard always ended at SAVE - resume there.
+            currentRow = ROW.SAVE;
+        }
+
         while (!exitGenerate && !generated) {
             renderWizardPage(currentRow);
 
@@ -3341,17 +3418,17 @@ async function interactiveMode() {
                         deepthinkCustomStrategy,
                     });
 
-                    if (saveName) {
-                        // Serialize only the parser SELECTIONS - the actual parsed
-                        // content is regenerated from disk when the save is loaded,
-                        // so edits made to the files afterwards are picked up.
-                        const parsedState = {};
-                        for (const [filePath, info] of parsedFiles.entries()) {
-                            parsedState[filePath] = {
-                                selection: info.selection || null,
-                            };
-                        }
+                    // Serialize only the parser SELECTIONS - the actual parsed
+                    // content is regenerated from disk when the save is loaded,
+                    // so edits made to the files afterwards are picked up.
+                    const parsedState = {};
+                    for (const [filePath, info] of parsedFiles.entries()) {
+                        parsedState[filePath] = {
+                            selection: info.selection || null,
+                        };
+                    }
 
+                    if (saveName) {
                         await saveState({
                             version: 1,
                             files: [...selectedFiles],
@@ -3366,6 +3443,28 @@ async function interactiveMode() {
                             deepthinkCustomStrategy,
                         }, saveName);
                     }
+
+                    // Always update the fixed "last" state so
+                    // `node Struct.js last` can resume this exact flow.
+                    await saveLastState({
+                        version: 1,
+                        files: [...selectedFiles],
+                        includeInstructions,
+                        userDemand,
+                        outputFormat,
+                        parsed: parsedState,
+                        referenceOnly: [...referenceOnlyFiles],
+                        deepthinkInstruction,
+                        deepthinkBudget,
+                        deepthinkStrategy,
+                        deepthinkCustomStrategy,
+                        wizard: {
+                            enabled: true,
+                            lastRow: 'save',
+                            parseChoice,
+                            refChoice,
+                        },
+                    });
 
                     generated = true;
                     break;
@@ -3632,6 +3731,21 @@ async function interactiveMode() {
                         referenceOnlyFiles: new Set(),
                     });
 
+                    // Update fixed "last" state (find-results direct generation).
+                    await saveLastState({
+                        version: 1,
+                        files: [...selectedFiles],
+                        includeInstructions: true,
+                        userDemand: '',
+                        outputFormat: 'tagged',
+                        parsed: {},
+                        referenceOnly: [],
+                        deepthinkInstruction: false,
+                        deepthinkBudget: 4000,
+                        deepthinkStrategy: 'auto',
+                        deepthinkCustomStrategy: '',
+                    });
+
                     cleanupAndExit(0);
                     return;
                 }
@@ -3695,6 +3809,26 @@ async function interactiveMode() {
                         outputFormat: 'tagged',
                         parsedFiles: new Map(),
                         referenceOnlyFiles: new Set(),
+                    });
+
+                    // Update fixed "last" state (find-results P generation -
+                    // remember the prompt text for `node Struct.js last`).
+                    await saveLastState({
+                        version: 1,
+                        files: [...selectedFiles],
+                        includeInstructions: true,
+                        userDemand: userDemand.trim(),
+                        outputFormat: 'tagged',
+                        parsed: {},
+                        referenceOnly: [],
+                        deepthinkInstruction: false,
+                        deepthinkBudget: 4000,
+                        deepthinkStrategy: 'auto',
+                        deepthinkCustomStrategy: '',
+                        promptFlow: {
+                            enabled: true,
+                            lastPrompt: userDemand.trim(),
+                        },
                     });
 
                     cleanupAndExit(0);
@@ -4230,6 +4364,21 @@ async function interactiveMode() {
                 referenceOnlyFiles: new Set(),
             });
 
+            // Update fixed "last" state (direct generation - no wizard).
+            await saveLastState({
+                version: 1,
+                files: [...selectedFiles],
+                includeInstructions: true,
+                userDemand: '',
+                outputFormat: 'tagged',
+                parsed: {},
+                referenceOnly: [],
+                deepthinkInstruction: false,
+                deepthinkBudget: 4000,
+                deepthinkStrategy: 'auto',
+                deepthinkCustomStrategy: '',
+            });
+
             cleanupAndExit(0);
             return;
         }
@@ -4297,6 +4446,26 @@ async function interactiveMode() {
                 referenceOnlyFiles: new Set(),
             });
 
+            // Update fixed "last" state (P flow - remember the prompt
+            // text so `node Struct.js last` reopens the editor pre-filled).
+            await saveLastState({
+                version: 1,
+                files: [...selectedFiles],
+                includeInstructions: true,
+                userDemand: userDemand.trim(),
+                outputFormat: 'tagged',
+                parsed: {},
+                referenceOnly: [],
+                deepthinkInstruction: false,
+                deepthinkBudget: 4000,
+                deepthinkStrategy: 'auto',
+                deepthinkCustomStrategy: '',
+                promptFlow: {
+                    enabled: true,
+                    lastPrompt: userDemand.trim(),
+                },
+            });
+
             cleanupAndExit(0);
             return;
         }
@@ -4346,8 +4515,153 @@ async function interactiveMode() {
         return [...result];
     }
 
+    // ========================================================
+    //  RESTORE state when called with an initialState (e.g.
+    //  `node Struct.js last`). Pre-populates the selection and
+    //  re-parses previously parsed files. All existing behavior
+    //  is untouched when no initialState is provided.
+    // ========================================================
+    if (initialState) {
+        if (Array.isArray(initialState.files)) {
+            for (const filePath of initialState.files) {
+                try {
+                    await fs.access(filePath);
+                    await selectFile(filePath);
+                } catch {
+                    // missing file - skip
+                }
+            }
+        }
+
+        if (Array.isArray(initialState.referenceOnly)) {
+            for (const filePath of initialState.referenceOnly) {
+                if (selectedFiles.has(filePath)) {
+                    referenceOnlyFiles.add(filePath);
+                }
+            }
+        }
+
+        if (initialState.parsed && typeof initialState.parsed === 'object') {
+            for (const [filePath, parseInfo] of Object.entries(initialState.parsed)) {
+                if (!selectedFiles.has(filePath)) continue;
+                if (!parseInfo || !parseInfo.selection) continue;
+                try {
+                    CodeParser.parse(filePath);
+                    const summary = CodeParser.getSummary();
+                    const filtered = CodeParser.generateFiltered(parseInfo.selection);
+                    const report = CodeParser.getLastReport();
+                    const originalContent = await fs.readFile(filePath, 'utf8');
+                    if (filtered && filtered.trim()) {
+                        parsedFiles.set(filePath, {
+                            parsedContent: filtered,
+                            originalSize: originalContent.length,
+                            parsedSize: filtered.length,
+                            stats: summary,
+                            notes: report.notes || [],
+                            validation: report.validation || { ok: true, issues: [] },
+                            selection: parseInfo.selection,
+                        });
+                    }
+                } catch {
+                    // ignore re-parse errors - selection may no longer fit
+                }
+            }
+        }
+
+        if (initialState.wizard && initialState.wizard.enabled) {
+            pendingWizardResume = initialState.wizard;
+        }
+        if (initialState.promptFlow && initialState.promptFlow.enabled) {
+            pendingPromptResume = initialState.promptFlow;
+        }
+    }
+
     process.stdin.on('data', onKeypress);
     render();
+
+    // If the restored state came from a customize-wizard flow,
+    // auto-open the wizard and jump to its last step so the user
+    // can review / press Enter to regenerate. Left Arrow backs
+    // out of the wizard back into the browser as usual.
+    if (initialState && initialState.wizard && initialState.wizard.enabled) {
+        await handleGenerate();
+        process.stdin.setRawMode(true);
+        process.stdin.resume();
+        process.stdin.on('data', onKeypress);
+        render();
+    }
+
+    // If the restored state came from a P (generate with request)
+    // flow, reopen the multi-line prompt editor pre-filled with the
+    // last prompt text. Cancelling returns to the browser; saving
+    // regenerates with the edited prompt using the same defaults.
+    if (initialState && initialState.promptFlow && initialState.promptFlow.enabled) {
+        const lastPrompt = typeof initialState.userDemand === 'string'
+            ? initialState.userDemand
+            : (typeof initialState.promptFlow.lastPrompt === 'string'
+                ? initialState.promptFlow.lastPrompt
+                : '');
+
+        pendingPromptResume = null;
+
+        const editResult = await openTextEditor(lastPrompt, 'USER REQUEST');
+
+        if (editResult.type === 'cancel') {
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
+            return;
+        }
+
+        const userDemand = editResult.value;
+
+        if (!userDemand || userDemand.trim() === '') {
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
+            return;
+        }
+
+        console.log(`\n${GREEN}${BOLD}=== GENERATE WITH USER REQUEST ===${RESET}\n`);
+        console.log(`Selected files:  ${selectedFiles.size}`);
+        console.log(`AI instructions: yes`);
+        console.log(`Output format:   Tagged replacements`);
+        console.log(`Parsing:         skipped`);
+        console.log(`Reference-only:  none\n`);
+
+        await generateStruct([...selectedFiles], 'struct.txt', {
+            includeInstructions: true,
+            userDemand: userDemand.trim(),
+            outputFormat: 'tagged',
+            parsedFiles: new Map(),
+            referenceOnlyFiles: new Set(),
+        });
+
+        // Keep the "last" state in sync so repeated `last` runs
+        // remember the (possibly edited) prompt.
+        await saveLastState({
+            version: 1,
+            files: [...selectedFiles],
+            includeInstructions: true,
+            userDemand: userDemand.trim(),
+            outputFormat: 'tagged',
+            parsed: {},
+            referenceOnly: [],
+            deepthinkInstruction: false,
+            deepthinkBudget: 4000,
+            deepthinkStrategy: 'auto',
+            deepthinkCustomStrategy: '',
+            promptFlow: {
+                enabled: true,
+                lastPrompt: userDemand.trim(),
+            },
+        });
+
+        cleanupAndExit(0);
+        return;
+    }
 }
 
 // ============================================================
@@ -4357,6 +4671,21 @@ async function main() {
     const args = process.argv.slice(2);
 
     if (args.length > 0) {
+        // `node Struct.js last` -> enter the interactive struct menu with
+        // the files from the most recent generation pre-selected. If that
+        // generation was a customize-wizard flow OR a P (generate with
+        // request) flow, resume at the matching step with all answers
+        // restored (including the last typed prompt text).
+        if (args[0] === 'last') {
+            const lastState = await loadLastState();
+            if (!lastState) {
+                console.error('No "last" state found. Run a generation first.');
+                process.exit(1);
+            }
+            await interactiveMode(lastState);
+            return;
+        }
+
         const saveName = args[0];
 
         try {
