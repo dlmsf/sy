@@ -8246,7 +8246,8 @@ if (configuration.remember) {
           if (it.type === 'field') {
             const label = it.label || '';
             const val = String(it.value || '');
-            return label ? `${label}: ░${val}░` : `░${val}░`;
+            const display = it.password === true ? '*'.repeat(val.length) : val;
+            return label ? `${label}: ░${display}░` : `░${display}░`;
           }
           if (typeof it.name === 'string') return it.name;
           try {
@@ -8419,15 +8420,19 @@ if (configuration.remember) {
             const maxLen = this.fieldMaxWidth || 20;
             let val = '';
             const label = option.label || '';
+            const isPwd = option.password === true;
+            const mask = (s) => isPwd ? '*'.repeat(String(s).length) : s;
             if (this.isEditing && lineIndex === focusLine && columnIndex === focusColumn && this.activeField) {
               val = this.activeField.value || '';
               const blink = (Math.floor(Date.now() / 500) % 2 === 0) ? '█' : ' ';
               const truncated = val.length > maxLen ? val.slice(-maxLen) : val;
-              return label ? `${label}: ░${truncated}${blink}░` : `░${truncated}${blink}░`;
+              const display = mask(truncated);
+              return label ? `${label}: ░${display}${blink}░` : `░${display}${blink}░`;
             } else {
               val = option.value || '';
               const truncated = val.length > maxLen ? val.slice(0, maxLen) : val;
-              return label ? `${label}: ░${truncated}░` : `░${truncated}░`;
+              const display = mask(truncated);
+              return label ? `${label}: ░${display}░` : `░${display}░`;
             }
           }
 
@@ -10373,6 +10378,40 @@ class Session {
     this.External = config.external || false
     /** @type {string} */
     this.UniqueID = config.uniqueid || `${this.MachineID}-P${this.ProcessID}`
+    /**
+     * Authenticated user's email (session-level auth). Set by the auth
+     * manager after a successful login/register. Used as the key for
+     * per-account session persistence (see SyAuthManager).
+     * @type {string|undefined}
+     */
+    this.Email = config.email || undefined
+    /**
+     * Whether the session has been authenticated against a SyAuthManager
+     * account. When false, Funcs that declare `requireLogin: true` will
+     * redirect the session to '__auth__'.
+     * @type {boolean}
+     */
+    this.Authenticated = config.authenticated || false
+    /**
+     * Role of the authenticated account. 'user' by default, 'admin' when
+     * the account has been promoted via the admin panel or created by
+     * the --admin CLI flag.
+     * @type {string}
+     */
+    this.Role = config.role || 'user'
+    /**
+     * Whether the account's email has been verified via its confirmation
+     * code. Mirrors the account record's `verified` flag.
+     * @type {boolean}
+     */
+    this.Verified = config.verified || false
+    /**
+     * Current confirmation code for the authenticated account, when the
+     * account still requires verification. Exposed so user code can hook
+     * an email sender via this._syappInstance.Auth.getPendingConfirmation(session).
+     * @type {string|undefined}
+     */
+    this.ConfirmationCode = config.confirmation_code || undefined
     /** @type {string|undefined} */
     this.ActualPath = undefined
     /** @type {string|undefined} */
@@ -11245,6 +11284,19 @@ class SyAPP_Func {
     this.Log = config.log || false
     /** @type {boolean} */
     this.UserID_Only = config.userid_only || false
+    /**
+     * When true AND the owning SyAPP instance has an enabled Auth manager,
+     * this Func will refuse to render until the current session has been
+     * authenticated. Unauthenticated sessions are redirected to '__auth__'
+     * with the original Func name passed as `returnTo`, so login can
+     * restore the intended destination once it succeeds.
+     *
+     * Set via the Func constructor config:
+     *   super('MyApp', buildFn, { requireLogin: true })
+     *
+     * @type {boolean}
+     */
+    this.RequireLogin = config.requireLogin === true || false
     /** @type {Array} */
     this.Routes = config.routes || []
     /** @type {string} */
@@ -17198,6 +17250,12 @@ function levenshteinDistance(str1, str2) {
             type: 'field',
             label: config.label || '', // empty if not provided
             value: value,
+            // If true, the current value is masked with '*' in the render
+            // (both in the idle state and during live editing). The
+            // underlying value stays the raw string, so `onChange` /
+            // Storages still see the real text — this is only a display
+            // concern. Used by the built-in auth Func's password fields.
+            password: config.password === true,
             // If true, this field is rendered in the pinned-bottom
             // area at the bottom of the screen, below a single separator line.
             pinned: pinned || false,
@@ -25727,7 +25785,34 @@ function levenshteinDistance(str1, str2) {
       const sessionId = props.session.UniqueID;
       const previousFuncName = props.session.PreviousPath;
       const currentFuncName = props.session.ActualPath || this.Name;
-      
+
+      // ------------------------------------------------------------------
+      // AUTH GATE — per-Func `requireLogin` support.
+      // ------------------------------------------------------------------
+      // When this Func was constructed with `requireLogin: true`, AND the
+      // owning SyAPP instance has an enabled Auth manager, AND the current
+      // session is not yet authenticated, the build is short-circuited and
+      // the loader is redirected to the built-in '__auth__' Func (login /
+      // register / verify screen). The original Func name is passed as
+      // `returnTo` so login can bring the session back once it succeeds.
+      //
+      // The auth Funcs themselves ('__auth__' and '__authadmin__') are
+      // explicitly exempt to prevent an infinite redirect loop.
+      // ------------------------------------------------------------------
+      const __authExempt = (this.Name === '__auth__' || this.Name === '__authadmin__');
+      if (this.RequireLogin && !__authExempt &&
+          this._syappInstance && this._syappInstance.Auth &&
+          this._syappInstance.Auth.enabled &&
+          !props.session.Authenticated) {
+        return {
+          hud_obj: { title: '', options: [] },
+          wait_input: false,
+          input_obj: {},
+          goto_now: { path: '__auth__', props: { returnTo: this.Name } },
+          routes: {}
+        };
+      }
+
       if (previousFuncName && previousFuncName !== currentFuncName) {
         const previousFunc = this._syappInstance?.Funcs?.get(previousFuncName);
         if (previousFunc) {
@@ -27519,6 +27604,1116 @@ class AdminManager {
   }
 }
 
+// --------------------------- SyAuthManager Class ---------------------------
+
+/**
+ * Session-level authentication and per-account data persistence.
+ *
+ * Responsibilities:
+ *   • Holds the account registry (email → { salt, passwordHash, role,
+ *     verified, confirmationCode, data, createdAt }).
+ *   • Provides a small, clean API for register / login / verify /
+ *     role management / confirmation-code regeneration.
+ *   • Periodically persists every account (metadata + per-func session
+ *     data) to one JSON file per account inside a per-instance
+ *     directory:
+ *
+ *       ~/.syapp/sessions/<sessionStorageName>/<email>.json
+ *
+ *     `sessionStorageName` defaults to the MainFunc.Name and can be
+ *     overridden via the `--name <custom>` CLI flag or the
+ *     `sessionStorageName` config field.
+ *
+ * The register() / getPendingConfirmation() APIs are fully programmatic
+ * — a user build function can drive the whole auth flow (register →
+ * send email with confirmation code → verify) without ever touching the
+ * built-in __auth__ UI.
+ *
+ * Confirmation codes are DISABLED by default. Enable them with
+ * `--verify` / `--auth-verify`, or via `authRequireVerification: true`
+ * in the SyAPP config. When enabled, the __auth__ UI never displays
+ * the code — it is exposed only through `getPendingConfirmation()`,
+ * so the host can deliver it out-of-band via an email sender hook.
+ *
+ * Global registration (whether the __auth__ register screen is
+ * available) is a per-instance toggle. It can be flipped at runtime
+ * from the admin panel, and the value is persisted to
+ * `<sessionDir>/_config.json` so it survives restarts.
+ *
+ * @class
+ */
+class SyAuthManager {
+  constructor(syapp, config = {}) {
+    /** @type {SyAPP} */
+    this.syapp = syapp
+
+    /** @type {boolean} */
+    this.enabled = config.enabled === true
+
+    /** @type {boolean} */
+    this.persistenceEnabled = config.persistenceEnabled !== false && this.enabled
+
+    /**
+     * When true, accounts start UNVERIFIED on register and the
+     * confirmation code must be entered before login succeeds. When
+     * false (default), accounts are created already-verified and no
+     * confirmation code is generated at all.
+     * @type {boolean}
+     */
+    this.requireVerification = config.requireVerification === true
+
+    /**
+     * Global registration toggle. When false, the __auth__ register
+     * screen is hidden and the Auth.register() API refuses to create
+     * new accounts (admin-created accounts via the admin panel are
+     * still allowed).
+     * @type {boolean}
+     */
+    this.registrationEnabled = config.registrationEnabled !== false
+
+    /** @type {string} */
+    this.sessionName = String(config.sessionName || 'default')
+
+    /** @type {number} */
+    this.saveIntervalMs = Math.max(1000, parseInt(config.saveIntervalMs, 10) || 5000)
+
+    // Root directory for session json files
+    const homeDir = os.homedir()
+    const rootBase = config.sessionDir || path.join(homeDir, '.syapp', 'sessions')
+    this.rootDir = path.join(rootBase, this.sessionName)
+    if (this.enabled && !fs.existsSync(this.rootDir)) {
+      try { fs.mkdirSync(this.rootDir, { recursive: true }) } catch (_) {}
+    }
+
+    /** @type {Map<string, Object>} email → account record */
+    this.accounts = new Map()
+
+    /** @type {NodeJS.Timeout|null} */
+    this._autoSaveTimer = null
+
+    this._loadAccounts()
+    this._loadGlobalConfig()
+
+    if (this.enabled && this.persistenceEnabled) {
+      this._startAutoSave()
+    }
+  }
+
+  // ---------------- Directory / file helpers ----------------
+
+  _sessionFile(email) {
+    const safe = String(email || 'unknown').replace(/[^a-zA-Z0-9_.@-]/g, '_')
+    return path.join(this.rootDir, `${safe}.json`)
+  }
+
+  _globalConfigFile() {
+    return path.join(this.rootDir, '_config.json')
+  }
+
+  _ensureDir() {
+    try {
+      if (!fs.existsSync(this.rootDir)) {
+        fs.mkdirSync(this.rootDir, { recursive: true })
+      }
+    } catch (_) {}
+  }
+
+  // ---------------- Global config (registration toggle, etc.) ----------------
+
+  _loadGlobalConfig() {
+    if (!this.enabled) return
+    this._ensureDir()
+    try {
+      const f = this._globalConfigFile()
+      if (!fs.existsSync(f)) return
+      const cfg = JSON.parse(fs.readFileSync(f, 'utf8'))
+      if (cfg && typeof cfg === 'object') {
+        if (typeof cfg.registrationEnabled === 'boolean') {
+          this.registrationEnabled = cfg.registrationEnabled
+        }
+        if (typeof cfg.requireVerification === 'boolean') {
+          this.requireVerification = cfg.requireVerification
+        }
+      }
+    } catch (_) {}
+  }
+
+  _saveGlobalConfig() {
+    if (!this.enabled) return
+    this._ensureDir()
+    try {
+      const payload = {
+        registrationEnabled: this.registrationEnabled,
+        requireVerification: this.requireVerification,
+        savedAt: new Date().toISOString()
+      }
+      fs.writeFileSync(this._globalConfigFile(), JSON.stringify(payload, null, 2), 'utf8')
+    } catch (_) {}
+  }
+
+  setRegistrationEnabled(value) {
+    this.registrationEnabled = !!value
+    this._saveGlobalConfig()
+    return { ok: true, registrationEnabled: this.registrationEnabled }
+  }
+
+  setRequireVerification(value) {
+    this.requireVerification = !!value
+    this._saveGlobalConfig()
+    return { ok: true, requireVerification: this.requireVerification }
+  }
+
+  // ---------------- Account loading / saving ----------------
+
+  _loadAccounts() {
+    if (!this.enabled) return
+    this._ensureDir()
+    try {
+      const files = fs.readdirSync(this.rootDir)
+      for (const f of files) {
+        if (!f.endsWith('.json')) continue
+        if (f.startsWith('_')) continue // reserved for internal metadata
+        try {
+          const data = JSON.parse(fs.readFileSync(path.join(this.rootDir, f), 'utf8'))
+          if (data && typeof data.email === 'string' && data.email.length > 0) {
+            this.accounts.set(data.email, data)
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+
+  _writeAccountFile(email, account) {
+    this._ensureDir()
+    try {
+      const payload = {
+        email: account.email,
+        salt: account.salt || '',
+        passwordHash: account.passwordHash || '',
+        role: account.role || 'user',
+        verified: !!account.verified,
+        confirmationCode: account.confirmationCode || null,
+        createdAt: account.createdAt || new Date().toISOString(),
+        data: account.data || {},
+        savedAt: new Date().toISOString()
+      }
+      fs.writeFileSync(this._sessionFile(email), JSON.stringify(payload, null, 2), 'utf8')
+    } catch (_) {}
+  }
+
+  _saveAccounts() {
+    for (const [email, account] of this.accounts) {
+      this._writeAccountFile(email, account)
+    }
+  }
+
+  // ---------------- Crypto helpers ----------------
+
+  _hashPassword(password, salt) {
+    const hash = createHash('sha256')
+    hash.update(String(salt || '') + String(password || ''))
+    return hash.digest('hex')
+  }
+
+  _genSalt() {
+    return createHash('sha256')
+      .update(String(Date.now()) + String(Math.random()) + String(process.pid))
+      .digest('hex')
+      .slice(0, 16)
+  }
+
+  _genCode() {
+    return String(Math.floor(100000 + Math.random() * 900000))
+  }
+
+  _isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || ''))
+  }
+
+  // ---------------- Public API — registration / login / verify ----------------
+
+  /**
+   * Register a new account. By default captures ONLY email + password,
+   * with password confirmation checked by the caller (or by passing it
+   * to `confirmation`). Uniqueness is enforced by checking whether the
+   * email already exists in the registry.
+   *
+   * Refuses when global registration is disabled, UNLESS the caller
+   * explicitly passes `options.allowDisabledRegistration = true` — a
+   * reserved escape hatch for admin-created accounts.
+   *
+   * @param {string} email
+   * @param {string} password
+   * @param {string} [confirmation=password] - Password confirmation
+   * @param {Object} [options]
+   * @param {string} [options.role='user']
+   * @param {boolean} [options.autoVerify=false]
+   * @param {Object} [options.data={}] - Initial per-account session data
+   * @param {boolean} [options.allowDisabledRegistration=false]
+   * @returns {{ok: boolean, error?: string, email?: string, role?: string, verified?: boolean, confirmationCode?: string|null, requiresVerification?: boolean}}
+   */
+  async register(email, password, confirmation = password, options = {}) {
+    if (!this.enabled) return { ok: false, error: 'Auth is disabled on this instance' }
+
+    if (!this.registrationEnabled && options.allowDisabledRegistration !== true) {
+      return { ok: false, error: 'Registration is currently disabled' }
+    }
+
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const cleanPassword = String(password || '')
+    const cleanConfirmation = String(confirmation == null ? cleanPassword : confirmation)
+
+    if (!this._isValidEmail(cleanEmail)) {
+      return { ok: false, error: 'Invalid email' }
+    }
+    if (cleanPassword.length < 4) {
+      return { ok: false, error: 'Password too short (minimum 4 characters)' }
+    }
+    if (cleanPassword !== cleanConfirmation) {
+      return { ok: false, error: 'Passwords do not match' }
+    }
+    if (this.accounts.has(cleanEmail)) {
+      return { ok: false, error: 'Email already registered' }
+    }
+
+    const salt = this._genSalt()
+    const passwordHash = this._hashPassword(cleanPassword, salt)
+    const role = options.role === 'admin' ? 'admin' : 'user'
+    const autoVerify = options.autoVerify === true
+
+    // Verification step is OPT-IN: only when the manager was created
+    // with requireVerification=true (CLI --verify / --auth-verify or
+    // authRequireVerification: true) do we create the account as
+    // unverified and generate a code. Default behaviour: created as
+    // already-verified, no code generated at all.
+    const needsCode = this.requireVerification && !autoVerify
+    const verified = !needsCode
+    const confirmationCode = needsCode ? this._genCode() : null
+
+    const account = {
+      email: cleanEmail,
+      salt,
+      passwordHash,
+      role,
+      verified,
+      confirmationCode,
+      createdAt: new Date().toISOString(),
+      data: (options.data && typeof options.data === 'object') ? options.data : {}
+    }
+
+    this.accounts.set(cleanEmail, account)
+    this._writeAccountFile(cleanEmail, account)
+
+    return {
+      ok: true,
+      email: cleanEmail,
+      role,
+      verified,
+      confirmationCode,
+      requiresVerification: needsCode
+    }
+  }
+
+  /**
+   * Attempt a login with the given email + password.
+   * On success the caller is responsible for calling
+   * `markSessionAuthenticated(session, result)` to link the session.
+   *
+   * @param {string} email
+   * @param {string} password
+   * @param {Object} [options]
+   * @param {boolean} [options.requireAdmin=false] - When true, only
+   *        accounts with role = 'admin' are allowed to log in.
+   * @returns {{ok: boolean, error?: string, email?: string, role?: string, verified?: boolean, requiresVerification?: boolean}}
+   */
+  async login(email, password, options = {}) {
+    if (!this.enabled) return { ok: false, error: 'Auth is disabled on this instance' }
+
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const cleanPassword = String(password || '')
+
+    const account = this.accounts.get(cleanEmail)
+    if (!account) return { ok: false, error: 'Invalid credentials' }
+
+    const hash = this._hashPassword(cleanPassword, account.salt || '')
+    if (hash !== account.passwordHash) {
+      return { ok: false, error: 'Invalid credentials' }
+    }
+
+    if (options.requireAdmin === true && account.role !== 'admin') {
+      return { ok: false, error: 'This account is not an administrator' }
+    }
+
+    if (this.requireVerification && !account.verified) {
+      return {
+        ok: false,
+        error: 'Email not verified',
+        requiresVerification: true
+      }
+    }
+
+    return {
+      ok: true,
+      email: cleanEmail,
+      role: account.role || 'user',
+      verified: !!account.verified
+    }
+  }
+
+  /**
+   * Verify an account against its confirmation code.
+   * @param {string} email
+   * @param {string} code
+   * @returns {{ok: boolean, error?: string, email?: string, alreadyVerified?: boolean}}
+   */
+  verify(email, code) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const account = this.accounts.get(cleanEmail)
+    if (!account) return { ok: false, error: 'Account not found' }
+    if (account.verified) return { ok: true, alreadyVerified: true, email: cleanEmail }
+    if (String(code) !== String(account.confirmationCode)) {
+      return { ok: false, error: 'Invalid confirmation code' }
+    }
+    account.verified = true
+    account.confirmationCode = null
+    this.accounts.set(cleanEmail, account)
+    this._writeAccountFile(cleanEmail, account)
+    return { ok: true, email: cleanEmail }
+  }
+
+  /**
+   * Link an authenticated account to a session (sets Email / Role /
+   * Verified / Authenticated on the session) and restores any persisted
+   * per-func session data.
+   * @param {Session} session
+   * @param {Object} result - The result object from login()
+   */
+  markSessionAuthenticated(session, result) {
+    if (!session || !result || !result.ok) return
+    session.Email = result.email
+    session.Authenticated = true
+    session.Role = result.role || 'user'
+    session.Verified = !!result.verified
+    session.UserID = result.email
+
+    // Restore persisted per-func session data (if any) into the live
+    // session's UserStorage maps.
+    const account = this.accounts.get(result.email)
+    if (!account || !account.data || typeof account.data !== 'object') return
+    if (!this.syapp || !this.syapp.Funcs) return
+
+    for (const [funcName, funcData] of Object.entries(account.data)) {
+      const func = this.syapp.Funcs.get(funcName)
+      if (!func || !func.Storages || !funcData || typeof funcData !== 'object') continue
+      for (const [key, value] of Object.entries(funcData)) {
+        try { func.Storages.Set(session.UniqueID, key, value) } catch (_) {}
+      }
+    }
+  }
+
+  /**
+   * Clear the authentication state of a session (used for "logout").
+   * Does not remove the underlying account record.
+   * @param {Session} session
+   */
+  logout(session) {
+    if (!session) return
+    session.Authenticated = false
+    session.Email = undefined
+    session.Role = 'user'
+    session.Verified = false
+    session.ConfirmationCode = undefined
+    session.UserID = undefined
+  }
+
+  // ---------------- Per-account data helpers ----------------
+
+  getSessionData(session) {
+    if (!session || !session.Email) return null
+    const account = this.accounts.get(session.Email)
+    return account ? (account.data || null) : null
+  }
+
+  setSessionData(session, key, value) {
+    if (!session || !session.Email) return false
+    const account = this.accounts.get(session.Email)
+    if (!account) return false
+    if (!account.data) account.data = {}
+    account.data[key] = value
+    this.accounts.set(session.Email, account)
+    return true
+  }
+
+  /**
+   * Retrieve the pending confirmation code for a session's account.
+   * Intended for programmatic email-sender integration: any build
+   * function can call `this._syappInstance.Auth.getPendingConfirmation(props.session)`
+   * to obtain `{ email, code }` and dispatch it via an email API.
+   *
+   * Returns null when verification is disabled, the account is already
+   * verified, or there is no pending account. The confirmation code is
+   * NEVER displayed inside the __auth__ UI — the only way to see it is
+   * through this method (or the admin panel's "Confirmation code" line,
+   * which is intended for the operator only).
+   *
+   * @param {Session} session
+   * @returns {{email: string, code: string}|null}
+   */
+  getPendingConfirmation(session) {
+    if (!session || !session.Email) return null
+    const account = this.accounts.get(session.Email)
+    if (!account || account.verified) return null
+    if (!account.confirmationCode) return null
+    return { email: account.email, code: account.confirmationCode }
+  }
+
+  // ---------------- Admin operations ----------------
+
+  setAdmin(email, isAdmin) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const account = this.accounts.get(cleanEmail)
+    if (!account) return { ok: false, error: 'Account not found' }
+    account.role = isAdmin ? 'admin' : 'user'
+    this.accounts.set(cleanEmail, account)
+    this._writeAccountFile(cleanEmail, account)
+    return { ok: true }
+  }
+
+  setVerified(email, verified) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const account = this.accounts.get(cleanEmail)
+    if (!account) return { ok: false, error: 'Account not found' }
+    account.verified = !!verified
+    if (verified) account.confirmationCode = null
+    this.accounts.set(cleanEmail, account)
+    this._writeAccountFile(cleanEmail, account)
+    return { ok: true }
+  }
+
+  regenerateCode(email) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const account = this.accounts.get(cleanEmail)
+    if (!account) return { ok: false, error: 'Account not found' }
+    account.confirmationCode = this._genCode()
+    // Regenerating a code implies the account is NOT verified until
+    // the new code is accepted — otherwise the code would be dead on
+    // arrival.
+    account.verified = false
+    this.accounts.set(cleanEmail, account)
+    this._writeAccountFile(cleanEmail, account)
+    return { ok: true, code: account.confirmationCode }
+  }
+
+  /**
+   * Change an account's password (admin-side, no old-password check).
+   * @param {string} email
+   * @param {string} newPassword
+   * @returns {{ok: boolean, error?: string}}
+   */
+  setPassword(email, newPassword) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    const cleanPassword = String(newPassword || '')
+    if (cleanPassword.length < 4) return { ok: false, error: 'Password too short (minimum 4 characters)' }
+    const account = this.accounts.get(cleanEmail)
+    if (!account) return { ok: false, error: 'Account not found' }
+    const salt = this._genSalt()
+    account.salt = salt
+    account.passwordHash = this._hashPassword(cleanPassword, salt)
+    this.accounts.set(cleanEmail, account)
+    this._writeAccountFile(cleanEmail, account)
+    return { ok: true }
+  }
+
+  removeAccount(email) {
+    const cleanEmail = String(email || '').trim().toLowerCase()
+    if (!this.accounts.has(cleanEmail)) return { ok: false, error: 'Account not found' }
+    this.accounts.delete(cleanEmail)
+    try {
+      const f = this._sessionFile(cleanEmail)
+      if (fs.existsSync(f)) fs.unlinkSync(f)
+    } catch (_) {}
+    return { ok: true }
+  }
+
+  listAccounts() {
+    const out = []
+    for (const [email, acc] of this.accounts) {
+      out.push({
+        email,
+        role: acc.role || 'user',
+        verified: !!acc.verified,
+        confirmationCode: acc.verified ? null : (acc.confirmationCode || null),
+        createdAt: acc.createdAt || null
+      })
+    }
+    return out
+  }
+
+  isAdmin(session) {
+    return !!(session && session.Authenticated && session.Role === 'admin')
+  }
+
+  // ---------------- Auto-save ----------------
+
+  _persistSessions() {
+    if (!this.enabled || !this.persistenceEnabled) return
+    if (!this.syapp) return
+
+    // Group live session data into each account record, keyed by func.
+    try {
+      for (const [sessionId, session] of this.syapp.Sessions) {
+        if (!session || !session.Email) continue
+        const account = this.accounts.get(session.Email)
+        if (!account) continue
+        if (!account.data || typeof account.data !== 'object') account.data = {}
+
+        for (const [funcName, func] of this.syapp.Funcs) {
+          const userData = func && func.UserStorage ? func.UserStorage.get(sessionId) : null
+          if (userData && typeof userData === 'object' && Object.keys(userData).length > 0) {
+            account.data[funcName] = { ...userData }
+          }
+        }
+        this.accounts.set(session.Email, account)
+      }
+    } catch (_) {}
+
+    // Write every account file to disk.
+    this._saveAccounts()
+  }
+
+  _startAutoSave() {
+    if (this._autoSaveTimer) return
+    this._autoSaveTimer = setInterval(() => {
+      try { this._persistSessions() } catch (_) {}
+    }, this.saveIntervalMs)
+  }
+
+  stopAutoSave() {
+    if (this._autoSaveTimer) {
+      try { clearInterval(this._autoSaveTimer) } catch (_) {}
+      this._autoSaveTimer = null
+    }
+  }
+}
+
+// --------------------------- SyAuthFunc Class ---------------------------
+
+/**
+ * Built-in login / register / verify Func.
+ *
+ * The whole UI is intentionally minimal — a handful of `this.Field`
+ * calls plus a couple of buttons. Uses only the login/password pair by
+ * default (with a confirmation field on register) as the identity
+ * uniqueness contract.
+ *
+ * Flow:
+ *   • 'login'    — email + password fields, Login + "Register" buttons
+ *   • 'register' — email + password + confirmation fields, Register + Back
+ *   • 'verify'   — code field, Verify + Back. Only reachable when the
+ *                  host opted into confirmation codes via `--verify` /
+ *                  `--auth-verify` / `authRequireVerification: true`.
+ *                  When enabled, the UI NEVER displays the confirmation
+ *                  code itself — only the pending email — because the
+ *                  code is meant to be delivered out-of-band (via
+ *                  `Auth.getPendingConfirmation()` + an email sender).
+ *
+ * The Register button is only shown when the global registration
+ * toggle is enabled (Auth.registrationEnabled). Admins can flip that
+ * toggle from the __authadmin__ panel.
+ *
+ * On successful login the session is linked to the account via
+ * `Auth.markSessionAuthenticated()` and the session is navigated to the
+ * originally-requested Func (the `returnTo` prop), or the main func.
+ *
+ * @extends SyAPP_Func
+ */
+class SyAuthFunc extends SyAPP_Func {
+  constructor() {
+    super(
+      '__auth__',
+      async (props) => {
+        const id = props.session.UniqueID
+        const auth = this._syappInstance && this._syappInstance.Auth
+
+        // Auth manager disabled — show a diagnostic instead of a dead screen.
+        if (!auth || !auth.enabled) {
+          this.Text(id, '')
+          this.Text(id, ColorText.brightYellow('⚠ Authentication is not enabled on this SyAPP instance.'))
+          this.Text(id, '')
+          this.Text(id, ColorText.dim('Enable it via config.auth = true, or run with --ss / --admin.'))
+          return
+        }
+
+        const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
+
+        // Persist a returnTo passed via props (from the auth gate redirect).
+        if (props.returnTo && props.returnTo !== this.Name && props.returnTo !== '__auth__') {
+          this.Storages.Set(id, 'auth_return_to', props.returnTo)
+        }
+        const returnTo = this.Storages.Get(id, 'auth_return_to')
+          || (this._syappInstance && this._syappInstance.MainFunc && this._syappInstance.MainFunc.Name)
+          || ''
+
+        // ---------------- Handle actions ----------------
+        if (curProps.__auth_switch) {
+          const target = curProps.__auth_switch === 'register'
+            ? 'register'
+            : (curProps.__auth_switch === 'verify' ? 'verify' : 'login')
+          this.Storages.Set(id, 'auth_mode', target)
+          this.Storages.Delete(id, 'auth_message')
+          delete curProps.__auth_switch
+        }
+
+        if (curProps.__auth_login) {
+          delete curProps.__auth_login
+          const email = this.Storages.Get(id, 'field_auth_email') || ''
+          const password = this.Storages.Get(id, 'field_auth_password') || ''
+          const res = await auth.login(email, password)
+
+          if (res.ok) {
+            auth.markSessionAuthenticated(props.session, res)
+            this.Storages.Delete(id, 'field_auth_password')
+            this.Storages.Set(id, 'auth_message', '')
+            this.Storages.Delete(id, 'auth_return_to')
+            // Navigate to the requested Func (or main func)
+            if (returnTo && returnTo !== this.Name) {
+              this.GotoNow(id, returnTo, { props: {} })
+            }
+            return
+          }
+
+          if (res.requiresVerification) {
+            this.Storages.Set(id, 'auth_pending_email', String(email).trim().toLowerCase())
+            this.Storages.Set(id, 'auth_mode', 'verify')
+            this.Storages.Set(id, 'auth_message', '⏳ Email not verified — enter the confirmation code below.')
+          } else {
+            this.Storages.Set(id, 'auth_message', `❌ ${res.error || 'Login failed'}`)
+          }
+        }
+
+        if (curProps.__auth_register) {
+          delete curProps.__auth_register
+          const email = this.Storages.Get(id, 'field_auth_email') || ''
+          const password = this.Storages.Get(id, 'field_auth_password') || ''
+          const confirmation = this.Storages.Get(id, 'field_auth_confirm') || ''
+
+          const res = await auth.register(email, password, confirmation)
+          if (res.ok) {
+            if (res.requiresVerification) {
+              // Confirmation code path. NEVER show the code in the UI —
+              // it is delivered out-of-band via Auth.getPendingConfirmation()
+              // (email sender hook) or read by the operator from the admin
+              // panel. The user only sees the "enter your code" prompt.
+              this.Storages.Set(id, 'auth_pending_email', res.email)
+              this.Storages.Set(id, 'auth_mode', 'verify')
+              this.Storages.Set(id, 'auth_message',
+                '✅ Registered. A confirmation code has been issued — enter it below.')
+            } else {
+              // Default path: no verification required — registration
+              // immediately produces a verified account. Send the user
+              // straight to the login form.
+              this.Storages.Set(id, 'auth_mode', 'login')
+              this.Storages.Set(id, 'auth_message', '✅ Registered. You can log in now.')
+            }
+            this.Storages.Delete(id, 'field_auth_password')
+            this.Storages.Delete(id, 'field_auth_confirm')
+          } else {
+            this.Storages.Set(id, 'auth_message', `❌ ${res.error || 'Registration failed'}`)
+          }
+        }
+
+        if (curProps.__auth_verify) {
+          delete curProps.__auth_verify
+          const pendingEmail = this.Storages.Get(id, 'auth_pending_email') || ''
+          const code = this.Storages.Get(id, 'field_auth_code') || ''
+          const res = auth.verify(pendingEmail, code)
+          if (res.ok) {
+            this.Storages.Set(id, 'auth_mode', 'login')
+            this.Storages.Set(id, 'auth_message', '✅ Verified. You can log in now.')
+            this.Storages.Delete(id, 'auth_pending_email')
+            this.Storages.Delete(id, 'field_auth_code')
+          } else {
+            this.Storages.Set(id, 'auth_message', `❌ ${res.error || 'Verification failed'}`)
+          }
+        }
+
+        // ---------------- Render ----------------
+        const mode = this.Storages.Get(id, 'auth_mode') || 'login'
+        const message = this.Storages.Get(id, 'auth_message') || ''
+        const regEnabled = auth.registrationEnabled !== false
+
+        this.Text(id, '')
+        this.Text(id, ColorText.brightCyan('🔐 SyAPP Authentication'))
+        this.Text(id, '')
+
+        if (message) {
+          this.Text(id, message)
+          this.Text(id, '')
+        }
+
+        if (mode === 'register') {
+          // Defensive: even if the mode was somehow set to 'register'
+          // while global registration is disabled, bounce back to login.
+          if (!regEnabled) {
+            this.Storages.Set(id, 'auth_mode', 'login')
+            this.Storages.Set(id, 'auth_message', '❌ Registration is currently disabled')
+            return
+          }
+          this.Field(id, 'auth_email', { label: 'Email', initialValue: '' })
+          this.Field(id, 'auth_password', { label: 'Password', initialValue: '', password: true })
+          this.Field(id, 'auth_confirm', { label: 'Confirm', initialValue: '', password: true })
+          this.Text(id, '')
+          this.Button(id, { name: ColorText.bgGreen(ColorText.black(' 📝 Register ')), props: { __auth_register: 1 } })
+          this.Button(id, { name: ColorText.dim('← Back to Login'), props: { __auth_switch: 'login' } })
+        } else if (mode === 'verify') {
+          const pendingEmail = this.Storages.Get(id, 'auth_pending_email') || ''
+          if (pendingEmail) {
+            this.Text(id, ColorText.dim(`Verifying: ${pendingEmail}`))
+            this.Text(id, '')
+          }
+          this.Field(id, 'auth_code', { label: 'Code', initialValue: '' })
+          this.Text(id, '')
+          this.Button(id, { name: ColorText.bgGreen(ColorText.black(' ✅ Verify ')), props: { __auth_verify: 1 } })
+          this.Button(id, { name: ColorText.dim('← Back to Login'), props: { __auth_switch: 'login' } })
+        } else {
+          this.Field(id, 'auth_email', { label: 'Email', initialValue: '' })
+          this.Field(id, 'auth_password', { label: 'Password', initialValue: '', password: true })
+          this.Text(id, '')
+          this.Button(id, { name: ColorText.bgGreen(ColorText.black(' 🔓 Login ')), props: { __auth_login: 1 } })
+          if (regEnabled) {
+            this.Button(id, { name: '📝 Register', props: { __auth_switch: 'register' } })
+          }
+        }
+      }
+    )
+  }
+}
+
+// --------------------------- SyAuthAdminFunc Class ---------------------------
+
+/**
+ * Built-in admin panel for managing auth accounts.
+ *
+ * IMPORTANT — the panel itself requires ADMIN credentials before
+ * rendering ANY content. On boot (or on any manual navigation to
+ * '__authadmin__'), if the current session is not already an
+ * authenticated admin, the panel shows a compact login form and only
+ * proceeds once a matching account with role = 'admin' is verified.
+ *
+ * On a FRESH install started with `--admin`, SyAPP's constructor seeds
+ * a bootstrap admin account automatically (admin@local / admin) so the
+ * operator can log in immediately without any manual setup. Once that
+ * account exists, subsequent `--admin` runs will NOT re-seed it —
+ * credentials must be entered to enter the panel.
+ *
+ * The panel is DEDICATED to admin work: once --admin is active, the
+ * operator stays here. There is no "back to app" shortcut, since the
+ * operator launched the process specifically for admin mode.
+ *
+ * Once inside, the panel provides:
+ *
+ *   • A global "Registration" toggle (persisted to disk), which
+ *     controls whether the __auth__ register screen is available to
+ *     new users.
+ *   • A per-user editor (EDIT mode) reachable via the ✎ button on
+ *     each row. Edit mode allows:
+ *       – Role         (user ↔ admin)
+ *       – Verified     (yes ↔ no)
+ *       – Password     (set a new one via this.Field)
+ *       – Confirmation code regeneration
+ *       – Delete account
+ *   • Compact per-row actions for quick operations (verify, promote,
+ *     regenerate code) in the list view.
+ *   • The current confirmation code of any unverified account, so the
+ *     operator can relay it manually to the user (or wire it into an
+ *     email sender via Auth.getPendingConfirmation()).
+ *
+ * @extends SyAPP_Func
+ */
+class SyAuthAdminFunc extends SyAPP_Func {
+  constructor() {
+    super(
+      '__authadmin__',
+      async (props) => {
+        const id = props.session.UniqueID
+        const auth = this._syappInstance && this._syappInstance.Auth
+
+        if (!auth || !auth.enabled) {
+          this.Text(id, '')
+          this.Text(id, ColorText.brightYellow('⚠ Authentication is disabled on this SyAPP instance.'))
+          this.Text(id, ColorText.dim('Enable it with --ss / --admin, or config.auth = true.'))
+          return
+        }
+
+        const curProps = this.Builds.get(id)?.Session?.ActualProps || {}
+
+        // ==================================================================
+        // GATE: require an authenticated ADMIN before showing the panel.
+        // ==================================================================
+        if (!(props.session.Authenticated && props.session.Role === 'admin')) {
+          // ---- handle login action ----
+          if (curProps.__admin_gate_login) {
+            delete curProps.__admin_gate_login
+            const email = this.Storages.Get(id, 'field_admin_gate_email') || ''
+            const password = this.Storages.Get(id, 'field_admin_gate_password') || ''
+            const res = await auth.login(email, password, { requireAdmin: true })
+            if (res.ok) {
+              auth.markSessionAuthenticated(props.session, res)
+              this.Storages.Delete(id, 'field_admin_gate_password')
+              this.Storages.Delete(id, 'admin_gate_msg')
+            } else {
+              this.Storages.Set(id, 'admin_gate_msg', `❌ ${res.error || 'Login failed'}`)
+            }
+          }
+
+          // Still unauthenticated after the action handlers → show gate.
+          if (!(props.session.Authenticated && props.session.Role === 'admin')) {
+            const msg = this.Storages.Get(id, 'admin_gate_msg') || ''
+
+            this.Text(id, '')
+            this.Text(id, ColorText.brightCyan('🛡️  SyAPP Admin Panel'))
+            this.Text(id, ColorText.dim('Administrator credentials required.'))
+            this.Text(id, '')
+            if (msg) {
+              this.Text(id, msg)
+              this.Text(id, '')
+            }
+
+            this.Field(id, 'admin_gate_email', { label: 'Admin Email', initialValue: '' })
+            this.Field(id, 'admin_gate_password', { label: 'Password', initialValue: '', password: true })
+            this.Text(id, '')
+            this.Button(id, { name: ColorText.bgGreen(ColorText.black(' 🔓 Enter Admin Panel ')), props: { __admin_gate_login: 1 } })
+            return
+          }
+        }
+
+        // ==================================================================
+        // AUTHENTICATED ADMIN — show the management panel.
+        // ==================================================================
+
+        // ---------------- Header actions ----------------
+        if (curProps.__admin_logout) {
+          delete curProps.__admin_logout
+          auth.logout(props.session)
+          this.Alert(id, '🔒 Logged out', { duration: 2000 })
+        }
+
+        // ---------------- Global toggles ----------------
+        if (curProps.__admin_toggle_register) {
+          delete curProps.__admin_toggle_register
+          const next = !auth.registrationEnabled
+          auth.setRegistrationEnabled(next)
+          this.Alert(id, next ? '✅ Global registration ENABLED' : '🚫 Global registration DISABLED', { duration: 2500 })
+        }
+
+        // ---------------- Per-row actions (list view) ----------------
+        if (curProps.__admin_setverify) {
+          const raw = String(curProps.__admin_setverify)
+          delete curProps.__admin_setverify
+          const [email, val] = raw.split('::')
+          if (email) auth.setVerified(email, val === '1')
+        }
+        if (curProps.__admin_setrole) {
+          const raw = String(curProps.__admin_setrole)
+          delete curProps.__admin_setrole
+          const [email, val] = raw.split('::')
+          if (email) auth.setAdmin(email, val === '1')
+        }
+        if (curProps.__admin_regen) {
+          const email = String(curProps.__admin_regen)
+          delete curProps.__admin_regen
+          if (email) {
+            const res = auth.regenerateCode(email)
+            if (res.ok) {
+              this.Alert(id, `↻ New code for ${email}: ${res.code}`, { duration: 5000 })
+            }
+          }
+        }
+        if (curProps.__admin_edit_user) {
+          const email = String(curProps.__admin_edit_user)
+          delete curProps.__admin_edit_user
+          this.Storages.Set(id, 'admin_edit_email', email)
+          this.Storages.Set(id, 'admin_edit_msg', '')
+        }
+        if (curProps.__admin_edit_cancel) {
+          delete curProps.__admin_edit_cancel
+          this.Storages.Delete(id, 'admin_edit_email')
+          this.Storages.Delete(id, 'admin_edit_msg')
+          this.Storages.Delete(id, 'field_admin_edit_password')
+        }
+
+        // ---------------- Edit view actions ----------------
+        if (curProps.__admin_edit_save) {
+          delete curProps.__admin_edit_save
+          const email = this.Storages.Get(id, 'admin_edit_email') || ''
+          if (email) {
+            const newPwd = this.Storages.Get(id, 'field_admin_edit_password') || ''
+            if (newPwd) {
+              const res = auth.setPassword(email, newPwd)
+              if (!res.ok) {
+                this.Storages.Set(id, 'admin_edit_msg', `❌ ${res.error || 'Password update failed'}`)
+              } else {
+                this.Storages.Set(id, 'admin_edit_msg', '✅ Password updated')
+                this.Storages.Delete(id, 'field_admin_edit_password')
+              }
+            } else {
+              this.Storages.Set(id, 'admin_edit_msg', '✅ Changes saved')
+            }
+          }
+        }
+        if (curProps.__admin_edit_delete) {
+          const email = String(curProps.__admin_edit_delete)
+          delete curProps.__admin_edit_delete
+          const res = auth.removeAccount(email)
+          if (res.ok) {
+            this.Alert(id, `🗑 Deleted ${email}`, { duration: 2500 })
+            if (this.Storages.Get(id, 'admin_edit_email') === email) {
+              this.Storages.Delete(id, 'admin_edit_email')
+              this.Storages.Delete(id, 'admin_edit_msg')
+            }
+          }
+        }
+
+        // ==================================================================
+        // EDIT USER VIEW
+        // ==================================================================
+        const editEmail = this.Storages.Get(id, 'admin_edit_email')
+        if (editEmail) {
+          const acc = auth.accounts.get(editEmail)
+          if (!acc) {
+            this.Storages.Delete(id, 'admin_edit_email')
+            // fall through to list below
+          } else {
+            const editMsg = this.Storages.Get(id, 'admin_edit_msg') || ''
+            const roleLabel = acc.role === 'admin' ? '👑 admin' : '👤 user'
+            const verLabel = acc.verified ? '✅ verified' : '⏳ unverified'
+
+            this.Text(id, '')
+            this.Text(id, ColorText.brightCyan(`✎ Edit User: ${acc.email}`))
+            this.Text(id, ColorText.dim(`role: ${roleLabel}   status: ${verLabel}`))
+            this.Text(id, '')
+            if (editMsg) { this.Text(id, editMsg); this.Text(id, '') }
+
+            // Role toggle
+            this.Button(id, {
+              name: acc.role === 'admin'
+                ? ColorText.bgGreen(ColorText.black(' 👑 Admin ')) + '  ' + ColorText.dim('↓ Demote to user')
+                : ColorText.dim('↑ Promote to admin'),
+              props: { __admin_setrole: `${acc.email}::${acc.role === 'admin' ? '0' : '1'}` }
+            })
+
+            // Verify toggle
+            this.Button(id, {
+              name: acc.verified
+                ? ColorText.bgGreen(ColorText.black(' ✅ Verified ')) + '  ' + ColorText.dim('✖ Unverify')
+                : ColorText.dim('✓ Mark as verified'),
+              props: { __admin_setverify: `${acc.email}::${acc.verified ? '0' : '1'}` }
+            })
+
+            // Password reset
+            this.Text(id, '')
+            this.Text(id, ColorText.dim('Set a new password (leave blank to keep current):'))
+            this.Field(id, 'admin_edit_password', {
+              label: 'New Password',
+              initialValue: '',
+              password: true
+            })
+
+            // Confirmation code (when unverified)
+            if (!acc.verified && acc.confirmationCode) {
+              this.Text(id, '')
+              this.Text(id, ColorText.brightYellow(`⏳ Confirmation code: ${acc.confirmationCode}`))
+            }
+
+            this.Text(id, '')
+            this.Buttons(id, [
+              { name: ColorText.bgGreen(ColorText.black(' 💾 Save Changes ')), props: { __admin_edit_save: 1 } },
+              { name: '↻ New Code', props: { __admin_regen: acc.email } },
+              { name: ColorText.dim('← Back'), props: { __admin_edit_cancel: 1 } }
+            ])
+            this.Button(id, { name: ColorText.red('🗑 Delete Account'), props: { __admin_edit_delete: acc.email } })
+            return
+          }
+        }
+
+        // ==================================================================
+        // LIST VIEW
+        // ==================================================================
+        const accounts = auth.listAccounts()
+
+        this.Text(id, '')
+        this.Text(id, ColorText.brightCyan(`🛡️  SyAPP Admin Panel`))
+        this.Text(id, ColorText.dim(`Logged in as: ${props.session.Email || '(unknown)'}  •  role: ${props.session.Role}`))
+        this.Text(id, ColorText.dim(`Storage: ${auth.rootDir}`))
+        this.Text(id, ColorText.dim(`Accounts: ${accounts.length}`))
+        this.Text(id, '')
+
+        // Global registration toggle
+        this.Buttons(id, [
+          {
+            name: auth.registrationEnabled
+              ? ColorText.bgGreen(ColorText.black(' ✅ Registration: ON '))
+              : ColorText.bgRed(ColorText.brightWhite(' 🚫 Registration: OFF ')),
+            props: { __admin_toggle_register: 1 }
+          },
+          {
+            name: auth.requireVerification
+              ? ColorText.bgYellow(ColorText.black(' ⏳ Verification: ON '))
+              : ColorText.dim(' ○ Verification: OFF'),
+            props: {}
+          }
+        ])
+
+        this.Text(id, '')
+
+        if (accounts.length === 0) {
+          this.Text(id, ColorText.dim('  (no accounts registered yet)'))
+        } else {
+          await this.Pagination.Button(id, 'authadmin_accounts', accounts, {
+            items_per_page: 5,
+            custom: {
+              showSeparators: false,
+              showPageInfo: true,
+              showNavigation: true
+            },
+            renderItem: (itemData) => {
+              const a = itemData.item
+              const roleIcon = a.role === 'admin' ? '👑' : '👤'
+              const verifiedIcon = a.verified ? '✅' : '⏳'
+
+              this.Button(id, {
+                name: `${roleIcon} ${verifiedIcon} ${a.email}`
+              })
+
+              this.Buttons(id, [
+                { name: '✎ Edit', props: { __admin_edit_user: a.email } },
+                {
+                  name: a.verified ? '✖ Unverify' : '✓ Verify',
+                  props: { __admin_setverify: `${a.email}::${a.verified ? '0' : '1'}` }
+                },
+                {
+                  name: a.role === 'admin' ? '↓ Demote' : '↑ Promote',
+                  props: { __admin_setrole: `${a.email}::${a.role === 'admin' ? '0' : '1'}` }
+                },
+                { name: '↻ Code', props: { __admin_regen: a.email } }
+              ])
+
+              if (!a.verified && a.confirmationCode) {
+                this.Text(id, ColorText.dim(`    Confirmation code: ${a.confirmationCode}`))
+              }
+              this.Text(id, '')
+            }
+          })
+        }
+
+        this.Text(id, '')
+        this.Button(id, { name: ColorText.dim('🔒 Logout'), props: { __admin_logout: 1 } })
+      },
+      { refreshMode: true }
+    )
+  }
+}
+
 // --------------------------- SyAPP Class ---------------------------
 
 /**
@@ -27590,6 +28785,26 @@ class SyAPP {
     this._mainSourceFile = (userConfig && typeof userConfig._mainSourceFile === 'string')
       ? userConfig._mainSourceFile
       : null;
+
+    /**
+     * When true, the SyAPP boots directly into the auth admin panel
+     * ('__authadmin__') after the init gate completes. Set by the CLI
+     * `--admin` flag through _bootApp's config hand-off.
+     *
+     * The __authadmin__ Func itself requires an ADMIN login before it
+     * renders any content — so a fresh process started with `--admin`
+     * shows a credentials prompt (email + password) that must match a
+     * registered account with role = 'admin'.
+     *
+     * The very first `--admin` boot on a fresh install seeds a
+     * bootstrap admin account (default email = admin@local, default
+     * password = admin). This account is created ONLY if no accounts
+     * exist yet, so it can never overwrite a real admin.
+     *
+     * @type {boolean}
+     * @private
+     */
+    this._startInAdmin = (userConfig && userConfig._startInAdmin === true) || false;
 
     /**
      * Resolves once the SyAPP init process (if any) has fully finished.
@@ -27958,6 +29173,92 @@ this.HUD = new TerminalHUD({
       });
     };
 
+    // ------------------------------------------------------------------
+    // AUTH MANAGER — optional login/password system at the session level.
+    // ------------------------------------------------------------------
+    // Enabled via config.auth / config.authEnabled, or via the --ss /
+    // --admin CLI flags (which route through _bootApp and force config
+    // auth = true). Accounts AND their per-account session data are
+    // persisted to one JSON file per account inside a per-instance
+    // directory:
+    //
+    //   ~/.syapp/sessions/<sessionStorageName>/<email>.json
+    //
+    // Writes happen every `sessionSaveIntervalMs` (default 5000 ms = 5s),
+    // and immediately on account mutations (register / verify / setAdmin
+    // / regenerateCode). sessionStorageName comes from the --name CLI
+    // flag, or falls back to the resolved MainFunc.Name.
+    //
+    // The confirmation-code step is DISABLED by default: accounts are
+    // created as already-verified so login works immediately. It can be
+    // enabled via:
+    //   • CLI:  --verify / --auth-verify
+    //   • config: { authRequireVerification: true }
+    // When enabled, the __auth__ UI never displays the code — it is
+    // exposed ONLY through Auth.getPendingConfirmation(session) so the
+    // host can deliver it out-of-band (email API, admin panel, etc.).
+    // ------------------------------------------------------------------
+    this.Auth = new SyAuthManager(this, {
+      enabled: userConfig.auth === true || userConfig.authEnabled === true,
+      persistenceEnabled: userConfig.sessionPersistence === true || userConfig.auth === true || userConfig.authEnabled === true,
+      requireVerification: userConfig.authRequireVerification === true,
+      registrationEnabled: userConfig.registrationEnabled !== false,
+      sessionDir: userConfig.sessionStoragePath || undefined,
+      sessionName: userConfig.sessionStorageName || this.MainFunc.Name,
+      saveIntervalMs: userConfig.sessionSaveIntervalMs || 5000
+    });
+
+    // ------------------------------------------------------------------
+    // BOOTSTRAP ADMIN — first-run seeding for the admin panel.
+    // ------------------------------------------------------------------
+    // When --admin is used on a FRESH install (no accounts exist yet),
+    // seed a single bootstrap admin account so the operator can enter
+    // the admin panel immediately. The credentials are printed once at
+    // startup so the operator can change them via the panel afterwards.
+    //
+    //   email:    admin@local
+    //   password: admin
+    //
+    // This seeding runs ONLY when:
+    //   • the process was started with --admin (_startInAdmin = true),
+    //   • the Auth manager is enabled,
+    //   • the accounts registry is EMPTY (no prior account of any kind).
+    //
+    // So it can never overwrite a real admin account on subsequent runs.
+    //
+    // IMPORTANT — the seed account is created directly in the accounts
+    // map with its passwordHash pre-computed via the SAME _hashPassword
+    // helper the login path uses. There is no intermediate "verified"
+    // flag, no separate seed storage, and no bypass of the login check:
+    // the seeded account is a FULLY NORMAL account and logs in through
+    // the exact same code path as any other admin (hash + salt + role).
+    // ------------------------------------------------------------------
+    if (this._startInAdmin && this.Auth && this.Auth.enabled && this.Auth.accounts.size === 0) {
+      try {
+        const seedEmail = 'admin@local'
+        const seedPassword = 'admin'
+        const seedSalt = this.Auth._genSalt()
+        const seedAccount = {
+          email: seedEmail,
+          salt: seedSalt,
+          passwordHash: this.Auth._hashPassword(seedPassword, seedSalt),
+          role: 'admin',
+          verified: true,
+          confirmationCode: null,
+          createdAt: new Date().toISOString(),
+          data: {}
+        }
+        this.Auth.accounts.set(seedEmail, seedAccount)
+        this.Auth._writeAccountFile(seedEmail, seedAccount)
+        console.log('')
+        console.log(ColorText.brightGreen('🛡️  Bootstrap admin account created (fresh install)'))
+        console.log(`   ${ColorText.brightWhite('Email:')}    ${seedEmail}`)
+        console.log(`   ${ColorText.brightWhite('Password:')} ${seedPassword}`)
+        console.log(ColorText.dim('   Change these credentials from the admin panel after logging in.'))
+        console.log('')
+      } catch (_) {}
+    }
+
     this.ProcessFuncs(this.MainFunc.Func);
     this.ProcessFuncs(NotFounded);
     this.ProcessFuncs(ErrorFunc);
@@ -27970,6 +29271,12 @@ this.HUD = new TerminalHUD({
     // `node SyAPP.js --manage` to list / inspect / kill / connect-to
     // every background instance spawned by `node SyAPP.js --bg`.
     this.ProcessFuncs(SyPMManagerFunc);
+    // Pre-load the built-in auth Funcs so they are always reachable by
+    // name (auth redirects, admin panel navigation, config-only auth
+    // exploration, etc.). Their build methods gracefully no-op when the
+    // auth manager is disabled.
+    this.ProcessFuncs(SyAuthFunc);
+    this.ProcessFuncs(SyAuthAdminFunc);
 
     // ============================================================
     // EMB RETURN TARGETS
@@ -29251,6 +30558,22 @@ this.HUD = new TerminalHUD({
     this._syappInitReady
       .then(() => {
         if (!this.serverConfig.enableHTTP) {
+          // --admin mode boots straight into the auth admin panel,
+          // which will itself demand ADMIN credentials before
+          // rendering any content. See SyAuthAdminFunc.
+          if (this._startInAdmin) {
+            return this.LoadScreen('__authadmin__', { props: {} });
+          }
+          // Auth enabled: start at the login screen if the main session
+          // is not yet authenticated. Once login succeeds, __auth__ will
+          // navigate back to the main func (or the originally-requested
+          // requireLogin Func).
+          if (this.Auth && this.Auth.enabled) {
+            const mainSession = this.Sessions.get(this.MainSessionID);
+            if (mainSession && !mainSession.Authenticated) {
+              return this.LoadScreen('__auth__', { props: { returnTo: this.MainFunc.Name } });
+            }
+          }
           return this.LoadScreen();
         }
       })
@@ -35066,6 +36389,19 @@ function _installCtrlC(syapp) {
   // ------------------------------------------------------------------
   const cleanupTerminal = () => {
     // ----------------------------------------------------------------
+    // AUTH MANAGER CLEANUP — persist the final session state, then stop
+    // the 5-second auto-save timer. The synchronous _persistSessions
+    // call ensures nothing is lost between the last timer tick and the
+    // process exiting.
+    // ----------------------------------------------------------------
+    try {
+      if (syapp && syapp.Auth) {
+        try { if (syapp.Auth._persistSessions) syapp.Auth._persistSessions() } catch (_) {}
+        try { if (syapp.Auth.stopAutoSave) syapp.Auth.stopAutoSave() } catch (_) {}
+      }
+    } catch (_) {}
+
+    // ----------------------------------------------------------------
     // EMB BACKGROUND PROCESS TREE CLEANUP
     // ----------------------------------------------------------------
     // Before this process dies, send SIGTERM to every child process
@@ -36182,6 +37518,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _bgMode = false
     let _manageMode = false
     let _packMode = false
+    let _ssMode = false          // --ss: enable auth + session persistence
+    let _adminMode = false       // --admin: auth + persistence + admin panel
+    let _verifyMode = false      // --verify / --auth-verify: enable confirmation codes
     let _nameFlag = false        // --name present
     let _customName = null       // explicit --name <value>
     const _plainArgs = []
@@ -36218,6 +37557,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         _manageMode = true
       } else if (a === '--pack') {
         _packMode = true
+      } else if (a === '--ss') {
+        _ssMode = true
+      } else if (a === '--admin') {
+        _adminMode = true
+      } else if (a === '--verify' || a === '--auth-verify') {
+        _verifyMode = true
       } else if (a === '--name') {
         // NEW: --name support for --bg.
         //
@@ -36412,8 +37757,56 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         } catch (_) {}
       }
 
-      const app = new SyAPP(FuncClass, extraConfig)
+      // Wire the --ss / --admin / --verify flags into the auth manager
+      // config.
+      //   --ss             → enable auth + session persistence
+      //   --admin          → enable auth + persistence, and start at the
+      //                      admin panel (which requires an ADMIN login)
+      //   --verify         → enable the confirmation-code verification
+      //                      step (OFF by default)
+      //   --auth-verify    → alias of --verify
+      //
+      // `extraConfig` overrides are always respected, so callers that
+      // already pass an explicit `auth` / `authRequireVerification` /
+      // `sessionStorageName` keep working unchanged.
+      const __authEnabled = (_ssMode || _adminMode) ? true : extraConfig.auth
+      const __finalConfig = {
+        ...extraConfig,
+        auth: __authEnabled === true ? true : extraConfig.auth,
+        sessionPersistence: (_ssMode || _adminMode) ? true : extraConfig.sessionPersistence,
+        sessionStorageName: _customName || extraConfig.sessionStorageName
+      }
+      // Verification is OFF by default. Only an explicit config value or
+      // one of the CLI flags can turn it on.
+      if (_verifyMode) {
+        __finalConfig.authRequireVerification = true
+      } else if (__finalConfig.authRequireVerification === undefined) {
+        __finalConfig.authRequireVerification = false
+      }
+      // If --name was supplied without a value but a target file exists,
+      // derive the session name from the file basename so each app has
+      // its own isolated session directory by default.
+      if (!__finalConfig.sessionStorageName && _nameFlag && _plainArgs[0]) {
+        const __targetBase = path.basename(
+          String(_plainArgs[0]).replace(/\.(js|mjs|cjs|json|jsonl)$/i, '')
+        )
+        if (__targetBase && __targetBase !== 'SyAPP') {
+          __finalConfig.sessionStorageName = __targetBase
+        }
+      }
+      // Admin boot: --admin sets _startInAdmin so the init gate loads
+      // the admin panel first. The admin panel itself demands ADMIN
+      // credentials before rendering content (see SyAuthAdminFunc),
+      // so no session is auto-authenticated here. On a fresh install,
+      // SyAPP's constructor seeds a bootstrap admin account
+      // (admin@local / admin) so the operator can log in immediately.
+      if (_adminMode) {
+        __finalConfig._startInAdmin = true
+      }
+
+      const app = new SyAPP(FuncClass, __finalConfig)
       _installCtrlC(app)
+
       if (_streamMode === 'server') {
         _startStreamingServer(app, _streamPort, _streamHost)
       }
