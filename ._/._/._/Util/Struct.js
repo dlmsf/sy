@@ -1120,27 +1120,64 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
             structContent += `OUTPUT FORMAT: FULL CODE ONLY (NO TAGS, NO ABBREVIATIONS)\n`;
             structContent += `Provide the complete, entire code for EVERY file that requires changes.\n`;
             structContent += `You MUST NOT use the [CODEREPLACER] tag schema or any other tag/replacement format.\n`;
-            structContent += `Output only the raw, full source code for each file.\n
-`;
+            structContent += `Output only the raw, full source code for each file.\n\n`;
+
+            structContent += `${'!'.repeat(78)}\n`;
+            structContent += `!!                     ABSOLUTE RULE - NO EXCEPTIONS                       !!\n`;
+            structContent += `${'!'.repeat(78)}\n\n`;
+            structContent += `The ENTIRE file MUST be written, from the FIRST line to the LAST line.\n`;
+            structContent += `Do NOT stop early. Do NOT skip ANY section. Do NOT collapse ANY block.\n`;
+            structContent += `Do NOT use ANY form of shorthand, abbreviation, elision, or placeholder.\n`;
+            structContent += `If the file is 5000 lines, you MUST output all 5000 lines.\n`;
+            structContent += `If the file is 20000 lines, you MUST output all 20000 lines.\n`;
+            structContent += `There is NO size limit. There is NO excuse for truncation.\n`;
+            structContent += `A partial file is WORSE than no file - it is a FAILURE.\n\n`;
+            structContent += `${'!'.repeat(78)}\n\n`;
+
             structContent += `STRICT RULES - THE FOLLOWING ARE STRICTLY FORBIDDEN:\n`;
             structContent += `- Do NOT use any tag schema (no [CODEREPLACER], no [ORIGINAL-START], etc.).\n`;
             structContent += `- Do NOT abbreviate the code in ANY way.\n`;
             structContent += `- Do NOT use placeholders such as "...", "// ...", "// existing code",\n`;
-            structContent += `  "// rest is unchanged", "/* unchanged */", "// same as before", "// unchanged"\n`;
+            structContent += `  "// rest is unchanged", "/* unchanged */", "// same as before", "// unchanged",\n`;
+            structContent += `  "// code continues", "// (rest of code)", "// todo", "/* ... */",\n`;
+            structContent += `  "// [rest of file unchanged]", "<same as before>", "<original code>",\n`;
             structContent += `  or any equivalent shortcut.\n`;
             structContent += `- Do NOT summarize, truncate, or skip any part of the code.\n`;
             structContent += `- Do NOT write things like "code continues here" or "(unchanged)".\n`;
             structContent += `- Do NOT write only the modified portions - you MUST write EVERY line.\n`;
+            structContent += `- Do NOT collapse multiple functions/classes/methods into "...".\n`;
+            structContent += `- Do NOT replace large blocks with comments like "// implementation here".\n`;
+            structContent += `- Do NOT write "the rest is the same" - it is NOT acceptable.\n`;
             structContent += `- Output the ENTIRE file from the first line to the last line, in full.\n`;
-            structContent += `- Include all imports, comments, functions, classes, and everything else.\n
-`;
-            structContent += `For each file, start the code block with the exact same file path header
-`;
-            structContent += `as provided below (FILE: <path>) so it is clear which code belongs to which file.\n
-`;
+            structContent += `- Include all imports, comments, functions, classes, and everything else.\n`;
+            structContent += `- Include every helper, every branch, every edge-case, every comment.\n\n`;
+
+            structContent += `MANDATORY PRE-OUTPUT VERIFICATION (do this for EVERY file):\n`;
+            structContent += `  1. Count the lines in the ORIGINAL file (from the FILE: section below).\n`;
+            structContent += `  2. Count the lines you are about to output.\n`;
+            structContent += `  3. If your output has FEWER lines than the original (unless you were\n`;
+            structContent += `     explicitly asked to remove code), STOP and write the full file.\n`;
+            structContent += `  4. Verify the LAST line of the original file appears in your output.\n`;
+            structContent += `  5. Verify the FIRST line (imports / header) appears in your output.\n`;
+            structContent += `  6. Verify there are NO "..." placeholders anywhere in your output.\n`;
+            structContent += `  7. Only after ALL checks pass may you finish the file.\n\n`;
+
+            structContent += `MANDATORY POST-OUTPUT SELF-CHECK (do this for EVERY file):\n`;
+            structContent += `  Before moving to the next file, re-read your own output and ask:\n`;
+            structContent += `    - Did I include EVERY original line, or did I skip something?\n`;
+            structContent += `    - Did I use any abbreviation? (If yes -> rewrite the file.)\n`;
+            structContent += `    - Does my output LOOK like the original but with my changes?\n`;
+            structContent += `    - Is the closing brace of the file present?\n`;
+            structContent += `  If ANY answer is wrong, REWRITE THE ENTIRE FILE from scratch.\n\n`;
+
+            structContent += `For each file, start the code block with the exact same file path header\n`;
+            structContent += `as provided below (FILE: <path>) so it is clear which code belongs to which file.\n\n`;
             structContent += `CRITICAL: The output MUST be complete, runnable, unabbreviated code.\n`;
-            structContent += `Any abbreviation or omission makes the response INVALID and it will fail.\n
-`;
+            structContent += `Any abbreviation or omission makes the response INVALID and it will fail.\n`;
+            structContent += `A response that skips any line of any file is a HARD FAILURE.\n`;
+            structContent += `A response that uses "..." or "// unchanged" anywhere is a HARD FAILURE.\n`;
+            structContent += `A response that writes fewer lines than the original (with only requested\n`;
+            structContent += `changes applied) is a HARD FAILURE and will be rejected.\n\n`;
         }
 
         structContent += `${'='.repeat(50)}\n
@@ -4665,12 +4702,101 @@ async function interactiveMode(initialState = null) {
 }
 
 // ============================================================
+//  DIRECT RUNNER: extract the USER REQUEST from a struct file.
+//
+//  Usage:
+//      node Struct.js extract <structfile>
+//
+//  Input:
+//      Any struct file produced by `generateStruct` above
+//      (the same format this project emits).
+//
+//  Behavior:
+//      * Reads the struct file as UTF-8 text.
+//      * Finds the "USER REQUEST: " marker.
+//      * Extracts everything between the marker and the next
+//        structural section marker (a run of 50+ identical
+//        chars from - # ! * =, which is how every block below
+//        the USER REQUEST is separated).
+//      * Writes the extracted text to "./result" (no extension).
+//
+//  If no USER REQUEST is present, or the section is empty,
+//  the result file is NOT created and the process exits with
+//  code 1.
+//
+//  Purely additive: this does NOT touch the interactive flow,
+//  the wizard, the generate flow, or any save/load behavior.
+// ============================================================
+async function extractUserRequestFromStruct(structFilePath, outputFileName = 'result') {
+    let content;
+
+    try {
+        content = await fs.readFile(structFilePath, 'utf8');
+    } catch (err) {
+        console.error(`Error reading struct file "${structFilePath}": ${err.message}`);
+        process.exit(1);
+    }
+
+    // Normalize line endings so the section markers always match
+    // regardless of whether the file was written on Windows.
+    content = content.replace(/\r\n/g, '\n');
+
+    const marker = 'USER REQUEST: ';
+    const markerIdx = content.indexOf(marker);
+
+    if (markerIdx === -1) {
+        console.error('No USER REQUEST found in the struct file.');
+        console.error('Nothing was written to the result file.');
+        process.exit(1);
+    }
+
+    // Everything after the marker is a candidate for the request
+    // body. It ends at the FIRST structural marker that follows:
+    // a run of 50+ identical chars from - # ! * = at the start of
+    // a line. These are the delimiters used by every subsequent
+    // block (deepthink, safety warning, parsed-files, reference-
+    // only, output format, and the per-file headers themselves).
+    const afterMarker = content.slice(markerIdx + marker.length);
+    const endMatch = afterMarker.match(/\n[-#!*=]{50,}/);
+
+    let request = endMatch
+        ? afterMarker.slice(0, endMatch.index)
+        : afterMarker;
+
+    // Preserve internal blank lines exactly; only strip trailing
+    // whitespace/newlines so the result ends with clean content.
+    request = request.replace(/\s+$/, '');
+
+    if (!request || request.trim() === '') {
+        console.error('USER REQUEST section is empty - nothing to write.');
+        process.exit(1);
+    }
+
+    await fs.writeFile(outputFileName, request + '\n', 'utf8');
+
+    console.log(`USER REQUEST extracted to: ${path.resolve(outputFileName)}`);
+    console.log(`Length: ${request.length} characters, ${request.split('\n').length} line(s)`);
+}
+
+// ============================================================
 //  Main entry point
 // ============================================================
 async function main() {
     const args = process.argv.slice(2);
 
     if (args.length > 0) {
+        // `node Struct.js extract <structfile>` -> direct runner that
+        // extracts the USER REQUEST from a struct file into ./result.
+        // Additive: does NOT touch the save/load flow below.
+        if (args[0] === 'extract') {
+            if (args.length < 2) {
+                console.error('Usage: node Struct.js extract <structfile>');
+                process.exit(1);
+            }
+            await extractUserRequestFromStruct(args[1]);
+            return;
+        }
+
         // `node Struct.js last` -> enter the interactive struct menu with
         // the files from the most recent generation pre-selected. If that
         // generation was a customize-wizard flow OR a P (generate with
