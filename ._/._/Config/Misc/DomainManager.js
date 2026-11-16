@@ -74,7 +74,7 @@ class GoDaddyManager extends SyAPP.Func() {
     super(
       'GoDaddyManager',
       async (props) => { await this._render(props) },
-      { refreshMode: false, log: false }
+      { refreshMode: true, log: false }
     )
   }
 
