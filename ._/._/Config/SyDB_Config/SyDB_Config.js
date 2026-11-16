@@ -261,6 +261,12 @@ class SyDB_Config extends SyAPP.Func() {
 
                     this.Text(uid, `SyDB Settings${extra_message}`)
                     this.Button(uid, { name: toggleText, props: { toggle_view_mode: true, page: 'settings' } })
+                    await this.Emb(uid, {
+  name: "emb1",
+  filePath: "./SyDB_CorruptTest.js",
+  pathMode: 'relative',
+  dropdown: {"up_buttontext":"Corruption Test","down_buttontext":"Corruption Test"},
+})
                     this.Button(uid, { name: this.TextColor.red('Reset DB'), props: { resetdb: true } })
                     this.Button(uid, { name: ' ' })
                     this.Button(uid, { name: '← Return', props: { page: '' } })

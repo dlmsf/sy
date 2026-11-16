@@ -4,7 +4,7 @@ import SyAPP from './._/SyAPP.js'
 class SyManager {
 
 static Start(name = 'sy'){
-  new SyAPP(Sy,{mainFuncName : name})
+  new SyAPP(Sy,{mainFuncName : name,pack : true})
 }
 
 }

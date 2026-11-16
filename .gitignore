@@ -29,6 +29,8 @@ alpine-cloudinit.qcow2.partial
 noble-server-cloudimg-amd64.img
 *.img
 *.c
+sydb_corruption_findings.jsonl
+sydb_corruption_minimal.txt
 
 # Cloud-init generated files
 noble-cloud-init.iso

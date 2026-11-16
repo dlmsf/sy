@@ -2,7 +2,7 @@ import readline from 'readline';
 import { stdin, stdout } from 'process';
 import EventEmitter from 'events';
 import { readFileSync, existsSync } from 'fs';
-import { execSync, spawn } from 'child_process';
+import { execSync, spawn, spawnSync } from 'child_process';
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -28,6 +28,25 @@ class ModuleBundler {
     this.moduleRegistry  = new Map();
     this.moduleCounter   = 0;
     this.debug           = options.debug === true;
+
+    /**
+     * Optional IN-MEMORY source overrides.
+     *
+     * A `Map<string, string>` keyed by ABSOLUTE resolved file path. When
+     * present, `processModule()` reads a module's content from this map
+     * (when the file is a key) instead of from disk. Files not present
+     * fall through to `readFileSync()` as before.
+     *
+     * This is what allows the `--pack` flow to inline `this.Emb()` calls
+     * IN MEMORY ONLY — the original files on disk are never modified,
+     * but the generated bundle correctly contains the transformed
+     * (inline-mode) source of every reachable module.
+     *
+     * @type {Map<string, string>}
+     */
+    this.sourceOverrides = (options.sourceOverrides instanceof Map)
+      ? options.sourceOverrides
+      : new Map();
 
     /**
      * Module specifiers / resolved paths / basenames to treat as EXTERNAL.
@@ -418,8 +437,29 @@ class ModuleBundler {
       let match;
       while ((match = re.exec(out)) !== null) {
         const full = match[0];
+        // ------------------------------------------------------------------
+        // ENTRY FILE: normalise to a BUNDLE-SAFE main-script check.
+        //
+        // Previously this used `if (true)` — which forced the packed
+        // bundle to ALWAYS auto-run `new SyAPP(...)` on import, even
+        // when the bundle was loaded via `node SyAPP.js --config
+        // '<cfg>' <packfile>`. That caused a double-boot:
+        //   1. the bundle's `if (true) { new SyAPP(...) }` fires on
+        //      `await import(fileUrl)`, AND
+        //   2. the CLI's `_bootApp()` creates a second instance.
+        //
+        // Using `import.meta.url === \`file://\${process.argv[1]}\``
+        // preserves the original ESM semantics:
+        //   • `node <packfile>`                 → auto-run (correct)
+        //   • `node SyAPP.js <packfile>`        → no auto-run, CLI
+        //                                          handles boot (correct)
+        //   • `import('<packfile>')`            → no auto-run (correct)
+        //
+        // The string is written with escaped backticks so it survives
+        // being placed inside a JS template literal below.
+        // ------------------------------------------------------------------
         const repl = isEntry
-          ? `if (true) { // was: ${full.trim()}`
+          ? `if (import.meta.url === \`file://\${process.argv[1]}\`) { // was: ${full.trim()}`
           : `if (false) { // was: ${full.trim()}`;
         out = out.slice(0, match.index) + repl + out.slice(match.index + full.length);
         re.lastIndex = match.index + repl.length;
@@ -557,7 +597,15 @@ class ModuleBundler {
       return info;
     }
 
-    const originalContent = readFileSync(filePath, 'utf8');
+    // ----------------------------------------------------------------
+    // Read from the IN-MEMORY override map when this file was rewritten
+    // by the `--pack` inline-Emb step. Files not in the map fall through
+    // to the normal disk read, so every non-transformed module keeps
+    // its existing behaviour untouched.
+    // ----------------------------------------------------------------
+    const originalContent = this.sourceOverrides.has(filePath)
+      ? this.sourceOverrides.get(filePath)
+      : readFileSync(filePath, 'utf8');
     const imports         = this.parseImports(originalContent).map(imp => ({
       ...imp,
       // Annotate each import with its ignore status once, so downstream
@@ -20668,6 +20716,7 @@ function levenshteinDistance(str1, str2) {
         editDownText:    `${nsKey}_editDownText`,
         editBothText:    `${nsKey}_editBothText`,
         resetDropdown:   `${nsKey}_resetDropdown`,
+        togglePathMode:  `${nsKey}_togglePathMode`,
         // NEW: background-run-mode props
         toggleRunMode:   `${nsKey}_togglerunmode`,
         restartBg:       `${nsKey}_restartbg`
@@ -20802,62 +20851,57 @@ function levenshteinDistance(str1, str2) {
           args: Array.isArray(cfg.args) ? cfg.args.slice() : [],
           // Persistent dropdown text/emoji state. Initialized from the
           // call-site config so the widget renders with the caller's
-          // values on the first pass, and overwritten by the disk
-          // record (if any) so user edits survive a process restart.
+          // values on the first pass.
           dropdown: {
             up_buttontext: cfg.dropdown.up_buttontext,
             down_buttontext: cfg.dropdown.down_buttontext,
             up_emoji: cfg.dropdown.up_emoji,
             down_emoji: cfg.dropdown.down_emoji
           },
+          // Path representation for PATH save mode:
+          //   'global'   → absolute path (current/default behaviour)
+          //   'relative' → path relative to the host file's directory
+          // The widget ALWAYS resolves internally to an absolute path;
+          // this setting controls only what the generated snippet and
+          // the host-file write-back show.
+          pathMode: (cfg.pathMode === 'global' || cfg.pathMode === 'relative') ? cfg.pathMode : 'global',
+          // NEW: run mode (bg vs normal), sourced EXCLUSIVELY from the
+          // call-site config so the widget is 100% driven by the file.
+          runMode: (cfg.runMode === 'normal' || cfg.runMode === 'bg') ? cfg.runMode : 'bg',
           autoApplyArgToDropdown: false
         };
 
-        // Step 1 — disk record keyed by (outer file, owner func, widget
-        // name). The namespaced key guarantees that an embedded func's
-        // own Emb() never collides with the OUTER func's Emb() record.
-        if (!boot.filePath && !boot.code && outerFilePath) {
-          const disk = _embDiskLoad(outerFilePath, diskKey);
-          if (disk && (disk.filePath || disk.code)) {
-            boot.source = disk.source || (disk.filePath ? 'file' : 'code');
-            boot.filePath = disk.filePath || null;
-            boot.code = disk.code || null;
-            boot.saveMode = (disk.saveMode === 'inline' || disk.saveMode === 'path')
-              ? disk.saveMode
-              : 'inline';
-            if (Array.isArray(disk.args)) boot.args = disk.args.slice();
-            // NEW: restore persisted runMode (falls back to 'bg' when
-            // the disk record predates this feature).
-            if (disk.runMode === 'normal' || disk.runMode === 'bg') {
-              boot.runMode = disk.runMode;
-            }
-            // Restore custom dropdown text/emoji from disk so a widget
-            // whose label was edited keeps its label across restarts.
-            if (disk.dropdown && typeof disk.dropdown === 'object') {
-              boot.dropdown = { ...boot.dropdown, ...disk.dropdown };
-            }
-          }
-        }
-
-        // Step 2 — self-heal by scanning the running file for an
-        // existing this.Emb(...) call already carrying a filePath.
+        // ------------------------------------------------------------------
+        // CONFIG IS THE SINGLE SOURCE OF TRUTH.
         //
-        // IMPORTANT: this scan is now restricted to the OUTER func
-        // (isOuterFunc) only. The scan matches by `name:` string, so it
-        // cannot tell apart an Emb declared in the outer file from an
-        // Emb declared inside a dynamically imported embedded func. An
-        // embedded func whose Emb shares the same `name` would otherwise
-        // recover the OUTER func's Emb record — the exact recursive
-        // Enter-Func loop this guard prevents.
-        if (!boot.filePath && !boot.code && outerFilePath && isOuterFunc) {
+        // Every field of `boot` is initialised from the call-site config
+        // (cfg) above. The previous implementation ALSO tried to recover
+        // additional state from:
+        //   (a) the per-(outer-file, widget-name) disk mirror, and
+        //   (b) a self-heal scan of the running file's source,
+        // which silently overrode the explicit config when a stale entry
+        // existed on disk from a previous run with a different `name`.
+        // That produced the "recovers the config of a past name" symptom.
+        //
+        // Those recovery paths are now DISABLED. The widget's state is
+        // a pure projection of the current file's `this.Emb(...)` call.
+        // If the user changes `runMode` / `args` / `dropdown` / etc.,
+        // the widget reflects the new value immediately on the next
+        // render — because the file IS the value.
+        //
+        // A relative filePath is resolved against the host file's
+        // directory so the widget always operates on ABSOLUTE paths
+        // internally. The snippet still shows the relative form
+        // (pathMode === 'relative'), so nothing about the on-disk
+        // representation changes.
+        // ------------------------------------------------------------------
+        if (boot.filePath && !path.isAbsolute(boot.filePath) && outerFilePath) {
           try {
-            const src = fs.readFileSync(outerFilePath, 'utf8');
-            const healed = _embScanRunningFileForWidget(src, cfg.name);
-            if (healed && (healed.filePath || healed.code)) {
-              boot.source = healed.filePath ? 'file' : 'code';
-              boot.filePath = healed.filePath || null;
-              boot.code = healed.code || null;
-              boot.saveMode = 'inline';
+            boot.filePath = path.resolve(path.dirname(outerFilePath), boot.filePath);
+            // Keep pathMode 'relative' only when it was NOT explicitly
+            // set to 'global' in the config — the explicit config wins.
+            if (cfg.pathMode !== 'global') {
+              boot.pathMode = 'relative';
             }
           } catch (_) {}
         }
@@ -20916,8 +20960,12 @@ function levenshteinDistance(str1, str2) {
         this.Storages.Set(id, storageKey, state);
       }
 
-      // Persist any successfully-recovered entry to disk so the NEXT
-      // boot does not have to re-scan the outer file. Best-effort.
+      // NOTE: the disk mirror is no longer consulted for state recovery
+      // (see the "CONFIG IS THE SINGLE SOURCE OF TRUTH" block above),
+      // but we still mirror writes to it so the SelfBuilder's
+      // Finish & Return path can resolve the produced func's file path
+      // after a process restart. The mirror is WRITE-ONLY as far as
+      // this.Emb() bootstrap is concerned.
       if (outerFilePath && (state.filePath || state.code)) {
         _embDiskSave(outerFilePath, diskKey, state);
       }
@@ -21120,6 +21168,12 @@ function levenshteinDistance(str1, str2) {
                 `await this.Emb(id, {`,
                 `  name: ${JSON.stringify(cfg.name)}`
               ];
+              // Preserve the user's run mode choice (if non-default)
+              // even after Clear, so a fresh setup starts with the
+              // same background/inline preference.
+              if (state.runMode === 'normal') {
+                freshLines.push(`  runMode: 'normal',`);
+              }
               const ddOut = {};
               if (state.dropdown && typeof state.dropdown === 'object') {
                 for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
@@ -21163,7 +21217,7 @@ function levenshteinDistance(str1, str2) {
 
         if (__pathHost && state.filePath) {
           try {
-            const snippet = this._embSnippetPath(state, cfg);
+            const snippet = this._embSnippetPath(state, cfg, __pathHost);
             const existing = fs.existsSync(__pathHost)
               ? fs.readFileSync(__pathHost, 'utf8')
               : '';
@@ -21238,6 +21292,38 @@ function levenshteinDistance(str1, str2) {
         }
       }
 
+      // ---------------- PATH MODE TOGGLE (global ↔ relative) ----------------
+      // Cycles the filePath representation used in the generated snippet:
+      //   • global   → absolute path (e.g. /home/new/sy/._/._/Sy.js)
+      //   • relative → path relative to the host file's directory
+      //                (e.g. ../../Sy.js)
+      // The choice is persisted to the disk mirror and, when the host
+      // file is known, immediately rewritten into the host file's
+      // `this.Emb(...)` call so it survives a fresh launch.
+      if (curProps[P.togglePathMode]) {
+        delete curProps[P.togglePathMode];
+        state.pathMode = (state.pathMode === 'relative') ? 'global' : 'relative';
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) {
+          try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {}
+        }
+        const __toggleHost = cfg.sourceFile ||
+          ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+        if (__toggleHost && state.filePath) {
+          try {
+            const snippet = this._embSnippetPath(state, cfg, __toggleHost);
+            const existing = fs.readFileSync(__toggleHost, 'utf8');
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+            if (replaced !== null) {
+              fs.writeFileSync(__toggleHost, replaced);
+              this.Alert(id,
+                `📝 Path mode: ${state.pathMode}`,
+                { duration: 2500 });
+            }
+          } catch (_) {}
+        }
+      }
+
       // ---------------- Enter Func ----------------
       // Navigate INTO the embedded func as a normal screen.
       //
@@ -21299,7 +21385,7 @@ function levenshteinDistance(str1, str2) {
         if (!hostFile) return false;
         try {
           const snippet = (state.saveMode === 'path')
-            ? this._embSnippetPath(state, cfg)
+            ? this._embSnippetPath(state, cfg, hostFile)
             : this._embSnippetInline(state, cfg);
           const existing = fs.readFileSync(hostFile, 'utf8');
           const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
@@ -21455,6 +21541,28 @@ function levenshteinDistance(str1, str2) {
         state.runMode = nextMode;
         this.Storages.Set(id, storageKey, state);
         if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+
+        // NEW: rewrite the host file's this.Emb(...) call IMMEDIATELY
+        // so the new runMode is reflected in the file itself — not
+        // just in memory / the disk mirror. This mirrors the existing
+        // behaviour of every other config toggle (saveAsPath,
+        // saveAsInline, togglePathMode). Without this, the widget's
+        // dropdown shows the change but re-parsing the file reverts
+        // to the default 'bg' mode.
+        try {
+          const __runModeHost = cfg.sourceFile ||
+            ((outerFilePath && fs.existsSync(outerFilePath)) ? outerFilePath : null);
+          if (__runModeHost && (state.filePath || state.code)) {
+            const snippet = (state.saveMode === 'path')
+              ? this._embSnippetPath(state, cfg, __runModeHost)
+              : this._embSnippetInline(state, cfg);
+            const existing = fs.readFileSync(__runModeHost, 'utf8');
+            const replaced = this._embReplaceExistingCall(existing, cfg.name, snippet);
+            if (replaced !== null) {
+              fs.writeFileSync(__runModeHost, replaced);
+            }
+          }
+        } catch (_) {}
 
         this.Alert(id,
           nextMode === 'bg'
@@ -22021,7 +22129,7 @@ function levenshteinDistance(str1, str2) {
           try {
             const snippet = state.saveMode === 'inline'
               ? this._embSnippetInline(state, cfg)
-              : this._embSnippetPath(state, cfg);
+              : this._embSnippetPath(state, cfg, hostFile);
             const existing = fs.existsSync(hostFile)
               ? fs.readFileSync(hostFile, 'utf8')
               : '';
@@ -22434,6 +22542,34 @@ function levenshteinDistance(str1, str2) {
             props: { [P.saveAsPath]: true }
           }
         ]);
+
+        // When PATH mode is active, expose a second toggle that cycles
+        // the path representation between GLOBAL (absolute) and
+        // RELATIVE (`../../file.js`). The preview shows the exact
+        // string that will be written into the host file's snippet.
+        if (__pathSelected) {
+          const __pathMode = state.pathMode === 'relative' ? 'relative' : 'global';
+          let __preview = state.filePath || '(not set)';
+          if (__pathMode === 'relative' && state.filePath && outerFilePath) {
+            try {
+              const absHost = path.isAbsolute(outerFilePath)
+                ? outerFilePath
+                : path.resolve(process.cwd(), outerFilePath);
+              const absTarget = path.isAbsolute(state.filePath)
+                ? state.filePath
+                : path.resolve(process.cwd(), state.filePath);
+              let rel = path.relative(path.dirname(absHost), absTarget);
+              if (rel && !rel.startsWith('.')) rel = './' + rel;
+              if (rel) __preview = rel;
+            } catch (_) {}
+          }
+          this.Button(id, {
+            name: __pathMode === 'relative'
+              ? ColorText.bgGreen(ColorText.black(` ✓ Relative: ${_fit(__preview, 40)} `))
+              : ColorText.bgGreen(ColorText.black(` ✓ Global: ${_fit(__preview, 40)} `)),
+            props: { [P.togglePathMode]: true }
+          });
+        }
 
         // ---------------- Run mode row ----------------
         // 'bg' (default)     → separate --server process, Enter Func
@@ -23365,7 +23501,31 @@ function levenshteinDistance(str1, str2) {
 
       // The replacement text (with `await ` stripped, since the call
       // site's own context supplies awaits).
-      const plain = String(newSnippet).replace(/^\s*await\s+/, '');
+      let plain = String(newSnippet).replace(/^\s*await\s+/, '');
+
+      // -----------------------------------------------------------
+      // PRESERVE THE CALLER'S FIRST-ARGUMENT VARIABLE NAME.
+      //
+      // The generated snippet always uses `id` as the first argument.
+      // If the original call site used a DIFFERENT variable name
+      // (e.g. `await this.Emb(myid, {...})`), splicing the new snippet
+      // in verbatim would silently rename the call site's variable to
+      // `id` — which may not exist in the surrounding scope and would
+      // break the user's code.
+      //
+      // We extract the original first argument and substitute it back
+      // into the snippet before performing the replacement. Only a
+      // simple identifier is substituted (the common case); anything
+      // more complex (method calls, ternaries, etc.) is preserved
+      // as-is to avoid mangling.
+      // -----------------------------------------------------------
+      const applyIdVar = (snippet, originalBody) => {
+        const firstArg = (_sbSplitArgs(originalBody || '')[0] || '').trim();
+        if (!firstArg) return snippet;
+        if (!/^[A-Za-z_$][\w$]*$/.test(firstArg)) return snippet;
+        if (firstArg === 'id') return snippet;
+        return snippet.replace(/^(\s*this\.Emb\(\s*)id(\s*,)/, `$1${firstArg}$2`);
+      };
 
       // -----------------------------------------------------------
       // Case 1: direct top-level match. Splice directly.
@@ -23381,6 +23541,8 @@ function levenshteinDistance(str1, str2) {
       // for those unusual files.
       // -----------------------------------------------------------
       if (found.hops.length === 0) {
+        const originalBody = src.slice(found.targetBodyStart, found.targetBodyEnd);
+        plain = applyIdVar(plain, originalBody);
         const result = src.slice(0, found.targetCallStart) + plain + src.slice(found.targetCallEnd);
         if (!this._embSourceLooksBalanced(src) || this._embSourceLooksBalanced(result)) {
           return result;
@@ -23422,13 +23584,25 @@ function levenshteinDistance(str1, str2) {
           if (cIdx < 0) continue;
           const body = innermostUnescaped.slice(oIdx + 1, cIdx);
           if (this._embBodyHasName(body, embName)) {
-            return { start: m.index, end: cIdx + 1 };
+            return { start: m.index, end: cIdx + 1, bodyStart: oIdx + 1, bodyEnd: cIdx };
           }
         }
         return null;
       })();
 
       if (!targetInInner) return null;
+
+      // NEW: preserve the caller's first-argument variable name in
+      // the nested case too. The original body slice comes from the
+      // same coordinates as `innermostUnescaped` (the target call's
+      // arg span).
+      {
+        const originalInnerBody = innermostUnescaped.slice(
+          targetInInner.bodyStart,
+          targetInInner.bodyEnd
+        );
+        plain = applyIdVar(plain, originalInnerBody);
+      }
 
       const innerReplaced =
         innermostUnescaped.slice(0, targetInInner.start) +
@@ -24066,14 +24240,62 @@ function levenshteinDistance(str1, str2) {
      * Build the source snippet for the PATH save mode.
      * @private
      */
-    this._embSnippetPath = (state, cfg) => {
+    this._embSnippetPath = (state, cfg, hostFile = null) => {
+      // Choose the filePath representation based on state.pathMode.
+      //
+      //   'global'   → absolute path (unchanged default behaviour)
+      //   'relative' → path relative to the host file's directory,
+      //                e.g. '../../Sy.js', only when the host file is
+      //                known and state.filePath is a real path. Falls
+      //                back to the absolute path otherwise.
+      //
+      // state.filePath is ALWAYS absolute internally — the relative
+      // form appears only in the snippet, so file resolution stays
+      // identical whichever mode the user picks.
+      let displayPath = state.filePath || './path/to/func.js';
+      if (state.pathMode === 'relative' && state.filePath && hostFile) {
+        try {
+          const absHost = path.isAbsolute(hostFile)
+            ? hostFile
+            : path.resolve(process.cwd(), hostFile);
+          const absTarget = path.isAbsolute(state.filePath)
+            ? state.filePath
+            : path.resolve(process.cwd(), state.filePath);
+          let rel = path.relative(path.dirname(absHost), absTarget);
+          if (rel && !rel.startsWith('.')) rel = './' + rel;
+          if (rel) displayPath = rel;
+        } catch (_) {}
+      }
+
+      // Build the snippet line by line, keeping every emitted property
+      // line comma-terminated. The `filePath` line ALWAYS ends with a
+      // comma (whether or not `pathMode` is emitted next) so a
+      // relative-mode snippet like:
+      //
+      //     filePath: "../../Sy.js",
+      //     pathMode: 'relative',
+      //
+      // stays syntactically valid. The final `})` closes the call.
       const lines = [
         `await this.Emb(id, {`,
         `  name: ${JSON.stringify(cfg.name)},`,
-        `  filePath: ${JSON.stringify(state.filePath || './path/to/func.js')}`
+        `  filePath: ${JSON.stringify(displayPath)},`
       ];
+      // Emit pathMode explicitly when relative, so re-parsing the
+      // snippet preserves the user's choice even when the recorded
+      // path is later edited to an absolute one.
+      if (state.pathMode === 'relative') {
+        lines.push(`  pathMode: 'relative',`);
+      }
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
+      }
+      // NEW: persist the run mode (bg vs same process) when it differs
+      // from the default 'bg'. This is what makes the widget's
+      // "Same process" toggle survive a re-parse (Self Build export,
+      // page reload, manual file inspection, etc.).
+      if (state.runMode === 'normal') {
+        lines.push(`  runMode: 'normal',`);
       }
       // Emit only non-default dropdown text/emoji, so an untouched
       // widget's source stays byte-for-byte identical.
@@ -24145,6 +24367,9 @@ function levenshteinDistance(str1, str2) {
         if (Array.isArray(state.args) && state.args.length > 0) {
           lines.push(`  args: ${JSON.stringify(state.args)},`);
         }
+        if (state.runMode === 'normal') {
+          lines.push(`  runMode: 'normal',`);
+        }
         const ddOut = {};
         if (state.dropdown && typeof state.dropdown === 'object') {
           for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
@@ -24194,6 +24419,9 @@ function levenshteinDistance(str1, str2) {
       }
       if (Array.isArray(state.args) && state.args.length > 0) {
         lines.push(`  args: ${JSON.stringify(state.args)},`);
+      }
+      if (state.runMode === 'normal') {
+        lines.push(`  runMode: 'normal',`);
       }
       const ddOut = {};
       if (state.dropdown && typeof state.dropdown === 'object') {
@@ -27519,6 +27747,742 @@ class AdminManager {
   }
 }
 
+// --------------------------- SyAPP Pack-Mode Helpers ---------------------------
+//
+// Constructor-level `pack: true` support.
+//
+// A `new SyAPP(MyFunc, { pack: true, ...rest })` call behaves exactly like:
+//
+//   1. node SyAPP.js --pack <mainfunc-file>
+//   2. node SyAPP.js --config '<serialized rest>' <packfile>
+//
+// The main func's SOURCE FILE is resolved in priority order:
+//
+//   (a) userConfig._mainSourceFile — set by the CLI when running
+//       `node SyAPP.js MyApp.js`.
+//
+//   (b) process.argv[1] — the file the user invoked directly
+//       (`node MyApp.js`).
+//
+//   (c) the caller's stack frame — last-resort fallback.
+//
+// Once a candidate file is picked, the class is located in one of
+// three ways:
+//
+//   1. DEFINED IN THAT FILE, WITH a `new SyAPP(...pack: true)` call
+//      → the class is isolated into a temp `.mjs` file (imports
+//        rewritten to absolute `file://` URLs so they still resolve
+//        from `os.tmpdir()`), the `new SyAPP(...)` block is dropped,
+//        and THAT temp file becomes the pack target.
+//
+//   2. DEFINED IN THAT FILE, WITHOUT a pack call
+//      → the file is packed as-is (existing `--pack` behaviour).
+//
+//   3. IMPORTED FROM ANOTHER FILE (e.g. `import Sy from './Sy.js'`)
+//      → the import statement is followed to its real path, and THAT
+//        resolved file is packed directly — no isolation needed
+//        because the importing file's `new SyAPP(...pack: true)`
+//        never runs inside the packed bundle.
+//
+// The final step drops the `pack: true` key from the config serialised
+// into `--config`, so the child process does NOT recurse into pack mode
+// itself. Every other config key (including `mainFuncName`) is forwarded
+// untouched, preserving the intended `new SyAPP(Sy, { mainFuncName: 'x' })`
+// naming.
+//
+// ----------------------------------------------------------------------
+// SILENT PACK MODE
+// ----------------------------------------------------------------------
+// Every step of the pack flow — the `--pack` subprocess, the child
+// CLI's own banner logs, and the helper's own warnings — is kept OUT
+// of the parent terminal. The full transcript is written to
+// `~/.syapp/pack.log` so it can be inspected at any time. Only a
+// short failure notice is printed to stderr when something goes
+// wrong.
+//
+// `_syappPackLog()` is the single sink for this transcript: everything
+// in `_syappRunPackMode` and `_syappRunPackChild` that used to call
+// `console.log` / `console.error` goes through it instead.
+// ----------------------------------------------------------------------
+// ---------------------------
+
+const _SYAPP_PACK_LOG_DIR = path.join(os.homedir(), '.syapp');
+const _SYAPP_PACK_LOG_FILE = path.join(_SYAPP_PACK_LOG_DIR, 'pack.log');
+
+/**
+ * Append a line to the pack log file. Never throws.
+ * @private
+ */
+function _syappPackLog(line) {
+  try {
+    if (!fs.existsSync(_SYAPP_PACK_LOG_DIR)) {
+      fs.mkdirSync(_SYAPP_PACK_LOG_DIR, { recursive: true });
+    }
+    const stamp = new Date().toISOString();
+    fs.appendFileSync(_SYAPP_PACK_LOG_FILE, `[${stamp}] ${line}\n`, 'utf8');
+  } catch (_) { /* logging must never break the flow */ }
+}
+
+/**
+ * Return the last `n` non-empty lines of the pack log file.
+ * @private
+ */
+function _syappPackLogTail(n = 20) {
+  try {
+    if (!fs.existsSync(_SYAPP_PACK_LOG_FILE)) return '';
+    const content = fs.readFileSync(_SYAPP_PACK_LOG_FILE, 'utf8');
+    const lines = content.split('\n').filter(l => l.trim().length > 0);
+    return lines.slice(-n).join('\n');
+  } catch (_) { return ''; }
+}
+
+/**
+ * Print a short failure notice to stderr (never stdout) and point the
+ * user at the full log for details.
+ * @private
+ */
+function _syappPackFailSummary(message) {
+  try {
+    process.stderr.write(
+      ColorText.brightRed(`❌ pack: ${message}`) +
+      ColorText.dim(`\n   Full log: ${_SYAPP_PACK_LOG_FILE}\n`)
+    );
+  } catch (_) { /* ignore */ }
+}
+
+/**
+ * Print a short success notice to stderr (never stdout).
+ * @private
+ */
+function _syappPackSuccessSummary() {
+  try {
+    process.stderr.write(
+      ColorText.brightGreen('✅ pack: instance started\n') +
+      ColorText.dim(`   Full log: ${_SYAPP_PACK_LOG_FILE}\n`)
+    );
+  } catch (_) { /* ignore */ }
+}
+
+/**
+ * Find the first file in the current call stack that is NOT the given
+ * excluded path. Used as a last-resort fallback when neither
+ * `_mainSourceFile` nor `process.argv[1]` identify the main func file.
+ * @private
+ */
+function _syappFindCallerPath(excludePath) {
+  try {
+    const stack = (new Error().stack || '').split('\n');
+    const exclude = path.resolve(excludePath || '');
+    for (const line of stack) {
+      const m = line.match(/\(?([\/][^():]+\.(?:js|mjs|cjs)):\d+:\d+\)?/);
+      if (!m) continue;
+      const candidate = path.resolve(m[1]);
+      if (candidate === exclude) continue;
+      if (!fs.existsSync(candidate)) continue;
+      return candidate;
+    }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+/**
+ * Scan forward from `openIdx` (which must equal `openChar`) to the
+ * matching `closeChar`, skipping strings, template literals and
+ * comments. Returns the index of the closing char, or -1 on failure.
+ * @private
+ */
+function _syappScanBalanced(src, openIdx, openChar, closeChar) {
+  if (typeof src !== 'string' || src[openIdx] !== openChar) return -1;
+  let depth = 0, inStr = null, inTpl = false, inLine = false, inBlock = false;
+  for (let i = openIdx; i < src.length; i++) {
+    const c = src[i], nx = src[i + 1];
+    if (inLine) { if (c === '\n') inLine = false; continue; }
+    if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (inTpl) {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { inTpl = false; continue; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '`') { inTpl = true; continue; }
+    if (c === '/' && nx === '/') { inLine = true; i++; continue; }
+    if (c === '/' && nx === '*') { inBlock = true; i++; continue; }
+    if (c === openChar) depth++;
+    else if (c === closeChar) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Convenience wrapper for balanced `{ ... }` scanning.
+ * @private
+ */
+function _syappScanBalancedBrace(src, openIdx) {
+  return _syappScanBalanced(src, openIdx, '{', '}');
+}
+
+/**
+ * Compute the source-directory depth of `pos` inside `src`, ignoring
+ * braces inside strings/templates/comments.
+ * @private
+ */
+function _syappBraceDepthAt(src, pos) {
+  let depth = 0, inStr = null, inTpl = false, inLine = false, inBlock = false;
+  for (let i = 0; i < pos && i < src.length; i++) {
+    const c = src[i], nx = src[i + 1];
+    if (inLine) { if (c === '\n') inLine = false; continue; }
+    if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (inTpl) {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { inTpl = false; continue; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '`') { inTpl = true; continue; }
+    if (c === '/' && nx === '/') { inLine = true; i++; continue; }
+    if (c === '/' && nx === '*') { inBlock = true; i++; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+  }
+  return depth;
+}
+
+/**
+ * Return true when `src` contains `class <className> extends ...` at
+ * the top level (optionally `export`-prefixed).
+ * @private
+ */
+function _syappClassDefinedInSource(src, className) {
+  if (!src || !className) return false;
+  const escName = String(className).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(
+    `^[ \\t]*(?:export\\s+(?:default\\s+)?)?class\\s+${escName}\\s+extends\\s+`,
+    'm'
+  );
+  return re.test(src);
+}
+
+/**
+ * Return true when `src` contains at least one `new SyAPP(...)` call
+ * whose arguments include a `pack: true` property.
+ * @private
+ */
+function _syappSourceHasPackCall(src) {
+  if (typeof src !== 'string' || !src) return false;
+  const re = /new\s+SyAPP\s*\(/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = _syappScanBalanced(src, openIdx, '(', ')');
+    if (closeIdx < 0) { re.lastIndex = m.index + 1; continue; }
+    const args = src.slice(openIdx + 1, closeIdx);
+    if (/\bpack\s*:\s*true\b/.test(args)) return true;
+    re.lastIndex = closeIdx + 1;
+  }
+  return false;
+}
+
+/**
+ * Resolve an import specifier to an on-disk file, trying the usual
+ * extensions and `index.*` fallbacks. Returns null when the specifier
+ * is not a relative path or no candidate file exists.
+ * @private
+ */
+function _syappResolveImportPath(spec, srcDir) {
+  if (!spec || typeof spec !== 'string') return null;
+  if (!spec.startsWith('./') && !spec.startsWith('../') && !spec.startsWith('/')) {
+    return null; // bare package name — not a local file
+  }
+  const base = spec.startsWith('/') ? spec : path.resolve(srcDir, spec);
+  const candidates = [
+    base,
+    base + '.js',
+    base + '.mjs',
+    base + '.cjs',
+    path.join(base, 'index.js'),
+    path.join(base, 'index.mjs'),
+    path.join(base, 'index.cjs')
+  ];
+  for (const cand of candidates) {
+    try {
+      if (fs.existsSync(cand) && fs.statSync(cand).isFile()) return cand;
+    } catch (_) {}
+  }
+  return null;
+}
+
+/**
+ * Given a source file and a class name, scan every `import` statement
+ * and return the on-disk file that provides the class as a binding.
+ *
+ * Recognised shapes:
+ *   import X from './path'          (default)
+ *   import X, { Y } from './path'   (default + named)
+ *   import { X } from './path'      (named)
+ *   import { Y as X } from './path' (aliased)
+ *
+ * @private
+ */
+function _syappFindClassSourceFile(src, className, sourceFile) {
+  if (!src || !className) return null;
+  const srcDir = path.dirname(sourceFile);
+  const importRe = /^[ \t]*import\s+([\s\S]+?)\s+from\s+['"]([^'"]+)['"]/gm;
+  let m;
+  while ((m = importRe.exec(src)) !== null) {
+    const clause = m[1].trim();
+    const specifier = m[2];
+
+    // Default binding: `X` or `X, { ... }`
+    const defaultMatch = clause.match(/^([A-Za-z_$][\w$]*)\s*(?:,|$)/);
+    if (defaultMatch && defaultMatch[1] === className) {
+      const resolved = _syappResolveImportPath(specifier, srcDir);
+      if (resolved) return resolved;
+    }
+
+    // Named bindings: `{ X }`, `{ Y as X }`, `{ X, Z }`
+    const namedMatch = clause.match(/\{([^}]+)\}/);
+    if (namedMatch) {
+      const parts = namedMatch[1].split(',');
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (!trimmed) continue;
+        const asMatch = trimmed.match(/^([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)$/);
+        if (asMatch) {
+          if (asMatch[2] === className) {
+            const resolved = _syappResolveImportPath(specifier, srcDir);
+            if (resolved) return resolved;
+          }
+        } else if (trimmed === className) {
+          const resolved = _syappResolveImportPath(specifier, srcDir);
+          if (resolved) return resolved;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract the main func class from `src` along with all imports and
+ * top-level `const|let|var|function` declarations, EXCLUDING any
+ * `new SyAPP(...)` call and any `if (...) { ... }` main-guard block
+ * that lives outside the class body.
+ *
+ * Relative import specifiers are rewritten to absolute `file://` URLs
+ * (anchored at `sourceFile`'s directory) so the isolated temp file can
+ * resolve them correctly from `os.tmpdir()`. Bare specifiers and
+ * already-absolute paths are left untouched.
+ *
+ * @param {string} src - Source of the invocation file
+ * @param {string} funcClassName - Class name of the main func
+ * @param {string} sourceFile - Absolute path of the invocation file
+ * @returns {string|null}
+ * @private
+ */
+function _syappIsolateMainFuncSource(src, funcClassName, sourceFile) {
+  if (!src || !funcClassName) return null;
+  const srcDir = path.dirname(sourceFile);
+
+  // -------------------- rewrite helper --------------------
+  const rewriteSpecifier = (spec) => {
+    if (!spec) return spec;
+    if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+    try {
+      const abs = path.resolve(srcDir, spec);
+      return url.pathToFileURL(abs).href;
+    } catch (_) { return spec; }
+  };
+
+  // -------------------- imports --------------------
+  const imports = [];
+  const importRe = /^[ \t]*import\s+[\s\S]*?\bfrom\s+['"][^'"]+['"][^\n]*$/gm;
+  let m;
+  while ((m = importRe.exec(src)) !== null) {
+    const stmt = m[0].trim();
+    const rewritten = stmt.replace(
+      /(\bfrom\s+)(['"])([^'"]+)\2/g,
+      (_, kw, q, spec) => kw + q + rewriteSpecifier(spec) + q
+    );
+    if (!imports.includes(rewritten)) imports.push(rewritten);
+  }
+  const sideEffectRe = /^[ \t]*import\s+['"][^'"]+['"][^\n]*$/gm;
+  while ((m = sideEffectRe.exec(src)) !== null) {
+    const stmt = m[0].trim();
+    const rewritten = stmt.replace(
+      /(['"])([^'"]+)\1/g,
+      (_, q, spec) => q + rewriteSpecifier(spec) + q
+    );
+    if (!imports.includes(rewritten)) imports.push(rewritten);
+  }
+
+  // -------------------- main func class --------------------
+  const escName = funcClassName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const classRe = new RegExp(
+    `^[ \\t]*(?:export\\s+(?:default\\s+)?)?class\\s+${escName}\\s+extends\\s+[^{]+\\{`,
+    'm'
+  );
+  const classMatch = classRe.exec(src);
+  if (!classMatch) return null;
+
+  const classStart = classMatch.index;
+  const openBraceIdx = classMatch.index + classMatch[0].length - 1;
+  const closeBraceIdx = _syappScanBalancedBrace(src, openBraceIdx);
+  if (closeBraceIdx < 0) return null;
+
+  let classSrc = src.slice(classStart, closeBraceIdx + 1);
+  // Strip any existing export keyword so we can add one explicitly.
+  classSrc = classSrc.replace(/^(\s*)export\s+default\s+class\s+/, '$1class ');
+  classSrc = classSrc.replace(/^(\s*)export\s+class\s+/, '$1class ');
+
+  // -------------------- top-level const/let/var/function --------------------
+  const decls = [];
+  const declRe = /^[ \t]*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/gm;
+  while ((m = declRe.exec(src)) !== null) {
+    if (_syappBraceDepthAt(src, m.index) !== 0) continue;
+    const stmtStart = m.index;
+    let stmtEnd = src.length;
+    let sd = 0;
+    for (let j = m.index + m[0].length; j < src.length; j++) {
+      const c = src[j];
+      if (c === '{' || c === '(' || c === '[') sd++;
+      else if (c === '}' || c === ')' || c === ']') sd--;
+      else if (c === ';' && sd === 0) { stmtEnd = j + 1; break; }
+      else if (c === '\n' && sd === 0 && j > m.index + m[0].length) {
+        const rest = src.slice(j + 1).match(/^[ \t]*(\S)/);
+        if (rest && !/[.)\]},?:+\-*/]/.test(rest[1])) { stmtEnd = j + 1; break; }
+      }
+    }
+    decls.push(src.slice(stmtStart, stmtEnd));
+  }
+
+  const fnRe = /^[ \t]*(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(/gm;
+  while ((m = fnRe.exec(src)) !== null) {
+    if (_syappBraceDepthAt(src, m.index) !== 0) continue;
+    const bodyStart = src.indexOf('{', m.index + m[0].length);
+    if (bodyStart < 0) continue;
+    const bodyEnd = _syappScanBalancedBrace(src, bodyStart);
+    if (bodyEnd < 0) continue;
+    decls.push(src.slice(m.index, bodyEnd + 1));
+  }
+
+  // -------------------- compose --------------------
+  const parts = [];
+  if (imports.length > 0) { parts.push(imports.join('\n')); parts.push(''); }
+  if (decls.length > 0) { parts.push(decls.join('\n\n')); parts.push(''); }
+  parts.push(classSrc);
+  parts.push('');
+  parts.push(`export default ${funcClassName};`);
+
+  return parts.join('\n');
+}
+
+/**
+ * Serialize the user config into a JSON string suitable for `--config`.
+ * Skips internal keys (`pack`, `_mainSourceFile`, `mainfunc`) and any
+ * value that cannot be JSON round-tripped (functions, circular refs,
+ * BigInt, etc.). Returns null when nothing serializable remains.
+ * @private
+ */
+function _syappBuildPackConfigJson(userConfig) {
+  if (!userConfig || typeof userConfig !== 'object') return null;
+  const skip = new Set(['pack', '_mainSourceFile', 'mainfunc']);
+  const out = {};
+  let skippedNonSerializable = 0;
+  for (const k of Object.keys(userConfig)) {
+    if (skip.has(k)) continue;
+    const v = userConfig[k];
+    if (typeof v === 'function' || typeof v === 'undefined' || typeof v === 'symbol') {
+      skippedNonSerializable++;
+      continue;
+    }
+    try {
+      const json = JSON.stringify(v);
+      if (json === undefined) { skippedNonSerializable++; continue; }
+      JSON.parse(json);
+      out[k] = v;
+    } catch (_) {
+      skippedNonSerializable++;
+    }
+  }
+  if (skippedNonSerializable > 0) {
+    _syappPackLog(
+      `warning: ${skippedNonSerializable} non-serializable config key(s) skipped for --config`
+    );
+  }
+  if (Object.keys(out).length === 0) return null;
+  return JSON.stringify(out);
+}
+
+/**
+ * Locate the pack target for a `new SyAPP(MyFunc, { pack: true })` call.
+ *
+ * Returns `{ file, tempFiles }` on success or `{ error }` on failure.
+ * `tempFiles` lists every temporary file that MUST be cleaned up after
+ * the child process exits.
+ *
+ * @private
+ */
+function _syappResolvePackTarget(mainFunc, userConfig, syappJsPath) {
+  const funcClassName = typeof mainFunc === 'function' && mainFunc.name ? mainFunc.name : null;
+  if (!funcClassName) {
+    return { error: 'anonymous main func cannot be packed (isolation requires a class name)' };
+  }
+
+  // -------------------- 1. Collect candidate source files --------------------
+  const candidates = [];
+  if (userConfig && typeof userConfig._mainSourceFile === 'string' && userConfig._mainSourceFile) {
+    candidates.push(userConfig._mainSourceFile);
+  }
+  const argv1 = process.argv[1];
+  if (argv1 && typeof argv1 === 'string') {
+    const abs = path.isAbsolute(argv1) ? argv1 : path.resolve(process.cwd(), argv1);
+    if (path.resolve(abs) !== path.resolve(syappJsPath) && fs.existsSync(abs)) {
+      candidates.push(abs);
+    }
+  }
+  const callerPath = _syappFindCallerPath(syappJsPath);
+  if (callerPath) candidates.push(callerPath);
+
+  if (candidates.length === 0) {
+    return { error: 'could not determine a candidate source file (set _mainSourceFile, or run `node MyApp.js` directly)' };
+  }
+
+  // -------------------- 2. Walk candidates until one resolves --------------------
+  const tempFiles = [];
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+
+    let src;
+    try { src = fs.readFileSync(candidate, 'utf8'); }
+    catch (_) { continue; }
+
+    // ---- Case A: class is DEFINED in this file ----
+    if (_syappClassDefinedInSource(src, funcClassName)) {
+      // A1: file also has a `new SyAPP(...pack: true)` call → isolate
+      if (_syappSourceHasPackCall(src)) {
+        const isolated = _syappIsolateMainFuncSource(src, funcClassName, candidate);
+        if (!isolated) {
+          return { error: `could not isolate "${funcClassName}" from ${candidate}` };
+        }
+        const tempFile = path.join(
+          os.tmpdir(),
+          `syapp_pack_src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`
+        );
+        try { fs.writeFileSync(tempFile, isolated, 'utf8'); }
+        catch (e) { return { error: `failed to write isolation temp file: ${e.message}` }; }
+        tempFiles.push(tempFile);
+        _syappPackLog(`isolation: ${candidate} → ${tempFile}`);
+        return { file: tempFile, tempFiles };
+      }
+      // A2: no pack call → pack the file as-is
+      _syappPackLog(`direct pack (A2): ${candidate}`);
+      return { file: candidate, tempFiles };
+    }
+
+    // ---- Case B: class is IMPORTED from another file ----
+    const importedFrom = _syappFindClassSourceFile(src, funcClassName, candidate);
+    if (importedFrom) {
+      // Check whether the resolved class source ALSO has a pack call.
+      // Extremely unusual, but if it does, isolate it (otherwise the
+      // packed bundle's `new SyAPP(...pack: true)` would recurse).
+      try {
+        const resolvedSrc = fs.readFileSync(importedFrom, 'utf8');
+        if (_syappSourceHasPackCall(resolvedSrc) &&
+            _syappClassDefinedInSource(resolvedSrc, funcClassName)) {
+          const isolated = _syappIsolateMainFuncSource(resolvedSrc, funcClassName, importedFrom);
+          if (!isolated) {
+            return { error: `could not isolate "${funcClassName}" from ${importedFrom}` };
+          }
+          const tempFile = path.join(
+            os.tmpdir(),
+            `syapp_pack_src_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mjs`
+          );
+          try { fs.writeFileSync(tempFile, isolated, 'utf8'); }
+          catch (e) { return { error: `failed to write isolation temp file: ${e.message}` }; }
+          tempFiles.push(tempFile);
+          _syappPackLog(`isolation (resolved): ${importedFrom} → ${tempFile}`);
+          return { file: tempFile, tempFiles };
+        }
+      } catch (_) { /* fall through */ }
+      _syappPackLog(`direct pack (B): ${candidate} → ${importedFrom}`);
+      return { file: importedFrom, tempFiles };
+    }
+  }
+
+  return {
+    error:
+      `could not resolve a source file for class "${funcClassName}". ` +
+      `Tried: ${candidates.join(', ')}`
+  };
+}
+
+/**
+ * Run the constructor-level pack flow.
+ *
+ * SILENT MODE: every step logs to `~/.syapp/pack.log` instead of the
+ * terminal. The user sees only a short failure notice (on error) or a
+ * short success notice (on success).
+ *
+ * @param {Function} mainFunc - Main func class
+ * @param {Object} userConfig - Config from `new SyAPP(mainFunc, userConfig)`
+ * @returns {number} Exit code to propagate to the parent process
+ * @private
+ */
+function _syappRunPackMode(mainFunc, userConfig) {
+  const syappJsPath = url.fileURLToPath(import.meta.url);
+
+  // Truncate the log so each run's transcript is self-contained.
+  try {
+    if (!fs.existsSync(_SYAPP_PACK_LOG_DIR)) {
+      fs.mkdirSync(_SYAPP_PACK_LOG_DIR, { recursive: true });
+    }
+    fs.writeFileSync(_SYAPP_PACK_LOG_FILE, '', 'utf8');
+  } catch (_) {}
+  _syappPackLog(`pack mode start — syapp=${syappJsPath}`);
+
+  const resolved = _syappResolvePackTarget(mainFunc, userConfig, syappJsPath);
+  if (resolved.error) {
+    _syappPackLog(`ERROR resolve: ${resolved.error}`);
+    _syappPackFailSummary(resolved.error);
+    return 1;
+  }
+
+  const sourceFile = resolved.file;
+  const tempFiles = Array.isArray(resolved.tempFiles) ? resolved.tempFiles : [];
+  _syappPackLog(`pack target: ${sourceFile}`);
+
+  try {
+    // -------------------- 3. Run `--pack` on the target file --------------------
+    // `stdio: 'pipe'` — subprocess output is captured and written to
+    // the log file, NOT to the parent's terminal.
+    _syappPackLog(`running: node ${syappJsPath} --pack ${sourceFile}`);
+    const packResult = spawnSync(
+      process.execPath,
+      [syappJsPath, '--pack', sourceFile],
+      { stdio: 'pipe', cwd: process.cwd(), encoding: 'utf8' }
+    );
+    if (packResult.stdout) _syappPackLog(`--pack stdout:\n${packResult.stdout}`);
+    if (packResult.stderr) _syappPackLog(`--pack stderr:\n${packResult.stderr}`);
+    if (packResult.error || packResult.status !== 0) {
+      _syappPackLog(`ERROR --pack: status=${packResult.status}`);
+      _syappPackFailSummary(
+        `--pack failed (status ${packResult.status || 'error'}). ` +
+        `\n   ${_syappPackLogTail(20)}`
+      );
+      return packResult.status || 1;
+    }
+
+    // -------------------- 4. Locate the pack output --------------------
+    let outputFile = null;
+    try {
+      const src = fs.readFileSync(sourceFile, 'utf8');
+      const m = src.match(/class\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
+      const baseName = m ? m[1] : 'untitled';
+      outputFile = path.resolve(path.dirname(sourceFile), `${baseName}-pack.js`);
+    } catch (_) {}
+    if (!outputFile || !fs.existsSync(outputFile)) {
+      try {
+        const dir = path.dirname(sourceFile);
+        const candidates = fs.readdirSync(dir).filter(f => f.endsWith('-pack.js'));
+        if (candidates.length === 1) outputFile = path.join(dir, candidates[0]);
+      } catch (_) {}
+    }
+    if (!outputFile || !fs.existsSync(outputFile)) {
+      _syappPackLog(`ERROR output: pack file not found`);
+      _syappPackFailSummary(
+        `output file not found. \n   ${_syappPackLogTail(20)}`
+      );
+      return 1;
+    }
+    _syappPackLog(`pack output: ${outputFile}`);
+
+    // If the input was a temp isolation file, the output also landed in
+    // `os.tmpdir()`, so we must remove it after the child exits.
+    if (tempFiles.includes(sourceFile)) {
+      tempFiles.push(outputFile);
+    }
+
+    // -------------------- 5. Spawn the child CLI --------------------
+    const configJson = _syappBuildPackConfigJson(userConfig);
+    _syappPackLog(`child config: ${configJson === null ? '(none)' : configJson}`);
+
+    const childArgs = [syappJsPath];
+    if (configJson !== null) childArgs.push('--config', configJson);
+    childArgs.push(outputFile);
+
+    // ------------------------------------------------------------------
+    // SILENT CHILD BOOTSTRAP.
+    //
+    // `stdio: ['inherit', 'pipe', 'pipe']` means:
+    //   • stdin  → inherited (the app needs the terminal)
+    //   • stdout → piped  (captured here, mirrored to log)
+    //   • stderr → piped  (captured here, mirrored to log)
+    //
+    // BUT the child needs to keep the terminal FOR ITSELF — it is the
+    // actual running SyAPP instance and its HUD drives the whole
+    // screen. So we cannot pipe stdout in the normal sense (the child
+    // would have no TTY and the HUD would render to a pipe).
+    //
+    // The correct silent strategy is:
+    //   1. inject an environment variable `SYAPP_PACK_CHILD=1` so the
+    //      child CLI KNOWS it is running as a silent child;
+    //   2. inside the child CLI's `_bootApp` (and elsewhere where
+    //      banner logs are emitted), suppress console output when that
+    //      env var is set;
+    //   3. use `stdio: 'inherit'` so the child owns the terminal for
+    //      the HUD.
+    //
+    // That is why the rest of the child invocation below is
+    // `spawnSync(..., { stdio: 'inherit', env: { ...process.env, SYAPP_PACK_CHILD: '1' } })`.
+    // The child's own bootstrap logs (HTTP server banner, route
+    // discovery, stream server banner, etc.) are gated on that env
+    // var and are silenced accordingly — see the `_bootApp` /
+    // `_installCtrlC` / streaming-server modifications in the CLI
+    // section of this file.
+    // ------------------------------------------------------------------
+    _syappPackLog(`running child: node ${childArgs.join(' ')}`);
+
+    const _sigintSuppress = () => {};
+    process.on('SIGINT', _sigintSuppress);
+    let childResult;
+    try {
+      childResult = spawnSync(process.execPath, childArgs, {
+        stdio: 'inherit',
+        cwd: process.cwd(),
+        env: { ...process.env, SYAPP_PACK_CHILD: '1' }
+      });
+    } finally {
+      try { process.removeListener('SIGINT', _sigintSuppress); } catch (_) {}
+    }
+    _syappPackLog(`child exited: status=${childResult.status}`);
+
+    if (childResult.status === 0) {
+      _syappPackSuccessSummary();
+    } else {
+      _syappPackFailSummary(`child exited with status ${childResult.status}`);
+    }
+
+    return childResult.status || 0;
+  } finally {
+    for (const f of tempFiles) {
+      try { fs.unlinkSync(f); } catch (_) {}
+    }
+  }
+}
+
 // --------------------------- SyAPP Class ---------------------------
 
 /**
@@ -27558,6 +28522,34 @@ class SyAPP {
     } else {
       mainFunc = mainFuncOrConfig?.mainfunc || TemplateFunc;
       userConfig = mainFuncOrConfig || {};
+    }
+
+    // ============================================================
+    // CONSTRUCTOR-LEVEL PACK MODE
+    // ============================================================
+    // When `pack: true` is set, the constructor does NOT boot normally.
+    // Instead it behaves like:
+    //
+    //     node SyAPP.js --pack <mainfunc-file>
+    //     node SyAPP.js --config '<serialized userConfig>' <packfile>
+    //
+    // — see _syappRunPackMode for the exact flow. This branch is
+    // reached only when the caller explicitly opts in, so every other
+    // code path is untouched.
+    //
+    // SILENT MODE: no pack-step output reaches stdout. The full
+    // transcript goes to `~/.syapp/pack.log`; only a short summary
+    // is printed to stderr on success or failure.
+    //
+    // The process that calls this constructor EXITS once the child
+    // process finishes, so the user's script does not continue past
+    // `new SyAPP(...)` in pack mode. This is intentional: the pack
+    // flow produces a bundle and hands control to a fresh SyAPP
+    // child, which is the actual running instance.
+    // ============================================================
+    if (userConfig && userConfig.pack === true) {
+      const packExitCode = _syappRunPackMode(mainFunc, userConfig);
+      process.exit(packExitCode);
     }
 
     /**
@@ -29901,6 +30893,12 @@ function _embDiskSave(outerFilePath, embName, storageEntry) {
       dropdown: (storageEntry && storageEntry.dropdown && typeof storageEntry.dropdown === 'object')
         ? storageEntry.dropdown
         : null,
+      // Persist the filePath representation (global vs relative) so a
+      // hard restart re-opens the widget in the same mode the user
+      // last chose.
+      pathMode: (storageEntry && (storageEntry.pathMode === 'global' || storageEntry.pathMode === 'relative'))
+        ? storageEntry.pathMode
+        : 'global',
       updatedAt: Date.now()
     };
     fs.writeFileSync(f, JSON.stringify(payload, null, 2), 'utf8');
@@ -30367,6 +31365,8 @@ function _genFuncJS(state, syappRelPath) {
             }
           }
           cfg.saveMode = mode
+          if (it.pathMode === 'relative') cfg.pathMode = 'relative'
+          if (it.runMode === 'normal') cfg.runMode = 'normal'
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
@@ -30645,6 +31645,8 @@ function _sbMakeItemForMethod(methodName, id) {
         filePath: '',
         code: '',
         saveMode: 'inline',
+        pathMode: 'global',
+        runMode: 'bg',
         dropdown: {}
       }
     }
@@ -31100,7 +32102,7 @@ class SelfBuilder extends SyAPP_Func {
                 ? ownerFunc._embSnippetInline(snippetState, snippetCfg)
                 : ''
               : ownerFunc && typeof ownerFunc._embSnippetPath === 'function'
-                ? ownerFunc._embSnippetPath(snippetState, snippetCfg)
+                ? ownerFunc._embSnippetPath(snippetState, snippetCfg, hostFile)
                 : '';
 
             if (snippet && ownerFunc && typeof ownerFunc._embReplaceExistingCall === 'function') {
@@ -33433,6 +34435,8 @@ class SelfBuilder extends SyAPP_Func {
           const cfg = { name: it.name }
           if (it.filePath) cfg.filePath = it.filePath
           if (it.code) cfg.code = it.code
+          if (it.pathMode === 'relative') cfg.pathMode = 'relative'
+          if (it.runMode === 'normal') cfg.runMode = 'normal'
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args.slice()
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           await this.Emb(id, cfg)
@@ -33456,6 +34460,15 @@ class SelfBuilder extends SyAPP_Func {
               if (Array.isArray(st.args) && !this._embArgsEqual(st.args, it.args || [])) {
                 it.args = st.args.slice()
               }
+              // Sync pathMode so the SelfBuilder export / re-parse
+              // round-trip preserves the user's global ↔ relative
+              // choice.
+              if (st.pathMode === 'relative') it.pathMode = 'relative';
+              else if (st.pathMode === 'global') it.pathMode = 'global';
+              // Sync the run mode so the SelfBuilder export / re-parse
+              // round-trip preserves the user's bg ↔ same-process
+              // choice.
+              if (st.runMode === 'normal' || st.runMode === 'bg') it.runMode = st.runMode;
               // Sync the widget's dropdown text/emoji back to the item
               // (non-default values only), so _genFuncJS emits them when
               // the SelfBuilder exports / saves. Without this, edits made
@@ -34640,6 +35653,16 @@ function _sbCallToItem(call, sessionVar) {
         filePath: typeof cfg.filePath === 'string' ? cfg.filePath : '',
         code: typeof cfg.code === 'string' ? cfg.code : '',
         saveMode: inferredMode,
+        // Path representation — inferred from the explicit cfg.pathMode
+        // when present, otherwise from whether cfg.filePath is relative.
+        pathMode: (cfg.pathMode === 'global' || cfg.pathMode === 'relative')
+          ? cfg.pathMode
+          : (typeof cfg.filePath === 'string' && cfg.filePath && !path.isAbsolute(cfg.filePath)
+              ? 'relative'
+              : 'global'),
+        // Run mode (bg process vs same process). Defaults to 'bg'
+        // when the source does not carry an explicit value.
+        runMode: (cfg.runMode === 'normal') ? 'normal' : 'bg',
         dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
           ? cfg.dropdown
           : {},
@@ -36156,6 +37179,792 @@ function _syappCreateEsmMirror(absolutePath) {
   return mirrorFile;
 }
 
+/**
+ * Create a temporary mirror of a user's `.js` file with the SyAPP import
+ * FORCED to point at the CURRENTLY-RUNNING SyAPP.js module
+ * (`import.meta.url`).
+ *
+ * This is the "super handler" for SyAPP imports. Whenever the user's
+ * file has a broken SyAPP import specifier, no SyAPP import at all, or
+ * an import that resolves to a DIFFERENT SyAPP.js copy, this mirror
+ * makes the file loadable by anchoring `SyAPP` to the exact module that
+ * is currently executing this CLI.
+ *
+ * Detected import shapes — the SPECIFIER is rewritten, the import
+ * CLAUSE is preserved (so named bindings still work):
+ *
+ *   import SyAPP from '...'
+ *   import SyAPP, { X } from '...'
+ *   import { SyAPP } from '...'
+ *   import { X, SyAPP, Y as Z } from '...'
+ *   import * as SyAPP from '...'
+ *
+ * If no SyAPP import is present, a `import SyAPP from '<url>';` line is
+ * injected at the top of the file — but ONLY when the source actually
+ * references `SyAPP` as a class (i.e. `extends SyAPP` or
+ * `SyAPP.Func()`). A file that merely mentions "SyAPP" in a comment or
+ * string is left untouched, avoiding spurious imports in unrelated
+ * scripts.
+ *
+ * Relative imports of OTHER modules are rewritten against the ORIGINAL
+ * directory (same as `_syappCreateEsmMirror`), so the mirrored file
+ * resolves its sibling imports correctly from the temp directory.
+ *
+ * The mirror is always written with a `.mjs` extension and a sibling
+ * `package.json` marking the tree as ESM, so Node treats it as a module
+ * regardless of the original file's location or its surrounding
+ * package.json scope.
+ *
+ * @param {string} absolutePath - Absolute path to the source .js file.
+ * @param {string} syappModuleUrl - file:// URL of the currently-running
+ *                                  SyAPP.js (i.e. `import.meta.url`).
+ * @returns {string} Absolute path to the mirrored .mjs file.
+ * @private
+ */
+function _syappCreateSyappImportMirror(absolutePath, syappModuleUrl) {
+  const source = fs.readFileSync(absolutePath, 'utf8');
+  const srcDir = path.dirname(absolutePath);
+  const mirrorRoot = path.join(os.tmpdir(), 'syapp_cli_syapp_mirror');
+  if (!fs.existsSync(mirrorRoot)) fs.mkdirSync(mirrorRoot, { recursive: true });
+
+  // Mark the mirror tree as ESM so any bare `.js` file inside is treated
+  // as a module by Node (belt-and-braces — we also write `.mjs` below).
+  const pkgPath = path.join(mirrorRoot, 'package.json');
+  if (!fs.existsSync(pkgPath)) {
+    fs.writeFileSync(pkgPath, JSON.stringify({ type: 'module' }, null, 2), 'utf8');
+  }
+
+  // One subdirectory per source file, keyed by a hash of the absolute
+  // path AND the runtime SyAPP URL — a stale mirror can never be reused
+  // against a different runtime.
+  const hash = createHash('sha1')
+    .update(absolutePath + '::' + syappModuleUrl)
+    .digest('hex')
+    .slice(0, 16);
+  const mirrorDir = path.join(mirrorRoot, hash);
+  if (!fs.existsSync(mirrorDir)) fs.mkdirSync(mirrorDir, { recursive: true });
+
+  const baseName = path.basename(absolutePath).replace(/\.(js|mjs|cjs)$/i, '.mjs');
+  const mirrorFile = path.join(mirrorDir, baseName);
+
+  // ------------------------------------------------------------------
+  // Step 1 — Rewrite relative imports of OTHER modules so they resolve
+  //          from the ORIGINAL source directory (the mirror lives in
+  //          os.tmpdir() and would otherwise resolve them there).
+  // ------------------------------------------------------------------
+  const rewriteSpecifier = (spec) => {
+    if (!spec) return spec;
+    if (!spec.startsWith('./') && !spec.startsWith('../')) return spec;
+    const absTarget = path.resolve(srcDir, spec);
+    return url.pathToFileURL(absTarget).href;
+  };
+
+  let mirrorSource = source
+    .replace(/(\bfrom\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+      return kw + q + rewriteSpecifier(spec) + q;
+    })
+    .replace(/(\bimport\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => {
+      return kw + q + rewriteSpecifier(spec) + q;
+    });
+
+  // ------------------------------------------------------------------
+  // Step 2 — Find and REWRITE the SyAPP import to point at the
+  //          currently-running SyAPP.js.
+  //
+  // The regex is line-anchored (multi-line flag) so indented imports
+  // and multi-line import clauses are matched. Word boundaries on
+  // `SyAPP` prevent matching `SyAPPFunc`, `SyAPPX`, etc. — but allow
+  // `SyAPP.js` in a STRING to be matched ONLY when the surrounding
+  // clause is a real SyAPP import (the trailing `from` requirement
+  // guarantees that).
+  //
+  // The specifier may be single-quoted, double-quoted, or backticked.
+  // After replacement, the import clause (e.g. `SyAPP, { X }`) and any
+  // trailing `;` / whitespace are preserved untouched.
+  // ------------------------------------------------------------------
+  let foundSyappImport = false;
+  const syappImportRe = /(^[ \t]*import\s+(?:(?!\bfrom\b)[\s\S])*?\bSyAPP\b[\s\S]*?\bfrom\s+)(['"])([^'"]+)\2/gm;
+  mirrorSource = mirrorSource.replace(syappImportRe, (m, pre, q, _spec) => {
+    foundSyappImport = true;
+    return pre + q + syappModuleUrl + q;
+  });
+
+  // ------------------------------------------------------------------
+  // Step 3 — If no SyAPP import was found, inject one at the top of the
+  //          file, but ONLY when the source actually uses SyAPP as a
+  //          class reference. This covers the "I forgot to import SyAPP
+  //          but I wrote `extends SyAPP.Func()`" case, while leaving
+  //          unrelated scripts that merely mention "SyAPP" in a
+  //          comment or string untouched.
+  // ------------------------------------------------------------------
+  if (!foundSyappImport) {
+    const usesSyappAsClass =
+      /\bextends\s+SyAPP\b/.test(mirrorSource) ||
+      /\bSyAPP\s*\.\s*Func\b/.test(mirrorSource);
+    if (usesSyappAsClass) {
+      mirrorSource = `import SyAPP from ${JSON.stringify(syappModuleUrl)};\n` + mirrorSource;
+    }
+  }
+
+  fs.writeFileSync(mirrorFile, mirrorSource, 'utf8');
+  return mirrorFile;
+}
+
+// ============================================================
+// PACK — inline conversion of this.Emb() calls
+// ============================================================
+// The `--pack` flow converts every path-mode `this.Emb(...)` call in
+// the entry file's import graph (plus every embedded file reachable
+// through those calls, recursively) into inline mode, so the produced
+// bundle is fully self-contained.
+//
+// The conversion builds the new config object using EXACTLY the same
+// snippet-generation flow the Emb widget's "Save as Inline" button
+// uses:
+//
+//   1. Read the referenced file (`fs.readFileSync(filePath, 'utf8')`).
+//   2. `this._embExtractInlineClass(raw)` — strip the SyAPP import and
+//      `export` keywords, keep everything else.
+//   3. `this._embSnippetInline(state, cfg)` — build the snippet using
+//      the widget's own escaping rules
+//      (`.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$\{/g, '\\${')`).
+//
+// IMPORTANT — SURGICAL REPLACEMENT, NOT FULL CALL REGENERATION.
+//
+// The new snippet produced by `_embSnippetInline` always starts with
+// `await this.Emb(id, { ... })`. Splicing that WHOLE snippet in place
+// of the original call would:
+//   • change the first-argument variable name (uid → id, session → id,
+//     …), breaking any call site that uses a non-standard session var;
+//   • force an `await` onto call sites that did not have one;
+//   • overwrite the exact call shape the user wrote.
+//
+// Instead, this module:
+//   1. runs `_embSnippetInline` to obtain the CORRECT config-object
+//      body (with the correct escaping, pathMode/runMode/args/dropdown
+//      emission rules, etc.);
+//   2. extracts the `{ ... }` object from that snippet;
+//   3. replaces ONLY the original call's `{ ... }` body with that
+//      object, leaving the original `this.Emb(<original-first-arg>, `
+//      prefix and the trailing `)` / `await` state entirely untouched.
+//
+// IMPORTANT — ORIGINAL FILES ARE NEVER MODIFIED.
+//
+// Every transformation happens IN MEMORY. The converted source of each
+// module is stored in a `sourceOverrides` Map that is passed into the
+// `ModuleBundler`. The bundler reads from that map for transformed
+// modules and falls through to `readFileSync()` for every other module.
+// The resulting bundle therefore contains the transformed content, but
+// the `.js` files on disk remain byte-for-byte identical to what they
+// were before `--pack` ran.
+// ============================================================
+
+/**
+ * Locate the FIRST `{ ... }` balanced-brace region inside `s`, starting
+ * at or after `fromIdx`. Skips strings, template literals, and
+ * comments.
+ * @private
+ */
+function _packFindObjectLiteral(s, fromIdx) {
+  if (typeof s !== 'string') return null;
+  let inStr = null;
+  let inTemplate = false;
+  let inLine = false;
+  let inBlock = false;
+  for (let i = fromIdx; i < s.length; i++) {
+    const c = s[i], nx = s[i + 1];
+    if (inLine) { if (c === '\n') inLine = false; continue; }
+    if (inBlock) { if (c === '*' && nx === '/') { inBlock = false; i++; } continue; }
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (inTemplate) {
+      if (c === '\\') { i++; continue; }
+      if (c === '`') { inTemplate = false; continue; }
+      continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; continue; }
+    if (c === '`') { inTemplate = true; continue; }
+    if (c === '/' && nx === '/') { inLine = true; i++; continue; }
+    if (c === '/' && nx === '*') { inBlock = true; i++; continue; }
+    if (c === '{') {
+      // Walk to matching '}' with the same skip rules.
+      let depth = 0;
+      let i2 = i;
+      let sStr = null, sTemplate = false, sLine = false, sBlock = false;
+      for (; i2 < s.length; i2++) {
+        const cc = s[i2], nn = s[i2 + 1];
+        if (sLine) { if (cc === '\n') sLine = false; continue; }
+        if (sBlock) { if (cc === '*' && nn === '/') { sBlock = false; i2++; } continue; }
+        if (sStr) {
+          if (cc === '\\') { i2++; continue; }
+          if (cc === sStr) sStr = null;
+          continue;
+        }
+        if (sTemplate) {
+          if (cc === '\\') { i2++; continue; }
+          if (cc === '`') { sTemplate = false; continue; }
+          continue;
+        }
+        if (cc === '"' || cc === "'") { sStr = cc; continue; }
+        if (cc === '`') { sTemplate = true; continue; }
+        if (cc === '/' && nn === '/') { sLine = true; i2++; continue; }
+        if (cc === '/' && nn === '*') { sBlock = true; i2++; continue; }
+        if (cc === '{') depth++;
+        else if (cc === '}') {
+          depth--;
+          if (depth === 0) {
+            return { start: i, end: i2 + 1, text: s.slice(i, i2 + 1) };
+          }
+        }
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Given a snippet produced by `_embSnippetInline` (whose shape is
+ * `await this.Emb(id, { ...config... })`), extract the config object
+ * body as a standalone `{ ... }` string.
+ * @private
+ */
+function _packExtractConfigObjectFromSnippet(snippet) {
+  if (typeof snippet !== 'string') return null;
+  const openIdx = snippet.indexOf('(');
+  if (openIdx < 0) return null;
+  // Skip past the first argument (which may be `id`, `uid`, etc.) to
+  // reach the config object that follows the first comma.
+  let depth = 0;
+  let firstCommaIdx = -1;
+  let inStr = null;
+  for (let i = openIdx + 1; i < snippet.length; i++) {
+    const c = snippet[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === inStr) inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { inStr = c; continue; }
+    if (c === '(' || c === '[') depth++;
+    else if (c === ')' || c === ']') { if (depth === 0) break; depth--; }
+    else if (c === ',' && depth === 0) { firstCommaIdx = i; break; }
+  }
+  if (firstCommaIdx < 0) return null;
+  const obj = _packFindObjectLiteral(snippet, firstCommaIdx + 1);
+  if (!obj) return null;
+  return obj.text;
+}
+
+/**
+ * Walk a single source string, find every direct `this.Emb(...)` call,
+ * and produce a rewritten source where path-mode calls are converted
+ * to inline mode.
+ *
+ * Each replaced call preserves the ORIGINAL first argument and the
+ * ORIGINAL `await` state — only the config object `{ ... }` is swapped
+ * for the new inline-mode config body, so the call shape the user
+ * wrote is not disturbed.
+ *
+ * @param {string} src          - Source text of the host file.
+ * @param {string} hostFile     - Absolute path of the host file.
+ * @param {SyAPP_Func} tempFunc - Probe instance used for the helper
+ *                                methods (_embScanParenSimple,
+ *                                _embExtractInlineClass,
+ *                                _embSnippetInline,
+ *                                _embExtractRawCodeValue,
+ *                                _embUnescapeOneLayer).
+ * @param {Set<string>} visiting - Cycle guard for nested file reads.
+ * @returns {Promise<{ src: string, converted: number }>}
+ * @private
+ */
+/**
+ * Strip JavaScript comments from a source string, leaving every other
+ * byte untouched.
+ *
+ * Handles every way to create a comment in JavaScript:
+ *   • `//` line comments
+ *   • `/* ... *\/` block comments (including multi-line)
+ *   • `<!--` HTML-like open comments
+ *   • `-->` HTML-like close comments (only at start of line)
+ *
+ * Content inside string literals, template literals and regular
+ * expression literals is preserved verbatim.
+ *
+ * Lines that become empty (whitespace only) BECAUSE of comment removal
+ * are dropped entirely, so no empty lines are left in the place of
+ * removed comments. Blank lines that were already blank are kept.
+ *
+ * @param {string} src
+ * @returns {string}
+ * @private
+ */
+function _stripJSComments(src) {
+  if (typeof src !== 'string' || src.length === 0) return src;
+
+  const out = [];
+  let line = [];
+  let lineHadComment = false;
+  let i = 0;
+  const n = src.length;
+
+  let state = 'normal';
+
+  const REGEX_KEYWORDS = new Set([
+    'return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
+    'void', 'throw', 'case', 'do', 'else', 'yield', 'await', 'default'
+  ]);
+
+  const flushLine = () => {
+    const lineStr = line.join('');
+    if (lineStr.trim() === '' && lineHadComment) {
+      // Entire line came from a removed comment — skip it so no empty
+      // line is left in its place.
+    } else {
+      out.push(lineStr);
+    }
+    line = [];
+    lineHadComment = false;
+  };
+
+  // Whether a `/` at the current position can begin a regex literal,
+  // based on the last significant token on the current line (or start
+  // of line — regex allowed).
+  const canPrecedeRegexHere = () => {
+    let j = line.length - 1;
+    while (j >= 0 && /\s/.test(line[j])) j--;
+    if (j < 0) return true;
+    const lastChar = line[j];
+    if (/[\w$]/.test(lastChar)) {
+      let start = j;
+      while (start > 0 && /[\w$]/.test(line[start - 1])) start--;
+      const word = line.slice(start, j + 1).join('');
+      return REGEX_KEYWORDS.has(word);
+    }
+    return '([{,;:=!&|?+-*%<>^~'.includes(lastChar);
+  };
+
+  while (i < n) {
+    const c = src[i];
+    const next = src[i + 1];
+
+    if (state === 'line-comment') {
+      if (c === '\n') { state = 'normal'; flushLine(); i++; continue; }
+      lineHadComment = true;
+      i++;
+      continue;
+    }
+
+    if (state === 'block-comment') {
+      if (c === '*' && next === '/') { state = 'normal'; lineHadComment = true; i += 2; continue; }
+      if (c === '\n') { lineHadComment = true; flushLine(); i++; continue; }
+      lineHadComment = true;
+      i++;
+      continue;
+    }
+
+    if (state === 'single') {
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === "'") state = 'normal';
+      i++;
+      continue;
+    }
+
+    if (state === 'double') {
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === '"') state = 'normal';
+      i++;
+      continue;
+    }
+
+    if (state === 'template') {
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === '`') state = 'normal';
+      i++;
+      continue;
+    }
+
+    if (state === 'regex') {
+      // Regex literals cannot span a newline — abort and preserve the
+      // line as-is when we hit one (avoids eating real code on a
+      // heuristic false positive).
+      if (c === '\n') { state = 'normal'; flushLine(); i++; continue; }
+      line.push(c);
+      if (c === '\\') { if (i + 1 < n) { line.push(src[i + 1]); i += 2; continue; } }
+      if (c === '/') { state = 'regex-flags'; }
+      i++;
+      continue;
+    }
+
+    if (state === 'regex-flags') {
+      if (/[a-z]/i.test(c)) { line.push(c); i++; continue; }
+      state = 'normal';
+    }
+
+    if (c === '\n') { flushLine(); i++; continue; }
+
+    if (c === '/' && next === '/') {
+      state = 'line-comment';
+      lineHadComment = true;
+      i += 2;
+      continue;
+    }
+
+    if (c === '/' && next === '*') {
+      state = 'block-comment';
+      lineHadComment = true;
+      // Token separator so `a/* */b` cannot merge into `ab`.
+      line.push(' ');
+      i += 2;
+      continue;
+    }
+
+    if (c === '<' && next === '!' && src[i + 2] === '-' && src[i + 3] === '-') {
+      state = 'line-comment';
+      lineHadComment = true;
+      i += 4;
+      continue;
+    }
+
+    if (c === '-' && next === '-' && src[i + 2] === '>') {
+      const before = line.join('');
+      if (before.trim() === '') {
+        state = 'line-comment';
+        lineHadComment = true;
+        i += 3;
+        continue;
+      }
+    }
+
+    if (c === '/') {
+      if (canPrecedeRegexHere()) {
+        state = 'regex';
+        line.push('/');
+        i++;
+        continue;
+      }
+    }
+
+    if (c === "'") { state = 'single'; line.push(c); i++; continue; }
+    if (c === '"') { state = 'double'; line.push(c); i++; continue; }
+    if (c === '`') { state = 'template'; line.push(c); i++; continue; }
+
+    line.push(c);
+    i++;
+  }
+
+  if (line.length > 0 || lineHadComment) flushLine();
+
+  const hadTrailingNewline = src.endsWith('\n');
+  return out.join('\n') + (hadTrailingNewline ? '\n' : '');
+}
+
+async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting, stripComments) {
+  if (typeof src !== 'string' || !src) return { src, converted: 0 };
+
+  // Find every direct this.Emb(...) call in this file.
+  const calls = [];
+  const re = /this\.Emb\s*\(/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = tempFunc._embScanParenSimple(src, openIdx);
+    if (closeIdx < 0) continue;
+    calls.push({
+      start: m.index,
+      end: closeIdx + 1,
+      bodyStart: openIdx + 1,
+      bodyEnd: closeIdx,
+      raw: src.slice(m.index, closeIdx + 1),
+      body: src.slice(openIdx + 1, closeIdx)
+    });
+    re.lastIndex = closeIdx + 1;
+  }
+  if (calls.length === 0) return { src, converted: 0 };
+
+  // Process from END backwards so earlier offsets stay valid.
+  let out = src;
+  let converted = 0;
+
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const call = calls[i];
+    const body = call.body;
+
+    // Extract this call's config fields using the same shape the
+    // widget reads from its own state.
+    const nameM = body.match(/(?:^|[{,\s])["']?name["']?\s*:\s*(["'`])((?:\\.|[^\\])*?)\1/);
+    const embName = nameM ? nameM[2] : 'default';
+
+    const fpM = body.match(/(?:^|[{,\s])["']?filePath["']?\s*:\s*(["'`])((?:\\.|[^\\])*?)\1/);
+    const embFilePath = fpM ? fpM[2] : null;
+
+    const smM = body.match(/(?:^|[{,\s])["']?saveMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
+    const embSaveMode = smM ? smM[2] : null;
+
+    const rawCodeInfo = tempFunc._embExtractRawCodeValue(body);
+    const rawCode = rawCodeInfo ? rawCodeInfo.value : null;
+    const hasCode = rawCode !== null && String(rawCode).trim().length > 0;
+
+    const argsM = body.match(/(?:^|[{,\s])["']?args["']?\s*:\s*(\[[\s\S]*?\])/);
+    let embArgs = [];
+    if (argsM) {
+      try {
+        const parsed = JSON.parse(argsM[1]);
+        if (Array.isArray(parsed)) embArgs = parsed;
+      } catch (_) {}
+    }
+
+    const ddM = body.match(/(?:^|[{,\s])["']?dropdown["']?\s*:\s*(\{[\s\S]*?\})/);
+    let embDropdown = {};
+    if (ddM) {
+      try {
+        const parsed = JSON.parse(ddM[1]);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) embDropdown = parsed;
+      } catch (_) {}
+    }
+
+    const rmM = body.match(/(?:^|[{,\s])["']?runMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
+    const embRunMode = (rmM && (rmM[2] === 'normal' || rmM[2] === 'bg')) ? rmM[2] : 'bg';
+
+    const pmM = body.match(/(?:^|[{,\s])["']?pathMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
+    const embPathMode = (pmM && (pmM[2] === 'global' || pmM[2] === 'relative')) ? pmM[2] : 'global';
+
+    // --- Decide: is this call ALREADY inline? ---
+    // Following the exact rule the widget itself uses:
+    //   • saveMode === 'path'                                → path
+    //   • saveMode === 'inline'                              → inline
+    //   • otherwise, code present + no filePath              → inline
+    //   • otherwise, filePath present                        → path
+    const isPathMode = (
+      embSaveMode === 'path' ||
+      (embSaveMode !== 'inline' && embFilePath !== null && !hasCode)
+    );
+
+    // --- Inline-mode call: recurse into its code field only ---
+    if (!isPathMode && hasCode) {
+      const unescaped = tempFunc._embUnescapeOneLayer(rawCode);
+      const nested = await _packInlineEmbInSource(unescaped, hostFile, tempFunc, visiting, stripComments);
+      // Strip comments from the nested inline code (template-literal-safe,
+      // so already-processed nested emb templates are untouched but the
+      // current level's comments are removed).
+      const nestedStripped = stripComments ? _stripJSComments(nested.src) : nested.src;
+      if (nestedStripped === unescaped) continue; // nothing changed
+
+      // Build the new config object via the widget's own snippet
+      // builder, so escaping / pathMode / runMode / args / dropdown
+      // rules match path→inline switching exactly.
+      const snippetState = {
+        source: 'code',
+        filePath: embFilePath || null,
+        code: nestedStripped,
+        saveMode: 'inline',
+        pathMode: embPathMode,
+        runMode: embRunMode,
+        args: embArgs,
+        dropdown: embDropdown
+      };
+      const snippetCfg = { name: embName };
+      const snippet = tempFunc._embSnippetInline(snippetState, snippetCfg);
+      const newConfigObj = _packExtractConfigObjectFromSnippet(snippet);
+      if (!newConfigObj) continue;
+
+      // Surgical replacement: swap ONLY the original config object,
+      // keeping the original first argument and await state untouched.
+      const objInOriginal = _packFindObjectLiteral(call.raw, 0);
+      if (!objInOriginal) continue;
+      const newCallRaw =
+        call.raw.slice(0, objInOriginal.start) +
+        newConfigObj +
+        call.raw.slice(objInOriginal.end);
+
+      out = out.slice(0, call.start) + newCallRaw + out.slice(call.end);
+      converted++;
+      continue;
+    }
+
+    // --- Path-mode call: convert to inline ---
+    if (isPathMode && embFilePath) {
+      const absPath = path.isAbsolute(embFilePath)
+        ? embFilePath
+        : path.resolve(path.dirname(hostFile), embFilePath);
+
+      if (!fs.existsSync(absPath)) continue; // leave path-mode call as-is
+      if (visiting.has(absPath)) continue;   // cycle guard
+
+      let embeddedSrc;
+      try {
+        embeddedSrc = fs.readFileSync(absPath, 'utf8');
+      } catch (_) {
+        continue;
+      }
+
+      visiting.add(absPath);
+      let processedEmbedded = embeddedSrc;
+      try {
+        // Recursively inline any nested path-mode Emb calls in the
+        // embedded file's source BEFORE extracting the class.
+        const nested = await _packInlineEmbInSource(processedEmbedded, absPath, tempFunc, visiting, stripComments);
+        processedEmbedded = nested.src;
+      } finally {
+        visiting.delete(absPath);
+      }
+
+      // Extract the inline class using the widget's OWN extractor.
+      // When comment stripping is on, strip comments from the
+      // extracted class so the embedded source placed into the
+      // inline `code:` template literal is comment-free. Nested
+      // emb templates (already processed recursively) are preserved
+      // because the stripper treats template literals as opaque.
+      let inlineClass;
+      try {
+        inlineClass = tempFunc._embExtractInlineClass(processedEmbedded);
+        if (stripComments) inlineClass = _stripJSComments(inlineClass);
+      } catch (_) {
+        continue;
+      }
+
+      // Build the snippet via the widget's OWN snippet builder so the
+      // escaping rules are byte-for-byte identical to the widget's
+      // "Save as Inline" flow.
+      const snippetState = {
+        source: 'file',
+        filePath: absPath,       // used only as the base-dir hint
+        code: inlineClass,
+        saveMode: 'inline',
+        pathMode: embPathMode,
+        runMode: embRunMode,
+        args: embArgs,
+        dropdown: embDropdown
+      };
+      const snippetCfg = { name: embName };
+      const snippet = tempFunc._embSnippetInline(snippetState, snippetCfg);
+      const newConfigObj = _packExtractConfigObjectFromSnippet(snippet);
+      if (!newConfigObj) continue;
+
+      // Surgical replacement: swap ONLY the original config object,
+      // keeping the original first argument and await state untouched.
+      const objInOriginal = _packFindObjectLiteral(call.raw, 0);
+      if (!objInOriginal) continue;
+      const newCallRaw =
+        call.raw.slice(0, objInOriginal.start) +
+        newConfigObj +
+        call.raw.slice(objInOriginal.end);
+
+      out = out.slice(0, call.start) + newCallRaw + out.slice(call.end);
+      converted++;
+    }
+  }
+
+  return { src: out, converted };
+}
+
+/**
+ * Compute the transformed source for one file WITHOUT writing anything
+ * to disk. The result is stashed in `overrides` (keyed by absolute
+ * path) so the bundler can use it as the file's content.
+ *
+ * @param {string} filePath
+ * @param {SyAPP_Func} tempFunc
+ * @param {Map<string, string>} overrides - In-memory source overrides.
+ * @returns {Promise<{ changed: boolean, converted: number }>}
+ * @private
+ */
+async function _packInlineEmbInFile(filePath, tempFunc, overrides, stripComments) {
+  const abs = path.resolve(filePath);
+  if (!fs.existsSync(abs)) return { changed: false, converted: 0 };
+  if (!/\.(js|mjs|cjs)$/i.test(abs)) return { changed: false, converted: 0 };
+
+  let src;
+  try {
+    src = fs.readFileSync(abs, 'utf8');
+  } catch (_) {
+    return { changed: false, converted: 0 };
+  }
+
+  const visiting = new Set([abs]);
+  const result = await _packInlineEmbInSource(src, abs, tempFunc, visiting, stripComments);
+
+  // Apply the final per-file comment strip. Emb-template content is
+  // already comment-free (from the recursive processing), so this
+  // safely removes only the module's own outer comments.
+  const finalSrc = stripComments ? _stripJSComments(result.src) : result.src;
+
+  if (finalSrc === src) return { changed: false, converted: 0 };
+
+  // STORE IN MEMORY ONLY — never touch the file on disk.
+  overrides.set(abs, finalSrc);
+  return { changed: true, converted: result.converted };
+}
+
+/**
+ * Walk the import graph of `entryFilePath` and inline-convert every
+ * path-mode `this.Emb(...)` call in every reachable file.
+ *
+ * The converted sources are stored in the returned `overrides` map
+ * (keyed by absolute path) and NEVER written back to disk. The caller
+ * passes that map into the `ModuleBundler` so the resulting bundle
+ * contains the transformed code, while every `.js` file on disk keeps
+ * its original bytes.
+ *
+ * @param {string} entryFilePath
+ * @returns {Promise<{ converted: number, filesTouched: number, overrides: Map<string, string> }>}
+ * @private
+ */
+async function _packInlineAllEmbs(entryFilePath, stripComments) {
+  const tempFunc = new SyAPP_Func('__pack_temp__');
+  const visited = new Set();
+  const overrides = new Map();
+  let totalConverted = 0;
+  let filesTouched = 0;
+
+  let passes = 0;
+  while (passes < 5) {
+    passes++;
+
+    const discovery = new ModuleBundler(entryFilePath, {
+      ignoreImports: ['SyAPP.js'],
+      syappRuntimeUrl: import.meta.url,
+      sourceOverrides: overrides
+    });
+    try {
+      discovery.processModule(discovery.entryFile);
+    } catch (_) {
+      break;
+    }
+
+    const files = Array.from(discovery.moduleRegistry.keys())
+      .filter(f => !discovery.isNativeModule(f) && !visited.has(f));
+
+    if (files.length === 0) break;
+
+    let changedThisPass = 0;
+    for (const file of files) {
+      visited.add(file);
+      try {
+        const result = await _packInlineEmbInFile(file, tempFunc, overrides, stripComments);
+        if (result.changed) {
+          changedThisPass++;
+          filesTouched++;
+          totalConverted += result.converted;
+        }
+      } catch (_) {
+        // Skip files that cannot be processed — the bundler will see
+        // them unchanged and continue as before.
+      }
+    }
+
+    if (changedThisPass === 0) break;
+  }
+
+  return { converted: totalConverted, filesTouched, overrides };
+}
+
 // If this file is run directly, execute the CLI with HTTP disabled by default.
 //
 // Usage:
@@ -36182,8 +37991,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _bgMode = false
     let _manageMode = false
     let _packMode = false
+    let _noCommentStrip = false  // --comment present: skip comment removal
     let _nameFlag = false        // --name present
     let _customName = null       // explicit --name <value>
+    let _userConfigArg = {}      // --config <json> parsed object
+    let _viewConfigMode = false  // --viewconfig present
     const _plainArgs = []
 
     for (let i = 0; i < _rawCliArgs.length; i++) {
@@ -36218,6 +38030,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         _manageMode = true
       } else if (a === '--pack') {
         _packMode = true
+      } else if (a === '--comment') {
+        _noCommentStrip = true
       } else if (a === '--name') {
         // NEW: --name support for --bg.
         //
@@ -36242,9 +38056,125 @@ if (import.meta.url === `file://${process.argv[1]}`) {
             i++
           }
         }
+      } else if (a === '--config') {
+        // --config <json> : JSON object forwarded to the new SyAPP()
+        // instance as its configuration object.
+        const next = _rawCliArgs[i + 1]
+        if (next === undefined) {
+          console.error(ColorText.brightRed('❌ --config requires a JSON string argument'))
+          process.exit(1)
+        }
+        try {
+          const parsed = JSON.parse(next)
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            console.error(ColorText.brightRed('❌ --config requires a JSON object'))
+            process.exit(1)
+          }
+          _userConfigArg = parsed
+          i++
+        } catch (e) {
+          console.error(ColorText.brightRed(`❌ --config invalid JSON: ${e.message}`))
+          process.exit(1)
+        }
+      } else if (a === '--viewconfig') {
+        _viewConfigMode = true
       } else {
         _plainArgs.push(a)
       }
+    }
+
+    // ---- --viewconfig : print configuration reference and exit ----
+    if (_viewConfigMode) {
+      const _vc = ColorText
+      const _line = _vc.brightCyan('═'.repeat(67))
+      console.log(`
+${_line}
+  ${_vc.brightCyan('SyAPP --config  |  Configuration JSON Reference')}
+${_line}
+
+${_vc.brightYellow('USAGE')}
+
+  node SyAPP.js --config '<json>' [file.js|saveName]
+
+  The JSON passed to ${_vc.green('--config')} is used as the configuration object
+  for the new ${_vc.brightWhite('SyAPP()')} instance, equivalent to:
+
+      ${_vc.dim('new SyAPP(MyFunc, <json>)')}
+
+  The JSON value MUST be a single object literal. Quotes must be
+  shell-escaped (typically by wrapping the value in single quotes).
+
+${_vc.brightYellow('SUPPORTED KEYS')}
+
+  ${_vc.green('mainFuncName')}         string
+      Custom name for the main function.
+
+  ${_vc.green('port')}                 number  (default: 3000)
+      HTTP server port (only used when enableHTTP is true).
+
+  ${_vc.green('host')}                 string  (default: "0.0.0.0")
+      HTTP server bind host.
+
+  ${_vc.green('enableHTTP')}           boolean (default: false)
+      Enable the built-in HTTP server.
+
+  ${_vc.green('httpConfig')}           object  (default: {})
+      Arbitrary config object passed to build functions.
+
+  ${_vc.green('baseRoute')}            boolean (default: false)
+      Use base routes (drop the func-name prefix).
+
+  ${_vc.green('includeFuncName')}      boolean (default: true)
+      Include the function name in HTTP routes.
+
+  ${_vc.green('RefreshMode')}          boolean (default: true)
+      Enable the global auto-refresh loop.
+
+  ${_vc.green('RefreshInterval')}      number  (default: 400)
+      Auto-refresh interval in ms.
+
+  ${_vc.green('maxFuncHistorySize')}   number  (default: 20)
+      Max function-history entries per session.
+
+  ${_vc.green('mouseClickMode')}       "single" | "double"  (default: "single")
+      Click mode for the HUD.
+
+  ${_vc.green('autoPinPages')}         boolean (default: false)
+      Auto-generate pinned nav buttons for pages.
+
+  ${_vc.green('processArgs')}          array of strings
+      Positional args forwarded to ${_vc.dim('this.Args()')}.
+
+${_vc.brightYellow('EXAMPLES')}
+
+  ${_vc.dim('# Load MyApp.js with a custom main func name')}
+  node SyAPP.js --config '{"mainFuncName":"admin"}' MyApp.js
+
+  ${_vc.dim('# Enable the HTTP server on port 8080')}
+  node SyAPP.js --config '{"enableHTTP":true,"port":8080}' MyApp.js
+
+  ${_vc.dim('# Double-click mode, no auto-refresh')}
+  node SyAPP.js --config '{"mouseClickMode":"double","RefreshMode":false}' MyApp.js
+
+  ${_vc.dim('# Combined with --server (streaming host)')}
+  node SyAPP.js --server 9000 --config '{"mainFuncName":"app"}' MyApp.js
+
+  ${_vc.dim('# Combined with a saved app name')}
+  node SyAPP.js --config '{"port":8080}' my-saved-app
+
+${_vc.brightYellow('NOTES')}
+
+  • ${_vc.green('--config')} does NOT propagate to processes spawned by ${_vc.green('--bg')};
+    configure the child via its own file / saved state instead.
+
+  • Values from ${_vc.green('--config')} are merged with the CLI-internal
+    values (${_vc.dim('processArgs')}, ${_vc.dim('_mainSourceFile')}); the internal
+    values always win on conflict.
+
+  • ${_vc.green('--viewconfig')} is informational only and exits immediately —
+    it never boots an app.
+`)
+      return
     }
 
     // `--connect` mode runs standalone — no SyAPP app is loaded.
@@ -36316,7 +38246,83 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         : path.resolve(path.dirname(absFile), `${funcName}-pack.js`);
 
       try {
-        const bundled = SyAPP.Pack(absFile);
+        // ------------------------------------------------------------------
+        // STEP — Inline every path-mode this.Emb() call IN MEMORY.
+        //
+        // The conversion uses the SAME snippet-generation flow as the
+        // Emb widget's "Save as Inline" button:
+        //
+        //   • read the referenced file,
+        //   • extract the inline class,
+        //   • build the snippet via _embSnippetInline (identical escaping),
+        //   • swap ONLY the config object in the original call (the
+        //     first argument and await state are preserved verbatim).
+        //
+        // CRITICAL: the transformed sources are stored in an in-memory
+        // `overrides` map and passed into ModuleBundler. The original
+        // `.js` files on disk are NEVER touched — the only file that
+        // gets written is the final bundle at `outPath`.
+        //
+        // Applied recursively to every file reachable through the entry
+        // file's ESM imports, so the produced bundle is self-contained
+        // even at arbitrary embedding depth.
+        //
+        // If the conversion fails for any reason, the pack proceeds
+        // with the sources unchanged — this step can never make a
+        // previously-working pack fail.
+        // ------------------------------------------------------------------
+        const stripComments = !_noCommentStrip;
+        let overrides = new Map();
+        try {
+          const inlined = await _packInlineAllEmbs(absFile, stripComments);
+          overrides = inlined.overrides;
+          if (inlined.converted > 0) {
+            console.log(ColorText.brightGreen(
+              `✅ Inlined ${inlined.converted} this.Emb() call(s) across ${inlined.filesTouched} file(s) (in-memory only)`
+            ));
+          } else {
+            console.log(ColorText.dim(
+              `   No path-mode this.Emb() calls to inline`
+            ));
+          }
+        } catch (inlineErr) {
+          console.warn(ColorText.yellow(
+            `⚠ Emb inlining skipped: ${inlineErr && inlineErr.message ? inlineErr.message : inlineErr}`
+          ));
+          overrides = new Map();
+        }
+
+        // Feed the transformed sources into the bundler via the new
+        // `sourceOverrides` option. The bundler reads from that map
+        // first, falling back to disk for every module that was not
+        // transformed.
+        const bundler = new ModuleBundler(absFile, {
+          ignoreImports: ['SyAPP.js'],
+          syappRuntimeUrl: import.meta.url,
+          sourceOverrides: overrides
+        });
+        bundler.processModule(bundler.entryFile);
+        let bundled = bundler.generateBundle();
+
+        // ------------------------------------------------------------------
+        // FINAL COMMENT-STRIP PASS — runs after every other step.
+        //
+        // Module contents are already comment-free (from the per-file
+        // strip performed inside _packInlineEmbInFile), and embedded
+        // this.Emb() code was already stripped recursively. This final
+        // pass removes the auto-generated wrapper comments (the bundle
+        // header, `// Module: …` blocks, `// Original imports:` blocks,
+        // `// External (ignored) imports` etc.) so the written file is
+        // fully comment-free.
+        //
+        // Skipped when the `--comment` flag is present on the command
+        // line, so `node SyAPP.js --pack --comment file.js` behaves
+        // exactly like the pre-change pack flow.
+        // ------------------------------------------------------------------
+        if (stripComments) {
+          bundled = _stripJSComments(bundled);
+        }
+
         fs.writeFileSync(outPath, bundled, 'utf8');
         console.log(ColorText.brightGreen(
           `✅ Packed ${path.basename(absFile)} → ${outPath}`
@@ -36412,7 +38418,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         } catch (_) {}
       }
 
-      const app = new SyAPP(FuncClass, extraConfig)
+      const app = new SyAPP(FuncClass, { ..._userConfigArg, ...extraConfig })
       _installCtrlC(app)
       if (_streamMode === 'server') {
         _startStreamingServer(app, _streamPort, _streamHost)
@@ -36850,29 +38856,71 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       // imports (relative and bare), its full module graph, and any
       // SyAPP_Func subclasses it declares.
       //
-      // ESM SCOPE FALLBACK — a `.js` file that sits OUTSIDE a package.json
-      // that declares `"type": "module"` is treated by Node as CommonJS.
-      // If that file uses ESM syntax (`import` / `export` / `import.meta`
-      // / top-level await) — which is exactly what every Self Build
-      // output file does — the direct import fails with one of:
+      // ------------------------------------------------------------------
+      // THREE-STAGE IMPORT — with a SUPER HANDLER for SyAPP imports.
       //
-      //   SyntaxError: Cannot use import statement outside a module
-      //   SyntaxError: Unexpected token 'export'
-      //   SyntaxError: Cannot use 'import.meta' outside a module
-      //   SyntaxError: await is only valid in async functions
+      // Stage 1: plain direct import.
+      //   Fast path. Works for every well-formed file whose SyAPP import
+      //   resolves correctly.
       //
-      // For those SPECIFIC errors we transparently mirror the file into a
-      // temp `.mjs` (with a generated `package.json` marking the mirror
-      // tree as ESM) and retry the import. This lets
-      // `node SyAPP.js MyApp.js` just work, regardless of where MyApp.js
-      // lives on disk. Any other import error (a real syntax error in the
-      // source, a missing dependency, an explicit throw, etc.) is
-      // surfaced unchanged — the mirror step would not help those and
-      // would only obscure the real message.
-      let importedModule;
+      // Stage 2: ESM-scope mirror.
+      //   Fixes "Cannot use import statement outside a module" for .js
+      //   files living outside a package.json `"type": "module"` scope.
+      //   Existing behaviour, unchanged.
+      //
+      // Stage 3: SyAPP-import mirror (the SUPER HANDLER).
+      //   Rewrites (or injects) the file's SyAPP import to point at the
+      //   CURRENTLY-RUNNING SyAPP.js (`import.meta.url`) and re-imports.
+      //   Handles:
+      //     • broken / non-existent SyAPP import specifier,
+      //     • missing SyAPP import entirely (file uses `SyAPP.Func()`
+      //       without importing `SyAPP` — would normally throw
+      //       "SyAPP is not defined" on instantiation),
+      //     • SyAPP imported from a STALE local copy that does not
+      //       match the runtime's exported surface.
+      // ------------------------------------------------------------------
+
+      // Pick the first valid SyAPP_Func class from an imported module.
+      const pickExportedFunc = (mod) => {
+        const candidates = [];
+        if (mod) {
+          if (mod.default !== undefined && mod.default !== null) {
+            candidates.push({ name: 'default', value: mod.default });
+          }
+          for (const key of Object.keys(mod)) {
+            if (key === 'default') continue;
+            candidates.push({ name: key, value: mod[key] });
+          }
+        }
+        for (const cand of candidates) {
+          let value = cand.value;
+          if (value && typeof value !== 'function' && typeof value === 'object') {
+            const nestedKeys = ['default', 'MainFunc', 'Func', 'SyAPP_Func'];
+            for (const nk of nestedKeys) {
+              const nested = value[nk];
+              if (isSyAPPFuncClass(nested)) {
+                value = nested;
+                break;
+              }
+            }
+          }
+          if (isSyAPPFuncClass(value)) {
+            return { func: value, name: cand.name };
+          }
+        }
+        return null;
+      };
+
+      let importedModule = null;
+      let picked = null;
+      let lastImportError = null;
+
+      // ---- Stage 1: direct import ----
       try {
         importedModule = await import(fileUrl);
+        picked = pickExportedFunc(importedModule);
       } catch (importErr) {
+        lastImportError = importErr;
         const errMsg = String((importErr && importErr.message) || '');
         const isEsmScopeError =
           /Cannot use import statement outside a module/i.test(errMsg) ||
@@ -36881,84 +38929,75 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           /await is only valid in async functions/i.test(errMsg);
 
         if (isEsmScopeError && absolutePath.toLowerCase().endsWith('.js')) {
+          // ---- Stage 2: ESM-scope mirror ----
           try {
             const mirrorPath = _syappCreateEsmMirror(absolutePath);
             const mirrorUrl = url.pathToFileURL(mirrorPath).href;
             importedModule = await import(mirrorUrl);
-            console.log(ColorText.dim(
-              `ℹ️  Loaded "${targetFile}" via ESM mirror — file was outside the package.json module scope`
-            ));
-          } catch (mirrorErr) {
-            console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
-            console.error(importErr);
-            console.error(ColorText.brightRed(`❌ ESM mirror retry also failed:`));
-            console.error(mirrorErr);
-            process.exit(1);
-          }
-        } else {
-          console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
-          console.error(importErr);
-          process.exit(1);
-        }
-      }
-
-      // ------------------------------------------------------------------
-      // Collect all exported functions and pick the first one that looks
-      // like a SyAPP_Func.
-      //
-      // Priority:
-      //   1. default export
-      //   2. any named export
-      //   3. nested keys inside a plain-object default export
-      // ------------------------------------------------------------------
-      const candidates = [];
-
-      if (importedModule) {
-        if (importedModule.default !== undefined && importedModule.default !== null) {
-          candidates.push({ name: 'default', value: importedModule.default });
-        }
-        for (const key of Object.keys(importedModule)) {
-          if (key === 'default') continue;
-          candidates.push({ name: key, value: importedModule[key] });
-        }
-      }
-
-      let ExportedFunc = null;
-      let ExportedFuncName = null;
-
-      for (const cand of candidates) {
-        let value = cand.value;
-
-        // Descend into plain-object exports looking for common nested keys.
-        if (value && typeof value !== 'function' && typeof value === 'object') {
-          const nestedKeys = ['default', 'MainFunc', 'Func', 'SyAPP_Func'];
-          for (const nk of nestedKeys) {
-            const nested = value[nk];
-            if (isSyAPPFuncClass(nested)) {
-              value = nested;
-              break;
+            picked = pickExportedFunc(importedModule);
+            if (picked) {
+              console.log(ColorText.dim(
+                `ℹ️  Loaded "${targetFile}" via ESM mirror — file was outside the package.json module scope`
+              ));
             }
+          } catch (mirrorErr) {
+            lastImportError = mirrorErr;
           }
-        }
-
-        if (isSyAPPFuncClass(value)) {
-          ExportedFunc = value;
-          ExportedFuncName = cand.name;
-          break;
         }
       }
 
-      if (typeof ExportedFunc !== 'function') {
-        console.error(ColorText.brightRed(
-          `❌ SyAPP runner: "${targetFile}" does not export a class extending SyAPP_Func.\n` +
-          `   Expected one of:\n` +
-          `     export default class MyFunc extends SyAPP_Func { ... }\n` +
-          `     export default class MyFunc extends SyAPP.Func() { ... }\n` +
-          `     export class MainFunc extends SyAPP_Func { ... }\n` +
-          `     export class Func extends SyAPP_Func { ... }`
-        ));
+      // ---- Stage 3: SyAPP-import mirror (SUPER HANDLER) ----
+      //
+      // Triggered when:
+      //   • Stage 1 / 2 threw, OR
+      //   • Stage 1 / 2 imported successfully but no valid SyAPP_Func
+      //     class was found (e.g. the file uses SyAPP.Func() without
+      //     importing SyAPP, so the class instantiation fails with
+      //     "SyAPP is not defined" and the duck-type check rejects it).
+      if (!picked) {
+        try {
+          const syappRuntimeUrl = import.meta.url;
+          const syappMirrorPath = _syappCreateSyappImportMirror(absolutePath, syappRuntimeUrl);
+          const syappMirrorUrl = url.pathToFileURL(syappMirrorPath).href;
+          const syappMirrorModule = await import(syappMirrorUrl);
+          const mirrorPicked = pickExportedFunc(syappMirrorModule);
+          if (mirrorPicked) {
+            picked = mirrorPicked;
+            console.log(ColorText.dim(
+              `ℹ️  Loaded "${targetFile}" via SyAPP-import mirror — SyAPP import anchored to the running SyAPP.js`
+            ));
+          }
+        } catch (superErr) {
+          // Prefer the Stage 1 / 2 error when one exists: the mirror
+          // error is often a generic "Cannot find module" for a path
+          // that was already broken before we touched it, which would
+          // hide the real reason the first import failed.
+          if (!lastImportError) {
+            lastImportError = superErr;
+          }
+        }
+      }
+
+      // ---- Final failure ----
+      if (!picked) {
+        if (lastImportError) {
+          console.error(ColorText.brightRed(`❌ SyAPP runner: failed to import "${targetFile}":`));
+          console.error(lastImportError);
+        } else {
+          console.error(ColorText.brightRed(
+            `❌ SyAPP runner: "${targetFile}" does not export a class extending SyAPP_Func.\n` +
+            `   Expected one of:\n` +
+            `     export default class MyFunc extends SyAPP_Func { ... }\n` +
+            `     export default class MyFunc extends SyAPP.Func() { ... }\n` +
+            `     export class MainFunc extends SyAPP_Func { ... }\n` +
+            `     export class Func extends SyAPP_Func { ... }`
+          ));
+        }
         process.exit(1);
       }
+
+      const ExportedFunc = picked.func;
+      const ExportedFuncName = picked.name;
 
       // Boot SyAPP with the user-provided class as the main function.
       // SyAPP's constructor will:
