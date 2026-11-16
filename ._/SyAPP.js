@@ -9641,6 +9641,21 @@ getOptionDataForEvent(option) {
   safeEnableMouseTracking() {
     if (this.isMouseEnabled || !this.isInMenu) return;
     
+    // Skip while a this.Field() is being edited — the terminal's own
+    // right-click paste menu is only available when the app has NOT
+    // enabled mouse tracking. The refresh loop (RefreshMode: true,
+    // on by default) would otherwise re-enable mouse tracking every
+    // ~400-500ms via displayMenu → setupMenuState →
+    // safeEnableMouseTracking, silently killing the terminal's paste
+    // menu moments after the user entered the field. This is exactly
+    // the "right-click paste fails when refresh mode is on" symptom.
+    //
+    // stopFieldEditing() clears isEditing BEFORE calling
+    // enableMouseTracking() → safeEnableMouseTracking, so mouse
+    // tracking is correctly restored the instant the user presses
+    // Enter / Escape in the field. Nothing else changes.
+    if (this.isEditing) return;
+    
     try {
       // Enable mouse tracking with wheel support
       stdout.write('\x1b[?1000h'); // Enable basic mouse tracking
