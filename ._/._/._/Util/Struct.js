@@ -709,6 +709,315 @@ function parseCustomTokenBudget(raw) {
 }
 
 // ============================================================
+//  STRUCT SPLITTING
+//
+//  Splits a fully-generated struct string into multiple parts
+//  for AI consumption when the total content exceeds the AI's
+//  context window.
+//
+//  Splitting strategy:
+//    1. First break the struct into CHUNKS: the instructions
+//       block + one chunk per FILE: block.
+//    2. Any chunk whose token count exceeds the per-part target
+//       is subdivided at LINE boundaries (never mid-line) into
+//       sub-chunks that each fit under the target.
+//    3. Finally, pack the resulting (expanded) chunk list into
+//       parts up to the target token budget.
+//
+//  The FIRST part intentionally receives the small "instructions"
+//  chunk plus the FIRST piece of the first file, so that every
+//  part (including the first) sits at the target budget. The
+//  LAST part receives whatever remains - it is the only part
+//  that may be smaller than the target (this is the expected
+//  "finish early" behavior).
+//
+//  Purely additive: does NOT touch generateStruct's existing
+//  behavior when splitEnabled is false.
+// ============================================================
+const SPLIT_CHARS_PER_TOKEN = 4;
+
+// Split a full struct string into an ordered list of chunks:
+//   [ { type: 'instructions', content }, { type: 'file', content }, ... ]
+//
+// The 'instructions' chunk is everything before the first
+// `====\nFILE: ...\n====\n` header. Each 'file' chunk starts at
+// one FILE: header and ends just before the next one.
+function splitStructIntoChunks(structContent) {
+    const fileHeaderRegex = /^={50}\nFILE: .+\n={50}\n/gm;
+    const positions = [];
+    let m;
+    while ((m = fileHeaderRegex.exec(structContent)) !== null) {
+        positions.push(m.index);
+    }
+
+    if (positions.length === 0) {
+        return [{ type: 'instructions', content: structContent }];
+    }
+
+    const chunks = [];
+
+    if (positions[0] > 0) {
+        chunks.push({ type: 'instructions', content: structContent.slice(0, positions[0]) });
+    }
+
+    for (let i = 0; i < positions.length; i++) {
+        const start = positions[i];
+        const end = i < positions.length - 1 ? positions[i + 1] : structContent.length;
+        chunks.push({ type: 'file', content: structContent.slice(start, end) });
+    }
+
+    return chunks;
+}
+
+// Token estimate using the project-wide 4-chars-per-token ratio.
+function estimateStructTokens(text) {
+    return Math.ceil(text.length / SPLIT_CHARS_PER_TOKEN);
+}
+
+// Split ONE oversized chunk into multiple sub-chunks at LINE
+// boundaries so each sub-chunk fits under the target budget.
+// The original FILE: header stays attached to the FIRST
+// sub-chunk, so the AI can still see which file the following
+// text belongs to (subsequent sub-chunks are raw continuation
+// lines from the same file).
+function splitOversizedChunk(chunkContent, targetTokensPerPart) {
+    const targetChars = Math.max(1, targetTokensPerPart * SPLIT_CHARS_PER_TOKEN);
+    const lines = chunkContent.split('\n');
+    const subChunks = [];
+
+    let current = '';
+    let currentChars = 0;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        // Length including the trailing newline character we will
+        // re-add on append (except for the very last line).
+        const lineLen = line.length + 1;
+
+        // A single line longer than the target budget: emit it as
+        // its own sub-chunk (it is a single physical line - we do
+        // NOT split mid-line, to keep the file syntactically sane).
+        if (lineLen > targetChars) {
+            if (current.length > 0) {
+                subChunks.push(current);
+                current = '';
+                currentChars = 0;
+            }
+            subChunks.push(line);
+            continue;
+        }
+
+        if (currentChars > 0 && currentChars + lineLen > targetChars) {
+            subChunks.push(current);
+            current = '';
+            currentChars = 0;
+        }
+
+        current += line;
+        currentChars += lineLen;
+
+        if (i < lines.length - 1) {
+            current += '\n';
+        }
+    }
+
+    if (current.length > 0) {
+        subChunks.push(current);
+    }
+
+    return subChunks;
+}
+
+// Pack chunks into parts so each part (except the LAST) stays at
+// or under the given token budget.
+//
+// Algorithm:
+//   Step 1 - expand: any single chunk whose token count exceeds
+//            the target is subdivided at line boundaries.
+//   Step 2 - pack:   the (now-expanded) chunk list is packed
+//            into parts, appending chunks while they fit under
+//            the target and starting a new part otherwise.
+//   Step 3 - rebalance (fill-the-first-part pass): the small
+//            instructions chunk would otherwise leave the FIRST
+//            part under budget while everything else stays full.
+//            After the normal packing, the algorithm rebalances
+//            by MOVING line-boundary sub-chunks from the front
+//            of the second part into the first part until the
+//            first part is at (or just under) the target. This
+//            guarantees the ONLY part that ends up smaller than
+//            the target is the LAST one.
+//
+// Small files therefore stay together at file boundaries; a huge
+// file is split across multiple parts so the target is respected
+// (never mid-line - only at physical line boundaries).
+function splitContentIntoParts(structContent, targetTokensPerPart) {
+    const target = Math.max(1, parseInt(targetTokensPerPart, 10) || 1);
+
+    // ---- Step 1: file-boundary chunks ----
+    const chunks = splitStructIntoChunks(structContent);
+
+    // ---- Step 1b: expand any oversized chunk at line boundaries ----
+    // Each expanded item carries `{ content }`. The instruction chunk
+    // stays first; oversized files are broken into line-aligned
+    // sub-chunks that each fit under the target.
+    const expanded = [];
+    for (const chunk of chunks) {
+        const chunkTokens = estimateStructTokens(chunk.content);
+        if (chunkTokens > target) {
+            const subChunks = splitOversizedChunk(chunk.content, target);
+            for (const sub of subChunks) {
+                expanded.push(sub);
+            }
+        } else {
+            expanded.push(chunk.content);
+        }
+    }
+
+    // ---- Step 2: pack expanded chunks into parts ----
+    const parts = [];
+    let current = '';
+    let currentTokens = 0;
+
+    for (const chunkContent of expanded) {
+        const chunkTokens = estimateStructTokens(chunkContent);
+
+        if (current === '') {
+            current = chunkContent;
+            currentTokens = chunkTokens;
+        } else if (currentTokens + chunkTokens <= target) {
+            current += chunkContent;
+            currentTokens += chunkTokens;
+        } else {
+            parts.push({ content: current, tokens: currentTokens });
+            current = chunkContent;
+            currentTokens = chunkTokens;
+        }
+    }
+
+    if (current !== '') {
+        parts.push({ content: current, tokens: currentTokens });
+    }
+
+    // ---- Step 3: rebalance so ONLY the last part is small ----
+    // If there are at least two parts and the first part is under
+    // the target, move line-boundary sub-chunks from the FRONT of
+    // the second part into the first part until the first part
+    // reaches (or just passes) the target budget. This preserves
+    // line boundaries (never cuts mid-line) and leaves the small
+    // remainder at the END (the last part), which is the expected
+    // "last part finishes early" behavior.
+    //
+    // We iterate because after moving some content the second part
+    // may become the new "first small part" compared to the third
+    // part, so we keep going forward until everything except the
+    // last part is at or just under the target.
+    if (parts.length >= 2) {
+        // Rebalance every part except the LAST one by pulling
+        // line-aligned content from the part immediately after it.
+        for (let i = 0; i < parts.length - 1; i++) {
+            // Only rebalance a part that is UNDER the target and
+            // whose follower has content to spare.
+            while (parts[i].tokens < target && parts[i + 1].tokens > 0) {
+                // How many more tokens the current part can absorb.
+                const room = target - parts[i].tokens;
+                if (room <= 0) break;
+
+                // Split the follower into lines so we can take the
+                // smallest possible front chunk that fits in `room`.
+                const followerLines = parts[i + 1].content.split('\n');
+
+                // Find how many leading lines fit into `room` tokens.
+                let takeCount = 0;
+                let takeChars = 0;
+                const roomChars = room * SPLIT_CHARS_PER_TOKEN;
+
+                for (let l = 0; l < followerLines.length; l++) {
+                    const lineLen = followerLines[l].length + 1;
+                    if (takeChars + lineLen > roomChars) break;
+                    takeChars += lineLen;
+                    takeCount++;
+                }
+
+                // If not even ONE line fits, stop - the follower's
+                // first line alone exceeds the remaining room (this
+                // happens with extremely long single lines). Keep
+                // the part as-is; the last part will simply be the
+                // one that carries the remainder.
+                if (takeCount === 0) break;
+
+                // Do not consume the ENTIRE follower - if we would
+                // take everything, we lose the "last part" we are
+                // trying to leave small. Stop one line short so the
+                // follower still exists.
+                if (takeCount >= followerLines.length) {
+                    takeCount = followerLines.length - 1;
+                    if (takeCount <= 0) break;
+
+                    // Recompute takeChars for the reduced takeCount.
+                    takeChars = 0;
+                    for (let l = 0; l < takeCount; l++) {
+                        takeChars += followerLines[l].length + 1;
+                    }
+                }
+
+                // Move the chosen leading lines from the follower
+                // into the current part.
+                let moved = '';
+                for (let l = 0; l < takeCount; l++) {
+                    moved += followerLines[l];
+                    if (l < takeCount - 1) moved += '\n';
+                }
+                // Preserve the newline that separated the moved
+                // block from the remainder.
+                moved += '\n';
+
+                const remainderLines = followerLines.slice(takeCount);
+                let remainder = '';
+                for (let l = 0; l < remainderLines.length; l++) {
+                    remainder += remainderLines[l];
+                    if (l < remainderLines.length - 1) remainder += '\n';
+                }
+
+                // Apply the transfer.
+                parts[i].content += moved;
+                parts[i].tokens = estimateStructTokens(parts[i].content);
+
+                parts[i + 1].content = remainder;
+                parts[i + 1].tokens = estimateStructTokens(parts[i + 1].content);
+
+                // Guard: if the follower has become empty, drop it
+                // so we do not end up with an empty last part.
+                if (parts[i + 1].tokens === 0) {
+                    parts.splice(i + 1, 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    return parts;
+}
+
+// Build the AI notice that is PREPENDED to PART 1 only. It tells
+// the AI that the code is coming in N parts so it waits for all of
+// them before making any changes.
+function buildPartsNotice(totalParts) {
+    const rule = '='.repeat(50);
+    let notice = '';
+    notice += `${rule}\n`;
+    notice += `NOTICE: CODE IS SENT IN MULTIPLE PARTS\n`;
+    notice += `${rule}\n\n`;
+    notice += `This code is being sent in ${totalParts} parts due to size limits.\n`;
+    notice += `You are currently reading PART 1 of ${totalParts}.\n`;
+    notice += `You will receive parts 2 through ${totalParts} in subsequent messages.\n\n`;
+    notice += `IMPORTANT: Please wait until you have received ALL ${totalParts} parts\n`;
+    notice += `before making any changes or providing any code modifications.\n`;
+    notice += `The complete picture is only visible when all parts have been read.\n\n`;
+    notice += `${rule}\n\n`;
+    return notice;
+}
+
+// ============================================================
 //  Generate the "100% WORKING CODE" safety warning block.
 //
 //  This is a REINFORCEMENT / ATTENTION message that is injected
@@ -941,6 +1250,10 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
         deepthinkBudget = 4000,          // NEW: token budget for the <thinking> block
         deepthinkStrategy = 'auto',      // NEW: reasoning strategy ('auto'|'socratic'|...|'custom')
         deepthinkCustomStrategy = '',    // NEW: free-text strategy when deepthinkStrategy === 'custom'
+        splitEnabled = false,            // NEW: split struct into multiple parts
+        splitMode = 'tokens',            // NEW: 'tokens' | 'parts'
+        splitTokensPerPart = 20000,      // NEW: token budget per part (when splitMode='tokens')
+        splitPartsCount = 5,             // NEW: number of parts (when splitMode='parts')
     } = options;
 
     let structContent = '';
@@ -1228,8 +1541,85 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
         }
     }
 
-    await fs.writeFile(outputFileName, structContent, 'utf8');
-    console.log(`\nStruct file written to: ${path.resolve(outputFileName)}`);
+    // ============================================================
+    //  WRITE PHASE
+    //
+    //  When splitEnabled is true, the generated struct is split
+    //  into multiple part files inside a dedicated directory
+    //  (struct_parts/). The split is FILE-BOUNDARY-AWARE first,
+    //  and any single file that on its own exceeds the target
+    //  is further cut at LINE boundaries so no part grossly
+    //  exceeds the per-part token budget. The first part is
+    //  prepended with a notice telling the AI that the code
+    //  arrives in N parts. When splitEnabled is false, the
+    //  existing single-file behaviour is preserved exactly.
+    //
+    //  After packing, a rebalance pass moves line-aligned
+    //  sub-chunks forward (first -> second -> third ...) so that
+    //  every part EXCEPT the last is filled up to the target.
+    //  The LAST part is the only one that may be smaller than the
+    //  target - this is the expected "last part finishes early"
+    //  behavior the user asked for.
+    // ============================================================
+    if (splitEnabled) {
+        // Compute the total struct tokens (informative only).
+        const totalStructTokens = estimateStructTokens(structContent);
+
+        // Determine the target tokens-per-part from the chosen mode.
+        // Mode 'parts': ceil(total / parts). Mode 'tokens': user value.
+        let targetTokensPerPart;
+        if (splitMode === 'parts') {
+            const safeParts = Math.max(1, parseInt(splitPartsCount, 10) || 1);
+            targetTokensPerPart = Math.ceil(totalStructTokens / safeParts);
+        } else {
+            targetTokensPerPart = Math.max(1, parseInt(splitTokensPerPart, 10) || 20000);
+        }
+
+        const parts = splitContentIntoParts(structContent, targetTokensPerPart);
+
+        const dirName = 'struct_parts';
+        try {
+            await fs.mkdir(dirName, { recursive: true });
+        } catch (err) {
+            console.error(`\nError creating directory "${dirName}": ${err.message}`);
+            process.exit(1);
+        }
+
+        // Remove any stale struct_part_N.txt files so leftover parts
+        // from a previous run with a different part count don't linger.
+        try {
+            const existing = await fs.readdir(dirName);
+            for (const f of existing) {
+                if (/^struct_part_\d+\.txt$/.test(f)) {
+                    try { await fs.unlink(path.join(dirName, f)); } catch { /* ignore */ }
+                }
+            }
+        } catch { /* directory just created - nothing to clean */ }
+
+        // Write each part. Part 1 gets the multi-part notice prepended.
+        for (let i = 0; i < parts.length; i++) {
+            let partContent = parts[i].content;
+
+            if (i === 0) {
+                partContent = buildPartsNotice(parts.length) + partContent;
+            }
+
+            const partFileName = path.join(dirName, `struct_part_${i + 1}.txt`);
+            await fs.writeFile(partFileName, partContent, 'utf8');
+
+            const partTokens = estimateStructTokens(partContent);
+            console.log(
+                `  Part ${i + 1}/${parts.length}: ${partFileName} ` +
+                `(${formatNumber(partTokens)} tokens)`
+            );
+        }
+
+        console.log(`\nStruct split into ${parts.length} part(s) in: ${path.resolve(dirName)}`);
+    } else {
+        // Existing single-file behavior - untouched.
+        await fs.writeFile(outputFileName, structContent, 'utf8');
+        console.log(`\nStruct file written to: ${path.resolve(outputFileName)}`);
+    }
     
     if (needsPathEnforcement && includeInstructions) {
         console.log(`\n${YELLOW}⚠️  Path preservation enforcement added - paths with ._/ patterns detected${RESET}`);
@@ -1291,6 +1681,13 @@ async function loadState(saveName) {
                 parsed: parsed.parsed && typeof parsed.parsed === 'object' ? parsed.parsed : {},
                 referenceOnly: Array.isArray(parsed.referenceOnly) ? parsed.referenceOnly : [],
                 deepthinkInstruction: !!parsed.deepthinkInstruction,
+                deepthinkBudget: Number.isFinite(parsed.deepthinkBudget) ? parsed.deepthinkBudget : 4000,
+                deepthinkStrategy: typeof parsed.deepthinkStrategy === 'string' ? parsed.deepthinkStrategy : 'auto',
+                deepthinkCustomStrategy: typeof parsed.deepthinkCustomStrategy === 'string' ? parsed.deepthinkCustomStrategy : '',
+                splitEnabled: !!parsed.splitEnabled,
+                splitMode: typeof parsed.splitMode === 'string' ? parsed.splitMode : 'tokens',
+                splitTokensPerPart: Number.isFinite(parsed.splitTokensPerPart) ? parsed.splitTokensPerPart : 20000,
+                splitPartsCount: Number.isFinite(parsed.splitPartsCount) ? parsed.splitPartsCount : 5,
             };
         }
     } catch {
@@ -1314,6 +1711,10 @@ async function loadState(saveName) {
         deepthinkBudget: 4000,
         deepthinkStrategy: 'auto',
         deepthinkCustomStrategy: '',
+        splitEnabled: false,
+        splitMode: 'tokens',
+        splitTokensPerPart: 20000,
+        splitPartsCount: 5,
     };
 }
 
@@ -1365,6 +1766,10 @@ async function regenerateFromState(state) {
         deepthinkBudget = 4000,
         deepthinkStrategy = 'auto',
         deepthinkCustomStrategy = '',
+        splitEnabled = false,
+        splitMode = 'tokens',
+        splitTokensPerPart = 20000,
+        splitPartsCount = 5,
     } = state;
 
     const existingFiles = [];
@@ -1453,6 +1858,10 @@ async function regenerateFromState(state) {
         deepthinkBudget,
         deepthinkStrategy,
         deepthinkCustomStrategy,
+        splitEnabled,
+        splitMode,
+        splitTokensPerPart,
+        splitPartsCount,
     });
 }
 
@@ -2742,6 +3151,81 @@ async function interactiveMode(initialState = null) {
     };
 
     // ========================================================
+    //  NUMERIC key reader with a LIVE estimate rendered inline.
+    //
+    //  Used for the split-token and split-parts rows so the user
+    //  sees the estimated part count / tokens-per-part update on
+    //  every keystroke. Same behaviour as askStepWithBack for
+    //  Enter / Left Arrow / Ctrl+C / Backspace, but ONLY digits
+    //  are accepted and an estimateFn(n) result is printed in
+    //  MAGENTA next to the buffer.
+    // ========================================================
+    const askNumericWithLiveEstimate = (label, initialValue, defaultValue, estimateFn) => {
+        return new Promise(resolve => {
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.setEncoding('utf8');
+
+            let buffer = String(initialValue == null ? '' : initialValue);
+
+            const render = () => {
+                process.stdout.write('\r\x1b[K');
+                process.stdout.write(`${label} ${buffer}`);
+                const num = parseInt(buffer, 10);
+                if (Number.isFinite(num) && num > 0 && typeof estimateFn === 'function') {
+                    const est = estimateFn(num);
+                    if (est) {
+                        process.stdout.write(`  ${MAGENTA}${est}${RESET}`);
+                    }
+                }
+            };
+
+            render();
+
+            const finishBack = () => {
+                process.stdin.removeListener('data', onData);
+                process.stdout.write('\n');
+                resolve({ type: 'back' });
+            };
+
+            const finishValue = () => {
+                process.stdin.removeListener('data', onData);
+                process.stdout.write('\n');
+                const trimmed = buffer.trim();
+                const value = (trimmed === '' && defaultValue !== null)
+                    ? String(defaultValue)
+                    : trimmed;
+                resolve({ type: 'value', value });
+            };
+
+            const onData = (key) => {
+                if (key === '\u0003') { finishBack(); return; }
+                if (key === '\r' || key === '\n') { finishValue(); return; }
+                if (key === '\u001b[D') { finishBack(); return; }
+
+                if (key === '\u007f' || key === '\b') {
+                    if (buffer.length > 0) {
+                        buffer = buffer.slice(0, -1);
+                        render();
+                    }
+                    return;
+                }
+
+                if (key.startsWith('\u001b')) return;
+                if (key.length === 1 && key.charCodeAt(0) < 32) return;
+
+                // Numeric input: accept digits only.
+                if (/^\d+$/.test(key)) {
+                    buffer += key;
+                    render();
+                }
+            };
+
+            process.stdin.on('data', onData);
+        });
+    };
+
+    // ========================================================
     //  Generate flow (CUSTOMIZE WIZARD) - extracted so both the
     //  main menu and the find-results view can trigger it with
     //  the C key.
@@ -2803,6 +3287,10 @@ async function interactiveMode(initialState = null) {
             DEEPTHINK_TOKENS: 'deepthink-tokens',
             DEEPTHINK_STRATEGY: 'deepthink-strategy',
             DEEPTHINK_CUSTOM: 'deepthink-custom',
+            SPLIT: 'split',
+            SPLIT_MODE: 'split-mode',
+            SPLIT_TOKENS: 'split-tokens',
+            SPLIT_PARTS: 'split-parts',
             SAVE: 'save',
         };
 
@@ -2818,7 +3306,18 @@ async function interactiveMode(initialState = null) {
         let deepthinkBudget = 4000;       // int  (default: 4000 tokens ~= one minute)
         let deepthinkStrategy = 'auto';   // string ('auto'|'socratic'|...|'custom')
         let deepthinkCustomStrategy = ''; // string (only used when strategy === 'custom')
+        let splitEnabled = false;         // bool (default: OFF)
+        let splitMode = 'tokens';         // 'tokens' | 'parts' (default: tokens)
+        let splitTokensPerPart = 20000;   // int (default: 20000 tokens per part)
+        let splitPartsCount = 5;          // int (default: 5 parts, only used when splitMode='parts')
         let saveName = '';                // string
+
+        // Estimated total struct tokens used ONLY for the live split
+        // previews in the wizard. The actual split runs on the real
+        // generated content so this is just a helpful forecast.
+        const STRUCT_OVERHEAD_TOKENS = 5000;
+        const estimatedStructTokens = () =>
+            totalTokens + (includeInstructions ? STRUCT_OVERHEAD_TOKENS : 0);
 
         // Which rows are currently part of the flow (some are conditional).
         const visibleRows = () => {
@@ -2840,6 +3339,12 @@ async function interactiveMode(initialState = null) {
                     if (deepthinkStrategy === 'custom') {
                         rows.push(ROW.DEEPTHINK_CUSTOM);
                     }
+                }
+                rows.push(ROW.SPLIT);
+                if (splitEnabled) {
+                    rows.push(ROW.SPLIT_MODE);
+                    if (splitMode === 'tokens') rows.push(ROW.SPLIT_TOKENS);
+                    else rows.push(ROW.SPLIT_PARTS);
                 }
             }
             rows.push(ROW.SAVE);
@@ -2925,6 +3430,20 @@ async function interactiveMode(initialState = null) {
                             ? `${sFirst}  [${sLines.length} lines]`
                             : sFirst;
                     }
+                case ROW.SPLIT:
+                    return splitEnabled ? 'yes' : 'no';
+                case ROW.SPLIT_MODE:
+                    return splitMode === 'parts' ? 'By number of parts' : 'By tokens per part';
+                case ROW.SPLIT_TOKENS: {
+                    const est = estimatedStructTokens();
+                    const parts = Math.max(1, Math.ceil(est / Math.max(1, splitTokensPerPart)));
+                    return `${formatNumber(splitTokensPerPart)} tok/part  (~${parts} part${parts === 1 ? '' : 's'})`;
+                }
+                case ROW.SPLIT_PARTS: {
+                    const est = estimatedStructTokens();
+                    const perPart = Math.max(1, Math.ceil(est / Math.max(1, splitPartsCount)));
+                    return `${splitPartsCount} part${splitPartsCount === 1 ? '' : 's'}  (~${formatNumber(perPart)} tok each)`;
+                }
                 case ROW.SAVE:
                     return saveName || '(empty)';
                 default:
@@ -2946,6 +3465,10 @@ async function interactiveMode(initialState = null) {
                 case ROW.DEEPTHINK_TOKENS: return '    Thinking token budget:';
                 case ROW.DEEPTHINK_STRATEGY: return '    Thinking strategy:';
                 case ROW.DEEPTHINK_CUSTOM: return '    Custom strategy text:';
+                case ROW.SPLIT: return '  Split struct.txt into multiple parts?';
+                case ROW.SPLIT_MODE: return '    Split mode:';
+                case ROW.SPLIT_TOKENS: return '    Tokens per part:';
+                case ROW.SPLIT_PARTS: return '    Number of parts:';
                 case ROW.SAVE: return 'Save session as (empty to skip):';
                 default: return '';
             }
@@ -3051,6 +3574,18 @@ async function interactiveMode(initialState = null) {
                 if (typeof initialState.deepthinkCustomStrategy === 'string') {
                     deepthinkCustomStrategy = initialState.deepthinkCustomStrategy;
                 }
+                if (typeof initialState.splitEnabled === 'boolean') {
+                    splitEnabled = initialState.splitEnabled;
+                }
+                if (typeof initialState.splitMode === 'string') {
+                    splitMode = initialState.splitMode;
+                }
+                if (Number.isFinite(initialState.splitTokensPerPart) && initialState.splitTokensPerPart > 0) {
+                    splitTokensPerPart = initialState.splitTokensPerPart;
+                }
+                if (Number.isFinite(initialState.splitPartsCount) && initialState.splitPartsCount > 0) {
+                    splitPartsCount = initialState.splitPartsCount;
+                }
             }
 
             // The saved wizard always ended at SAVE - resume there.
@@ -3101,6 +3636,30 @@ async function interactiveMode(initialState = null) {
                     console.log(`  ${BOLD}${p.key}${RESET} = ${p.label}${mark}`);
                 });
                 console.log(`\n  ${MAGENTA}Auto${RESET} lets the AI select the single strategy that best fits your request.`);
+            } else if (currentRow === ROW.SPLIT) {
+                console.log(`\n  ${BOLD}When enabled${RESET}, the generated struct is split into multiple part files`);
+                console.log(`  inside a ${YELLOW}struct_parts/${RESET} directory. Splitting happens at FILE boundaries`);
+                console.log(`  (a file is never cut in the middle) and the first part is prepended with a`);
+                console.log(`  notice telling the AI the total number of parts. ${YELLOW}Default: no (off).${RESET}`);
+            } else if (currentRow === ROW.SPLIT_MODE) {
+                console.log(`\n  ${BOLD}1${RESET} = By tokens per part (default, smart split)`);
+                console.log(`  ${BOLD}2${RESET} = By number of parts (equal-sized target)`);
+                const est = estimatedStructTokens();
+                console.log(`\n  ${MAGENTA}Estimated total struct:${RESET} ${formatNumber(est)} tokens`);
+            } else if (currentRow === ROW.SPLIT_TOKENS) {
+                const est = estimatedStructTokens();
+                const parts = Math.max(1, Math.ceil(est / Math.max(1, splitTokensPerPart)));
+                console.log(`\n  ${BOLD}Target tokens per part${RESET} (default 20000). The last part may be`);
+                console.log(`  smaller if the content finishes before the quota.`);
+                console.log(`  ${MAGENTA}Live estimate:${RESET} ~${parts} part(s) @ ~${formatNumber(splitTokensPerPart)} tokens each`);
+                console.log(`  ${MAGENTA}(actual count may vary slightly - it uses real FILE boundaries)${RESET}`);
+            } else if (currentRow === ROW.SPLIT_PARTS) {
+                const est = estimatedStructTokens();
+                const perPart = Math.max(1, Math.ceil(est / Math.max(1, splitPartsCount)));
+                console.log(`\n  ${BOLD}Target number of parts${RESET} (default 5). Parts will be approximately`);
+                console.log(`  equal-sized, ending at FILE boundaries.`);
+                console.log(`  ${MAGENTA}Live estimate:${RESET} ~${formatNumber(perPart)} tokens per part`);
+                console.log(`  ${MAGENTA}(actual count may vary slightly - it uses real FILE boundaries)${RESET}`);
             }
 
             // Ask this row's question (single-line, ← = back).
@@ -3265,6 +3824,7 @@ async function interactiveMode(initialState = null) {
                         userDemand = '';
                         outputFormat = 'tagged';
                         deepthinkInstruction = false;
+                        splitEnabled = false;
                     }
                     currentRow = nextRow(ROW.AI);
                     break;
@@ -3444,6 +4004,107 @@ async function interactiveMode(initialState = null) {
                     break;
                 }
 
+                case ROW.SPLIT: {
+                    res = await askStepWithBack(
+                        `${BOLD}Split struct.txt into multiple parts? (y/n):${RESET}`,
+                        '',
+                        'n'
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.SPLIT);
+                        break;
+                    }
+
+                    const a = res.value.toLowerCase();
+                    splitEnabled = (a === 'y' || a === 'yes');
+                    if (!splitEnabled) {
+                        // Reset split sub-state when disabled.
+                        splitMode = 'tokens';
+                        splitTokensPerPart = 20000;
+                        splitPartsCount = 5;
+                    }
+
+                    currentRow = nextRow(ROW.SPLIT);
+                    break;
+                }
+
+                case ROW.SPLIT_MODE: {
+                    res = await askStepWithBack(
+                        `${BOLD}Split mode (1=tokens per part, 2=number of parts):${RESET}`,
+                        '',
+                        '1'
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.SPLIT_MODE);
+                        break;
+                    }
+
+                    splitMode = (res.value === '2') ? 'parts' : 'tokens';
+                    currentRow = nextRow(ROW.SPLIT_MODE);
+                    break;
+                }
+
+                case ROW.SPLIT_TOKENS: {
+                    // Live-estimate display updates on EVERY keystroke.
+                    const estimateFn = (n) => {
+                        const est = estimatedStructTokens();
+                        const parts = Math.max(1, Math.ceil(est / Math.max(1, n)));
+                        return `~${parts} part(s) @ ${formatNumber(n)} tokens each`;
+                    };
+
+                    res = await askNumericWithLiveEstimate(
+                        `${BOLD}Tokens per part:${RESET}`,
+                        String(splitTokensPerPart),
+                        String(splitTokensPerPart),
+                        estimateFn
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.SPLIT_TOKENS);
+                        break;
+                    }
+
+                    const parsed = parseCustomTokenBudget(res.value);
+                    if (parsed === null) {
+                        console.log(`\n${RED}✗ Invalid value. Enter a positive whole number (e.g. 20000).${RESET}`);
+                        currentRow = ROW.SPLIT_TOKENS;
+                        break;
+                    }
+
+                    splitTokensPerPart = parsed;
+                    currentRow = nextRow(ROW.SPLIT_TOKENS);
+                    break;
+                }
+
+                case ROW.SPLIT_PARTS: {
+                    const estimateFn = (n) => {
+                        const est = estimatedStructTokens();
+                        const perPart = Math.max(1, Math.ceil(est / Math.max(1, n)));
+                        return `~${formatNumber(perPart)} tokens per part`;
+                    };
+
+                    res = await askNumericWithLiveEstimate(
+                        `${BOLD}Number of parts:${RESET}`,
+                        String(splitPartsCount),
+                        String(splitPartsCount),
+                        estimateFn
+                    );
+                    if (res.type === 'back') {
+                        currentRow = prevRow(ROW.SPLIT_PARTS);
+                        break;
+                    }
+
+                    const parsed = parseCustomTokenBudget(res.value);
+                    if (parsed === null) {
+                        console.log(`\n${RED}✗ Invalid value. Enter a positive whole number (e.g. 5).${RESET}`);
+                        currentRow = ROW.SPLIT_PARTS;
+                        break;
+                    }
+
+                    splitPartsCount = parsed;
+                    currentRow = nextRow(ROW.SPLIT_PARTS);
+                    break;
+                }
+
                 case ROW.SAVE: {
                     res = await askStepWithBack(
                         `${BOLD}Save session as (empty to skip):${RESET}`,
@@ -3468,6 +4129,10 @@ async function interactiveMode(initialState = null) {
                         deepthinkBudget,
                         deepthinkStrategy,
                         deepthinkCustomStrategy,
+                        splitEnabled,
+                        splitMode,
+                        splitTokensPerPart,
+                        splitPartsCount,
                     });
 
                     // Serialize only the parser SELECTIONS - the actual parsed
@@ -3493,6 +4158,10 @@ async function interactiveMode(initialState = null) {
                             deepthinkBudget,
                             deepthinkStrategy,
                             deepthinkCustomStrategy,
+                            splitEnabled,
+                            splitMode,
+                            splitTokensPerPart,
+                            splitPartsCount,
                         }, saveName);
                     }
 
@@ -3510,6 +4179,10 @@ async function interactiveMode(initialState = null) {
                         deepthinkBudget,
                         deepthinkStrategy,
                         deepthinkCustomStrategy,
+                        splitEnabled,
+                        splitMode,
+                        splitTokensPerPart,
+                        splitPartsCount,
                         wizard: {
                             enabled: true,
                             lastRow: 'save',
@@ -3796,6 +4469,10 @@ async function interactiveMode(initialState = null) {
                         deepthinkBudget: 4000,
                         deepthinkStrategy: 'auto',
                         deepthinkCustomStrategy: '',
+                        splitEnabled: false,
+                        splitMode: 'tokens',
+                        splitTokensPerPart: 20000,
+                        splitPartsCount: 5,
                     });
 
                     cleanupAndExit(0);
@@ -3877,6 +4554,10 @@ async function interactiveMode(initialState = null) {
                         deepthinkBudget: 4000,
                         deepthinkStrategy: 'auto',
                         deepthinkCustomStrategy: '',
+                        splitEnabled: false,
+                        splitMode: 'tokens',
+                        splitTokensPerPart: 20000,
+                        splitPartsCount: 5,
                         promptFlow: {
                             enabled: true,
                             lastPrompt: userDemand.trim(),
@@ -4429,6 +5110,10 @@ async function interactiveMode(initialState = null) {
                 deepthinkBudget: 4000,
                 deepthinkStrategy: 'auto',
                 deepthinkCustomStrategy: '',
+                splitEnabled: false,
+                splitMode: 'tokens',
+                splitTokensPerPart: 20000,
+                splitPartsCount: 5,
             });
 
             cleanupAndExit(0);
@@ -4512,6 +5197,10 @@ async function interactiveMode(initialState = null) {
                 deepthinkBudget: 4000,
                 deepthinkStrategy: 'auto',
                 deepthinkCustomStrategy: '',
+                splitEnabled: false,
+                splitMode: 'tokens',
+                splitTokensPerPart: 20000,
+                splitPartsCount: 5,
                 promptFlow: {
                     enabled: true,
                     lastPrompt: userDemand.trim(),
@@ -4705,6 +5394,10 @@ async function interactiveMode(initialState = null) {
             deepthinkBudget: 4000,
             deepthinkStrategy: 'auto',
             deepthinkCustomStrategy: '',
+            splitEnabled: false,
+            splitMode: 'tokens',
+            splitTokensPerPart: 20000,
+            splitPartsCount: 5,
             promptFlow: {
                 enabled: true,
                 lastPrompt: userDemand.trim(),

@@ -7,6 +7,7 @@ b.out
 test
 test.c
 tests
+struct_parts
 sypm_temp_*
 log.json
 test_sydb.c
