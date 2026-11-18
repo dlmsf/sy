@@ -849,7 +849,8 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 showDetail: false,
                 rssPeakMb: 0,
                 heapPeakMb: 0,
-                gcRuns: 0
+                gcRuns: 0,
+                recentLinesCache: null
             });
         }
         return this.Storages.Get(id, 'state');
@@ -918,6 +919,7 @@ class SyDBCorruptionTester extends SyAPP_Func {
             P.rssPeakMb = 0;
             P.heapPeakMb = 0;
             P.gcRuns = 0;
+            P.recentLinesCache = null;
             if (P.phase !== 'running') P.phase = 'idle';
             P.abortFlag = false;
             this.Storages.Set(id, 'state', P);
@@ -1099,18 +1101,33 @@ class SyDBCorruptionTester extends SyAPP_Func {
             }
         });
 
-        let recentLines = [];
-        try {
-            if (fs.existsSync(P.outFiles.minimalPath)) {
-                const stat = fs.statSync(P.outFiles.minimalPath);
-                if (stat.size < 4 * 1024 * 1024) {
-                    const lines = fs.readFileSync(P.outFiles.minimalPath, 'utf8').trim().split('\n').filter(Boolean);
-                    recentLines = lines.slice(-5);
+        let recentLines = Array.isArray(P.recentLinesCache) ? P.recentLinesCache : null;
+        if (recentLines === null) {
+            try {
+                if (fs.existsSync(P.outFiles.minimalPath)) {
+                    const stat = fs.statSync(P.outFiles.minimalPath);
+                    if (stat.size === 0) {
+                        recentLines = [];
+                    } else {
+                        const READ = 64 * 1024;
+                        const start = Math.max(0, stat.size - READ);
+                        const fd = fs.openSync(P.outFiles.minimalPath, 'r');
+                        const buf = Buffer.alloc(stat.size - start);
+                        try { fs.readSync(fd, buf, 0, buf.length, start); }
+                        finally { try { fs.closeSync(fd); } catch (_) {} }
+                        const text = buf.toString('utf8');
+                        const lines = text.split('\n').filter(Boolean);
+                        recentLines = lines.slice(-5);
+                    }
+                    P.recentLinesCache = recentLines;
+                    this.Storages.Set(id, 'state', P);
                 } else {
-                    recentLines = ['(minimal.txt larger than 4MB — open the file to see contents)'];
+                    recentLines = [];
                 }
+            } catch (_) {
+                recentLines = [];
             }
-        } catch (_) {}
+        }
 
         if (recentLines.length > 0) {
             this.Button(id, { name: this.TextColor.brightCyan('Recent corruptions:') });
@@ -1192,6 +1209,20 @@ class SyDBCorruptionTester extends SyAPP_Func {
                     return;
                 }
 
+                const _m = process.memoryUsage();
+                const _heapMb = _m.heapUsed / 1048576;
+                if (_heapMb >= 550) {
+                    if (typeof globalThis.__sydbGc === 'function') {
+                        for (let i = 0; i < 3; i++) {
+                            try { globalThis.__sydbGc(); } catch (_) {}
+                        }
+                    }
+                    if (attempt < maxRetries) {
+                        setTimeout(() => tryOnce(attempt + 1), 250);
+                    }
+                    return;
+                }
+
                 self.Storages.Set(id, 'state', self._stateFor(id));
 
                 syapp.LoadScreen(self.Name, {
@@ -1226,7 +1257,7 @@ class SyDBCorruptionTester extends SyAPP_Func {
 
         let lastRefresh = 0;
         let iterationSinceGc = 0;
-        const REFRESH_EVERY_MS = 400;
+        const REFRESH_EVERY_MS = 1200;
 
         while (true) {
             const st = tester._stateFor(id);
@@ -1422,6 +1453,7 @@ class SyDBCorruptionTester extends SyAPP_Func {
 
                 _appendFinding(full);
 
+                st.recentLinesCache = null;
                 st.lastCorruption =
                     `[${entry.group}/${entry.label}] ` + classifier;
                 st.lastOutcome = tester.TextColor.brightRed('CORRUPTION (recovering)');
@@ -1433,6 +1465,9 @@ class SyDBCorruptionTester extends SyAPP_Func {
                     await tester._ensureCollection(st, DB, COLL);
                     st.lastCycleWipeAt = Date.now();
                     tester.Storages.Set(id, 'state', st);
+                    if (typeof globalThis.__sydbGc === 'function') {
+                        try { globalThis.__sydbGc(); } catch (_) {}
+                    }
                 } catch (e) {
                     st.lastError = 'Recovery wipe failed: ' + (e && e.message || e);
                     tester.Storages.Set(id, 'state', st);
