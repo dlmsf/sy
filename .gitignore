@@ -32,6 +32,7 @@ noble-server-cloudimg-amd64.img
 *.c
 sydb_corruption_findings.jsonl
 sydb_corruption_minimal.txt
+sydb_corruption_types.txt
 
 # Cloud-init generated files
 noble-cloud-init.iso

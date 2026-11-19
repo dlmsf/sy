@@ -27,26 +27,34 @@ const SyAPP_Func = SyAPP.Func();
 
 let _findingsFd = null;
 let _minimalFd = null;
+let _typesFd = null;
 let _findingsPath = null;
 let _minimalPath = null;
+let _typesPath = null;
+const _typesSeen = new Set();
 
 function _ensureOutputFiles(baseDir) {
-    if (_findingsFd !== null && _minimalFd !== null) {
-        return { findingsPath: _findingsPath, minimalPath: _minimalPath };
+    if (_findingsFd !== null && _minimalFd !== null && _typesFd !== null) {
+        return { findingsPath: _findingsPath, minimalPath: _minimalPath, typesPath: _typesPath };
     }
     const dir = baseDir || process.cwd();
     _findingsPath = path.join(dir, 'sydb_corruption_findings.jsonl');
     _minimalPath = path.join(dir, 'sydb_corruption_minimal.txt');
+    _typesPath = path.join(dir, 'sydb_corruption_types.txt');
     try { fs.writeFileSync(_findingsPath, ''); } catch (_) {}
     try { fs.writeFileSync(_minimalPath, ''); } catch (_) {}
+    try { fs.writeFileSync(_typesPath, ''); } catch (_) {}
+    _typesSeen.clear();
     try {
         _findingsFd = fs.openSync(_findingsPath, 'a');
         _minimalFd = fs.openSync(_minimalPath, 'a');
+        _typesFd = fs.openSync(_typesPath, 'a');
     } catch (_) {
         _findingsFd = null;
         _minimalFd = null;
+        _typesFd = null;
     }
-    return { findingsPath: _findingsPath, minimalPath: _minimalPath };
+    return { findingsPath: _findingsPath, minimalPath: _minimalPath, typesPath: _typesPath };
 }
 
 function _appendFinding(record) {
@@ -57,6 +65,29 @@ function _appendFinding(record) {
 function _appendMinimal(line) {
     if (_minimalFd === null) return;
     try { fs.writeSync(_minimalFd, line + '\n'); } catch (_) {}
+}
+
+function _appendTypeOnce(key, line) {
+    if (_typesFd === null) return;
+    if (_typesSeen.has(key)) return;
+    _typesSeen.add(key);
+    try { fs.writeSync(_typesFd, line + '\n'); } catch (_) {}
+}
+
+function _formatTypeLine(info) {
+    return `type=${info.group} | kind=${info.kind} | first_step=${info.step} | ${_short(info.classifier || '', 140)}`;
+}
+
+function _loadTypeKeysFromFile(filePath) {
+    try {
+        if (!fs.existsSync(filePath)) return;
+        const content = fs.readFileSync(filePath, 'utf8');
+        for (const line of content.split('\n')) {
+            if (!line) continue;
+            const m = line.match(/^type=(.*?) \| kind=(.*?) \|/);
+            if (m) _typesSeen.add(`${m[1]}|${m[2]}`);
+        }
+    } catch (_) {}
 }
 
 const CURATED = [
@@ -346,23 +377,39 @@ function _mutate(seedStr, round) {
 }
 
 function _generateInput(step, srand) {
-    const strategyIdx = step % 14;
+    // Fully random input selection: derive a non-negative random value
+    // for each call. The strategies below rely on (x >> N) % arr.length
+    // being a valid index; JS >> is SIGNED, so x must have its sign bit
+    // cleared (0x7FFFFFFF mask) or negative indices -> undefined -> crash.
+    let entropy;
+    try {
+        entropy = crypto.randomBytes(8);
+    } catch (_) {
+        entropy = Buffer.alloc(8);
+        entropy.writeUInt32LE((Math.random() * 0xFFFFFFFF) >>> 0, 0);
+        entropy.writeUInt32LE((Math.random() * 0xFFFFFFFF) >>> 0, 4);
+    }
+    const r1 = entropy.readUInt32LE(0);
+    const r2 = entropy.readUInt32LE(4);
+    const rstep = (((r1 ^ Math.imul(step >>> 0, 2654435761)) + r2) >>> 0) & 0x7FFFFFFF;
+    const rseed = ((r2 ^ (srand >>> 0) ^ Math.imul(step >>> 0, 40503)) >>> 0);
+    const strategyIdx = rstep % 14;
     switch (strategyIdx) {
-        case 0: return _strategyCurated(step);
-        case 1: return _strategySingleByte(step);
-        case 2: return _strategyBytePair(step);
-        case 3: return _strategyByteRun(step);
-        case 4: return _strategyCodepoint(step);
-        case 5: return _strategyMutation(step);
-        case 6: return _strategyStructure(step);
-        case 7: return _strategyEncoding(step);
-        case 8: return _strategyLengthSweep(step);
-        case 9: return _strategyEscapeContext(step);
-        case 10: return _strategyPureRandom(step, srand);
-        case 11: return _strategyRepeat(step);
-        case 12: return _strategyBoundaryNumeric(step);
-        case 13: return _strategyWellformed(step);
-        default: return _strategyCurated(step);
+        case 0: return _strategyCurated(rstep);
+        case 1: return _strategySingleByte(rstep);
+        case 2: return _strategyBytePair(rstep);
+        case 3: return _strategyByteRun(rstep);
+        case 4: return _strategyCodepoint(rstep);
+        case 5: return _strategyMutation(rstep);
+        case 6: return _strategyStructure(rstep);
+        case 7: return _strategyEncoding(rstep);
+        case 8: return _strategyLengthSweep(rstep);
+        case 9: return _strategyEscapeContext(rstep);
+        case 10: return _strategyPureRandom(rstep, rseed);
+        case 11: return _strategyRepeat(rstep);
+        case 12: return _strategyBoundaryNumeric(rstep);
+        case 13: return _strategyWellformed(rstep);
+        default: return _strategyCurated(rstep);
     }
 }
 
@@ -489,7 +536,7 @@ function _strategyEscapeContext(step) {
 }
 
 function _strategyPureRandom(step, srand) {
-    const rng = _prng(srand ^ (step >>> 0));
+    const rng = _prng((srand >>> 0) ^ ((step >>> 0) & 0x7FFFFFFF));
     const lens = [1, 2, 4, 8, 16, 32, 64, 128, 256];
     const len = lens[rng() % lens.length];
     const bytes = Buffer.alloc(len);
@@ -1038,6 +1085,11 @@ class SyDBCorruptionTester extends SyAPP_Func {
             P.showView = 'minimal';
             this.Storages.Set(id, 'state', P);
         }
+        if (actualProps.__tester_view_types === '1') {
+            delete actualProps.__tester_view_types;
+            P.showView = 'types';
+            this.Storages.Set(id, 'state', P);
+        }
         if (actualProps.__tester_detail === '1') {
             delete actualProps.__tester_detail;
             P.showDetail = !P.showDetail;
@@ -1074,6 +1126,12 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 props: { __tester_view_minimal: '1' }
             },
             {
+                name: P.showView === 'types'
+                    ? this.TextColor.bgYellow(this.TextColor.black(' Types '))
+                    : this.TextColor.brightYellow('Types'),
+                props: { __tester_view_types: '1' }
+            },
+            {
                 name: P.showView === 'main'
                     ? this.TextColor.bgCyan(this.TextColor.black(' Main '))
                     : this.TextColor.brightCyan('Main'),
@@ -1094,6 +1152,12 @@ class SyDBCorruptionTester extends SyAPP_Func {
         if (P.showView === 'minimal') {
             this.Button(id, { name: this.TextColor.dim('minimal.txt') });
             this._fileAsButtons(id, P.outFiles.minimalPath, 40);
+            return;
+        }
+
+        if (P.showView === 'types') {
+            this.Button(id, { name: this.TextColor.dim('types.txt') });
+            this._fileAsButtons(id, P.outFiles.typesPath, 40);
             return;
         }
 
@@ -1131,6 +1195,24 @@ class SyDBCorruptionTester extends SyAPP_Func {
                     ? this.TextColor.brightRed(String(P.corruptionCount))
                     : this.TextColor.green('0'))
         });
+
+        {
+            const _totalSteps = P.step || 0;
+            const _corruptions = P.corruptionCount || 0;
+            let _cleanPct = 100;
+            if (_totalSteps > 0) {
+                _cleanPct = ((_totalSteps - _corruptions) / _totalSteps) * 100;
+                if (_cleanPct < 0) _cleanPct = 0;
+                if (_cleanPct > 100) _cleanPct = 100;
+            }
+            this.Button(id, {
+                name: this.TextColor.bold('Clean rate: ') +
+                    (_corruptions === 0
+                        ? this.TextColor.green('100.00%')
+                        : this.TextColor.brightRed(_cleanPct.toFixed(2) + '%')) +
+                    this.TextColor.dim(` (${_corruptions} corruption${_corruptions === 1 ? '' : 's'} / ${_totalSteps} steps)`)
+            });
+        }
 
         const mem = process.memoryUsage();
         const rssMbExact = mem.rss / 1048576;
@@ -1626,6 +1708,16 @@ class SyDBCorruptionTester extends SyAPP_Func {
                     step: st.step
                 }));
 
+                _appendTypeOnce(
+                    `${entry.group}|${mismatch.kind}`,
+                    _formatTypeLine({
+                        group: entry.group,
+                        kind: mismatch.kind,
+                        step: st.step,
+                        classifier
+                    })
+                );
+
                 const full = {
                     ts: new Date().toISOString(),
                     runId: st.runId,
@@ -2092,20 +2184,24 @@ function _maybeForceGc(st, iteration) {
 }
 
 function _workerEnsureOutputFiles(baseDir) {
-    if (_findingsFd !== null && _minimalFd !== null) {
-        return { findingsPath: _findingsPath, minimalPath: _minimalPath };
+    if (_findingsFd !== null && _minimalFd !== null && _typesFd !== null) {
+        return { findingsPath: _findingsPath, minimalPath: _minimalPath, typesPath: _typesPath };
     }
     const dir = baseDir || process.cwd();
     _findingsPath = path.join(dir, 'sydb_corruption_findings.jsonl');
     _minimalPath = path.join(dir, 'sydb_corruption_minimal.txt');
+    _typesPath = path.join(dir, 'sydb_corruption_types.txt');
     try {
         _findingsFd = fs.openSync(_findingsPath, 'a');
         _minimalFd = fs.openSync(_minimalPath, 'a');
+        _typesFd = fs.openSync(_typesPath, 'a');
     } catch (_) {
         _findingsFd = null;
         _minimalFd = null;
+        _typesFd = null;
     }
-    return { findingsPath: _findingsPath, minimalPath: _minimalPath };
+    _loadTypeKeysFromFile(_typesPath);
+    return { findingsPath: _findingsPath, minimalPath: _minimalPath, typesPath: _typesPath };
 }
 
 async function _workerSetup(st, dbName, collName) {
@@ -2397,6 +2493,16 @@ async function _workerRunLoop(initialState) {
                 sanity,
                 step: st.step
             }));
+
+            _appendTypeOnce(
+                `${entry.group}|${mismatch.kind}`,
+                _formatTypeLine({
+                    group: entry.group,
+                    kind: mismatch.kind,
+                    step: st.step,
+                    classifier
+                })
+            );
 
             const full = {
                 ts: new Date().toISOString(),
