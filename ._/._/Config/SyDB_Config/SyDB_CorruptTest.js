@@ -809,6 +809,12 @@ const _MAX_CURATED_INPUT_BYTES = 65536;
 
 class SyDBCorruptionTester extends SyAPP_Func {
 
+    static _childHandles = new Map();
+    static _WORKER_FILE = (() => {
+        try { return decodeURIComponent(new URL(import.meta.url).pathname); }
+        catch (_) { return import.meta.url; }
+    })();
+
     constructor() {
         super(
             'sydb-corruption-tester',
@@ -850,7 +856,20 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 rssPeakMb: 0,
                 heapPeakMb: 0,
                 gcRuns: 0,
-                recentLinesCache: null
+                recentLinesCache: null,
+                protectedMode: false,
+                childRssMb: 0,
+                childHeapMb: 0,
+                childRssGrowthPerSec: 0,
+                mainRssGrowthPerSec: 0,
+                stepsPerSec: 0,
+                childRestartCount: 0,
+                childMemoryLimitHit: false,
+                _rateMain: { t: 0, rss: 0, v: 0, init: false },
+                _rateChild: { t: 0, rss: 0, v: 0, init: false },
+                _lastUiRefresh: 0,
+                _lastParentGc: 0,
+                _parentGcRuns: 0
             });
         }
         return this.Storages.Get(id, 'state');
@@ -868,12 +887,37 @@ class SyDBCorruptionTester extends SyAPP_Func {
         const userBuild = this.Builds.get(id);
         const actualProps = (userBuild && userBuild.Session && userBuild.Session.ActualProps) || {};
 
+        if (actualProps.__tester_protected === '1') {
+            delete actualProps.__tester_protected;
+            if (P.phase === 'running' || P.phase === 'stopping') {
+                P.lastOutcome = this.TextColor.yellow('wait — currently ' + P.phase);
+                this.Storages.Set(id, 'state', P);
+            } else {
+                P.protectedMode = !P.protectedMode;
+                P.lastOutcome = P.protectedMode
+                    ? this.TextColor.cyan('mode: protected (child process)')
+                    : this.TextColor.cyan('mode: default (in-process)');
+                this.Storages.Set(id, 'state', P);
+            }
+        }
+
         if (actualProps.__tester_toggle === '1') {
             delete actualProps.__tester_toggle;
 
             if (P.phase === 'running') {
                 P.phase = 'stopping';
                 P.abortFlag = true;
+                if (P.protectedMode) {
+                    const child = SyDBCorruptionTester._childHandles.get(id);
+                    if (child) {
+                        try { child.send({ type: 'stop' }); } catch (_) {}
+                    } else {
+                        P.phase = 'idle';
+                        P.abortFlag = false;
+                        P.loopActive = false;
+                        P.lastOutcome = this.TextColor.green('stopped (no worker)');
+                    }
+                }
                 this.Storages.Set(id, 'state', P);
             } else if (P.phase !== 'stopping') {
                 P.phase = 'running';
@@ -884,23 +928,53 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 P.rssPeakMb = 0;
                 P.heapPeakMb = 0;
                 P.gcRuns = 0;
+                P.childRestartCount = 0;
+                P.childMemoryLimitHit = false;
+                P.childRssMb = 0;
+                P.childHeapMb = 0;
+                P.childRssGrowthPerSec = 0;
+                P.mainRssGrowthPerSec = 0;
+                P.stepsPerSec = 0;
+                P._rateMain = { t: 0, rss: 0, v: 0, init: false };
+                P._rateChild = { t: 0, rss: 0, v: 0, init: false };
+                P._lastUiRefresh = 0;
+                P._lastParentGc = 0;
+                P._parentGcRuns = 0;
                 this.Storages.Set(id, 'state', P);
 
-                if (!P.loopActive) {
-                    P.loopActive = true;
-                    this.Storages.Set(id, 'state', P);
-                    setImmediate(() => {
-                        this._runFuzzLoop(id).catch((e) => {
-                            try {
-                                const st = this._stateFor(id);
-                                st.phase = 'idle';
-                                st.loopActive = false;
-                                st.lastError = 'Fuzz loop crashed: ' + (e && (e.stack || e.message) || e);
-                                this.Storages.Set(id, 'state', st);
-                                this._refreshUi(id);
-                            } catch (_) {}
+                // Clear any stale allocations from previous runs before
+                // starting fresh (especially valuable in protected mode).
+                if (P.protectedMode) {
+                    if (typeof globalThis.__sydbGc === 'function') {
+                        for (let _i = 0; _i < 3; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                    } else if (typeof global.gc === 'function') {
+                        for (let _i = 0; _i < 3; _i++) { try { global.gc(); } catch (_) {} }
+                    }
+                }
+
+                if (P.protectedMode) {
+                    if (!P.loopActive) {
+                        P.loopActive = true;
+                        this.Storages.Set(id, 'state', P);
+                        this._spawnWorker(id, P, 0, P.srand).catch(() => {});
+                    }
+                } else {
+                    if (!P.loopActive) {
+                        P.loopActive = true;
+                        this.Storages.Set(id, 'state', P);
+                        setImmediate(() => {
+                            this._runFuzzLoop(id).catch((e) => {
+                                try {
+                                    const st = this._stateFor(id);
+                                    st.phase = 'idle';
+                                    st.loopActive = false;
+                                    st.lastError = 'Fuzz loop crashed: ' + (e && (e.stack || e.message) || e);
+                                    this.Storages.Set(id, 'state', st);
+                                    this._refreshUi(id);
+                                } catch (_) {}
+                            });
                         });
-                    });
+                    }
                 }
             }
         }
@@ -956,6 +1030,12 @@ class SyDBCorruptionTester extends SyAPP_Func {
                     ? this.TextColor.bgRed(this.TextColor.black(' Stop '))
                     : this.TextColor.bgGreen(this.TextColor.black(' Start ')),
                 props: { __tester_toggle: '1' }
+            },
+            {
+                name: P.protectedMode
+                    ? this.TextColor.bgMagenta(this.TextColor.black(' Protected '))
+                    : this.TextColor.magenta('Protected'),
+                props: { __tester_protected: '1' }
             },
             {
                 name: P.showView === 'findings'
@@ -1029,16 +1109,64 @@ class SyDBCorruptionTester extends SyAPP_Func {
         });
 
         const mem = process.memoryUsage();
-        const rssMb = Math.round(mem.rss / 1048576);
-        const heapMb = Math.round(mem.heapUsed / 1048576);
+        const rssMbExact = mem.rss / 1048576;
+        const heapMbExact = mem.heapUsed / 1048576;
+        const rssMb = Math.round(rssMbExact);
+        const heapMb = Math.round(heapMbExact);
         if (rssMb > P.rssPeakMb) P.rssPeakMb = rssMb;
         if (heapMb > P.heapPeakMb) P.heapPeakMb = heapMb;
+
+        if (!P._rateMain) P._rateMain = { t: 0, rss: 0, v: 0, init: false };
+        if (!P._rateChild) P._rateChild = { t: 0, rss: 0, v: 0, init: false };
+        if (typeof P.childRssMb !== 'number') P.childRssMb = 0;
+        if (typeof P.childHeapMb !== 'number') P.childHeapMb = 0;
+        if (typeof P.childRestartCount !== 'number') P.childRestartCount = 0;
+        if (typeof P.stepsPerSec !== 'number') P.stepsPerSec = 0;
+        if (typeof P.mainRssGrowthPerSec !== 'number') P.mainRssGrowthPerSec = 0;
+        if (typeof P.childRssGrowthPerSec !== 'number') P.childRssGrowthPerSec = 0;
+        if (typeof P._parentGcRuns !== 'number') P._parentGcRuns = 0;
+
+        _updateRateEMA(P._rateMain, rssMbExact);
+        _updateRateEMA(P._rateChild, P.childRssMb);
+        P.mainRssGrowthPerSec = P._rateMain.v;
+        P.childRssGrowthPerSec = P._rateChild.v;
+
+        // Progressive GC in protected mode: keep parent heap low WITHOUT
+        // stopping the run. Runs at most every ~5s (throttled via _lastParentGc).
+        if (P.protectedMode) {
+            const _nowGc = Date.now();
+            if (_nowGc - (P._lastParentGc || 0) >= 5000) {
+                P._lastParentGc = _nowGc;
+                if (typeof globalThis.__sydbGc === 'function') {
+                    for (let _i = 0; _i < 2; _i++) {
+                        try { globalThis.__sydbGc(); P._parentGcRuns++; } catch (_) {}
+                    }
+                } else if (typeof global.gc === 'function') {
+                    for (let _i = 0; _i < 2; _i++) {
+                        try { global.gc(); P._parentGcRuns++; } catch (_) {}
+                    }
+                }
+            }
+        }
+
         this.Storages.Set(id, 'state', P);
 
         this.Button(id, {
-            name: this.TextColor.bold('Memory: ') +
-                this.TextColor.dim(`rss ${rssMb}MB (peak ${P.rssPeakMb}MB) · heap ${heapMb}MB (peak ${P.heapPeakMb}MB) · gc ${P.gcRuns}`)
+            name: this.TextColor.bold('Rate: ') +
+                this.TextColor.dim(P.stepsPerSec.toFixed(2) + ' steps/sec')
         });
+
+        this.Button(id, {
+            name: this.TextColor.bold('Memory: ') +
+                this.TextColor.dim(`main rss ${rssMb}MB (peak ${P.rssPeakMb}MB, ${_fmtRate(P.mainRssGrowthPerSec)}MB/s) · heap ${heapMb}MB (peak ${P.heapPeakMb}MB) · gc ${P.gcRuns}${P.protectedMode ? ` (parent ${P._parentGcRuns})` : ''}`)
+        });
+
+        if (P.protectedMode) {
+            this.Button(id, {
+                name: this.TextColor.bold('Child: ') +
+                    this.TextColor.dim(`rss ${P.childRssMb.toFixed(1)}MB (${_fmtRate(P.childRssGrowthPerSec)}MB/s) · heap ${P.childHeapMb.toFixed(1)}MB · restarts ${P.childRestartCount} · kill@400MB`)
+            });
+        }
 
         if (P.lastCorruption) {
             this.Button(id, {
@@ -1506,6 +1634,231 @@ class SyDBCorruptionTester extends SyAPP_Func {
         }
     }
 
+    async _spawnWorker(id, st, resumeStep, resumeSrand) {
+        const _CH = SyDBCorruptionTester._childHandles;
+        const _WF = SyDBCorruptionTester._WORKER_FILE;
+
+        const existing = _CH.get(id);
+        if (existing) {
+            try { existing.kill('SIGTERM'); } catch (_) {}
+            _CH.delete(id);
+        }
+
+        // Dynamic import — no top-level import needed for child_process.
+        let forkFn = null;
+        try {
+            const cp = await import('child_process');
+            if (cp) {
+                if (typeof cp.fork === 'function') forkFn = cp.fork;
+                else if (cp.default && typeof cp.default.fork === 'function') forkFn = cp.default.fork;
+            }
+        } catch (_) {}
+        if (typeof forkFn !== 'function') {
+            try {
+                const mod = await import('module');
+                const createRequire = mod && (mod.createRequire || (mod.default && mod.default.createRequire));
+                if (typeof createRequire === 'function') {
+                    const cp2 = createRequire(import.meta.url)('child_process');
+                    if (cp2 && typeof cp2.fork === 'function') forkFn = cp2.fork;
+                }
+            } catch (_) {}
+        }
+        if (typeof forkFn !== 'function') {
+            const cur = this._stateFor(id);
+            cur.phase = 'idle';
+            cur.loopActive = false;
+            cur.lastError = 'Failed to spawn worker: dynamic import of child_process failed';
+            this.Storages.Set(id, 'state', cur);
+            this._refreshUi(id);
+            return;
+        }
+
+        let child;
+        try {
+            child = forkFn(_WF, [], {
+                env: { ...process.env, SYDB_CORRUPT_WORKER: '1' },
+                stdio: ['ignore', 'inherit', 'inherit', 'ipc']
+            });
+        } catch (e) {
+            const cur = this._stateFor(id);
+            cur.phase = 'idle';
+            cur.loopActive = false;
+            cur.lastError = 'Failed to spawn worker: ' + (e && e.message || e);
+            this.Storages.Set(id, 'state', cur);
+            this._refreshUi(id);
+            return;
+        }
+
+        _CH.set(id, child);
+
+        child.on('message', (msg) => {
+            if (!msg) return;
+            try {
+                if (msg.type === 'ready') {
+                    try {
+                        child.send({
+                            type: 'init',
+                            state: {
+                                host: st.host,
+                                port: st.port,
+                                speedMs: st.speedMs,
+                                maxSteps: st.maxSteps,
+                                srand: (resumeSrand !== undefined) ? resumeSrand : st.srand,
+                                step: (resumeStep !== undefined) ? resumeStep : st.step,
+                                corruptionCount: st.corruptionCount || 0,
+                                runId: st.runId || null,
+                                cwd: process.cwd()
+                            }
+                        });
+                    } catch (_) {}
+                } else if (msg.type === 'progress') {
+                    const s = msg.state || {};
+                    const cur = this._stateFor(id);
+                    const _prevPhase = cur.phase;
+                    const _oldCorruptionCount = cur.corruptionCount;
+
+                    cur.step = (typeof s.step === 'number') ? s.step : cur.step;
+                    cur.corruptionCount = (typeof s.corruptionCount === 'number') ? s.corruptionCount : cur.corruptionCount;
+                    if (cur.corruptionCount > _oldCorruptionCount) {
+                        cur.recentLinesCache = null;
+                    }
+                    if (typeof s.srand === 'number') cur.srand = s.srand;
+                    if (s.lastGroup) cur.lastGroup = s.lastGroup;
+                    if (s.lastLabel) cur.lastLabel = s.lastLabel;
+
+                    // Truncate display-only lastValue at 512 chars. Full
+                    // value lives in the worker; parent UI only needs a
+                    // preview (display truncates to 40 chars anyway).
+                    if (typeof s.lastValue === 'string') {
+                        cur.lastValue = s.lastValue.length > 512 ? s.lastValue.slice(0, 512) : s.lastValue;
+                    }
+
+                    if (s.lastOutcome) cur.lastOutcome = s.lastOutcome;
+                    if (s.lastCorruption) cur.lastCorruption = s.lastCorruption;
+                    if (s.lastError) cur.lastError = s.lastError;
+                    if (typeof s.childRssMb === 'number') cur.childRssMb = s.childRssMb;
+                    if (typeof s.childHeapMb === 'number') cur.childHeapMb = s.childHeapMb;
+                    if (typeof s.gcRuns === 'number') cur.gcRuns = s.gcRuns;
+                    if (typeof s.stepsPerSec === 'number') cur.stepsPerSec = s.stepsPerSec;
+
+                    if (s.phase === 'restarting' && !cur.childMemoryLimitHit) {
+                        cur.childMemoryLimitHit = true;
+                        cur.childRestartCount = (cur.childRestartCount || 0) + 1;
+                        cur.recentLinesCache = null;
+                    } else if (s.phase === 'idle' || s.phase === 'done') {
+                        cur.phase = s.phase;
+                        cur.loopActive = false;
+                    }
+
+                    // Progressive parent GC — keep parent heap flat while
+                    // worker runs. Uses __sydbGc when available, else global.gc.
+                    const _nowGc = Date.now();
+                    if (cur.protectedMode && _nowGc - (cur._lastParentGc || 0) >= 5000) {
+                        cur._lastParentGc = _nowGc;
+                        if (typeof globalThis.__sydbGc === 'function') {
+                            for (let _i = 0; _i < 2; _i++) {
+                                try { globalThis.__sydbGc(); cur._parentGcRuns = (cur._parentGcRuns || 0) + 1; } catch (_) {}
+                            }
+                        } else if (typeof global.gc === 'function') {
+                            for (let _i = 0; _i < 2; _i++) {
+                                try { global.gc(); cur._parentGcRuns = (cur._parentGcRuns || 0) + 1; } catch (_) {}
+                            }
+                        }
+                    }
+
+                    this.Storages.Set(id, 'state', cur);
+
+                    // Throttle UI refresh — same cadence as the in-process
+                    // loop's REFRESH_EVERY_MS to avoid LoadScreen churn.
+                    // Force refresh immediately on phase transition.
+                    const _now = Date.now();
+                    const _phaseChanged = cur.phase !== _prevPhase;
+                    if (_phaseChanged || (_now - (cur._lastUiRefresh || 0) >= 1200)) {
+                        cur._lastUiRefresh = _now;
+                        this._refreshUi(id);
+                    }
+                } else if (msg.type === 'fatal') {
+                    const cur = this._stateFor(id);
+                    cur.lastError = 'Worker fatal: ' + msg.error;
+                    this.Storages.Set(id, 'state', cur);
+                }
+            } catch (_) {}
+        });
+
+        child.on('exit', (code, signal) => {
+            _CH.delete(id);
+            const cur = this._stateFor(id);
+
+            if (cur.abortFlag) {
+                cur.abortFlag = false;
+                cur.childMemoryLimitHit = false;
+                cur.phase = 'idle';
+                cur.loopActive = false;
+                cur.lastOutcome = this.TextColor.green('stopped by user');
+                if (cur.protectedMode) {
+                    if (typeof globalThis.__sydbGc === 'function') {
+                        for (let _i = 0; _i < 2; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                    } else if (typeof global.gc === 'function') {
+                        for (let _i = 0; _i < 2; _i++) { try { global.gc(); } catch (_) {} }
+                    }
+                }
+                this.Storages.Set(id, 'state', cur);
+                this._refreshUi(id);
+                return;
+            }
+
+            if (cur.childMemoryLimitHit) {
+                cur.childMemoryLimitHit = false;
+                cur.phase = 'running';
+                cur.loopActive = true;
+                this.Storages.Set(id, 'state', cur);
+                if (typeof globalThis.__sydbGc === 'function') {
+                    for (let _i = 0; _i < 3; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                } else if (typeof global.gc === 'function') {
+                    for (let _i = 0; _i < 3; _i++) { try { global.gc(); } catch (_) {} }
+                }
+                setTimeout(() => {
+                    this._spawnWorker(id, cur, cur.step, cur.srand).catch((err) => {
+                        try {
+                            const st = this._stateFor(id);
+                            st.phase = 'idle';
+                            st.loopActive = false;
+                            st.lastError = 'Restart failed: ' + (err && err.message || err);
+                            this.Storages.Set(id, 'state', st);
+                            this._refreshUi(id);
+                        } catch (_) {}
+                    });
+                }, 150);
+                return;
+            }
+
+            if (cur.phase === 'running' || cur.phase === 'stopping') {
+                cur.phase = 'idle';
+                cur.loopActive = false;
+                if (code !== 0 && code !== null && signal !== 'SIGTERM' && signal !== 'SIGKILL') {
+                    cur.lastError = `Worker exited unexpectedly (code=${code}, signal=${signal})`;
+                } else {
+                    cur.lastOutcome = this.TextColor.green('worker stopped');
+                }
+                if (cur.protectedMode) {
+                    if (typeof globalThis.__sydbGc === 'function') {
+                        for (let _i = 0; _i < 3; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                    } else if (typeof global.gc === 'function') {
+                        for (let _i = 0; _i < 3; _i++) { try { global.gc(); } catch (_) {} }
+                    }
+                }
+                this.Storages.Set(id, 'state', cur);
+                this._refreshUi(id);
+            }
+        });
+
+        child.on('error', (e) => {
+            const cur = this._stateFor(id);
+            cur.lastError = 'Worker error: ' + (e && e.message || e);
+            this.Storages.Set(id, 'state', cur);
+        });
+    }
+
     async _ensureCollection(st, dbName, collName) {
         await httpRequest({
             host: st.host,
@@ -1552,6 +1905,33 @@ class SyDBCorruptionTester extends SyAPP_Func {
     }
 }
 
+function _updateRateEMA(rate, currentValue) {
+    if (!rate) return;
+    if (typeof currentValue !== 'number' || !Number.isFinite(currentValue)) return;
+    const now = Date.now();
+    if (!rate.init) {
+        rate.init = true;
+        rate.t = now;
+        rate.rss = currentValue;
+        rate.v = 0;
+        return;
+    }
+    let dt = (now - rate.t) / 1000;
+    if (dt < 0.5) return;
+    if (dt > 10) dt = 10;
+    const delta = (currentValue - rate.rss) / dt;
+    const alpha = 0.25;
+    rate.v = (rate.v * (1 - alpha)) + (delta * alpha);
+    rate.t = now;
+    rate.rss = currentValue;
+}
+
+function _fmtRate(v) {
+    if (!Number.isFinite(v)) return '0.00';
+    const sign = v >= 0 ? '+' : '';
+    return sign + v.toFixed(2);
+}
+
 function _maybeForceGc(st, iteration) {
     const every = iteration <= 10 ? 5 : (iteration <= 100 ? 25 : 100);
     if (iteration % every !== 0) return;
@@ -1571,6 +1951,411 @@ function _maybeForceGc(st, iteration) {
             st.gcRuns = (st.gcRuns || 0) + 1;
         } catch (_) {}
     }
+}
+
+function _workerEnsureOutputFiles(baseDir) {
+    if (_findingsFd !== null && _minimalFd !== null) {
+        return { findingsPath: _findingsPath, minimalPath: _minimalPath };
+    }
+    const dir = baseDir || process.cwd();
+    _findingsPath = path.join(dir, 'sydb_corruption_findings.jsonl');
+    _minimalPath = path.join(dir, 'sydb_corruption_minimal.txt');
+    try {
+        _findingsFd = fs.openSync(_findingsPath, 'a');
+        _minimalFd = fs.openSync(_minimalPath, 'a');
+    } catch (_) {
+        _findingsFd = null;
+        _minimalFd = null;
+    }
+    return { findingsPath: _findingsPath, minimalPath: _minimalPath };
+}
+
+async function _workerSetup(st, dbName, collName) {
+    await httpRequest({
+        host: st.host, port: st.port, method: 'POST', path: '/api/databases',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: dbName }), timeoutMs: 10000
+    });
+    const schema = [{ name: FIELD_NAME, type: 'string', required: false, indexed: false }];
+    await httpRequest({
+        host: st.host, port: st.port, method: 'POST',
+        path: `/api/databases/${encodeURIComponent(dbName)}/collections`,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: collName, schema }), timeoutMs: 10000
+    });
+}
+
+async function _workerWipe(st, dbName, collName) {
+    await httpRequest({
+        host: st.host, port: st.port, method: 'DELETE',
+        path: `/api/databases/${encodeURIComponent(dbName)}/collections/${encodeURIComponent(collName)}`,
+        timeoutMs: 5000
+    });
+    await httpRequest({
+        host: st.host, port: st.port, method: 'DELETE',
+        path: `/api/databases/${encodeURIComponent(dbName)}`,
+        timeoutMs: 5000
+    });
+}
+
+function _workerMaybeGc(st, iteration) {
+    // More aggressive than in-process: every 25 iters up to 100, then
+    // every 50. Lower threshold (128MB) so GC runs sooner.
+    const every = iteration <= 10 ? 5 : (iteration <= 100 ? 25 : 50);
+    if (iteration % every !== 0) return;
+    const mem = process.memoryUsage();
+    const heapMb = mem.heapUsed / 1048576;
+    if (heapMb > 128) {
+        if (typeof globalThis.__sydbGc === 'function') {
+            try { globalThis.__sydbGc(); st.gcRuns = (st.gcRuns || 0) + 1; return; } catch (_) {}
+        }
+        if (typeof global.gc === 'function') {
+            try { global.gc(); st.gcRuns = (st.gcRuns || 0) + 1; } catch (_) {}
+        }
+    }
+}
+
+async function _workerRunLoop(initialState) {
+    const st = initialState || {};
+    if (!st.host) st.host = '127.0.0.1';
+    if (!st.port) st.port = 8080;
+    if (typeof st.speedMs !== 'number') st.speedMs = 25;
+    if (typeof st.maxSteps !== 'number') st.maxSteps = 0;
+    if (typeof st.step !== 'number') st.step = 0;
+    if (typeof st.corruptionCount !== 'number') st.corruptionCount = 0;
+    if (!st.srand) st.srand = 0xC0FFEE;
+    st.phase = 'running';
+
+    const DB = '__corruption_test__';
+    const COLL = '__corruption_coll__';
+
+    let abortFlag = false;
+    process.on('message', (msg) => {
+        if (msg && msg.type === 'stop') abortFlag = true;
+    });
+    process.on('disconnect', () => {
+        abortFlag = true;
+        setTimeout(() => process.exit(0), 500);
+    });
+
+    const rateState = { t: 0, step: 0, rss: 0, stepsV: 0, rssV: 0, init: false };
+
+    function updateWorkerRates() {
+        const now = Date.now();
+        const mem = process.memoryUsage();
+        const rssMb = mem.rss / 1048576;
+        st.childRssMb = rssMb;
+        st.childHeapMb = mem.heapUsed / 1048576;
+        if (!rateState.init) {
+            rateState.init = true;
+            rateState.t = now;
+            rateState.step = st.step;
+            rateState.rss = rssMb;
+            return;
+        }
+        let dt = (now - rateState.t) / 1000;
+        if (dt < 0.5) return;
+        if (dt > 10) dt = 10;
+        const stepsDelta = (st.step - rateState.step) / dt;
+        const rssDelta = (rssMb - rateState.rss) / dt;
+        const alpha = 0.25;
+        rateState.stepsV = (rateState.stepsV * (1 - alpha)) + (stepsDelta * alpha);
+        rateState.rssV = (rateState.rssV * (1 - alpha)) + (rssDelta * alpha);
+        rateState.t = now;
+        rateState.step = st.step;
+        rateState.rss = rssMb;
+    }
+
+    function sendProgress(isFinal) {
+        updateWorkerRates();
+        // Truncate lastValue before sending — big win for IPC bandwidth
+        // AND for parent-side state storage (Storages.Set clone cost).
+        const _lval = (typeof st.lastValue === 'string' && st.lastValue.length > 512)
+            ? st.lastValue.slice(0, 512)
+            : st.lastValue;
+        try {
+            process.send({
+                type: 'progress',
+                final: !!isFinal,
+                state: {
+                    step: st.step,
+                    corruptionCount: st.corruptionCount,
+                    srand: st.srand,
+                    lastGroup: st.lastGroup,
+                    lastLabel: st.lastLabel,
+                    lastValue: _lval,
+                    lastOutcome: st.lastOutcome,
+                    lastCorruption: st.lastCorruption,
+                    lastError: st.lastError,
+                    phase: st.phase,
+                    childRssMb: st.childRssMb,
+                    childHeapMb: st.childHeapMb,
+                    gcRuns: st.gcRuns || 0,
+                    stepsPerSec: rateState.stepsV,
+                    childRssGrowthPerSec: rateState.rssV
+                }
+            });
+        } catch (_) {}
+    }
+
+    _workerEnsureOutputFiles(st.cwd || process.cwd());
+
+    try { await _workerWipe(st, DB, COLL); } catch (_) {}
+    try {
+        await _workerSetup(st, DB, COLL);
+    } catch (e) {
+        st.lastError = 'Setup failed: ' + (e && e.message || e);
+        st.phase = 'idle';
+        sendProgress(true);
+        setTimeout(() => process.exit(0), 50);
+        return;
+    }
+
+    let lastSend = 0;
+    let iterationSinceGc = 0;
+    const SEND_EVERY_MS = 500;
+
+    while (true) {
+        if (abortFlag) {
+            st.phase = 'idle';
+            st.lastOutcome = 'stopped by user';
+            sendProgress(true);
+            break;
+        }
+
+        if (st.maxSteps > 0 && st.step >= st.maxSteps) {
+            st.phase = 'done';
+            st.lastOutcome = `reached maxSteps=${st.maxSteps}`;
+            sendProgress(true);
+            break;
+        }
+
+        const memCheck = process.memoryUsage();
+        const rssMbCheck = memCheck.rss / 1048576;
+        st.childRssMb = rssMbCheck;
+        st.childHeapMb = memCheck.heapUsed / 1048576;
+
+        // Graceful memory threshold handling: try GC first. Only restart
+        // if GC cannot bring RSS back under 400MB. This makes restarts
+        // much rarer for workloads where growth is mostly garbage.
+        if (rssMbCheck >= 400) {
+            let reclaimed = false;
+            if (typeof globalThis.__sydbGc === 'function') {
+                for (let _i = 0; _i < 3; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                reclaimed = true;
+            } else if (typeof global.gc === 'function') {
+                for (let _i = 0; _i < 3; _i++) { try { global.gc(); } catch (_) {} }
+                reclaimed = true;
+            }
+            if (reclaimed) {
+                const afterRss = process.memoryUsage().rss / 1048576;
+                st.childRssMb = afterRss;
+                st.gcRuns = (st.gcRuns || 0) + 1;
+                if (afterRss < 400) {
+                    // GC succeeded — keep running without restart.
+                    sendProgress(false);
+                    await Promise.resolve();
+                    continue;
+                }
+            }
+            st.phase = 'restarting';
+            st.lastOutcome = 'memory limit 400MB reached - restarting gracefully';
+            sendProgress(true);
+            break;
+        }
+
+        const entry = _generateInput(st.step, st.srand);
+        if (typeof entry.val === 'string' && entry.val.length > _MAX_CURATED_INPUT_BYTES) {
+            entry.val = entry.val.slice(0, _MAX_CURATED_INPUT_BYTES);
+        }
+
+        st.step += 1;
+        st.lastGroup = entry.group;
+        st.lastLabel = entry.label;
+        st.lastValue = entry.val;
+
+        const bodyObj = {};
+        bodyObj[FIELD_NAME] = entry.val;
+        const bodyStr = JSON.stringify(bodyObj);
+
+        const insertRes = await httpRequest({
+            host: st.host, port: st.port, method: 'POST',
+            path: `/api/databases/${encodeURIComponent(DB)}/collections/${encodeURIComponent(COLL)}/instances`,
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(bodyStr)
+            },
+            body: bodyStr, timeoutMs: 15000
+        });
+
+        if (_isServerUnreachable(insertRes)) {
+            st.lastOutcome = 'server unreachable — waiting (not counted)';
+            sendProgress(false);
+            await new Promise((r) => setTimeout(r, Math.max(1000, st.speedMs | 0)));
+            continue;
+        }
+
+        let insertOk = false;
+        let insertedId = null;
+        if (insertRes.ok && insertRes.status >= 200 && insertRes.status < 300) {
+            try {
+                const j = JSON.parse(insertRes.body);
+                if (j && j.success === true && typeof j.id === 'string') {
+                    insertOk = true;
+                    insertedId = j.id;
+                }
+            } catch (_) {}
+        }
+
+        let mismatch = null;
+        if (insertOk) {
+            const listRes = await httpRequest({
+                host: st.host, port: st.port, method: 'GET',
+                path: `/api/databases/${encodeURIComponent(DB)}/collections/${encodeURIComponent(COLL)}/instances?query=_id:${encodeURIComponent(insertedId)}`,
+                timeoutMs: 15000
+            });
+
+            if (_isServerUnreachable(listRes)) {
+                st.lastOutcome = 'server unreachable during readback — waiting (not counted)';
+                sendProgress(false);
+                await new Promise((r) => setTimeout(r, Math.max(1000, st.speedMs | 0)));
+                continue;
+            }
+
+            const extracted = _extractValueFromListResponse(listRes, insertedId, FIELD_NAME);
+            if (!extracted.ok) {
+                mismatch = { kind: 'readback_failed', detail: extracted.reason };
+            } else if (extracted.value !== entry.val) {
+                mismatch = { kind: 'value_mismatch', sent: entry.val, got: extracted.value };
+            }
+        } else {
+            mismatch = {
+                kind: 'insert_failed',
+                status: insertRes.ok ? insertRes.status : null,
+                error: insertRes.ok ? null : insertRes.error,
+                body: insertRes.ok ? _short(insertRes.body, 200) : null
+            };
+        }
+
+        const sanity = _sydbFileSanity(DB, COLL);
+        if (!mismatch && !sanity.ok) {
+            mismatch = { kind: 'disk_structure', detail: sanity };
+        }
+
+        if (mismatch) {
+            st.corruptionCount += 1;
+
+            const desc = _inputDescriptor(entry);
+            const classifier = _classifyCorruption(mismatch, entry, sanity);
+
+            _appendMinimal(_formatMinimalCause({
+                group: entry.group,
+                label: entry.label,
+                value: entry.val,
+                field: FIELD_NAME,
+                db: DB,
+                coll: COLL,
+                mismatch,
+                sanity,
+                step: st.step
+            }));
+
+            const full = {
+                ts: new Date().toISOString(),
+                runId: st.runId || null,
+                step: st.step,
+                host: st.host,
+                port: st.port,
+                db: DB,
+                coll: COLL,
+                field: FIELD_NAME,
+                strategy: entry.group,
+                strategyLabel: entry.label,
+                inputPreview: desc.preview,
+                inputPreviewJson: desc.previewJson,
+                inputLenChars: desc.lenChars,
+                inputLenBytes: desc.lenBytes,
+                inputHex: desc.hex,
+                inputValueUtf8: _short(entry.val, 512),
+                mismatch: {
+                    kind: mismatch.kind,
+                    status: mismatch.status,
+                    error: mismatch.error ? _short(mismatch.error, 200) : undefined,
+                    body: mismatch.body ? _short(mismatch.body, 200) : undefined,
+                    detail: typeof mismatch.detail === 'string' ? _short(mismatch.detail, 200) : mismatch.detail,
+                    sent: typeof mismatch.sent === 'string' ? _short(mismatch.sent, 512) : undefined,
+                    got: typeof mismatch.got === 'string' ? _short(mismatch.got, 512) : undefined
+                },
+                classifier,
+                insertedId,
+                insertHttpStatus: insertRes.ok ? insertRes.status : null,
+                insertHttpBody: insertRes.ok ? _short(insertRes.body, _MAX_LOG_BODY) : null,
+                diskSanity: sanity
+            };
+
+            try {
+                const listResForLog = await httpRequest({
+                    host: st.host, port: st.port, method: 'GET',
+                    path: `/api/databases/${encodeURIComponent(DB)}/collections/${encodeURIComponent(COLL)}/instances`,
+                    timeoutMs: 15000
+                });
+                if (listResForLog.ok && listResForLog.body && listResForLog.body.length < _MAX_LOG_BODY) {
+                    full.listHttpBody = listResForLog.body;
+                }
+            } catch (_) {}
+
+            _appendFinding(full);
+
+            st.lastCorruption = `[${entry.group}/${entry.label}] ` + classifier;
+            st.lastOutcome = 'CORRUPTION (recovering)';
+
+            try {
+                await _workerWipe(st, DB, COLL);
+                await _workerSetup(st, DB, COLL);
+            } catch (e) {
+                st.lastError = 'Recovery wipe failed: ' + (e && e.message || e);
+            }
+
+            _workerMaybeGc(st, ++iterationSinceGc);
+            iterationSinceGc = 0;
+
+            sendProgress(false);
+
+            const waitMs = Math.max(0, st.speedMs | 0);
+            if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+            else await Promise.resolve();
+
+            lastSend = Date.now();
+            continue;
+        }
+
+        st.lastOutcome = 'ok';
+        _workerMaybeGc(st, ++iterationSinceGc);
+
+        const waitMs = Math.max(0, st.speedMs | 0);
+        if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+        else await Promise.resolve();
+
+        const now = Date.now();
+        if (now - lastSend >= SEND_EVERY_MS) {
+            lastSend = now;
+            sendProgress(false);
+        }
+    }
+
+    setTimeout(() => process.exit(0), 50);
+}
+
+if (process.env.SYDB_CORRUPT_WORKER === '1' && typeof process.send === 'function') {
+    process.on('message', (msg) => {
+        if (msg && msg.type === 'init') {
+            _workerRunLoop(msg.state || {}).catch((e) => {
+                try { process.send({ type: 'fatal', error: String(e && (e.stack || e.message) || e) }); } catch (_) {}
+                setTimeout(() => process.exit(1), 50);
+            });
+        }
+    });
+    try { process.send({ type: 'ready' }); } catch (_) {}
 }
 
 export default SyDBCorruptionTester;
