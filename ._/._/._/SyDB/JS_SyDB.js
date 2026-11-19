@@ -1597,7 +1597,7 @@ class JS_SyDB {
             }
         }
 
-        const dataLength = completeJson.length;
+        const dataLength = Buffer.byteLength(completeJson);
         const totalRecordSize = JS_SyDB.RECORD_HEADER_SIZE + dataLength + 1;
 
         try {
@@ -1829,7 +1829,7 @@ class JS_SyDB {
                 return 0;
             }
 
-            const newDataLength = updatedJson.length;
+            const newDataLength = Buffer.byteLength(updatedJson);
             const newTotalSize = JS_SyDB.RECORD_HEADER_SIZE + newDataLength + 1;
 
             const remainingSize = fileHeader.fileSize - (targetOffset + targetSize);
