@@ -1202,16 +1202,14 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 this.TextColor.dim(`main rss ${rssMb}MB (peak ${P.rssPeakMb}MB, ${_fmtRate(P.mainRssGrowthPerSec)}MB/s) · heap ${heapMb}MB (peak ${P.heapPeakMb}MB) · gc ${P.gcRuns}${P.protectedMode ? ` (parent ${P._parentGcRuns})` : ''}`)
         });
 
-        if (!P.protectedMode) {
-            this.Button(id, {
-                name: this.TextColor.bold('ETE: ') +
-                    (P._eteHit
-                        ? this.TextColor.brightRed(`hit @ ${_PARENT_ETE_MB}MB (node heap limit ${_NODE_HEAP_LIMIT_MB}MB) — stopping`)
-                        : (P._eteSec === null
-                            ? this.TextColor.dim(`— (no growth) · threshold ${_PARENT_ETE_MB}MB · node heap limit ${_NODE_HEAP_LIMIT_MB}MB`)
-                            : this.TextColor.cyan(`${_fmtEte(P._eteSec)} to hit ${_PARENT_ETE_MB}MB · node heap limit ${_NODE_HEAP_LIMIT_MB}MB`)))
-            });
-        }
+        this.Button(id, {
+            name: this.TextColor.bold('ETE (parent): ') +
+                (P._eteHit
+                    ? this.TextColor.brightRed(`hit @ ${_PARENT_ETE_MB}MB (node heap limit ${_NODE_HEAP_LIMIT_MB}MB) — stopping`)
+                    : (P._eteSec === null
+                        ? this.TextColor.dim(`— (no growth) · threshold ${_PARENT_ETE_MB}MB · node heap limit ${_NODE_HEAP_LIMIT_MB}MB`)
+                        : this.TextColor.cyan(`${_fmtEte(P._eteSec)} to hit ${_PARENT_ETE_MB}MB · node heap limit ${_NODE_HEAP_LIMIT_MB}MB`)))
+        });
 
         if (P.protectedMode) {
             this.Button(id, {
