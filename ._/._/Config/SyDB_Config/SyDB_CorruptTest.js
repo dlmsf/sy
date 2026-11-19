@@ -4,6 +4,24 @@ import http from 'http';
 import crypto from 'crypto';
 import { pathToFileURL, fileURLToPath } from 'url';
 import SyAPP from '../../../SyAPP.js'
+import v8 from 'v8'
+
+// Node's default V8 heap limit is computed by Node from the host's
+// system RAM. Using the real value (instead of a hardcoded constant)
+// keeps the parent-side crash-prevention threshold accurate on any
+// machine.
+const _NODE_HEAP_LIMIT_MB = (() => {
+    try {
+        const limit = v8.getHeapStatistics().heap_size_limit;
+        if (Number.isFinite(limit) && limit > 0) return Math.floor(limit / 1048576);
+    } catch (_) {}
+    return 2048;
+})();
+// ETE (Estimated Time-to-crash Event) threshold for the in-process /
+// normal mode. Derived from the actual Node heap limit (which itself
+// tracks system RAM). 85% leaves a safe margin while still being an
+// accurate representation of the process crash point.
+const _PARENT_ETE_MB = Math.max(400, Math.floor(_NODE_HEAP_LIMIT_MB * 0.85));
 
 const SyAPP_Func = SyAPP.Func();
 
@@ -867,6 +885,9 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 childMemoryLimitHit: false,
                 _rateMain: { t: 0, rss: 0, v: 0, init: false },
                 _rateChild: { t: 0, rss: 0, v: 0, init: false },
+                _rateSteps: { t: 0, step: 0, v: 0, init: false },
+                _eteSec: null,
+                _eteHit: false,
                 _lastUiRefresh: 0,
                 _lastParentGc: 0,
                 _parentGcRuns: 0
@@ -937,6 +958,9 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 P.stepsPerSec = 0;
                 P._rateMain = { t: 0, rss: 0, v: 0, init: false };
                 P._rateChild = { t: 0, rss: 0, v: 0, init: false };
+                P._rateSteps = { t: 0, step: 0, v: 0, init: false };
+                P._eteSec = null;
+                P._eteHit = false;
                 P._lastUiRefresh = 0;
                 P._lastParentGc = 0;
                 P._parentGcRuns = 0;
@@ -1118,6 +1142,7 @@ class SyDBCorruptionTester extends SyAPP_Func {
 
         if (!P._rateMain) P._rateMain = { t: 0, rss: 0, v: 0, init: false };
         if (!P._rateChild) P._rateChild = { t: 0, rss: 0, v: 0, init: false };
+        if (!P._rateSteps) P._rateSteps = { t: 0, step: 0, v: 0, init: false };
         if (typeof P.childRssMb !== 'number') P.childRssMb = 0;
         if (typeof P.childHeapMb !== 'number') P.childHeapMb = 0;
         if (typeof P.childRestartCount !== 'number') P.childRestartCount = 0;
@@ -1130,6 +1155,22 @@ class SyDBCorruptionTester extends SyAPP_Func {
         _updateRateEMA(P._rateChild, P.childRssMb);
         P.mainRssGrowthPerSec = P._rateMain.v;
         P.childRssGrowthPerSec = P._rateChild.v;
+
+        // Steps/sec — same EMA-of-instantaneous-delta approach used by
+        // the protected-mode worker's rateState.stepsV. In normal mode
+        // the loop runs here, so update it from P.step. In protected
+        // mode the worker's IPC value stays authoritative (no override).
+        _updateStepRateEMA(P._rateSteps, P.step);
+        if (!P.protectedMode) {
+            P.stepsPerSec = P._rateSteps.v;
+        }
+
+        // ETE — projected elapsed-time-to-hit for the normal-mode
+        // crash-memory threshold (Node heap limit, derived from system
+        // RAM). Purely a display metric; the loop's safety check below
+        // performs the actual stop when RSS really reaches the limit.
+        P._eteSec = _computeEteSec(rssMbExact, P.mainRssGrowthPerSec);
+        P._eteHit = rssMbExact >= _PARENT_ETE_MB;
 
         // Progressive GC in protected mode: keep parent heap low WITHOUT
         // stopping the run. Runs at most every ~5s (throttled via _lastParentGc).
@@ -1160,6 +1201,17 @@ class SyDBCorruptionTester extends SyAPP_Func {
             name: this.TextColor.bold('Memory: ') +
                 this.TextColor.dim(`main rss ${rssMb}MB (peak ${P.rssPeakMb}MB, ${_fmtRate(P.mainRssGrowthPerSec)}MB/s) · heap ${heapMb}MB (peak ${P.heapPeakMb}MB) · gc ${P.gcRuns}${P.protectedMode ? ` (parent ${P._parentGcRuns})` : ''}`)
         });
+
+        if (!P.protectedMode) {
+            this.Button(id, {
+                name: this.TextColor.bold('ETE: ') +
+                    (P._eteHit
+                        ? this.TextColor.brightRed(`hit @ ${_PARENT_ETE_MB}MB (node heap limit ${_NODE_HEAP_LIMIT_MB}MB) — stopping`)
+                        : (P._eteSec === null
+                            ? this.TextColor.dim(`— (no growth) · threshold ${_PARENT_ETE_MB}MB · node heap limit ${_NODE_HEAP_LIMIT_MB}MB`)
+                            : this.TextColor.cyan(`${_fmtEte(P._eteSec)} to hit ${_PARENT_ETE_MB}MB · node heap limit ${_NODE_HEAP_LIMIT_MB}MB`)))
+            });
+        }
 
         if (P.protectedMode) {
             this.Button(id, {
@@ -1407,6 +1459,49 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 tester.Storages.Set(id, 'state', st);
                 tester._refreshUi(id);
                 return;
+            }
+
+            // ETE (Estimated Time-to-crash Event) — normal-mode equivalent
+            // of the worker's 400MB restart threshold. Uses the actual
+            // Node heap limit (derived from system RAM) as the crash
+            // point. Try GC, then namespace wipe, then stop before the
+            // process can actually crash.
+            {
+                const _rssNow = process.memoryUsage().rss / 1048576;
+                if (_rssNow >= _PARENT_ETE_MB) {
+                    if (typeof globalThis.__sydbGc === 'function') {
+                        for (let _i = 0; _i < 3; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                    } else if (typeof global.gc === 'function') {
+                        for (let _i = 0; _i < 3; _i++) { try { global.gc(); } catch (_) {} }
+                    }
+                    let _afterGc = process.memoryUsage().rss / 1048576;
+                    if (_afterGc >= _PARENT_ETE_MB) {
+                        try {
+                            await tester._wipeTestNamespace(st, DB, COLL);
+                            await tester._ensureCollection(st, DB, COLL);
+                        } catch (_) {}
+                        if (typeof globalThis.__sydbGc === 'function') {
+                            for (let _i = 0; _i < 3; _i++) { try { globalThis.__sydbGc(); } catch (_) {} }
+                        } else if (typeof global.gc === 'function') {
+                            for (let _i = 0; _i < 3; _i++) { try { global.gc(); } catch (_) {} }
+                        }
+                        _afterGc = process.memoryUsage().rss / 1048576;
+                    }
+                    if (_afterGc >= _PARENT_ETE_MB) {
+                        st.phase = 'idle';
+                        st.abortFlag = false;
+                        st.loopActive = false;
+                        st.lastOutcome = tester.TextColor.brightRed(
+                            'ETE hit: rss ' + Math.round(_afterGc) + 'MB >= ' + _PARENT_ETE_MB +
+                            'MB (node heap limit ' + _NODE_HEAP_LIMIT_MB + 'MB) — stopped before crash'
+                        );
+                        st._eteHit = true;
+                        st._eteSec = 0;
+                        tester.Storages.Set(id, 'state', st);
+                        tester._refreshUi(id);
+                        return;
+                    }
+                }
             }
 
             const entry = _generateInput(st.step, st.srand);
@@ -1913,17 +2008,62 @@ function _updateRateEMA(rate, currentValue) {
         rate.init = true;
         rate.t = now;
         rate.rss = currentValue;
+        rate.baseT = now;
+        rate.baseRss = currentValue;
+        rate.v = 0;
+        return;
+    }
+    const elapsed = (now - (rate.baseT || rate.t)) / 1000;
+    if (elapsed < 1) return;
+    // Cumulative net memory growth per second from the run baseline.
+    // This eliminates the GC-induced +/- jitter that an instantaneous
+    // delta produces, so the value reflects the net accumulation rate
+    // over the whole timeline since the run started.
+    rate.v = (currentValue - (rate.baseRss || rate.rss)) / elapsed;
+    rate.t = now;
+    rate.rss = currentValue;
+}
+
+// Steps/sec — identical math to the protected-mode worker's
+// rateState.stepsV (EMA of instantaneous delta, dt clamped to [0.5,10]s,
+// alpha=0.25). This is the "avg" behaviour the protected mode shows.
+function _updateStepRateEMA(rate, currentStep) {
+    if (!rate) return;
+    if (typeof currentStep !== 'number' || !Number.isFinite(currentStep)) return;
+    const now = Date.now();
+    if (!rate.init) {
+        rate.init = true;
+        rate.t = now;
+        rate.step = currentStep;
         rate.v = 0;
         return;
     }
     let dt = (now - rate.t) / 1000;
     if (dt < 0.5) return;
     if (dt > 10) dt = 10;
-    const delta = (currentValue - rate.rss) / dt;
+    const delta = (currentStep - rate.step) / dt;
     const alpha = 0.25;
     rate.v = (rate.v * (1 - alpha)) + (delta * alpha);
     rate.t = now;
-    rate.rss = currentValue;
+    rate.step = currentStep;
+}
+
+// ETE projection: seconds until RSS crosses the crash-memory threshold,
+// based on the current net growth rate. Returns null when growth is
+// effectively zero (never hits), 0 when already at/over the threshold.
+function _computeEteSec(currentRssMb, growthPerSec) {
+    if (typeof currentRssMb !== 'number' || !Number.isFinite(currentRssMb)) return null;
+    if (currentRssMb >= _PARENT_ETE_MB) return 0;
+    if (typeof growthPerSec !== 'number' || !Number.isFinite(growthPerSec) || growthPerSec <= 0.01) return null;
+    return (_PARENT_ETE_MB - currentRssMb) / growthPerSec;
+}
+
+function _fmtEte(sec) {
+    if (sec === null || !Number.isFinite(sec)) return '—';
+    if (sec <= 0) return 'hit';
+    if (sec < 60) return Math.round(sec) + 's';
+    if (sec < 3600) return (sec / 60).toFixed(1) + 'm';
+    return (sec / 3600).toFixed(2) + 'h';
 }
 
 function _fmtRate(v) {
