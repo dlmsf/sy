@@ -24128,6 +24128,19 @@ function levenshteinDistance(str1, str2) {
         return null;
       }
 
+      // Source/args fingerprint. In INLINE mode the inline `code` is the
+      // source of truth (filePath is only an import-resolution hint), so
+      // the key is a hash of the code: editing the code restarts the child.
+      const __bgKey = () => {
+        const argsKey = JSON.stringify(Array.isArray(state.args) ? state.args : []);
+        if (state.saveMode === 'inline' && state.code && String(state.code).trim()) {
+          return `inline:${createHash('sha1').update(String(state.code)).digest('hex')}|args:${argsKey}`;
+        }
+        return state.filePath
+          ? `file:${state.filePath}|args:${argsKey}`
+          : `code:${(state.code || '').slice(0, 512)}|args:${argsKey}`;
+      };
+
       // ---------------- Reuse / restart existing process ----------------
       const existing = state.bgProcess;
       if (existing && existing.pid) {
@@ -24140,10 +24153,7 @@ function levenshteinDistance(str1, str2) {
           // are used as a stable content fingerprint. `args` are folded
           // into the key so that editing an arg (via the widget's own
           // arg editor) triggers a fresh restart automatically.
-          const argsKey = JSON.stringify(Array.isArray(state.args) ? state.args : []);
-          const currentKey = state.filePath
-            ? `file:${state.filePath}|args:${argsKey}`
-            : `code:${(state.code || '').slice(0, 512)}|args:${argsKey}`;
+          const currentKey = __bgKey();
           if (existing.spawnSourceKey === currentKey) {
             return existing; // reuse
           }
@@ -24171,7 +24181,9 @@ function levenshteinDistance(str1, str2) {
       }
 
       // ---------------- Resolve target file ----------------
-      let targetFile = state.filePath;
+      // INLINE mode: run the inline code, not the (possibly stale) file.
+      const __preferInline = state.saveMode === 'inline' && state.code && String(state.code).trim();
+      let targetFile = __preferInline ? null : state.filePath;
       if (!targetFile || !fs.existsSync(targetFile)) {
         if (state.code && state.code.trim()) {
           const tmpDir = path.join(os.tmpdir(), 'syapp_emb_bg');
@@ -24183,6 +24195,22 @@ function levenshteinDistance(str1, str2) {
             `emb_${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}_${process.pid}_${Date.now()}.mjs`
           );
           let source = state.code;
+
+          // Relative imports in inline code must resolve against the
+          // ORIGINAL file's directory, not the temp dir.
+          if (state.filePath) {
+            try {
+              const __srcDir = path.dirname(path.isAbsolute(state.filePath)
+                ? state.filePath
+                : path.resolve(process.cwd(), state.filePath));
+              const __rw = (spec) => (spec && (spec.startsWith('./') || spec.startsWith('../')))
+                ? url.pathToFileURL(path.resolve(__srcDir, spec)).href
+                : spec;
+              source = source
+                .replace(/(\bfrom\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => kw + q + __rw(spec) + q)
+                .replace(/(\bimport\s+)(['"])([^'"]+)\2/g, (m, kw, q, spec) => kw + q + __rw(spec) + q);
+            } catch (_) {}
+          }
 
           // ------------------------------------------------------------------
           // PREPEND THE SyAPP IMPORT WHEN IT IS NOT ALREADY PRESENT.
@@ -24289,10 +24317,7 @@ function levenshteinDistance(str1, str2) {
         }
         SyPortLock.reassign(port, entry.pid, processName);
 
-        const argsKey = JSON.stringify(Array.isArray(state.args) ? state.args : []);
-        const spawnSourceKey = state.filePath
-          ? `file:${state.filePath}|args:${argsKey}`
-          : `code:${(state.code || '').slice(0, 512)}|args:${argsKey}`;
+        const spawnSourceKey = __bgKey();
 
         state.bgProcess = {
           id: entry.id,
