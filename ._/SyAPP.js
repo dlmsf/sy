@@ -24186,14 +24186,63 @@ function levenshteinDistance(str1, str2) {
       let targetFile = __preferInline ? null : state.filePath;
       if (!targetFile || !fs.existsSync(targetFile)) {
         if (state.code && state.code.trim()) {
-          const tmpDir = path.join(os.tmpdir(), 'syapp_emb_bg');
-          if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-          // `.mjs` extension so Node treats this fallback temp file as
-          // ESM by extension — matches the produced file convention.
-          targetFile = path.join(
-            tmpDir,
-            `emb_${(cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_')}_${process.pid}_${Date.now()}.mjs`
-          );
+          // Place the temp file NEXT TO the original source file (or, when
+          // that is unknown / not writable — e.g. a packed bundle moved
+          // elsewhere — next to the host file that is running), so bare
+          // package imports (node_modules lookup), relative imports and
+          // import.meta.url-based paths resolve like they do for the real
+          // file. Falls back to the OS temp dir.
+          let tmpDir = null;
+          let tmpIsSourceDir = false;
+          const __tmpDirCandidates = [];
+          try {
+            if (state.filePath) {
+              const __absSrcForTmp = path.isAbsolute(state.filePath)
+                ? state.filePath
+                : path.resolve(process.cwd(), state.filePath);
+              __tmpDirCandidates.push(path.dirname(__absSrcForTmp));
+            }
+            const __hostSrcForTmp = syapp && syapp._mainSourceFile;
+            if (typeof __hostSrcForTmp === 'string' && __hostSrcForTmp) {
+              __tmpDirCandidates.push(path.dirname(path.resolve(__hostSrcForTmp)));
+            }
+          } catch (_) { /* candidates are best-effort */ }
+          for (const __cand of __tmpDirCandidates) {
+            try {
+              fs.accessSync(__cand, fs.constants.W_OK);
+              tmpDir = __cand;
+              tmpIsSourceDir = true;
+              break;
+            } catch (_) { /* try next candidate */ }
+          }
+          if (!tmpDir) {
+            tmpDir = path.join(os.tmpdir(), 'syapp_emb_bg');
+            if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+          }
+          const __safeEmbName = (cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_');
+          // `.mjs` extension so Node treats this temp file as ESM by
+          // extension — matches the produced file convention.
+          targetFile = tmpIsSourceDir
+            ? path.join(tmpDir, `.syapp_emb_${__safeEmbName}_${process.pid}.mjs`)
+            : path.join(
+                tmpDir,
+                `emb_${__safeEmbName}_${process.pid}_${Date.now()}.mjs`
+              );
+          // Temp files created next to user sources are removed when this
+          // process exits (one listener for all of them).
+          if (tmpIsSourceDir) {
+            try {
+              if (!this._embTmpFiles) {
+                this._embTmpFiles = new Set();
+                process.on('exit', () => {
+                  for (const f of this._embTmpFiles) {
+                    try { fs.unlinkSync(f); } catch (_) {}
+                  }
+                });
+              }
+              this._embTmpFiles.add(targetFile);
+            } catch (_) {}
+          }
           let source = state.code;
 
           // Relative imports in inline code must resolve against the
@@ -24246,7 +24295,34 @@ function levenshteinDistance(str1, str2) {
               catch (__) { /* leave null */ }
             }
             if (syappUrl) {
-              source = `import SyAPP from ${JSON.stringify(syappUrl)};\n` + source;
+              // Default: plain default import (previous behaviour).
+              let __syappImportBlock = `import SyAPP from ${JSON.stringify(syappUrl)};\n`;
+
+              // _embExtractInlineClass strips EVERY `import ... SyAPP ...`
+              // statement, including ones that also import named exports
+              // (e.g. `import SyAPP, { ColorText } from '../SyAPP.js'`).
+              // When the original file is available, re-create those
+              // statements pointing at the running SyAPP.js so the named
+              // imports keep working.
+              try {
+                if (state.filePath && fs.existsSync(state.filePath)) {
+                  const __origSrc = fs.readFileSync(state.filePath, 'utf8');
+                  const __impRe = /^[ \t]*import\b([^;'"]*?)\bfrom\s*(['"])([^'"]+)\2[ \t]*;?/gm;
+                  const __found = [];
+                  let __m;
+                  while ((__m = __impRe.exec(__origSrc)) !== null) {
+                    const __clause = __m[1];
+                    if (/\bSyAPP\b/.test(__clause)) {
+                      __found.push(`import${__clause}from ${JSON.stringify(syappUrl)};`);
+                    }
+                  }
+                  if (__found.length > 0) {
+                    __syappImportBlock = __found.join('\n') + '\n';
+                  }
+                }
+              } catch (_) { /* keep the default import */ }
+
+              source = __syappImportBlock + source;
             }
           }
 
@@ -24254,6 +24330,66 @@ function levenshteinDistance(str1, str2) {
             const clsM = source.match(/\bclass\s+([A-Za-z_$][\w$]*)\s+extends\s+/);
             if (clsM) source += `\nexport default ${clsM[1]};\n`;
           }
+
+          // ------------------------------------------------------------
+          // MISSING-BINDING AUTOFIX
+          // Packed / re-extracted inline code can reference modules whose
+          // `import` statements were hoisted out of the code string (or
+          // stripped together with the SyAPP import). Add an import for
+          // every well-known name the code USES but neither imports nor
+          // declares:
+          //   • Node built-ins used as `name.`  (fs, path, os, url, ...)
+          //   • named exports of SyAPP.js (e.g. ColorText)
+          // Names already imported/declared in the code are never touched,
+          // so nothing can be declared twice. Best-effort: any failure
+          // here leaves the source exactly as it was.
+          // ------------------------------------------------------------
+          try {
+            const __escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const __isBound = (name) => {
+              const e = __escRe(name);
+              if (new RegExp('\\b(?:const|let|var|class|function\\*?)\\s+' + e + '\\b').test(source)) return true;
+              if (new RegExp('\\b(?:const|let|var)\\s*[\\[{][^=;]*\\b' + e + '\\b').test(source)) return true;
+              const impRe = /^[ \t]*import\b([^;'"]*?)\bfrom\s*['"][^'"]+['"]/gm;
+              let m;
+              while ((m = impRe.exec(source)) !== null) {
+                if (new RegExp('\\b' + e + '\\b').test(m[1])) return true;
+              }
+              return false;
+            };
+
+            const __extraImports = [];
+
+            const __builtinModules = ['fs', 'path', 'os', 'url', 'crypto', 'http', 'https', 'util', 'zlib', 'readline', 'net', 'child_process'];
+            for (const b of __builtinModules) {
+              if (new RegExp('(?<![\\w$.])' + __escRe(b) + '\\s*\\.').test(source) && !__isBound(b)) {
+                __extraImports.push(`import ${b} from ${JSON.stringify(b)};`);
+              }
+            }
+
+            let __selfUrl = null;
+            try { __selfUrl = import.meta.url; } catch (_) {}
+            if (__selfUrl) {
+              try {
+                const __ns = await import(__selfUrl);
+                const __named = [];
+                for (const k of Object.keys(__ns || {})) {
+                  if (k === 'default' || !/^[A-Za-z_$][\w$]*$/.test(k)) continue;
+                  if (new RegExp('(?<![\\w$.])' + __escRe(k) + '\\b').test(source) && !__isBound(k)) {
+                    __named.push(k);
+                  }
+                }
+                if (__named.length > 0) {
+                  __extraImports.push(`import { ${__named.join(', ')} } from ${JSON.stringify(__selfUrl)};`);
+                }
+              } catch (_) { /* SyAPP namespace unavailable — skip named imports */ }
+            }
+
+            if (__extraImports.length > 0) {
+              source = __extraImports.join('\n') + '\n' + source;
+            }
+          } catch (_) { /* autofix is best-effort */ }
+
           fs.writeFileSync(targetFile, source, 'utf8');
         } else {
           return null;
