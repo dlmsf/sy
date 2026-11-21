@@ -3,7 +3,11 @@ import path from 'path';
 import process from 'process';
 import os from 'os';
 import readline from 'readline';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { CodeParser, Selection, CodeEmitter, CLIMenu } from './CodeParser.js';
+
+const execFileAsync = promisify(execFile);
 
 // ============================================================
 //  ANSI escape codes for terminal control
@@ -2879,6 +2883,166 @@ async function runParserMenu(filePath) {
 // ============================================================
 //  Interactive file/directory navigation & selection
 // ============================================================
+async function isGitRepo(dir) {
+    try {
+        await fs.stat(path.join(dir, '.git'));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function findGitReposRecursive(dir, depth, maxDepth, found) {
+    if (depth > maxDepth) return;
+    let entries;
+    try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+        return;
+    }
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        if (entry.name === '.git') continue;
+        if (SEARCH_SKIP_DIRS.has(entry.name)) continue;
+        const fullPath = path.join(dir, entry.name);
+        if (await isGitRepo(fullPath)) found.add(fullPath);
+        await findGitReposRecursive(fullPath, depth + 1, maxDepth, found);
+    }
+}
+
+async function findGitRepos(startDir) {
+    const found = new Set();
+    const resolved = path.resolve(startDir);
+    let dir = resolved;
+    for (let i = 0; i < 8; i++) {
+        if (await isGitRepo(dir)) found.add(dir);
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+    await findGitReposRecursive(resolved, 0, 3, found);
+    return Array.from(found).sort();
+}
+
+async function execGit(args, opts = {}) {
+    const { stdout, stderr } = await execFileAsync('git', args, {
+        maxBuffer: 100 * 1024 * 1024,
+        ...opts,
+    });
+    return { stdout, stderr };
+}
+
+async function getGitBranches(repoPath) {
+    const format = '%(refname:short)|%(committerdate:iso-strict)|%(HEAD)';
+    const { stdout } = await execGit(['-C', repoPath, 'branch', '-a', '--format=' + format]);
+    const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean);
+    const branches = [];
+    const seen = new Set();
+    for (const line of lines) {
+        const parts = line.split('|');
+        const name = parts[0];
+        const dateStr = parts[1];
+        const head = parts[2];
+        if (!name) continue;
+        if (name.indexOf(' -> ') !== -1) continue;
+        if (seen.has(name)) continue;
+        seen.add(name);
+        branches.push({ name, date: dateStr || '', isCurrent: head === '*' });
+    }
+    branches.sort((a, b) => (b.date > a.date ? 1 : b.date < a.date ? -1 : 0));
+    return branches;
+}
+
+async function getGitCommits(repoPath, branch, limit = 1000) {
+    const format = '%H|%an|%ae|%at|%s';
+    const { stdout } = await execGit([
+        '-C', repoPath, 'log', branch,
+        '--max-count=' + limit,
+        '--format=' + format,
+    ]);
+    const lines = stdout.split('\n').filter(Boolean);
+    return lines.map(line => {
+        const p = line.split('|');
+        return {
+            hash: p[0] || '',
+            author: p[1] || '',
+            email: p[2] || '',
+            timestamp: parseInt(p[3], 10) || 0,
+            subject: p[4] || '',
+        };
+    });
+}
+
+async function generateMinimalCommitDiff(repoPath, commitHashes) {
+    if (!commitHashes || commitHashes.length === 0) return '';
+    const oldestFirst = commitHashes.slice().reverse();
+    const oldest = oldestFirst[0];
+    const newest = oldestFirst[oldestFirst.length - 1];
+    try {
+        const { stdout } = await execGit([
+            '-C', repoPath, 'diff', '--unified=0', '--no-color',
+            oldest + '^', newest,
+        ]);
+        if (stdout && stdout.trim()) return stdout;
+    } catch {
+        // fall through
+    }
+    const chunks = [];
+    for (const hash of oldestFirst) {
+        try {
+            const { stdout } = await execGit([
+                '-C', repoPath, 'show', '--format=', '--unified=0', '--no-color', hash,
+            ]);
+            if (stdout && stdout.trim()) chunks.push(stdout);
+        } catch {
+            // skip
+        }
+    }
+    return chunks.join('\n');
+}
+
+async function isStructGeneratedTmpFile(filePath) {
+    const base = path.basename(filePath);
+    if (base === 'struct_last.json') return true;
+    if (/^struct_commits_\d+\.diff$/.test(base)) return true;
+    if (/^struct_/.test(base)) return true;
+    if (base.endsWith('.json') || !path.extname(base)) {
+        try {
+            const content = await fs.readFile(filePath, 'utf8');
+            const parsed = JSON.parse(content);
+            if (parsed && typeof parsed === 'object' && Array.isArray(parsed.files)) return true;
+        } catch {
+            // not ours
+        }
+    }
+    return false;
+}
+
+async function listStructGeneratedTmpFiles() {
+    const tmpDir = os.tmpdir();
+    let entries;
+    try {
+        entries = await fs.readdir(tmpDir, { withFileTypes: true });
+    } catch {
+        return [];
+    }
+    const results = [];
+    for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const fullPath = path.join(tmpDir, entry.name);
+        if (!await isStructGeneratedTmpFile(fullPath)) continue;
+        let stats;
+        try {
+            stats = await fs.stat(fullPath);
+        } catch {
+            continue;
+        }
+        results.push({ path: fullPath, name: entry.name, size: stats.size, mtime: stats.mtimeMs });
+    }
+    results.sort((a, b) => b.mtime - a.mtime);
+    return results;
+}
+
 async function interactiveMode(initialState = null) {
     const originalRawMode = process.stdin.isRaw;
 
@@ -3018,7 +3182,7 @@ async function interactiveMode(initialState = null) {
         }
         
         console.log('─'.repeat(process.stdout.columns || 80));
-        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, G gen, C customize, P gen+request, b back, q quit`);
+        console.log(`${BOLD}Navigation:${RESET} ↑/↓ move, PgUp/PgDn page, Enter open/select, Space toggle, a current, A recursive, I with imports, l list, f find, s commits, t tmp, G gen, C customize, P gen+request, b back, q quit`);
         console.log('─'.repeat(process.stdout.columns || 80));
 
         visibleEntries.forEach((entry, index) => {
@@ -4796,6 +4960,232 @@ async function interactiveMode(initialState = null) {
         });
     }
 
+    async function showCommitSelectionFlow() {
+        clearScreen();
+        console.log(`${BOLD}${GREEN}=== SELECT COMMITS FROM GIT ===${RESET}\n`);
+
+        const repos = await findGitRepos(process.cwd());
+        if (repos.length === 0) {
+            console.log(`${YELLOW}No .git repositories found near ${process.cwd()}${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+
+        console.log(`Found ${repos.length} git repository(ies):\n`);
+        repos.forEach((r, i) => console.log(`  ${i + 1}. ${r}`));
+        const repoChoice = await askQuestion(`\nSelect repo (1-${repos.length}, empty to cancel):`);
+        if (!repoChoice || repoChoice.trim() === '') return;
+        const repoIdx = parseInt(repoChoice, 10);
+        if (isNaN(repoIdx) || repoIdx < 1 || repoIdx > repos.length) {
+            console.log(`${RED}Invalid choice.${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+        const repoPath = repos[repoIdx - 1];
+
+        let branches;
+        try {
+            branches = await getGitBranches(repoPath);
+        } catch (err) {
+            console.log(`${RED}Failed to list branches: ${err.message}${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+        if (branches.length === 0) {
+            console.log(`${YELLOW}No branches found.${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+
+        console.log(`\nBranches in ${repoPath}:\n`);
+        branches.forEach((b, i) => {
+            const marker = b.isCurrent ? ` ${GREEN}(current)${RESET}` : '';
+            console.log(`  ${i + 1}. ${b.name}${marker}`);
+        });
+        const branchChoice = await askQuestion(`\nSelect branch (1-${branches.length}, empty to cancel):`);
+        if (!branchChoice || branchChoice.trim() === '') return;
+        const branchIdx = parseInt(branchChoice, 10);
+        if (isNaN(branchIdx) || branchIdx < 1 || branchIdx > branches.length) {
+            console.log(`${RED}Invalid choice.${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+        const branchName = branches[branchIdx - 1].name;
+
+        let commits;
+        try {
+            commits = await getGitCommits(repoPath, branchName, 1000);
+        } catch (err) {
+            console.log(`${RED}Failed to list commits: ${err.message}${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+        if (commits.length === 0) {
+            console.log(`${YELLOW}No commits found.${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+
+        const PAGE_SIZE = 20;
+        let pageIndex = 0;
+        const totalPages = Math.ceil(commits.length / PAGE_SIZE);
+        const selectedHashes = new Set();
+
+        while (true) {
+            clearScreen();
+            console.log(`${BOLD}${GREEN}=== SELECT COMMITS ===${RESET}`);
+            console.log(`${BOLD}Repo:${RESET} ${YELLOW}${repoPath}${RESET}  ${BOLD}Branch:${RESET} ${YELLOW}${branchName}${RESET}`);
+            console.log(`${BOLD}Page ${pageIndex + 1}/${totalPages} | Selected: ${selectedHashes.size} commit(s)${RESET}`);
+            console.log('-'.repeat(60));
+
+            const pageStart = pageIndex * PAGE_SIZE;
+            const pageCommits = commits.slice(pageStart, pageStart + PAGE_SIZE);
+            pageCommits.forEach((c, i) => {
+                const actualIndex = pageStart + i;
+                const mark = selectedHashes.has(c.hash) ? `${GREEN}(*)${RESET}` : '( )';
+                const shortHash = c.hash.substring(0, 8);
+                const date = new Date(c.timestamp * 1000).toISOString().substring(0, 16).replace('T', ' ');
+                console.log(`  ${mark} ${actualIndex + 1}. ${YELLOW}${shortHash}${RESET} ${date} ${c.subject}`);
+            });
+            console.log('-'.repeat(60));
+
+            const prompt = 'Enter: numbers (1,3,5 or 2-4) | all | none | next | prev | done | cancel';
+            const input = await askQuestion(`\n${prompt}:`);
+            if (!input || input.trim() === '') continue;
+            const cmd = input.trim().toLowerCase();
+
+            if (cmd === 'cancel' || cmd === 'q') return;
+            if (cmd === 'done' || cmd === 'd') {
+                if (selectedHashes.size === 0) {
+                    console.log(`${YELLOW}No commits selected - nothing to do.${RESET}`);
+                    await askQuestion('Press Enter to continue...');
+                    continue;
+                }
+                break;
+            }
+            if (cmd === 'next' || cmd === 'n') {
+                if (pageIndex < totalPages - 1) pageIndex++;
+                continue;
+            }
+            if (cmd === 'prev' || cmd === 'p') {
+                if (pageIndex > 0) pageIndex--;
+                continue;
+            }
+            if (cmd === 'all' || cmd === 'a') {
+                for (const c of pageCommits) selectedHashes.add(c.hash);
+                continue;
+            }
+            if (cmd === 'none') {
+                for (const c of pageCommits) selectedHashes.delete(c.hash);
+                continue;
+            }
+
+            const idxs = parseIndexes(input, pageCommits.length);
+            if (idxs.length === 0) {
+                console.log(`${RED}Invalid input.${RESET}`);
+                await askQuestion('Press Enter to continue...');
+                continue;
+            }
+            for (const i of idxs) {
+                const commit = pageCommits[i];
+                if (selectedHashes.has(commit.hash)) selectedHashes.delete(commit.hash);
+                else selectedHashes.add(commit.hash);
+            }
+        }
+
+        const selectedArray = commits.filter(c => selectedHashes.has(c.hash)).map(c => c.hash);
+
+        console.log(`\nGenerating diff for ${selectedArray.length} commit(s)...`);
+        let diffText;
+        try {
+            diffText = await generateMinimalCommitDiff(repoPath, selectedArray);
+        } catch (err) {
+            console.log(`${RED}Failed: ${err.message}${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+
+        if (!diffText || !diffText.trim()) {
+            console.log(`${YELLOW}Empty diff.${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+
+        const diffPath = path.join(os.tmpdir(), `struct_commits_${Date.now()}.diff`);
+        await fs.writeFile(diffPath, diffText, 'utf8');
+        await selectFile(diffPath);
+
+        console.log(`\n${GREEN}(*) Diff written: ${diffPath}${RESET}`);
+        console.log(`${GREEN}(*) Size: ${formatNumber(diffText.length)} characters${RESET}`);
+        console.log(`${GREEN}(*) Added to selection (${selectedFiles.size} file(s) total).${RESET}`);
+        await askQuestion('Press Enter to return...');
+    }
+
+    async function showStructGeneratedFiles() {
+        clearScreen();
+        console.log(`${BOLD}${GREEN}=== STRUCT-GENERATED FILES IN /tmp ===${RESET}\n`);
+
+        const files = await listStructGeneratedTmpFiles();
+        if (files.length === 0) {
+            console.log(`${YELLOW}No struct-generated files found in ${os.tmpdir()}${RESET}`);
+            await askQuestion('Press Enter to return...');
+            return;
+        }
+
+        const toggleState = new Set();
+        for (const f of files) {
+            if (selectedFiles.has(f.path)) toggleState.add(f.path);
+        }
+
+        console.log(`Found ${files.length} file(s) in ${os.tmpdir()}:\n`);
+        files.forEach((f, i) => {
+            const mark = toggleState.has(f.path) ? `${GREEN}(*)${RESET}` : '( )';
+            const sizeStr = f.size < 1024 ? `${f.size} B` : `${(f.size / 1024).toFixed(1)} KB`;
+            const time = new Date(f.mtime).toISOString().substring(0, 16).replace('T', ' ');
+            console.log(`  ${mark} ${i + 1}. ${f.name}  (${sizeStr}, ${time})`);
+        });
+
+        const input = await askQuestion('\nNumbers to toggle (1,3,5 or 2-4 | all | none | empty=cancel):');
+        if (!input || input.trim() === '') return;
+        const cmd = input.trim().toLowerCase();
+
+        if (cmd === 'all' || cmd === 'a') {
+            for (const f of files) toggleState.add(f.path);
+        } else if (cmd === 'none' || cmd === 'n') {
+            toggleState.clear();
+        } else {
+            const idxs = parseIndexes(input, files.length);
+            if (idxs.length === 0) {
+                console.log(`${RED}Invalid input.${RESET}`);
+                await askQuestion('Press Enter to return...');
+                return;
+            }
+            for (const i of idxs) {
+                const f = files[i];
+                if (toggleState.has(f.path)) toggleState.delete(f.path);
+                else toggleState.add(f.path);
+            }
+        }
+
+        let added = 0;
+        let removed = 0;
+        for (const f of files) {
+            const shouldBe = toggleState.has(f.path);
+            const isSel = selectedFiles.has(f.path);
+            if (shouldBe && !isSel) {
+                await selectFile(f.path);
+                added++;
+            } else if (!shouldBe && isSel) {
+                deselectFile(f.path);
+                removed++;
+            }
+        }
+
+        console.log(`\n${GREEN}Applied: ${added} added, ${removed} removed.${RESET}`);
+        console.log(`${BOLD}Selection now: ${selectedFiles.size} file(s).${RESET}`);
+        await askQuestion('Press Enter to return...');
+    }
+
     const onKeypress = async (key) => {
         const maxEntries = getMaxEntries();
 
@@ -5208,6 +5598,28 @@ async function interactiveMode(initialState = null) {
             });
 
             cleanupAndExit(0);
+            return;
+        }
+
+        if (key === 's' || key === 'S') {
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+            await showCommitSelectionFlow();
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
+            return;
+        }
+
+        if (key === 't' || key === 'T') {
+            process.stdin.removeListener('data', onKeypress);
+            process.stdin.setRawMode(false);
+            await showStructGeneratedFiles();
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('data', onKeypress);
+            render();
             return;
         }
 
