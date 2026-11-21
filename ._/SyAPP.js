@@ -20734,7 +20734,10 @@ function levenshteinDistance(str1, str2) {
         togglePathMode:  `${nsKey}_togglePathMode`,
         // NEW: background-run-mode props
         toggleRunMode:   `${nsKey}_togglerunmode`,
-        restartBg:       `${nsKey}_restartbg`
+        restartBg:       `${nsKey}_restartbg`,
+        // NEW: shows/hides the embedded func's this.EmbOutput() value in
+        // the dropdown button text (ON by default)
+        toggleEmbOutput: `${nsKey}_toggleembout`
       };
 
       // ------------------------------------------------------------------
@@ -20883,6 +20886,9 @@ function levenshteinDistance(str1, str2) {
           // NEW: run mode (bg vs normal), sourced EXCLUSIVELY from the
           // call-site config so the widget is 100% driven by the file.
           runMode: (cfg.runMode === 'normal' || cfg.runMode === 'bg') ? cfg.runMode : 'bg',
+          // NEW: show the embedded func's this.EmbOutput() value in the
+          // dropdown text. ON by default; `embOutput: false` disables it.
+          outputEnabled: cfg.embOutput !== false,
           autoApplyArgToDropdown: false
         };
 
@@ -22375,6 +22381,47 @@ function levenshteinDistance(str1, str2) {
         this.Storages.Set(id, storageKey, state);
       }
 
+      // ---------------- EmbOutput toggle ----------------
+      if (curProps[P.toggleEmbOutput]) {
+        delete curProps[P.toggleEmbOutput];
+        state.outputEnabled = (state.outputEnabled === false);
+        this.Storages.Set(id, storageKey, state);
+        if (outerFilePath) { try { _embDiskSave(outerFilePath, diskKey, state); } catch (_) {} }
+        __embPersistArgsToHost();
+        this.Alert(id,
+          `📡 Embedded output: ${state.outputEnabled ? 'ON' : 'OFF'}`,
+          { duration: 1800 });
+      }
+
+      // ---------------- EmbOutput value ----------------
+      // Value published by the embedded func through this.EmbOutput():
+      //   • bg mode     → read from the channel file of the background
+      //                   process (rewritten by the child whenever its
+      //                   value changes, so every render sees the latest);
+      //   • inline mode → read from the instance that just ran.
+      let __embOutputText = '';
+      if (state.outputEnabled !== false) {
+        try {
+          let rawOutput = '';
+          if (state.runMode === 'bg') {
+            const outFile = state.bgProcess && state.bgProcess.outputFile;
+            if (outFile) {
+              const parsedOut = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+              if (parsedOut && typeof parsedOut.value === 'string') rawOutput = parsedOut.value;
+            }
+          } else if (embedded && embedded._embOutputInline &&
+                     typeof embedded._embOutputInline.value === 'string') {
+            rawOutput = embedded._embOutputInline.value;
+          }
+          __embOutputText = String(rawOutput).replace(/[\r\n]+/g, ' ').trim();
+        } catch (_) { __embOutputText = ''; }
+      }
+      const __embJoin = (base) => {
+        const b = String(base == null ? '' : base);
+        if (!__embOutputText) return b;
+        return b ? `${b} | ${__embOutputText}` : __embOutputText;
+      };
+
       await this.DropDown(id, `${storageKey}_mgmt`, async () => {
         // ---------------- SETUP view (no source yet) ----------------
         if (state.source === 'none') {
@@ -22625,6 +22672,17 @@ function levenshteinDistance(str1, str2) {
           });
         }
 
+        // EmbOutput on/off — ON by default for every new this.Emb().
+        this.Text(id, ' ');
+        this.Text(id, ColorText.dim('Embedded output (this.EmbOutput):'));
+        this.Button(id, {
+          name: state.outputEnabled !== false
+            ? ColorText.bgGreen(ColorText.black(' ✓ Output: ON ')) +
+              (__embOutputText ? ColorText.dim(`  ${_fit(__embOutputText, 30)}`) : '')
+            : ColorText.dim('○ Output: OFF'),
+          props: { [P.toggleEmbOutput]: true }
+        });
+
         const snippet = state.saveMode === 'inline'
           ? this._embSnippetInline(state, cfg)
           : this._embSnippetPath(state, cfg);
@@ -22655,13 +22713,148 @@ function levenshteinDistance(str1, str2) {
           props: { [P.clear]: true }
         });
       }, {
-        up_buttontext: state.dropdown.up_buttontext,
-        down_buttontext: state.dropdown.down_buttontext,
+        up_buttontext: __embJoin(state.dropdown.up_buttontext),
+        down_buttontext: __embJoin(state.dropdown.down_buttontext),
         up_emoji: state.dropdown.up_emoji,
         down_emoji: state.dropdown.down_emoji
       });
 
       return embedded;
+    };
+
+    // --------------------------- EmbOutput Method ---------------------------
+
+    /**
+     * Last value published through this.EmbOutput(), per session/build id.
+     * Used to avoid replacing (and re-publishing) a value that did not change.
+     * @type {Map<string, string>}
+     * @private
+     */
+    this._embOutputValues = new Map();
+
+    /**
+     * Inline link. Set by this.Emb() (see _embRunInline) on the instance of
+     * an embedded func that runs in the SAME process as its parent, so the
+     * parent can read the value right after the embedded build finishes.
+     * @type {{value: (string|undefined)}|null}
+     * @private
+     */
+    this._embOutputInline = null;
+
+    /**
+     * Publish a short text from an EMBEDDED func to the this.Emb() widget
+     * of its parent func. The parent appends it to the widget's dropdown
+     * button, both collapsed and expanded:
+     *
+     *     ▶ ◈ Embed | <value>      /      ▼ Hide Embed | <value>
+     *
+     * It can be called at any time (inside the build function or later from
+     * background code), so the parent follows the value in real time when
+     * the embedded func runs as a background process (default Emb mode).
+     *
+     * Behaviour:
+     *   • FALLBACK: when this func is not linked to any this.Emb() (not
+     *     spawned by one and not run inline by one) nothing happens.
+     *   • The last value is kept in a property of the class
+     *     (`_embOutputValues`); the same value is never replaced again.
+     *   • A different value replaces the previous one immediately.
+     *
+     * @param {string} id - User/build ID
+     * @param {string} value - Text to show in the parent's Emb dropdown
+     * @returns {boolean} true when a new value was published
+     */
+    this.EmbOutput = (id, value) => {
+      const inlineLink = this._embOutputInline;
+      const outputFile = process.env.SYAPP_EMB_OUTPUT_FILE;
+
+      // Fallback: not linked to a this.Emb() — do nothing.
+      if (!inlineLink && !outputFile) return false;
+
+      const text = (value === undefined || value === null) ? '' : String(value);
+
+      // Same value → nothing to replace.
+      if (this._embOutputValues.has(id) && this._embOutputValues.get(id) === text) return false;
+
+      // Same-process embedding: hand the value to the parent directly.
+      if (inlineLink) {
+        inlineLink.value = text;
+        this._embOutputValues.set(id, text);
+        return true;
+      }
+
+      // Background-process embedding: publish through the channel file the
+      // parent created for this process. Written to a temp file and renamed
+      // so the parent can never read a half-written value.
+      try {
+        const dir = path.dirname(outputFile);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const tmpFile = `${outputFile}.${process.pid}.tmp`;
+        fs.writeFileSync(tmpFile, JSON.stringify({ value: text, updatedAt: Date.now() }), 'utf8');
+        fs.renameSync(tmpFile, outputFile);
+        this._embOutputValues.set(id, text);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    /**
+     * Start watching an EmbOutput channel file so the owner func redraws
+     * when the background child publishes a new value.
+     *
+     * Only needed when this func is NOT already redrawn by the refresh
+     * ticker; otherwise reading the file at render time is enough and no
+     * watcher is created.
+     * @private
+     */
+    this._embWatchOutput = (outputFile) => {
+      try {
+        const syapp = this._syappInstance;
+        if (!outputFile || !syapp || typeof syapp._shouldRefreshFunction !== 'function') return;
+        if (syapp._shouldRefreshFunction(this.Name)) return;
+
+        fs.watchFile(outputFile, { persistent: false, interval: 250 }, () => {
+          try {
+            const session = syapp.Sessions.get(syapp.MainSessionID);
+            if (!session || session.InAction) return;
+            if (session.ActualPath !== this.Name) return;
+            if (syapp.HUD && syapp.HUD.isEditing) return;
+            const page = session.ActualProps && session.ActualProps.page;
+            syapp.LoadScreen(this.Name, {
+              props: page
+                ? { page, _isRefresh: true, _resizeRedraw: true }
+                : { _isRefresh: true, _resizeRedraw: true },
+              resetSelection: false
+            }).catch(() => {});
+          } catch (_) { /* a watcher callback must never break the host */ }
+        });
+      } catch (_) { /* best-effort */ }
+    };
+
+    /**
+     * Create the EmbOutput channel file path for a new background process,
+     * dropping the channel of the process it replaces. Never throws.
+     * @param {Object|null} previous - Previous bgProcess record (if any)
+     * @returns {string|null} Channel file path, or null on failure
+     * @private
+     */
+    this._embCreateOutputChannel = (previous) => {
+      try {
+        if (previous && previous.outputFile) {
+          try { fs.unwatchFile(previous.outputFile); } catch (_) {}
+          try { fs.unlinkSync(previous.outputFile); } catch (_) {}
+        }
+        const dir = path.join(os.tmpdir(), 'syapp_emb_output');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(
+          dir,
+          `emb_${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.json`
+        );
+        this._embWatchOutput(file);
+        return file;
+      } catch (_) {
+        return null;
+      }
     };
 
     // --------------------------- Connection Method ---------------------------
@@ -24071,11 +24264,29 @@ function levenshteinDistance(str1, str2) {
 
       try {
         try { SyPM.cleanup(); } catch (_) {}
-        const entry = SyPM.exec(cmd, {
-          name: processName,
-          workingDir: process.cwd(),
-          uniqueNameLock: true
-        });
+
+        // EmbOutput channel: the child inherits SYAPP_EMB_OUTPUT_FILE only
+        // for THIS spawn (the previous value is restored right after, so a
+        // process that is itself an embedded child keeps its own channel).
+        const __embOutFile = this._embCreateOutputChannel(existing);
+        const __prevEmbOutEnv = process.env.SYAPP_EMB_OUTPUT_FILE;
+        if (__embOutFile) process.env.SYAPP_EMB_OUTPUT_FILE = __embOutFile;
+        else delete process.env.SYAPP_EMB_OUTPUT_FILE;
+
+        let entry;
+        try {
+          entry = SyPM.exec(cmd, {
+            name: processName,
+            workingDir: process.cwd(),
+            uniqueNameLock: true
+          });
+        } catch (execErr) {
+          if (__embOutFile) { try { fs.unwatchFile(__embOutFile); } catch (_) {} }
+          throw execErr;
+        } finally {
+          if (__prevEmbOutEnv === undefined) delete process.env.SYAPP_EMB_OUTPUT_FILE;
+          else process.env.SYAPP_EMB_OUTPUT_FILE = __prevEmbOutEnv;
+        }
         SyPortLock.reassign(port, entry.pid, processName);
 
         const argsKey = JSON.stringify(Array.isArray(state.args) ? state.args : []);
@@ -24088,6 +24299,8 @@ function levenshteinDistance(str1, str2) {
           pid: entry.pid,
           port,
           name: processName,
+          // EmbOutput channel file the child publishes to (read by this.Emb()).
+          outputFile: __embOutFile,
           // Persist the log path so the "not reachable" error path below
           // can surface the child's actual crash message to the user
           // instead of a bare "[object Object]". SyPM.exec already
@@ -24161,6 +24374,9 @@ function levenshteinDistance(str1, str2) {
     this._embRunInline = async (parentId, EmbClass, cfg) => {
       const instance = new EmbClass();
       instance._syappInstance = this._syappInstance;
+      // Link for this.EmbOutput(): lets the parent Emb read the value the
+      // embedded func publishes during this inline run.
+      instance._embOutputInline = { value: undefined };
 
       // ------------------------------------------------------------------
       // NEW: Run the embedded func's SyAPPInit hook if it hasn't already
@@ -24312,6 +24528,11 @@ function levenshteinDistance(str1, str2) {
       if (state.runMode === 'normal') {
         lines.push(`  runMode: 'normal',`);
       }
+      // Persist the EmbOutput toggle only when it was turned OFF
+      // (ON is the default).
+      if (state.outputEnabled === false) {
+        lines.push(`  embOutput: false,`);
+      }
       // Emit only non-default dropdown text/emoji, so an untouched
       // widget's source stays byte-for-byte identical.
       const ddOut = {};
@@ -24437,6 +24658,9 @@ function levenshteinDistance(str1, str2) {
       }
       if (state.runMode === 'normal') {
         lines.push(`  runMode: 'normal',`);
+      }
+      if (state.outputEnabled === false) {
+        lines.push(`  embOutput: false,`);
       }
       const ddOut = {};
       if (state.dropdown && typeof state.dropdown === 'object') {
@@ -31382,6 +31606,7 @@ function _genFuncJS(state, syappRelPath) {
           cfg.saveMode = mode
           if (it.pathMode === 'relative') cfg.pathMode = 'relative'
           if (it.runMode === 'normal') cfg.runMode = 'normal'
+          if (it.embOutput === false) cfg.embOutput = false
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           L.push(`${indent}await this.Emb(id, ${JSON.stringify(cfg)})`)
@@ -34452,6 +34677,7 @@ class SelfBuilder extends SyAPP_Func {
           if (it.code) cfg.code = it.code
           if (it.pathMode === 'relative') cfg.pathMode = 'relative'
           if (it.runMode === 'normal') cfg.runMode = 'normal'
+          if (it.embOutput === false) cfg.embOutput = false
           if (Array.isArray(it.args) && it.args.length > 0) cfg.args = it.args.slice()
           if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
           await this.Emb(id, cfg)
@@ -34484,6 +34710,10 @@ class SelfBuilder extends SyAPP_Func {
               // round-trip preserves the user's bg ↔ same-process
               // choice.
               if (st.runMode === 'normal' || st.runMode === 'bg') it.runMode = st.runMode;
+              // Sync the EmbOutput toggle (ON by default) so the
+              // SelfBuilder export / re-parse round-trip keeps it.
+              if (st.outputEnabled === false) it.embOutput = false;
+              else if (st.outputEnabled === true) it.embOutput = true;
               // Sync the widget's dropdown text/emoji back to the item
               // (non-default values only), so _genFuncJS emits them when
               // the SelfBuilder exports / saves. Without this, edits made
@@ -35678,6 +35908,8 @@ function _sbCallToItem(call, sessionVar) {
         // Run mode (bg process vs same process). Defaults to 'bg'
         // when the source does not carry an explicit value.
         runMode: (cfg.runMode === 'normal') ? 'normal' : 'bg',
+        // EmbOutput display toggle (ON unless explicitly `embOutput: false`).
+        embOutput: cfg.embOutput === false ? false : true,
         dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
           ? cfg.dropdown
           : {},
@@ -36391,6 +36623,12 @@ const _STREAM_DEFAULT_HOST = 'localhost'
 function _embKillBackgroundProcess(bg) {
   if (!bg) return;
 
+  // Drop the EmbOutput channel of this process.
+  if (bg.outputFile) {
+    try { fs.unwatchFile(bg.outputFile); } catch (_) {}
+    try { fs.unlinkSync(bg.outputFile); } catch (_) {}
+  }
+
   // PREFERRED PATH — SyPM.hardKill(bg.id) with locks DISABLED.
   //
   // This is the in-place teardown used by Emb's ✕ Clear button, the
@@ -36479,6 +36717,11 @@ function _embCollectAllBackgroundRecords(syapp) {
 function _embKillAllBackgroundChildren(syapp) {
   const records = _embCollectAllBackgroundRecords(syapp);
   for (const { bg } of records) {
+    // Drop the EmbOutput channel of this process.
+    if (bg.outputFile) {
+      try { fs.unwatchFile(bg.outputFile); } catch (_) {}
+      try { fs.unlinkSync(bg.outputFile); } catch (_) {}
+    }
     // HARD KILL — lock-free. This is the exit-cascade path (Ctrl+C,
     // SIGTERM, SIGHUP). It does NOT write any persistent locks, so a
     // future SyAPP run reuses the same Emb names without needing an
@@ -37750,6 +37993,12 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting, stripCo
     const pmM = body.match(/(?:^|[{,\s])["']?pathMode["']?\s*:\s*(["'`])([^"'`]+)\1/);
     const embPathMode = (pmM && (pmM[2] === 'global' || pmM[2] === 'relative')) ? pmM[2] : 'global';
 
+    // EmbOutput toggle: only an explicit `embOutput: false` of THIS call
+    // (template contents of nested `code:` blobs are ignored).
+    const eoM = tempFunc._embStripTemplateContents(body)
+      .match(/(?:^|[{,\s])["']?embOutput["']?\s*:\s*false\b/);
+    const embOutputEnabled = !eoM;
+
     // --- Decide: is this call ALREADY inline? ---
     // Following the exact rule the widget itself uses:
     //   • saveMode === 'path'                                → path
@@ -37781,6 +38030,7 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting, stripCo
         saveMode: 'inline',
         pathMode: embPathMode,
         runMode: embRunMode,
+        outputEnabled: embOutputEnabled,
         args: embArgs,
         dropdown: embDropdown
       };
@@ -37854,6 +38104,7 @@ async function _packInlineEmbInSource(src, hostFile, tempFunc, visiting, stripCo
         saveMode: 'inline',
         pathMode: embPathMode,
         runMode: embRunMode,
+        outputEnabled: embOutputEnabled,
         args: embArgs,
         dropdown: embDropdown
       };
