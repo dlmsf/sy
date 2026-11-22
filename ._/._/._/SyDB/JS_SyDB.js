@@ -3270,7 +3270,7 @@ class JS_SyDB {
 
 export default JS_SyDB;
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (process.argv[1] === fileURLToPath(import.meta.url) && (process.argv.length > 2 || !path.basename(process.argv[1]).startsWith('sypm'))) {
     const sydb = new JS_SyDB();
     sydb.runCommand(process.argv).then(code => {
         if (code !== undefined && typeof code === 'number') {
