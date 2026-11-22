@@ -39,6 +39,8 @@ export function JStoString(jsFilePath, outputFilePath, options = {}) {
         validateJS: false,
         encoding: 'utf8',
         backupOriginal: false,
+        updateExisting: false,
+        autoConfirm: false,
         ...options
     };
 
@@ -52,6 +54,11 @@ export function JStoString(jsFilePath, outputFilePath, options = {}) {
 
         // Advanced escaping for JavaScript code in template string
         const escapedJSCode = escapeJSForTemplateString(jsCode, defaultOptions.minify);
+
+        // Optional: update an existing wrapper file in place (const/let/var string values only)
+        if (defaultOptions.updateExisting) {
+            return updateExistingWrapper(outputFilePath, escapedJSCode, jsFilePath, defaultOptions);
+        }
 
         // Create backup if requested
         if (defaultOptions.backupOriginal && fs.existsSync(outputFilePath)) {
@@ -316,12 +323,31 @@ function runCLI() {
         outputFilePath += '.js';
     }
     
+    // Determine whether to use update mode on the second argument
+    const forceUpdate = args.includes('--update');
+    const forceOutput = args.includes('--force-output');
+    let useUpdate = forceUpdate;
+
+    if (!forceUpdate && !forceOutput && args[1] && fs.existsSync(outputFilePath)) {
+        try {
+            const targetContent = fs.readFileSync(outputFilePath, 'utf8');
+            // Looks like a wrapper file if it has a const/let/var = `...` declaration
+            if (/(?:const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*`/.test(targetContent)) {
+                useUpdate = true;
+            }
+        } catch (e) {
+            // On read error, fall back to output mode
+        }
+    }
+    
     const options = {
         minify: args.includes('--minify'),
         addHeaders: !args.includes('--no-headers'),
         validateJS: args.includes('--validate'),
         backupOriginal: args.includes('--backup'),
-        constName: getOptionValue(args, '--name')
+        constName: getOptionValue(args, '--name'),
+        updateExisting: useUpdate,
+        autoConfirm: args.includes('--yes') || args.includes('-y')
     };
     
     try {
@@ -344,6 +370,175 @@ function getOptionValue(args, optionName) {
 }
 
 /**
+ * Updates an existing wrapper file in place.
+ * Finds const/let/var declarations whose template-string value is similar to
+ * the newly escaped source content, asks the user (or auto-confirms), and
+ * replaces ONLY the template string content. The variable name and every
+ * other part of the file are left byte-for-byte intact.
+ */
+export function updateExistingWrapper(targetFile, newEscapedContent, sourceJsPath, options = {}) {
+    if (!fs.existsSync(targetFile)) {
+        throw new Error(`Target file for update not found: ${targetFile}`);
+    }
+
+    const targetContent = fs.readFileSync(targetFile, options.encoding || 'utf8');
+
+    // Match: (const|let|var) <name> = `...`
+    // Content group handles escaped backslashes / backticks correctly.
+    const regex = /((?:const|let|var)\s+[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*`)((?:\\.|[^`\\])*)(`)/g;
+
+    const matches = [];
+    let match;
+    while ((match = regex.exec(targetContent)) !== null) {
+        const fullMatch = match[0];
+        const prefix = match[1];
+        const oldContent = match[2];
+        const closingBacktick = match[3];
+
+        const nameMatch = /(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/.exec(prefix);
+        const varName = nameMatch ? nameMatch[1] : 'unknown';
+
+        const sim = calculateStringSimilarity(oldContent, newEscapedContent);
+
+        matches.push({
+            start: match.index,
+            end: match.index + fullMatch.length,
+            prefix,
+            oldContent,
+            closingBacktick,
+            varName,
+            similarity: sim
+        });
+    }
+
+    if (matches.length === 0) {
+        console.log(`ℹ️  No const/let/var template-string declarations found in ${targetFile}. Nothing to update.`);
+        return {
+            success: true,
+            updated: false,
+            reason: 'no-declarations',
+            targetFile
+        };
+    }
+
+    const SIMILARITY_THRESHOLD = 0.3;
+    const autoConfirm = !!options.autoConfirm;
+    const replacements = [];
+
+    console.log(`🔍 Found ${matches.length} template-string declaration(s) in ${targetFile}`);
+
+    for (const m of matches) {
+        if (m.similarity < SIMILARITY_THRESHOLD) {
+            console.log(`⏭️  Skipping '${m.varName}' (similarity ${(m.similarity * 100).toFixed(1)}% < ${(SIMILARITY_THRESHOLD * 100).toFixed(0)}%)`);
+            continue;
+        }
+
+        let shouldReplace = false;
+        if (autoConfirm) {
+            shouldReplace = true;
+            console.log(`✅ Auto-replacing '${m.varName}' (similarity ${(m.similarity * 100).toFixed(1)}%)`);
+        } else {
+            const answer = syncPrompt(`Replace content of '${m.varName}' in ${targetFile}? (similarity ${(m.similarity * 100).toFixed(1)}%) [y/N] `);
+            shouldReplace = /^(y|yes)$/i.test(answer.trim());
+            if (!shouldReplace) {
+                console.log(`   Skipped '${m.varName}'`);
+            }
+        }
+
+        if (shouldReplace) {
+            replacements.push(m);
+        }
+    }
+
+    if (replacements.length === 0) {
+        console.log(`ℹ️  No replacements selected. ${targetFile} unchanged.`);
+        return {
+            success: true,
+            updated: false,
+            reason: 'no-selection',
+            targetFile
+        };
+    }
+
+    // Create backup if requested
+    if (options.backupOriginal) {
+        const backupPath = targetFile + '.backup';
+        fs.copyFileSync(targetFile, backupPath);
+    }
+
+    // Apply replacements from end to start so earlier offsets stay valid
+    let newTargetContent = targetContent;
+    const sortedReplacements = [...replacements].sort((a, b) => b.start - a.start);
+    for (const r of sortedReplacements) {
+        const newText = r.prefix + newEscapedContent + r.closingBacktick;
+        newTargetContent = newTargetContent.slice(0, r.start) + newText + newTargetContent.slice(r.end);
+    }
+
+    fs.writeFileSync(targetFile, newTargetContent, options.encoding || 'utf8');
+    fs.chmodSync(targetFile, 0o644);
+
+    console.log(`✅ Updated ${replacements.length} variable(s) in ${targetFile}`);
+    replacements.forEach(r => console.log(`   - ${r.varName}`));
+
+    return {
+        success: true,
+        updated: true,
+        targetFile,
+        sourceFile: sourceJsPath,
+        replacedVariables: replacements.map(r => r.varName),
+        replacedCount: replacements.length,
+        originalSize: targetContent.length,
+        newSize: newTargetContent.length
+    };
+}
+
+/**
+ * Jaccard similarity on character bigrams (same idea as Replacer.js)
+ */
+function calculateStringSimilarity(str1, str2) {
+    if (str1 === str2) return 1;
+    if (!str1 || !str2) return 0;
+
+    const bigrams = (str) => {
+        const grams = new Set();
+        for (let i = 0; i < str.length - 1; i++) {
+            grams.add(str.slice(i, i + 2));
+        }
+        return grams;
+    };
+
+    const s1 = bigrams(str1);
+    const s2 = bigrams(str2);
+    const intersection = new Set([...s1].filter(x => s2.has(x)));
+    const union = new Set([...s1, ...s2]);
+    return union.size === 0 ? 1 : intersection.size / union.size;
+}
+
+/**
+ * Minimal synchronous prompt (reads one line from stdin, fd 0)
+ */
+function syncPrompt(question) {
+    process.stdout.write(question);
+    let line = '';
+    const buf = Buffer.alloc(1);
+    let safety = 0;
+    while (safety < 65536) {
+        safety++;
+        let bytesRead;
+        try {
+            bytesRead = fs.readSync(0, buf, 0, 1, null);
+        } catch (e) {
+            break;
+        }
+        if (bytesRead === 0) break;
+        const ch = buf.toString('utf8', 0, 1);
+        if (ch === '\n') break;
+        if (ch !== '\r') line += ch;
+    }
+    return line;
+}
+
+/**
  * Show CLI help
  */
 function showHelp() {
@@ -355,6 +550,8 @@ Convert JS files to JavaScript modules with the JS code as template strings.
 Arguments:
   input.js                Path to the input JS file (required)
   output.js               Path to the output JS file (optional, defaults to wrapped_<input>.js)
+                          If this file already exists and contains template-string variable
+                          declarations, it will be updated in place (see --update / --force-output).
 
 Options:
   --minify                Minify the JS code before embedding
@@ -362,6 +559,11 @@ Options:
   --validate              Perform basic JS syntax validation
   --backup                Create backup of output file if it exists
   --name <constName>      Custom constant name for the wrapped code
+  --update                Force update mode: treat the second argument as an existing
+                          wrapper file and replace matching template-string values in place
+  --force-output          Force output mode: overwrite the second argument instead of
+                          updating it in place
+  --yes, -y               Auto-confirm all replacements in update mode (no prompt)
   -h, --help              Show this help message
   -v, --version           Show version information
 
@@ -371,6 +573,9 @@ Examples:
   js-to-string script.js --minify --validate
   js-to-string script.js output.js --minify --no-headers --name myCode
   js-to-string script.js --name AppCode --backup
+  js-to-string new-script.js existing-wrapper.js
+  js-to-string new-script.js existing-wrapper.js --update --yes
+  js-to-string new-script.js existing-wrapper.js --force-output
 `);
 }
 
