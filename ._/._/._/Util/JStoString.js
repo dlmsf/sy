@@ -372,7 +372,8 @@ function getOptionValue(args, optionName) {
 /**
  * Updates an existing wrapper file in place.
  * Finds const/let/var declarations whose template-string value is similar to
- * the newly escaped source content, asks the user (or auto-confirms), and
+ * the newly escaped source content, automatically picks the one with the
+ * highest similarity (must be 80%+, no prompt), and
  * replaces ONLY the template string content. The variable name and every
  * other part of the file are left byte-for-byte intact.
  */
@@ -421,33 +422,25 @@ export function updateExistingWrapper(targetFile, newEscapedContent, sourceJsPat
         };
     }
 
-    const SIMILARITY_THRESHOLD = 0.3;
-    const autoConfirm = !!options.autoConfirm;
+    const SIMILARITY_THRESHOLD = 0.8;
     const replacements = [];
 
     console.log(`🔍 Found ${matches.length} template-string declaration(s) in ${targetFile}`);
 
+    // Pick the single declaration with the highest similarity (first one wins on ties)
+    let bestMatch = null;
     for (const m of matches) {
-        if (m.similarity < SIMILARITY_THRESHOLD) {
-            console.log(`⏭️  Skipping '${m.varName}' (similarity ${(m.similarity * 100).toFixed(1)}% < ${(SIMILARITY_THRESHOLD * 100).toFixed(0)}%)`);
-            continue;
+        console.log(`   '${m.varName}': similarity ${(m.similarity * 100).toFixed(1)}%`);
+        if (bestMatch === null || m.similarity > bestMatch.similarity) {
+            bestMatch = m;
         }
+    }
 
-        let shouldReplace = false;
-        if (autoConfirm) {
-            shouldReplace = true;
-            console.log(`✅ Auto-replacing '${m.varName}' (similarity ${(m.similarity * 100).toFixed(1)}%)`);
-        } else {
-            const answer = syncPrompt(`Replace content of '${m.varName}' in ${targetFile}? (similarity ${(m.similarity * 100).toFixed(1)}%) [y/N] `);
-            shouldReplace = /^(y|yes)$/i.test(answer.trim());
-            if (!shouldReplace) {
-                console.log(`   Skipped '${m.varName}'`);
-            }
-        }
-
-        if (shouldReplace) {
-            replacements.push(m);
-        }
+    if (bestMatch.similarity >= SIMILARITY_THRESHOLD) {
+        console.log(`✅ Auto-replacing '${bestMatch.varName}' (best similarity ${(bestMatch.similarity * 100).toFixed(1)}%)`);
+        replacements.push(bestMatch);
+    } else {
+        console.log(`⏭️  Best match '${bestMatch.varName}' has similarity ${(bestMatch.similarity * 100).toFixed(1)}% < ${(SIMILARITY_THRESHOLD * 100).toFixed(0)}%, nothing replaced`);
     }
 
     if (replacements.length === 0) {
@@ -563,7 +556,8 @@ Options:
                           wrapper file and replace matching template-string values in place
   --force-output          Force output mode: overwrite the second argument instead of
                           updating it in place
-  --yes, -y               Auto-confirm all replacements in update mode (no prompt)
+  --yes, -y               (kept for compatibility) Update mode never prompts: it automatically
+                          replaces the most similar variable if similarity is 80%+
   -h, --help              Show this help message
   -v, --version           Show version information
 
