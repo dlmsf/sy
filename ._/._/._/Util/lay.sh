@@ -18,6 +18,7 @@
 #   repo [name|N]   - Switch to a different repository (alternative to reposwi)
 #   list            - List all layer instances (full names)
 #   repos           - List unique repository names
+#   diff            - Navigate to a git diff file's directory
 #   --test          - Run internal tests
 #   -v, --verbose  - Show detailed output (what's happening)
 #   -h, --help     - Show help
@@ -98,6 +99,7 @@ show_help() {
     printf "  lay reposwi [name|N] # Alternative: switch to different repository\n"
     printf "  lay list           # List all layer instances (full names)\n"
     printf "  lay repos          # List unique repository names\n"
+    printf "  lay diff           # Navigate to a git diff file's directory\n"
     printf "  lay --test         # Run internal tests\n"
     printf "  lay reverse        # Force go back/up (silent)\n"
     printf "  lay back           # Alternative: go back/up (silent)\n"
@@ -135,6 +137,7 @@ LIST_ALL_REPOSITORIES=0
 RUN_INTERNAL_TESTS=0
 SWITCH_BY_NAME=0
 TARGET_NAME=""
+DIFF_NAVIGATE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -209,6 +212,10 @@ while [ $# -gt 0 ]; do
             ;;
         repos|--repos|-rp)
             LIST_ALL_REPOSITORIES=1
+            shift
+            ;;
+        diff|--diff|-df)
+            DIFF_NAVIGATE=1
             shift
             ;;
         --test|-t|test)
@@ -1375,6 +1382,89 @@ switch_to_repository() {
     return 0
 }
 
+# Navigate to a git diff file's directory
+navigate_to_diff_file() {
+    # Check git availability
+    if ! command -v git >/dev/null 2>&1; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: git is required${COLOR_RESET}\n"
+        return 1
+    fi
+    
+    # Find git repository root
+    git_root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -z "$git_root" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: Not in a git repository${COLOR_RESET}\n"
+        return 1
+    fi
+    
+    # Collect changed files (unstaged + staged), deduplicated
+    diff_files=$(
+        cd "$git_root" 2>/dev/null || exit 0
+        git diff --name-only 2>/dev/null
+        git diff --name-only --cached 2>/dev/null
+    )
+    diff_files=$(printf "%s\n" "$diff_files" | awk 'NF && !seen[$0]++')
+    
+    if [ -z "$diff_files" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_YELLOW}No git diff files found${COLOR_RESET}\n"
+        return 1
+    fi
+    
+    file_count=$(printf "%s\n" "$diff_files" | wc -l | tr -d ' ')
+    
+    if [ "$file_count" -eq 1 ]; then
+        # Only one file - navigate directly without selection
+        selected_file="$diff_files"
+    else
+        # Multiple files - show selection list
+        printf "${COLOR_CYAN}Git diff files:${COLOR_RESET}\n"
+        counter=1
+        printf "%s\n" "$diff_files" | while IFS= read -r file_path; do
+            [ -z "$file_path" ] && continue
+            printf "  ${COLOR_BOLD}%d.${COLOR_RESET} %s\n" "$counter" "$file_path"
+            counter=$((counter + 1))
+        done
+        
+        printf "\n${COLOR_YELLOW}Enter number to navigate to (or 'n' to cancel): ${COLOR_RESET}"
+        read -r user_response
+        
+        case "$user_response" in
+            ''|[Nn]|[Nn][Oo])
+                printf "${COLOR_YELLOW}Cancelled.${COLOR_RESET}\n"
+                return 1
+                ;;
+            *[!0-9]*)
+                printf "${COLOR_RED}Invalid selection: %s${COLOR_RESET}\n" "$user_response"
+                return 1
+                ;;
+        esac
+        
+        selected_file=$(printf "%s\n" "$diff_files" | sed -n "${user_response}p")
+        if [ -z "$selected_file" ]; then
+            printf "${COLOR_RED}Invalid selection: %s${COLOR_RESET}\n" "$user_response"
+            return 1
+        fi
+    fi
+    
+    # Determine target directory (directory containing the selected file)
+    file_directory=$(dirname "$selected_file")
+    if [ "$file_directory" = "." ]; then
+        target_directory="$git_root"
+    else
+        target_directory="$git_root/$file_directory"
+    fi
+    
+    if [ ! -d "$target_directory" ]; then
+        [ $VERBOSE_MODE -eq 1 ] && printf "${COLOR_RED}Error: Directory not found: %s${COLOR_RESET}\n" "$target_directory"
+        return 1
+    fi
+    
+    [ $VERBOSE_MODE -eq 1 ] && printf "Navigating to: %s\n" "$target_directory"
+    cd "$target_directory" || return 1
+    [ $VERBOSE_MODE -eq 1 ] && printf "Now at: %s\n" "$PWD"
+    return 0
+}
+
 # Run internal tests
 run_internal_tests() {
     printf "${COLOR_YELLOW}Running internal tests...${COLOR_RESET}\n"
@@ -1601,6 +1691,12 @@ fi
 
 if [ $CLEAR_CURRENT_REPO -eq 1 ]; then
     clear_current_repo_instances
+    [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
+    return $? 2>/dev/null || exit $?
+fi
+
+if [ $DIFF_NAVIGATE -eq 1 ]; then
+    navigate_to_diff_file
     [ $? -eq 0 ] && [ $VERBOSE_MODE -eq 0 ] && clear
     return $? 2>/dev/null || exit $?
 fi
