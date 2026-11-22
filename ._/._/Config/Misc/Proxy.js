@@ -98,10 +98,10 @@ function listCertificates() {
 // permanent file (not /tmp), so it survives reboots.
 // ------------------------------------------------------------------
 const buildServerSource = (configPath) => `
-import http from 'node:http'
-import https from 'node:https'
-import { readFileSync } from 'node:fs'
-import { createSecureContext } from 'node:tls'
+const http = (await import('node:http')).default
+const https = (await import('node:https')).default
+const { readFileSync } = await import('node:fs')
+const { createSecureContext } = await import('node:tls')
 
 const CONFIG_PATH = ${JSON.stringify(configPath)}
 
@@ -115,7 +115,21 @@ function loadConfig() {
 }
 
 const cfg   = loadConfig()
-const rules = (cfg.rules || []).filter(r => r.domain && r.target)
+function normHost(h) {
+  let s = String(h || '').trim().toLowerCase()
+  const i = s.indexOf('://')
+  if (i !== -1) s = s.slice(i + 3)
+  s = s.split('/')[0]
+  if (s.charAt(0) !== '[') s = s.split(':')[0]
+  return s
+}
+
+function normTarget(t) {
+  const s = String(t || '').trim()
+  return s.indexOf('://') === -1 ? 'http://' + s : s
+}
+
+const rules = (cfg.rules || []).filter(r => r.domain && r.target).map(r => ({ ...r, domainKey: normHost(r.domain), targetUrl: normTarget(r.target) }))
 const opts  = cfg.opts || {}
 
 const certs = {}
@@ -155,7 +169,7 @@ const sp = opts.httpsPort || 443
 console.log('[proxy] Starting with ' + rules.length + ' rule(s) from ' + CONFIG_PATH)
 
 http.createServer((req, res) => {
-  const rule = rules.find(r => r.domain === req.headers.host)
+  const rule = rules.find(r => r.domainKey === normHost(req.headers.host))
   if (rule && rule.useHttps === false) return forward(req, res, rule, false)
   res.writeHead(301, { Location: 'https://' + req.headers.host + req.url }); res.end()
 }).listen(hp, '0.0.0.0', () => console.log('[proxy] HTTP  on ' + hp))
@@ -167,7 +181,7 @@ https.createServer({
     cb(new Error('No cert for ' + domain))
   }
 }, (req, res) => {
-  const rule = rules.find(r => r.domain === req.headers.host)
+  const rule = rules.find(r => r.domainKey === normHost(req.headers.host))
   if (rule) return forward(req, res, rule, true)
   res.writeHead(404); res.end('No rule')
 }).listen(sp, '0.0.0.0', () => console.log('[proxy] HTTPS on ' + sp))
