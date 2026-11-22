@@ -212,6 +212,10 @@ class GoDaddyManager extends SyAPP.Func() {
 
   _leWriteHookScripts() {
     try {
+      // The temp files below live in LE_DIR, which may not exist yet
+      // (it is otherwise only created when auto-renew is ON).
+      if (!fs.existsSync(LE_DIR)) fs.mkdirSync(LE_DIR, { recursive: true })
+
       // Must use sudo to write into /etc/letsencrypt/sypm/ for snap compatibility
       execSync('sudo -n mkdir -p ' + this._leShellQuote(LE_HOOK_DIR))
 
@@ -309,8 +313,13 @@ class GoDaddyManager extends SyAPP.Func() {
       // Clean up tmps
       try { fs.unlinkSync(tmpAuth); fs.unlinkSync(tmpCleanup) } catch (_) {}
 
+      this._leHookErr = ''
       return true
-    } catch (_) { return false }
+    } catch (e) {
+      const detail = (e && e.stderr) ? String(e.stderr).trim() : ''
+      this._leHookErr = detail || (e && e.message) || ''
+      return false
+    }
   }
 
   async _leInstallCertbot(id) {
@@ -352,7 +361,7 @@ class GoDaddyManager extends SyAPP.Func() {
     const token = this._token(id)
     if (!token) throw new Error('GoDaddy token not configured')
 
-    if (!this._leWriteHookScripts()) throw new Error('could not write hook scripts to /etc/letsencrypt/sypm (sudo required)')
+    if (!this._leWriteHookScripts()) throw new Error('could not write hook scripts to /etc/letsencrypt/sypm (sudo required)' + (this._leHookErr ? ': ' + this._leHookErr : ''))
 
     // Persist the token so that certbot's renewal config — which stores
     // the hook command but no env vars — can invoke the hooks at renewal
