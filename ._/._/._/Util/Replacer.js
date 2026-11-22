@@ -354,8 +354,8 @@ async function main() {
   console.log('Extracting code blocks...');
   const blocks = extractCodeBlocks(text);
   if (blocks.length === 0) {
-    console.log('No fenced code blocks found. Exiting.');
-    process.exit(0);
+    console.log('No fenced code blocks found. Treating entire file as a single code block.');
+    blocks.push({ language: '', code: text.replace(/\n$/, ''), precedingText: '' });
   }
   console.log(`Found ${blocks.length} code block(s).`);
 
