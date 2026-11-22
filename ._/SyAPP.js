@@ -3351,6 +3351,23 @@ main
             try { process.kill(-pgid, 'SIGKILL'); } catch (_) {}
         }
 
+        // Never take down processes that were started EXTERNALLY through
+        // SyPM (e.g. a Proxy launched by a func with SyPM.run). Only
+        // `syapp-bg-<port>…` entries (this.Emb() / SelfBuilder children)
+        // belong to the Emb tree. The roots themselves are always killed.
+        try {
+            const rootSet = new Set(roots.filter(Boolean));
+            for (const proc of this._loadRegistry()) {
+                if (!proc || typeof proc.name !== 'string') continue;
+                if (/^syapp-bg-\d+/.test(proc.name)) continue;
+                for (const ep of [proc.pid, proc.monitorPid]) {
+                    if (!ep || rootSet.has(ep) || !collected.has(ep)) continue;
+                    collected.delete(ep);
+                    for (const k of this._getAllChildPids(ep)) collected.delete(k);
+                }
+            }
+        } catch (_) {}
+
         const ordered = [...collected].sort((a, b) => b - a);
         let attempts = 0;
         for (const p of ordered) {
@@ -37004,6 +37021,10 @@ function _hardKillDescendants(syapp) {
     let count = 0;
     for (const proc of registry) {
       if (!proc) continue;
+      // Only sweep Emb / SelfBuilder-test children (`syapp-bg-<port>…`).
+      // Processes started externally via SyPM (e.g. Proxy.js) must
+      // survive the exit of this SyAPP.
+      if (typeof proc.name !== 'string' || !/^syapp-bg-\d+/.test(proc.name)) continue;
       const matchesDescendant =
         (proc.pid && descSet.has(proc.pid)) ||
         (proc.monitorPid && descSet.has(proc.monitorPid));
