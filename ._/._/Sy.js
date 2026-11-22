@@ -3,6 +3,8 @@ import SyAPP from "../SyAPP.js";
 import SyDB from "../SyDB.js";
 import SyPM from '../SyPM.js'
 import fs from 'fs'
+import os from 'os'
+import path from 'path'
 
 class SyInstances {
   static Model = SyDB.Model('SyInstances', {
@@ -70,6 +72,47 @@ class SyLink {
   static kill(processId) {
     if (!processId) return false;
     try { SyPM.kill(processId); return true; } catch (_) { return false; }
+  }
+
+  /** Last few meaningful lines of a process log, as one short line. Never throws. */
+  static logTail(info) {
+    try {
+      if (!info || !info.log || !fs.existsSync(info.log)) return '';
+      const lines = fs.readFileSync(info.log, 'utf-8')
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0);
+      const tail = lines.slice(-3).join(' | ');
+      return tail.length > 160 ? tail.slice(-160) : tail;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /**
+   * Verify that a freshly spawned process really came up and is staying up.
+   * Auto-restart monitors stay alive even when the program inside crashes, so
+   * the registry status / restart counter is checked as well.
+   * @returns {Promise<{ok:boolean, reason:string, logTail:string}>}
+   */
+  static async verifyStart(processId, graceMs = 1500) {
+    const stepMs = 150;
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < graceMs) {
+      await new Promise(r => setTimeout(r, stepMs));
+      const info = SyLink._registry().find(p => p.id === processId) || null;
+      if (!info) {
+        return { ok: false, reason: 'Process entry not found in the SyPM registry', logTail: '' };
+      }
+      if (!SyLink.alive(processId)) {
+        return { ok: false, reason: 'Process exited right after start', logTail: SyLink.logTail(info) };
+      }
+      const tries = Number(info.config && info.config.currentTries) || 0;
+      if (info.status === 'restarting' || info.status === 'dead' || tries > 0) {
+        return { ok: false, reason: 'Process crashed right after start', logTail: SyLink.logTail(info) };
+      }
+    }
+    return { ok: true, reason: '', logTail: '' };
   }
 
   /**
@@ -300,6 +343,28 @@ class Sy extends SyAPP.Func() {
         };
 
         const stopLinkedProcess = (instance) => SyLink.killForInstance(instance) > 0;
+
+        // Confirm a freshly spawned process really stays up, then persist the
+        // REAL state (never claim Online for a process that already died).
+        const finalizeStart = async (instance, spawned, extraFields = {}) => {
+          const check = await SyLink.verifyStart(spawned.id);
+          await SyInstances.Model.update(instance._id, {
+            ...extraFields,
+            ProcessId: spawned.id,
+            Running: check.ok,
+            Status: check.ok ? 'Online' : 'Offline'
+          });
+          if (!check.ok) {
+            // Stop the restart loop of a process that cannot stay up.
+            SyLink.killForInstance({ _id: instance._id, ProcessId: spawned.id });
+            this.Alert(
+              uid,
+              `⚠ ${check.reason}${check.logTail ? ': ' + check.logTail : ''}`,
+              { duration: 9000 }
+            );
+          }
+          return check;
+        };
 
         // ---------- CONTINUOUS ACID REAPER ----------
         // Runs at most once per ACID_SWEEP_MS per session, on every
@@ -810,9 +875,7 @@ class Sy extends SyAPP.Func() {
                     name: SyLink.nameFor(targetInstance),
                     autoRestart: true, restartTries: 5, daemon: _wantDaemon
                   });
-                  await SyInstances.Model.update(targetInstance._id, {
-                    ProcessId: _new.id, ProcessType: 'file', ProcessSource: _sel[0], Running: true, Status: 'Online'
-                  });
+                  await finalizeStart(targetInstance, _new, { ProcessType: 'file', ProcessSource: _sel[0] });
                   this.FileManager.ClearSelection(uid, `proc_file_${targetInstance._id}`);
                   setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
@@ -832,9 +895,7 @@ class Sy extends SyAPP.Func() {
                     name: SyLink.nameFor(targetInstance),
                     autoRestart: true, restartTries: 5, daemon: _wantDaemon
                   });
-                  await SyInstances.Model.update(targetInstance._id, {
-                    ProcessId: _new.id, ProcessType: 'code', ProcessSource: _code, Running: true, Status: 'Online'
-                  });
+                  await finalizeStart(targetInstance, _new, { ProcessType: 'code', ProcessSource: _code });
                   setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
@@ -853,9 +914,7 @@ class Sy extends SyAPP.Func() {
                     name: SyLink.nameFor(targetInstance),
                     autoRestart: true, restartTries: 5, daemon: _wantDaemon
                   });
-                  await SyInstances.Model.update(targetInstance._id, {
-                    ProcessId: _new.id, ProcessType: 'command', ProcessSource: _cmd, Running: true, Status: 'Online'
-                  });
+                  await finalizeStart(targetInstance, _new, { ProcessType: 'command', ProcessSource: _cmd });
                   setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
@@ -877,9 +936,7 @@ class Sy extends SyAPP.Func() {
                     name: SyLink.nameFor(targetInstance),
                     autoRestart: true, restartTries: 5, daemon: _wantDaemon
                   });
-                  await SyInstances.Model.update(targetInstance._id, {
-                    ProcessId: _new.id, ProcessType: 'flow', ProcessSource: _flow, Running: true, Status: 'Online'
-                  });
+                  await finalizeStart(targetInstance, _new, { ProcessType: 'flow', ProcessSource: _flow });
                   setManageState({ processView: 'menu', pendingDaemon: false });
                   instances = await SyInstances.Model.find();
                   targetInstance = instances.find(i => i._id === targetInstanceId);
@@ -1025,7 +1082,7 @@ class Sy extends SyAPP.Func() {
             if (_pv === 'menu') {
               if (!targetInstance) {
                 this.Text(uid, 'No target instance.');
-              } else if (!targetInstance.ProcessId) {
+              } else if (!targetInstance.ProcessId && !targetInstance.ProcessSource) {
                 this.Text(uid, 'No process linked. Choose a method:');
                 this.Button(uid, { name: '📄 From .js File', props: { process_action: 'link_file', page: 'manage', target_instance: targetInstance._id } });
                 this.Button(uid, { name: '📝 Write Code', props: { process_action: 'link_code', page: 'manage', target_instance: targetInstance._id } });
