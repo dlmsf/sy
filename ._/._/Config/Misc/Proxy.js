@@ -143,7 +143,7 @@ for (const r of rules) {
 }
 
 function forward(req, res, rule, isHttps) {
-  const t   = new URL(rule.target)
+  const t   = new URL(rule.targetUrl)
   const mod = t.protocol === 'https:' ? https : http
   const ip  = req.socket.remoteAddress
   const pr  = mod.request({
