@@ -69,6 +69,45 @@ function godaddyRequest(method, path, token, body) {
   })
 }
 
+/**
+ * Small GET helper returning the response body as text (or null on failure).
+ */
+function httpGetText(urlStr) {
+  return new Promise((resolve) => {
+    try {
+      const req = https.get(urlStr, { timeout: 8000 }, (res) => {
+        const chunks = []
+        res.on('data', (c) => chunks.push(c))
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve(Buffer.concat(chunks).toString('utf8').trim())
+          } else {
+            resolve(null)
+          }
+        })
+      })
+      req.on('timeout', () => { req.destroy(); resolve(null) })
+      req.on('error', () => resolve(null))
+    } catch (_) { resolve(null) }
+  })
+}
+
+/**
+ * Detects the public IPv4 address of this machine.
+ */
+async function detectPublicIPv4() {
+  const sources = [
+    'https://api.ipify.org',
+    'https://ipv4.icanhazip.com',
+    'https://ifconfig.me/ip'
+  ]
+  for (const s of sources) {
+    const txt = await httpGetText(s)
+    if (txt && /^(\d{1,3}\.){3}\d{1,3}$/.test(txt)) return txt
+  }
+  return null
+}
+
 class GoDaddyManager extends SyAPP.Func() {
   constructor() {
     super(
@@ -361,6 +400,69 @@ class GoDaddyManager extends SyAPP.Func() {
     this.Storages.Delete(id, 'le_status_' + domain)
   }
 
+  // After a successful certificate generation: make sure the domain's
+  // apex (@) and www point (A record, ttl 600) to this machine's public IP.
+  //  - existing A record      → edited with the IP
+  //  - existing CNAME record  → removed and replaced by the A record
+  //  - nothing                → A record created
+  async _leSetupARecords(id, domain) {
+    const token = this._token(id)
+    if (!token) throw new Error('GoDaddy token not configured')
+
+    const ip = await detectPublicIPv4()
+    if (!ip) throw new Error('could not detect the machine public IP')
+
+    // Locate the zone (the domain itself, or a parent of it)
+    const parts = String(domain).split('.')
+    let zone = null
+    for (let i = 0; i < parts.length - 1; i++) {
+      const cand = parts.slice(i).join('.')
+      const r = await godaddyRequest('GET', `/zones/${encodeURIComponent(cand)}/dns-records?pageSize=1`, token)
+      if (r.ok) { zone = cand; break }
+    }
+    if (!zone) throw new Error('no GoDaddy zone found for ' + domain)
+
+    const label = domain === zone ? '@' : domain.slice(0, -(zone.length + 1))
+    const names = [label, label === '@' ? 'www' : 'www.' + label]
+
+    const list = await godaddyRequest('GET', `/zones/${encodeURIComponent(zone)}/dns-records?pageSize=100&totalRequired=true`, token)
+    if (!list.ok) throw new Error('could not list DNS records (' + list.status + ')')
+    const items = Array.isArray(list.data && list.data.items) ? list.data.items
+                : (Array.isArray(list.data) ? list.data : [])
+
+    const recPath = (rid) => `/zones/${encodeURIComponent(zone)}/dns-records/${encodeURIComponent(rid)}`
+
+    for (const n of names) {
+      const same   = items.filter(r => r && r.name === n)
+      const aRecs  = same.filter(r => r.type === 'A')
+      const cnames = same.filter(r => r.type === 'CNAME')
+
+      // A CNAME cannot coexist with an A record → remove it first
+      for (const c of cnames) {
+        if (!c.recordId) continue
+        const d = await godaddyRequest('DELETE', recPath(c.recordId), token)
+        if (!d.ok) throw new Error('could not remove CNAME for ' + n + ' (' + d.status + ')')
+      }
+
+      const body = { name: n, type: 'A', data: ip, ttl: 600 }
+
+      if (aRecs.length > 0 && aRecs[0].recordId) {
+        const u = await godaddyRequest('PUT', recPath(aRecs[0].recordId), token, body)
+        if (!u.ok) throw new Error('could not update A record for ' + n + ' (' + u.status + ')')
+        // Remove duplicate A records so the name points only to this machine
+        for (let i = 1; i < aRecs.length; i++) {
+          if (!aRecs[i].recordId) continue
+          await godaddyRequest('DELETE', recPath(aRecs[i].recordId), token)
+        }
+      } else {
+        const c = await godaddyRequest('POST', `/zones/${encodeURIComponent(zone)}/dns-records`, token, body)
+        if (!c.ok) throw new Error('could not create A record for ' + n + ' (' + c.status + ')')
+      }
+    }
+
+    return `A ${names.join(', ')} → ${ip}`
+  }
+
   async _leReconcile(id) {
     const want  = this._leAutoRenew(id)
     const procs = this._leProcs()
@@ -588,7 +690,14 @@ class GoDaddyManager extends SyAPP.Func() {
       setImmediate(async () => {
         try {
           await self._leGenerateCert(id, domain)
-          self._setStatus(id, domain, { status: 'ok', finishedAt: Date.now() })
+          let dnsMsg = null
+          try {
+            dnsMsg = await self._leSetupARecords(id, domain)
+          } catch (dnsErr) {
+            dnsMsg = 'DNS A records failed: ' + dnsErr.message
+          }
+          self.Storages.Delete(id, 'gd_records_cache_' + domain)
+          self._setStatus(id, domain, { status: 'ok', finishedAt: Date.now(), dns: dnsMsg })
         } catch (e) {
           self._setStatus(id, domain, { status: 'error', finishedAt: Date.now(), error: e.message })
         }
