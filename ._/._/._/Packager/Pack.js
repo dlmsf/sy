@@ -926,6 +926,78 @@ class LocAnalyzer extends BaseAnalyzer {
 }
 
 /**
+ * Analyzer for counting approximate LLM tokens by language.
+ * Uses the common 4-characters-per-token heuristic for source/text files.
+ */
+class TokenAnalyzer extends BaseAnalyzer {
+  constructor() {
+    super();
+    this.name = 'Token Analyzer';
+    this.tokensByLanguage = {};
+    this.filesByLanguage = {};
+    this.totalTokens = 0;
+    this.totalCharacters = 0;
+  }
+
+  async processFile(filePath, stats) {
+    const filename = path.basename(filePath);
+    const relativePath = path.relative(process.cwd(), filePath);
+    const pathParts = relativePath.split(path.sep);
+
+    if (pathParts.includes('.git')) return;
+    for (const part of pathParts) {
+      if (IGNORE_DIRS.has(part)) return;
+    }
+
+    if (isArchiveFile(filename)) return;
+    if (await isBinaryFile(filePath, stats)) return;
+
+    const language = detectFileLanguage(filename);
+
+    if (language) {
+      try {
+        const content = await readFile(filePath, 'utf8');
+        const charCount = content.length;
+        const tokenCount = Math.ceil(charCount / 4);
+
+        this.tokensByLanguage[language] = (this.tokensByLanguage[language] || 0) + tokenCount;
+        this.filesByLanguage[language] = (this.filesByLanguage[language] || 0) + 1;
+        this.totalTokens += tokenCount;
+        this.totalCharacters += charCount;
+      } catch (error) {
+        // Skip files that can't be read
+      }
+    }
+  }
+
+  getReport() {
+    const sortedLanguages = Object.entries(this.tokensByLanguage)
+      .sort(([, a], [, b]) => b - a)
+      .map(([language, tokens]) => ({
+        language,
+        tokens,
+        files: this.filesByLanguage[language],
+        percentage: this.totalTokens > 0 ? ((tokens / this.totalTokens) * 100).toFixed(2) : '0.00'
+      }));
+
+    return {
+      totalTokens: this.totalTokens,
+      totalTokensFormatted: this.totalTokens.toLocaleString(),
+      totalCharacters: this.totalCharacters,
+      totalCharactersFormatted: this.totalCharacters.toLocaleString(),
+      languages: sortedLanguages
+    };
+  }
+
+  reset() {
+    this.tokensByLanguage = {};
+    this.filesByLanguage = {};
+    this.totalTokens = 0;
+    this.totalCharacters = 0;
+  }
+}
+
+/**
  * Analyzer for archive files
  */
 class ArchiveAnalyzer extends BaseAnalyzer {
@@ -1783,6 +1855,7 @@ async function processSingleDirectory(targetDir) {
   analyzer.registerAnalyzer(sizeAnalyzer);
   analyzer.registerAnalyzer(new PackageJsonAnalyzer());
   analyzer.registerAnalyzer(new LocAnalyzer());
+  analyzer.registerAnalyzer(new TokenAnalyzer());
   analyzer.registerAnalyzer(new ArchiveAnalyzer());
   analyzer.registerAnalyzer(new BinaryAnalyzer());
   
@@ -1897,6 +1970,28 @@ async function processSingleDirectory(targetDir) {
     console.log(`  ${colors.yellow}No code files found${colors.reset}`);
   }
   
+  // Tokens Report
+  printHeader('🪙 TOKENS (LLM estimate)', colors.blue);
+  const tokenReport = reports['Token Analyzer'];
+  
+  if (tokenReport.totalTokens > 0) {
+    printKeyValue('Total tokens', tokenReport.totalTokensFormatted, colors.bright, 20, 15);
+    printKeyValue('Total characters', tokenReport.totalCharactersFormatted, colors.dim, 20, 15);
+    
+    console.log(`\n  ${colors.dim}Top languages by tokens:${colors.reset}`);
+    tokenReport.languages.slice(0, 5).forEach(({language, tokens, percentage}) => {
+      const langColor = percentage > 30 ? colors.green : 
+                       percentage > 10 ? colors.yellow : colors.blue;
+      console.log(`    ${langColor}${language.padEnd(12)}${colors.reset} ${tokens.toLocaleString().padStart(10)} tokens ${colors.dim}(${percentage}%)${colors.reset}`);
+    });
+    
+    if (tokenReport.languages.length > 5) {
+      console.log(`    ${colors.dim}... and ${tokenReport.languages.length - 5} more languages${colors.reset}`);
+    }
+  } else {
+    console.log(`  ${colors.yellow}No tokens counted${colors.reset}`);
+  }
+  
   // Archive Files Report
   printHeader('📦 ARCHIVE FILES', colors.yellow);
   const archiveReport = reports['Archive Files Analyzer'];
@@ -1954,6 +2049,7 @@ async function processSingleDirectory(targetDir) {
     { icon: '📦', label: 'Archive', value: `${archiveReport.totalCount} files (${sizeReport.archiveSizeFormatted})`, color: colors.yellow },
     { icon: '🔧', label: '.git', value: sizeReport.gitSizeFormatted, color: colors.magenta },
     { icon: '📊', label: 'Lines', value: locReport.totalLinesFormatted, color: colors.green },
+    { icon: '🪙', label: 'Tokens', value: tokenReport.totalTokensFormatted, color: colors.blue },
     { icon: '📋', label: 'Files', value: sizeReport.fileCount.toLocaleString(), color: colors.cyan },
     { icon: '💎', label: 'Code Purity', value: sizeReport.codePurityRate, color: colors.bright + colors.cyan },
     { icon: '⚡', label: 'Repo Efficiency', value: sizeReport.repositoryEfficiencyRate, color: colors.bright + colors.green }
@@ -2036,6 +2132,7 @@ async function processMultipleDirectories(directories) {
     analyzer.registerAnalyzer(sizeAnalyzer);
     analyzer.registerAnalyzer(new PackageJsonAnalyzer());
     analyzer.registerAnalyzer(new LocAnalyzer());
+    analyzer.registerAnalyzer(new TokenAnalyzer());
     analyzer.registerAnalyzer(new ArchiveAnalyzer());
     analyzer.registerAnalyzer(new BinaryAnalyzer());
     
@@ -2063,6 +2160,7 @@ async function processMultipleDirectories(directories) {
     const sizeReport = reports[dir]['Total Size Analyzer'];
     const pkgReport = reports[dir]['Package.json Analyzer'];
     const locReport = reports[dir]['Lines of Code Analyzer'];
+    const tokenReport = reports[dir]['Token Analyzer'];
     const archiveReport = reports[dir]['Archive Files Analyzer'];
     const binaryReport = reports[dir]['Binary Files Analyzer'];
     const gitReport = reports[dir]['Git Analyzer'];
@@ -2071,6 +2169,7 @@ async function processMultipleDirectories(directories) {
       ...sizeReport,
       'Package.json Analyzer': pkgReport,
       'Lines of Code Analyzer': locReport,
+      'Token Analyzer': tokenReport,
       'Archive Files Analyzer': archiveReport,
       'Binary Files Analyzer': binaryReport,
       'Git Analyzer': gitReport
@@ -2116,6 +2215,16 @@ async function processMultipleDirectories(directories) {
     printLanguagesComparison(validDirs, flattenedReports);
   }
 
+  // Tokens Table
+  const hasTokens = validDirs.some(dir => flattenedReports[dir]['Token Analyzer'].totalTokens > 0);
+  if (hasTokens) {
+    console.log('\n' + colors.blue + colors.bright + '🪙 TOKENS' + colors.reset);
+    const tokenMetrics = [
+      { label: 'Total Tokens', key: 'totalTokens', winner: 'largest', getValue: (r) => r['Token Analyzer'].totalTokensFormatted }
+    ];
+    createTable(validDirs, tokenMetrics, flattenedReports);
+  }
+
   // Archive Files Table
   const hasArchives = validDirs.some(dir => flattenedReports[dir]['Archive Files Analyzer'].totalCount > 0);
   if (hasArchives) {
@@ -2152,6 +2261,7 @@ async function processMultipleDirectories(directories) {
     { label: 'Purity %', key: 'purityPercentage', winner: 'largest' }
   ]);
   if (hasLoc) allMetrics.push({ label: 'Total Lines', key: 'totalLines', winner: 'largest' });
+  if (hasTokens) allMetrics.push({ label: 'Total Tokens', key: 'totalTokens', winner: 'largest' });
   if (hasArchives) allMetrics.push({ label: 'Archive Files', key: 'totalCount', winner: 'smallest' });
   if (hasBinaries) allMetrics.push({ label: 'Binary Files', key: 'totalCount', winner: 'smallest' });
   
@@ -2177,6 +2287,9 @@ async function processMultipleDirectories(directories) {
         if (metric.key === 'archiveSizeFormatted') return parseFloat(report.archiveSizeMB);
         if (metric.key === 'gitSizeFormatted') return parseFloat(report.gitSizeMB);
         if (metric.key === 'totalLinesFormatted') return flattenedReports[dir]['Lines of Code Analyzer'].totalLines;
+      }
+      if (metric.key === 'totalTokens') {
+        return flattenedReports[dir]['Token Analyzer'].totalTokens;
       }
       if (metric.key === 'totalFiles' || metric.key === 'totalDeps' || metric.key === 'purityPercentage') {
         return parseFloat(flattenedReports[dir]['Package.json Analyzer'][metric.key]) || 0;
@@ -2286,6 +2399,7 @@ async function analyzeSingleDirectoryData(dir) {
   analyzer.registerAnalyzer(sizeAnalyzer);
   analyzer.registerAnalyzer(new PackageJsonAnalyzer());
   analyzer.registerAnalyzer(new LocAnalyzer());
+  analyzer.registerAnalyzer(new TokenAnalyzer());
   analyzer.registerAnalyzer(new ArchiveAnalyzer());
   analyzer.registerAnalyzer(new BinaryAnalyzer());
   
@@ -2321,6 +2435,7 @@ async function analyzeMultipleDirectoriesData(directories) {
     analyzer.registerAnalyzer(sizeAnalyzer);
     analyzer.registerAnalyzer(new PackageJsonAnalyzer());
     analyzer.registerAnalyzer(new LocAnalyzer());
+    analyzer.registerAnalyzer(new TokenAnalyzer());
     analyzer.registerAnalyzer(new ArchiveAnalyzer());
     analyzer.registerAnalyzer(new BinaryAnalyzer());
     
@@ -2340,6 +2455,7 @@ async function analyzeMultipleDirectoriesData(directories) {
       ...report['Total Size Analyzer'],
       'Package.json Analyzer': report['Package.json Analyzer'],
       'Lines of Code Analyzer': report['Lines of Code Analyzer'],
+      'Token Analyzer': report['Token Analyzer'],
       'Archive Files Analyzer': report['Archive Files Analyzer'],
       'Binary Files Analyzer': report['Binary Files Analyzer'],
       'Git Analyzer': report['Git Analyzer']
@@ -2365,6 +2481,7 @@ async function analyzeMultipleDirectoriesData(directories) {
   
   const hasPackageJson = validDirs.some(dir => flattenedReports[dir]['Package.json Analyzer'].totalFiles > 0);
   const hasLoc = validDirs.some(dir => flattenedReports[dir]['Lines of Code Analyzer'].totalLines > 0);
+  const hasTokens = validDirs.some(dir => flattenedReports[dir]['Token Analyzer'].totalTokens > 0);
   const hasArchives = validDirs.some(dir => flattenedReports[dir]['Archive Files Analyzer'].totalCount > 0);
   const hasBinaries = validDirs.some(dir => flattenedReports[dir]['Binary Files Analyzer'].totalCount > 0);
   const hasGit = validDirs.some(dir => flattenedReports[dir]['Git Analyzer'].totalRepositories > 0);
@@ -2378,6 +2495,7 @@ async function analyzeMultipleDirectoriesData(directories) {
     );
   }
   if (hasLoc) allMetrics.push({ label: 'Total Lines', key: 'totalLines', winner: 'largest' });
+  if (hasTokens) allMetrics.push({ label: 'Total Tokens', key: 'totalTokens', winner: 'largest' });
   if (hasArchives) allMetrics.push({ label: 'Archive Files', key: 'totalCount', winner: 'smallest' });
   if (hasBinaries) allMetrics.push({ label: 'Binary Files', key: 'totalCount', winner: 'smallest' });
   if (hasGit) {
@@ -2407,6 +2525,7 @@ async function analyzeMultipleDirectoriesData(directories) {
         return parseFloat(report['Package.json Analyzer'][metric.key]) || 0;
       }
       if (metric.key === 'totalLines') return report['Lines of Code Analyzer'].totalLines;
+      if (metric.key === 'totalTokens') return report['Token Analyzer'].totalTokens;
       if (metric.key === 'totalCount') {
         if (metric.label.includes('Archive')) return report['Archive Files Analyzer'].totalCount;
         if (metric.label.includes('Binary')) return report['Binary Files Analyzer'].totalCount;
@@ -2437,6 +2556,7 @@ async function analyzeMultipleDirectoriesData(directories) {
     winners,
     hasPackageJson,
     hasLoc,
+    hasTokens,
     hasArchives,
     hasBinaries,
     hasGit
