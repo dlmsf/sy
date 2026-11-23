@@ -3,6 +3,7 @@ import SyAPP from "../SyAPP.js";
 import SyDB from "../SyDB.js";
 import SyPM from '../SyPM.js'
 import fs from 'fs'
+import os from 'os'
 
 class SyInstances {
   static Model = SyDB.Model('SyInstances', {
