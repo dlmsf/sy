@@ -110,7 +110,9 @@ class ModuleBundler {
    * @returns {boolean}
    */
   isIgnoredImport(modulePath, currentFilePath) {
-    if (!this.ignoreImports || this.ignoreImports.length === 0) return false;
+    // NOTE: no early return when `ignoreImports` is empty — SyPM imports are
+    // ALWAYS externalized (see `_isProcessManagerImport` below), regardless of
+    // the user-supplied patterns.
     const resolved = this.isNativeModule(modulePath)
       ? modulePath
       : this.resolveModulePath(modulePath, currentFilePath);
@@ -121,7 +123,59 @@ class ModuleBundler {
       if (path.basename(resolved) === pattern) return true;
       if (path.basename(modulePath) === pattern) return true;
     }
+    // GENERAL FIX — SyPM must never be inlined into a bundle.
+    // A bundled copy of the process manager runs inside `__modules[...]` with
+    // a different module identity / import.meta.url than the real SyPM.js,
+    // which made processes spawned through it die right after starting.
+    // It is loaded from its real on-disk path at runtime instead, exactly
+    // like the unpacked run.
+    if (this._isProcessManagerImport(modulePath, resolved)) return true;
     return false;
+  }
+
+  /**
+   * Return true when the import refers to the SyPM process-manager module:
+   *   • the file is named SyPM (.js / .mjs / .cjs), whether the specifier is
+   *     relative, absolute or a file:// URL, OR
+   *   • the resolved local file declares `class SyPM`.
+   * Such modules are always kept EXTERNAL (never inlined into the bundle).
+   *
+   * @param {string} modulePath   - Raw import specifier
+   * @param {string} resolvedPath - Resolved path (or the specifier itself)
+   * @returns {boolean}
+   * @private
+   */
+  _isProcessManagerImport(modulePath, resolvedPath) {
+    try {
+      if (this.isNativeModule(modulePath)) return false;
+
+      const baseNoExt = (p) => path.basename(String(p || '')).replace(/\.[cm]?js$/i, '');
+      if (baseNoExt(modulePath) === 'SyPM' || baseNoExt(resolvedPath) === 'SyPM') return true;
+
+      let filePath = resolvedPath;
+      if (typeof filePath === 'string' && filePath.startsWith('file:')) {
+        filePath = fileURLToPath(filePath);
+      }
+      if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) return false;
+
+      if (!this._pmContentCache) this._pmContentCache = new Map();
+      if (this._pmContentCache.has(filePath)) return this._pmContentCache.get(filePath);
+
+      let result = false;
+      try {
+        if (statSync(filePath).isFile()) {
+          const src = this.sourceOverrides.has(filePath)
+            ? this.sourceOverrides.get(filePath)
+            : readFileSync(filePath, 'utf8');
+          result = /^[ \t]*(?:export\s+(?:default\s+)?)?class\s+SyPM\b/m.test(src);
+        }
+      } catch (_) { result = false; }
+
+      this._pmContentCache.set(filePath, result);
+      return result;
+    } catch (_) {
+      return false;
+    }
   }
 
   /**
@@ -686,7 +740,11 @@ class ModuleBundler {
           // the SAME global SyAPP.js that produced it.
           sourceUrl = this.syappRuntimeUrl;
         } else {
-          sourceUrl = url.pathToFileURL(absResolved).href;
+          // A specifier that is already a file:// URL (e.g. produced by the
+          // pack isolation step) must be used as-is, never re-converted.
+          sourceUrl = (typeof imp.modulePath === 'string' && imp.modulePath.startsWith('file:'))
+            ? imp.modulePath
+            : url.pathToFileURL(absResolved).href;
         }
 
         if (imp.type === 'side-effect') {
