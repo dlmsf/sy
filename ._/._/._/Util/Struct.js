@@ -5908,9 +5908,10 @@ async function main() {
         // `node Struct.js extract <structfile>` -> direct runner that
         // extracts the USER REQUEST from a struct file into ./result.
         // Additive: does NOT touch the save/load flow below.
-        if (args[0] === 'extract') {
+        if (args[0] === 'extract' || args[0] === '-e') {
             if (args.length < 2) {
                 console.error('Usage: node Struct.js extract <structfile>');
+                console.error('   or: node Struct.js -e <structfile>');
                 process.exit(1);
             }
             await extractUserRequestFromStruct(args[1]);
