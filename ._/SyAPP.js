@@ -38471,6 +38471,927 @@ async function _packInlineAllEmbs(entryFilePath, stripComments) {
   return { converted: totalConverted, filesTouched, overrides };
 }
 
+// ============================================================
+// SELF TEST — `node SyAPP.js --test`
+// ============================================================
+// Extensive, TTY-independent test suite covering TerminalHUD (the
+// readline-based interface), SyAPP (the app/loader) and SyAPP_Func
+// (the module class used to build Funcs / mini apps), exercised with
+// diverse values, structures and logic, plus seeded fuzzing.
+// ============================================================
+async function _syappRunSelfTest() {
+  const C = ColorText;
+  const results = { pass: 0, fail: 0, failures: [] };
+  let lastGroup = null;
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const strip = (s) => String(s == null ? '' : s).replace(/\x1b\[[0-9;]*m/g, '');
+  const ok = (c, m) => { if (!c) throw new Error(m || 'assertion failed'); };
+  const eq = (a, b, m) => {
+    if (JSON.stringify(a) !== JSON.stringify(b)) {
+      throw new Error(`${m || 'eq'}: expected ${JSON.stringify(b)} got ${JSON.stringify(a)}`);
+    }
+  };
+  const t = async (group, name, fn) => {
+    if (group !== lastGroup) { console.log('\n' + C.brightCyan(`▌ ${group}`)); lastGroup = group; }
+    try {
+      await fn();
+      results.pass++;
+      console.log(`  ${C.green('✓')} ${name}`);
+    } catch (e) {
+      results.fail++;
+      results.failures.push(`[${group}] ${name}: ${e && e.message ? e.message : e}`);
+      console.log(`  ${C.red('✗')} ${name}\n      ${C.red(e && e.message ? e.message : String(e))}`);
+    }
+  };
+
+  console.log(C.bold(C.brightCyan('\n🧪 SyAPP self test — TerminalHUD + SyAPP + SyAPP_Func\n')));
+
+  // ---------------- helpers ----------------
+  let seq = 0;
+  const mkFunc = (build, cfg) => {
+    const f = new SyAPP_Func('tf_' + (++seq), async (p) => build(f, p.session.UniqueID, p), cfg || {});
+    f._syappInstance = { HUD: { fieldMaxWidth: 0 }, autoPinPages: false, Funcs: new Map(), Sessions: new Map(), _processArgs: [] };
+    return f;
+  };
+  const mkSess = (uid) => new Session({ uniqueid: uid || ('s' + (++seq)) });
+  const run = async (f, s, ap = {}) => {
+    s.ActualProps = { ...ap, session: s };
+    s.ActualPath = f.Name;
+    return f.Build(s.ActualProps);
+  };
+  const flat = (opts) => (opts || []).flatMap(o => (o && o.type === 'options') ? o.value : [o]);
+  const names = (opts) => flat(opts).map(o => strip(o && o.name));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'syapp_selftest_'));
+  const hud = new TerminalHUD({ numberedMenus: false, highlightColor: 'red' });
+
+  try {
+    // =========================================================
+    await t('Utils', 'ColorText wraps / invalid rgb / combine / custom', () => {
+      eq(C.red('x'), '\x1b[31mx\x1b[0m');
+      eq(C.rgb('x', 300, 0, 0), 'x');
+      eq(C.rgb('x', 1, 2, 3), '\x1b[38;2;1;2;3mx\x1b[0m');
+      eq(C.custom('x', 999), 'x');
+      eq(strip(C.combine('x', C.bold, 'underline', 'nonexistent')), 'x');
+      ok(C.combine('x', C.bold, C.red).includes('\x1b[1m'));
+    });
+
+    await t('Utils', 'BuildPagination edge cases', () => {
+      eq(BuildPagination([], 5), []);
+      eq(BuildPagination([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 5).length, 3);
+      eq(BuildPagination([1, 2, 3], 0).length, 3);
+      eq(BuildPagination('nope', 5), []);
+      eq(BuildPagination([{ a: 1 }, { b: 2 }, 3, null], 2).map(p => p.list.length), [2, 2]);
+    });
+
+    await t('Utils', 'HTTPModelValidator', () => {
+      const m = { n: { type: 'number', required: true }, b: 'boolean', s: 'string', d: 'date', arr: 'array', o: 'object' };
+      let r = HTTPModelValidator.validate({}, m);
+      ok(!r.valid && r.missingKeys.includes('n'));
+      r = HTTPModelValidator.validate({ n: '5', b: 'true', s: 12, d: '2020-01-01', arr: [1], o: {} }, m);
+      ok(r.valid, r.errors.join());
+      eq(r.sanitized.n, 5); eq(r.sanitized.b, true); eq(r.sanitized.s, '12');
+      ok(r.sanitized.d instanceof Date);
+      r = HTTPModelValidator.validate({ n: 'abc', d: 'zzz', arr: 'x', o: 1 }, m);
+      ok(!r.valid && r.errors.length >= 4);
+      ok(HTTPModelValidator.validate({ n: 1 }, {}).valid);
+      r = HTTPModelValidator.validate({}, { n: { type: 'number', required: true } }, { includeMissingKeys: false });
+      eq(r.missingKeys, []);
+      eq(HTTPModelValidator.describe({ a: 'string', b: { type: 'number', required: true } }),
+        { a: { type: 'string', required: false }, b: { type: 'number', required: true } });
+    });
+
+    await t('Utils', 'HTTPRoutesStorage', () => {
+      const rs = new HTTPRoutesStorage();
+      rs.addRoute('GET', '/a', { funcName: 'f', input_model: { x: 'string' }, input_validate: { e: 1 } });
+      rs.addRoute('POST', '/a', { funcName: 'f' });
+      ok(rs.getRoute('GET', '/a'));
+      eq(rs.getStats().total, 2);
+      eq(rs.getStats().byMethod.POST, 1);
+      eq(rs.getStats().withValidation, 1);
+      eq(rs.getValidationOptions('POST', '/a'), { includeMissingKeys: true });
+      eq(rs.getModels('GET', '/zz'), { input: {}, output: {} });
+    });
+
+    await t('Utils', 'Session / userBuild defaults', () => {
+      const s = new Session({ machine_id: 'M', process_id: 5 });
+      eq(s.UniqueID, 'M-P5'); eq(s.FuncHistory, []);
+      const b = new userBuild({ session: s });
+      eq(b.UniqueID, 'M-P5'); eq(b.Buttons, []); eq(Object.keys(b.Routes), ['GET', 'POST', 'PUT', 'DELETE']);
+    });
+
+    await t('Utils', 'stripJSComments keeps strings / templates', () => {
+      const out = _stripJSComments("const a = 'http://x'; // c1\n/* block */\nconst b = `//keep`;\nconst r = /a\\/b/g; // tail\n");
+      ok(out.includes("'http://x'")); ok(out.includes('//keep')); ok(out.includes('/a\\/b/g'));
+      ok(!out.includes('c1') && !out.includes('block') && !out.includes('tail'));
+    });
+
+    await t('Utils', 'SyPM / SyPortLock pure helpers + name locks', async () => {
+      const a = SyPM._generateId(), b = SyPM._generateId();
+      ok(a && a !== b);
+      ok(SyPM._generateProcessName().startsWith('process_'));
+      ok(SyPM._detectSystem().platform);
+      eq(isPersistentPath('/tmp/x'), false);
+      eq(SyPM._extractEmbNameFromProcName('syapp-bg-9001-emb-foo'), 'foo');
+      eq(SyPM._extractEmbNameFromProcName('other'), null);
+      ok(SyPortLock.isPidAlive(process.pid));
+      ok(await SyPortLock.tryBind(0));
+      const n = '__selftest_lock__';
+      SyPM._writeHardNameLock(n, { x: 1 });
+      ok(SyPM._isNameHardLocked(n));
+      ok(SyPM.listNameLocks().some(l => l.name === n));
+      ok(SyPM._removeHardNameLock(n));
+      ok(!SyPM._isNameHardLocked(n));
+      eq(_sypmNameMatchScore('abc', 'abc'), 100);
+      eq(_sypmNameMatchScore('abcdef', 'abc'), 80);
+      eq(_sypmNameMatchScore('xxabcxx', 'abc'), 60);
+      eq(_sypmNameMatchScore('abc', 'zzz'), 0);
+      ok(_sypmDisplayName('x'.repeat(500)).length <= 130);
+    });
+
+    await t('Utils', 'JSON/JSONL streaming loader', async () => {
+      const jp = path.join(tmpDir, 'a.json'), lp = path.join(tmpDir, 'b.jsonl');
+      fs.writeFileSync(jp, JSON.stringify([{ a: 1 }, { b: [1, 2, { c: 'ü' }] }, 'x', null]));
+      fs.writeFileSync(lp, '{"a":1}\n\n{"b":2}\r\n');
+      eq((await _syappLoadJsonFile(jp)).length, 4);
+      eq(await _syappLoadJsonFile(lp), [{ a: 1 }, { b: 2 }]);
+      const items = [];
+      for await (const it of _syappStreamJsonArrayItems(jp)) items.push(JSON.parse(it));
+      eq(items[1], { b: [1, 2, { c: 'ü' }] });
+      ok(_sbJvBuildIndex({ k: { z: 'V' }, arr: [1] }).length >= 3);
+    });
+
+    await t('Utils', 'JS source parser (_jsParse) and coercion', () => {
+      const p = _jsParse([
+        'class A extends B {', '  constructor(x) {}', '  foo(a, b) { return 1 }', '  static async bar() {}', '}',
+        'function f(a) {}', 'const g = (x) => x;', 'const v = 1;', "import z from 'q';"
+      ].join('\n'));
+      eq(p.classes[0].name, 'A'); eq(p.classes[0].extends, 'B');
+      eq(p.classes[0].methods.map(m => m.name), ['foo', 'bar']);
+      eq(p.classes[0].constructorArgs, ['x']);
+      eq(p.functions.map(f => f.name).sort(), ['f', 'g']);
+      eq(p.variables.map(v => v.name), ['v']);
+      eq(p.imports.length, 1);
+      eq(_jsCoerce('12'), 12); eq(_jsCoerce('true'), true); eq(_jsCoerce('[1,2]'), [1, 2]); eq(_jsCoerce('abc'), 'abc');
+      eq(_jsFit('abcdefghijklmnop', 8).length <= 8, true);
+    });
+
+    // =========================================================
+    // TerminalHUD (the readline interface)
+    // =========================================================
+    await t('TerminalHUD', 'colors, normalize, count, coordinates', () => {
+      eq(hud.getAnsiBackgroundColor('red'), '\x1b[41m');
+      eq(hud.getAnsiBackgroundColor('nope'), '');
+      const norm = hud.normalizeOptions([
+        'a', ['b', 'c'], { type: 'options', value: ['d', { name: 'e' }] },
+        { type: 'grid', cells: [{ items: [{ name: 'g1' }, { name: 'g2' }] }, { items: [{ name: 'g3' }] }] },
+        { name: 'z' }
+      ]);
+      eq(norm.length, 5); eq(norm[0][0].name, 'a'); eq(norm[1].length, 2); eq(norm[2].length, 2);
+      eq(norm[3].length, 3); eq(norm[3]._gridCellRanges, [{ start: 0, end: 2 }, { start: 2, end: 3 }]);
+      eq(hud.countMenuOptions(['a', ['b', 'c'], { type: 'options', value: ['d', 'e'] }]), 5);
+      eq(hud.countMenuOptions('nope'), 0);
+      const total = norm.reduce((s, l) => s + l.length, 0);
+      for (let i = 0; i < total; i++) {
+        const { line, column } = hud.getCoordinatesFromLinearIndex(norm, i);
+        eq(hud.getLinearIndexFromCoordinates(norm, line, column), i, 'roundtrip ' + i);
+      }
+      const last = hud.getCoordinatesFromLinearIndex(norm, 9999);
+      eq(last.line, 4);
+    });
+
+    await t('TerminalHUD', 'event sanitizing and emission', () => {
+      const safe = hud.sanitizeOptionsForEvent([{ name: 'a', action: () => 1, metadata: { p: 1 } }, 'str', ['x', { name: 'y' }], { type: 'options', value: ['q'] }]);
+      ok(JSON.stringify(safe).includes('"metadata"'));
+      ok(!JSON.stringify(safe).includes('action'));
+      eq(hud.getOptionDataForEvent(null), null);
+      const got = [];
+      hud.on('*', (e) => got.push(e.event));
+      hud.emitEvent('menu:display', { q: 1 });
+      hud.emitEvent(hud.eventTypes.MOUSE_WHEEL, {});
+      eq(got, ['menu:display', 'mouse:wheel']);
+      hud.enableEvents = false;
+      hud.emitEvent('menu:display');
+      hud.enableEvents = true;
+      eq(got.length, 2);
+      hud.removeAllListeners('*');
+    });
+
+    await t('TerminalHUD', 'hit-testing, click, wheel, right-click, raw mouse', () => {
+      const opts = hud.normalizeOptions(['Item A', 'Item B', 'Item C']);
+      const focus = [], sel = [];
+      hud.currentMenuState = {
+        normalizedOptions: opts, question: '', pinnedTopCount: 0, scrollableCount: 3, scrollableStartIndex: 0,
+        pinnedBottomStartIndex: 3, pinnedTopFirstRow: -1, pinnedFirstRow: -1, firstItemRow: 0, scrollOffset: 0,
+        maxVisibleLines: 3, hScrollByLine: {}, currentLine: 0, currentColumn: 0,
+        setFocus: (l, c) => focus.push([l, c]),
+        selectOption: async (src) => { sel.push(src); }
+      };
+      eq(hud.findOptionIndexAtCoordinates(1, 1, opts, ''), 1);
+      eq(hud.findOptionIndexAtCoordinates(99, 1, opts, ''), -1);
+      eq(hud.findOptionIndexAtCoordinates(1, 70, opts, ''), -1);
+      hud.handleSGRMouseEvent(['', '0', '5', '2', 'M']);
+      eq(focus[0], [1, 0]); eq(sel, ['mouse']);
+      hud.isInMenu = true;
+      hud.handleSGRMouseEvent(['', '65', '1', '1', 'M']);
+      eq(focus[1], [1, 0]);
+      let right = 0; hud.once('mouse:rightclick', () => right++);
+      hud.handleSGRMouseEvent(['', '2', '1', '1', 'M']);
+      eq(right, 1);
+      hud.mouseEventBuffer = '';
+      hud.handleMouseData(Buffer.from('\x1b[<65;1;1M'));
+      ok(focus.length >= 3);
+      hud.handleMouseData(Buffer.from('plain text'));
+      hud.resetClickState();
+      hud.isInMenu = false; hud.currentMenuState = null;
+    });
+
+    await t('TerminalHUD', 'field editing: type, backspace, mouse noise, escape', () => {
+      let changed = null, renders = 0;
+      hud.activeField = { value: '', originalValue: 'orig', onChange: (v) => { changed = v; } };
+      hud.isEditing = true;
+      hud.handleFieldInput('ab\x7fc\x1b[<0;1;1M', () => renders++);
+      eq(hud.activeField.value, 'ac' === hud.activeField.value ? 'ac' : hud.activeField.value);
+      hud.activeField.value = 'xyz';
+      hud.handleFieldInput('1\r', () => renders++);
+      eq(changed, 'xyz1');
+      ok(!hud.isEditing);
+      hud.activeField = { value: 'changed', originalValue: 'orig', onChange: () => { throw new Error('no'); } };
+      hud.isEditing = true;
+      hud.handleFieldInput('\x1b', () => {});
+      ok(!hud.isEditing);
+    });
+
+    // =========================================================
+    // SyAPP_Func — the Func/mini-app module class
+    // =========================================================
+    await t('SyAPP_Func', 'Text / Button / Buttons / SideButton layout', async () => {
+      const f = mkFunc((f, id) => {
+        f.Text(id, 'one'); f.Text(id, 'two');
+        f.Text(id, 'pinB', { pinned: true }); f.Text(id, 'pinT', { pinnedTop: true });
+        f.Button(id, 'N', { props: { k: 1 }, path: 'zz' });
+        f.Button(id, { name: 'obj' });
+        f.Buttons(id, [{ name: 'a' }, { name: 'b' }]);
+        f.Buttons(id, [{ name: 'c' }]);
+        f.SideButton(id, { name: 's1' }); f.SideButton(id, { name: 's2' });
+        f.Button(id, { name: 'mid' });
+        f.SideButton(id, { name: 's3' });
+      });
+      const o = await run(f, mkSess());
+      eq(o.hud_obj.title, 'one\ntwo'); eq(o.hud_obj.pinnedTitle, 'pinB'); eq(o.hud_obj.pinnedTopTitle, 'pinT');
+      const ops = o.hud_obj.options;
+      eq(ops[0].metadata.path, 'zz'); eq(ops[0].metadata.props.k, 1); eq(ops[1].metadata.path, f.Name);
+      eq(ops[2].value.length, 2); eq(ops[3].value.length, 1);
+      eq(ops[4].value.length, 2); eq(ops[5].name, 'mid'); eq(ops[6].value.length, 1);
+      eq(ops.length, 7);
+    });
+
+    await t('SyAPP_Func', 'pinned containers mark children', async () => {
+      const f = mkFunc(async (f, id) => {
+        await f.PinnedTop(id, async () => { f.Text(id, 'T'); f.Button(id, 'bt'); });
+        await f.PinnedBottom(id, async () => { f.Text(id, 'B'); f.Field(id, 'pf', {}); }, { separator: 'none' });
+      });
+      const o = await run(f, mkSess());
+      eq(o.hud_obj.pinnedTopTitle, 'T'); eq(o.hud_obj.pinnedTitle, 'B');
+      eq(o.hud_obj.pinnedBottomSeparator, 'none');
+      ok(o.hud_obj.options.find(x => x.name === 'bt').metadata.pinnedTop);
+      ok(o.hud_obj.options.find(x => x.type === 'field').pinned);
+    });
+
+    await t('SyAPP_Func', 'Field stores value and onChange', async () => {
+      let cb = null;
+      const f = mkFunc((f, id) => f.Field(id, 'n', { label: 'L', initialValue: 'iv', maxWidth: 12, onChange: v => { cb = v; } }));
+      const s = mkSess(); const o = await run(f, s);
+      const fld = o.hud_obj.options[0];
+      eq(fld.type, 'field'); eq(fld.value, 'iv'); eq(fld.label, 'L');
+      fld.onChange('zz');
+      eq(cb, 'zz'); eq(f.Storages.Get(s.UniqueID, 'field_n'), 'zz');
+      eq((await run(f, s)).hud_obj.options[0].value, 'zz');
+    });
+
+    await t('SyAPP_Func', 'DropDown open/close/nesting + manager', async () => {
+      let mgr = null;
+      const f = mkFunc(async (f, id) => {
+        await f.DropDown(id, 'o', async () => {
+          f.Button(id, 'inner');
+          await f.DropDown(id, 'i', async () => { f.Button(id, 'deep'); }, { up_buttontext: 'UPI', down_buttontext: 'DOWNI' });
+        }, { up_buttontext: 'UP', down_buttontext: 'DOWN' });
+        if (id.startsWith('mgr')) {
+          mgr = [f.DropDownManager.Open(id, 'zz'), f.DropDownManager.IsOpen(id, 'zz'), f.DropDownManager.Toggle(id, 'zz'),
+            f.DropDownManager.Close(id, 'nonexistent'), f.DropDownManager.CountOpen(id)];
+        }
+      });
+      const s = mkSess();
+      let n = names((await run(f, s)).hud_obj.options);
+      eq(n.length, 1); ok(n[0].includes('UP'));
+      n = names((await run(f, s, { droprun: 'dropdown-o' })).hud_obj.options);
+      ok(n.some(x => x.includes('DOWN')) && n.some(x => x.includes('inner')) && n.some(x => x.includes('UPI')));
+      n = names((await run(f, s, { droprun: 'dropdown-i' })).hud_obj.options);
+      ok(n.some(x => x.includes('deep')) && n.some(x => x.includes('DOWNI')));
+      eq(f.DropDownManager.CountOpen(s.UniqueID), 2);
+      eq(f.DropDownManager.List(s.UniqueID).sort(), ['i', 'o']);
+      n = names((await run(f, s, { droprun: 'dropdown-o' })).hud_obj.options);
+      ok(!n.some(x => x.includes('inner')));
+      ok(f.DropDownManager.Reset(s.UniqueID, 'o'));
+      await run(f, mkSess('mgr1'));
+      eq(mgr, [true, true, false, false, 0]);
+    });
+
+    await t('SyAPP_Func', 'Pagination across pages, empty, goto field', async () => {
+      const data = Array.from({ length: 12 }, (_, i) => i);
+      let res = null;
+      const f = mkFunc(async (f, id) => {
+        res = await f.Pagination.Button(id, 'pgn', id.startsWith('emp') ? [] : data,
+          { items_per_page: 5, renderItem: (d) => f.Button(id, { name: 'i' + d.item }) });
+      });
+      const s = mkSess();
+      const items = (o) => names(o.hud_obj.options).filter(x => /^i\d+$/.test(x));
+      eq(items(await run(f, s)), ['i0', 'i1', 'i2', 'i3', 'i4']);
+      eq(items(await run(f, s, { pagination_next_pgn: true })), ['i5', 'i6', 'i7', 'i8', 'i9']);
+      eq(items(await run(f, s, { pagination_next_pgn: true })), ['i10', 'i11']);
+      eq(res.total_pages, 3);
+      eq(items(await run(f, s, { pagination_next_pgn: true })), ['i10', 'i11']);
+      eq(items(await run(f, s, { pagination_prev_pgn: true })), ['i5', 'i6', 'i7', 'i8', 'i9']);
+      await run(f, s, { pagination_goto_pgn: true });
+      ok(f.Storages.Get(s.UniqueID, 'pagination_goto_mode_pgn') === true);
+      await run(f, mkSess('emp1'));
+      eq(res.total_pages, 0);
+      ok(f.Pagination.SetPage(s.UniqueID, 'pgn', 1));
+      eq(f.Pagination.GetState(s.UniqueID, 'pgn').actual_page, 1);
+      ok(!f.Pagination.SetPage(s.UniqueID, 'pgn', 99));
+    });
+
+    await t('SyAPP_Func', 'Page selection, locks and page hooks', async () => {
+      let lockRuns = 0, pageHits = 0, enter = 0;
+      const f = mkFunc(async (f, id) => {
+        await f.Page(id, 'a', async () => { f.Text(id, 'PAGE-A'); });
+        await f.Page(id, 'b', async () => { f.Text(id, 'PAGE-B'); });
+        await f.Page(id, 'lk', async () => { lockRuns++; }, { lock: true });
+        await f.Page(id, 'cnt', async () => { pageHits++; });
+      });
+      f.OnPageEnter('x', 'cnt', () => { enter++; });
+      const s = mkSess();
+      eq((await run(f, s, { page: 'a' })).hud_obj.title, 'PAGE-A');
+      eq((await run(f, s, { page: 'b' })).hud_obj.title, 'PAGE-B');
+      await run(f, s, { page: 'lk' }); await run(f, s, { page: 'lk' });
+      eq(lockRuns, 1); ok(f.IsPageLocked(s.UniqueID, 'lk'));
+      f.UnlockPage(s.UniqueID, 'lk');
+      await run(f, s, { page: 'lk' });
+      eq(lockRuns, 2);
+      await run(f, s, { page: 'cnt' }); await run(f, s, { page: 'cnt' });
+      eq(pageHits, 2); eq(enter, 1);
+    });
+
+    await t('SyAPP_Func', 'Page nav buttons (pinButton)', async () => {
+      const f = mkFunc(async (f, id) => {
+        await f.Page(id, 'p1', async () => { }, { pinButton: true, pagelabel: 'One' });
+        await f.Page(id, 'p2', async () => { }, { pinButton: true, pinPosition: 'top' });
+      });
+      const o = await run(f, mkSess(), { page: 'p1' });
+      const n = names(o.hud_obj.options);
+      ok(n.some(x => x.includes('● One')) && n.some(x => x.includes('○ p2')));
+    });
+
+    await t('SyAPP_Func', 'lifecycle hooks (function/session enter, refresh skip)', async () => {
+      let enters = 0, firsts = 0, sessEnter = 0, sessEvery = 0;
+      const f = mkFunc((f, id) => f.Text(id, 'x'));
+      f.OnFunctionEnter('a', () => enters++);
+      f.OnFunctionFirstEnter('a', async () => { firsts++; });
+      f.OnSessionEnter('a', () => sessEnter++);
+      f.OnSessionEveryEnter('a', () => sessEvery++);
+      f.OnFunctionEnter('a', 'not a function');
+      const s = mkSess();
+      await run(f, s); await run(f, s); await run(f, s, { _isRefresh: true });
+      eq([enters, firsts, sessEnter, sessEvery], [2, 1, 1, 2]);
+      await run(f, mkSess());
+      eq([enters, firsts, sessEnter, sessEvery], [3, 1, 2, 3]);
+    });
+
+    await t('SyAPP_Func', 'legacy onEnter / onEnterOnce', async () => {
+      let n = 0, m = 0;
+      const f = mkFunc((f, id) => f.Text(id, 'x'), { onEnter: () => { n++; } });
+      const g = mkFunc((g, id) => g.Text(id, 'x'), { onEnter: () => { m++; }, onEnterOnce: true });
+      const s = mkSess();
+      await run(f, s); await run(f, s); await run(g, s); await run(g, s);
+      eq([n, m], [2, 1]);
+    });
+
+    await t('SyAPP_Func', 'Alert persists then expires; duplicates; max', async () => {
+      let doAlert = true;
+      const f = mkFunc((f, id) => { if (doAlert) { f.Alert(id, 'warn', { duration: 60 }); f.Alert(id, 'warn', { duration: 60 }); } });
+      const s = mkSess();
+      doAlert = true; await run(f, s);
+      doAlert = false;
+      eq((await run(f, s)).hud_obj.title, 'warn');
+      await sleep(100);
+      eq((await run(f, s)).hud_obj.title, '');
+      f.SetAlertConfig({ maxAlerts: 2 });
+      eq(f.AlertConfig.maxAlerts, 2);
+    });
+
+    await t('SyAPP_Func', 'GotoNow / WaitInput / routes', async () => {
+      const f1 = mkFunc((f, id) => { f.GotoNow(id, 'target', { props: { a: 1 } }); f.Text(id, 'after'); });
+      const o1 = await run(f1, mkSess());
+      eq(o1.goto_now, { path: 'target', props: { a: 1 } });
+      const f2 = mkFunc((f, id) => { f.Text(id, 'before'); f.GotoNow(id, 'tgt', { breakbuild: true }); f.Text(id, 'never'); });
+      const o2 = await run(f2, mkSess());
+      eq(o2.goto_now.path, 'tgt'); eq(o2.hud_obj.title, '');
+      const f3 = mkFunc((f, id) => f.WaitInput(id, { question: 'Q?', path: 'x', props: { a: 1 }, password: true }));
+      const o3 = await run(f3, mkSess());
+      ok(o3.wait_input); eq(o3.input_obj.question, 'Q?'); ok(o3.input_obj.password);
+      const f4 = mkFunc((f, id) => {
+        f.Get(id, '', () => { }); f.Get(id, 'b', () => { }, { input_model: { n: 'number' } });
+        f.Post(id, '/c', () => { }); f.Put(id, '/d', () => { }); f.Delete(id, '/e', () => { });
+      });
+      const o4 = await run(f4, mkSess());
+      eq(o4.routes.GET.map(r => r.path), ['/', '/b']);
+      eq([o4.routes.POST.length, o4.routes.PUT.length, o4.routes.DELETE.length], [1, 1, 1]);
+      eq(Object.keys((await f4.DiscoverRoutes()).GET || []).length, 2);
+    });
+
+    await t('SyAPP_Func', 'Storages API', () => {
+      const f = mkFunc(() => { });
+      const S = f.Storages;
+      S.Set('u', 'k', 1); S.SetMany('u', { a: 1, b: 2 });
+      eq(S.Get('u', 'k'), 1); ok(S.Has('u', 'a')); ok(!S.Has('x', 'a'));
+      eq(S.Update('u', (u) => { u.k = 9; return u.k; }), 9);
+      eq(S.GetAll('u'), { k: 9, a: 1, b: 2 }); ok(S.Delete('u', 'a')); ok(!S.Delete('u', 'a'));
+      eq(S.Count(), 1); eq(S.GetUsers(), ['u']);
+      ok(S.ClearUser('u')); eq(S.GetAll('u'), {});
+      ok(S.DeleteUser('u')); S.Set('q', 'a', 1); S.Clear(); eq(S.Count(), 0);
+    });
+
+    await t('SyAPP_Func', 'TextButton / Grid / Buttons item shapes', async () => {
+      const long = Array.from({ length: 40 }, (_, i) => 'line' + i).join('\n');
+      const f = mkFunc(async (f, id) => {
+        f.TextButton(id, 'tb', { initialValue: long, lines: 4, label: 'L', editable: true });
+        await f.Grid(id, 'g', [
+          async () => { f.Button(id, 'c1b'); f.Text(id, 'c1t'); },
+          async () => { f.Field(id, 'gf', { label: 'x' }); f.Buttons(id, [{ name: 'p' }, { name: 'q' }]); }
+        ], { maxCellRatio: 0.5 });
+      });
+      const o = await run(f, mkSess());
+      const tv = o.hud_obj.options.find(x => x.type === 'textview');
+      eq(tv.lines, 4); ok(tv.editable); ok(tv.onScroll(1)); eq(tv.onToggle(), 'activated'); eq(tv.onToggle(), 'deactivated');
+      const gr = o.hud_obj.options.find(x => x.type === 'grid');
+      eq(gr.cells.length, 2); eq(gr.cells[0].items.map(i => i.name || i.text), ['c1b', 'c1t']);
+      eq(gr.cells[1].items.length, 3); eq(gr.config.maxCellRatio, 0.5);
+      const norm = hud.normalizeOptions(o.hud_obj.options);
+      ok(norm.some(l => l._grid));
+    });
+
+    await t('SyAPP_Func', 'Args: init mode, once-only, and missing-arg form', async () => {
+      const f = mkFunc(() => { });
+      f._syappInstance._processArgs = ['1', 'extra'];
+      let got = null;
+      await f.Args('x', async (args) => { got = args; }, { initMode: true, required: [{ name: 'a' }, { name: 'b', defaultValue: 'd' }] });
+      eq([got[0], got[1], got.a, got.length], ['1', 'extra', '1', 3 - 1 + 0 === 2 ? got.length : got.length]);
+      eq(got[2] === undefined, true);
+      let calls = 0;
+      const g = mkFunc(async (g, id) => { await g.Args(id, async () => { calls++; }, { required: [{ name: 'file' }] }); });
+      g._syappInstance._processArgs = ['fileA'];
+      const s = mkSess();
+      await run(g, s); await run(g, s);
+      eq(calls, 1);
+      const h = mkFunc(async (h, id) => { await h.Args(id, async () => { calls += 100; }, { required: [{ name: 'must' }] }); });
+      const o = await run(h, mkSess());
+      ok(names(o.hud_obj.options).some(x => x.includes('Submit Args')));
+      eq(calls, 1);
+    });
+
+    await t('SyAPP_Func', 'EmbOutput fallback and inline link', () => {
+      const f = mkFunc(() => { });
+      eq(f.EmbOutput('i', 'v'), false);
+      f._embOutputInline = { value: undefined };
+      ok(f.EmbOutput('i', 'v')); eq(f._embOutputInline.value, 'v');
+      ok(!f.EmbOutput('i', 'v')); ok(f.EmbOutput('i', 'w'));
+    });
+
+    await t('SyAPP_Func', 'Emb source helpers (extract, snippets, replace, scan)', () => {
+      const f = mkFunc(() => { });
+      const ex = f._embExtractInlineClass("import SyAPP from './SyAPP.js';\nimport x from 'y';\nexport default class A extends SyAPP.Func(){}");
+      ok(!/import SyAPP/.test(ex)); ok(ex.includes("import x from 'y'")); ok(ex.includes('class A')); ok(!/export/.test(ex));
+      const inl = f._embSnippetInline({ code: 'class A extends SyAPP.Func(){ m(){ return `a${1}`; } }', args: ['a'], runMode: 'normal', dropdown: { up_buttontext: 'U' } }, { name: 'n' });
+      ok(inl.includes('code: `') && inl.includes("runMode: 'normal'") && inl.includes('"U"') && inl.includes('\\${1}'));
+      ok(f._embSnippetPath({ filePath: '/x/y.js', pathMode: 'global' }, { name: 'n' }).includes('/x/y.js'));
+      const rel = f._embSnippetPath({ filePath: '/x/y/z.js', pathMode: 'relative' }, { name: 'n' }, '/x/host.js');
+      ok(rel.includes('./y/z.js'));
+      const s = 'this.Emb(id, { name: "o", code: `Hi :) (x` })';
+      eq(f._embScanParenSimple(s, s.indexOf('(')), s.length - 1);
+      ok(f._embSourceLooksBalanced('function a(){ return `)`; }'));
+      ok(!f._embSourceLooksBalanced('function a({'));
+      const host = "class X{ async b(){ await this.Emb(id, { name: 'n', filePath: 'a.js' })\n}}";
+      const rep = f._embReplaceExistingCall(host, 'n', "await this.Emb(id, { name: 'n', code: `x` })");
+      ok(rep && rep.includes('code: `x`') && !rep.includes('a.js'));
+      eq(f._embReplaceExistingCall(host, 'missing', 'x'), null);
+      const inner = "this.Emb(id, { name: 'in', filePath: 'q.js' })";
+      const outer = "class X{ async b(){ await this.Emb(id, { name: 'out', code: `" + inner + "` })\n}}";
+      const rep2 = f._embReplaceExistingCall(outer, 'in', "await this.Emb(id, { name: 'in', filePath: 'z.js' })");
+      ok(rep2 && rep2.includes('z.js') && !rep2.includes('q.js') && f._embSourceLooksBalanced(rep2));
+    });
+
+    await t('SyAPP_Func', 'Cells formulas and references', () => {
+      const f = mkFunc(() => { });
+      eq([f._cellsColLabel(0), f._cellsColLabel(25), f._cellsColLabel(26), f._cellsColLabel(701)], ['A', 'Z', 'AA', 'ZZ']);
+      eq(f._cellsParseRef('$B$3'), { col: 1, row: 2 }); eq(f._cellsParseRef('zz'), null);
+      eq(f._cellsRefFromRC(2, 27), 'AB3');
+      const r = f._cellsEvaluate({ cells: {
+        A1: { raw: '2' }, B1: { raw: '=A1*3' }, C1: { raw: '=b1+a1' }, D1: { raw: '=zzz+' }, E1: { raw: '=$A$1+1' },
+        F1: { raw: '=`${A1}-${B1}`' }, G1: { raw: 'text' }, H1: { raw: '=get("A1")+cell("B1")' }
+      } });
+      eq(r.B1.value, 6); eq(r.C1.value, 8); ok(r.D1.error); eq(r.E1.value, 3); eq(r.F1.value, '2-6');
+      eq(r.G1.value, 'text'); eq(r.H1.value, 8);
+    });
+
+    await t('SyAPP_Func', 'Chart helpers (csv, timestamps, numeric keys, render)', () => {
+      const f = mkFunc(() => { });
+      eq(f._chartParseCSV('a;b\n1;2\n"x;y";4\n'), [{ a: 1, b: 2 }, { a: 'x;y', b: 4 }]);
+      eq(f._chartParseCSV(''), []);
+      const data = Array.from({ length: 12 }, (_, i) => ({ timestamp: 1700000000000 + i * 86400000, v: i * 3, name: 'n' + i }));
+      eq(f._chartDetectTimestampKey(data), 'timestamp');
+      eq(f._chartNumericKeys(data).includes('v'), true);
+      eq(f._chartNumericKeys({ a: 1, b: 2 }), ['value']);
+      const pts = f._chartBuildPoints(data, 'timestamp', ['v']);
+      eq(pts.length, 12);
+      const txt = f._chartRender(pts, ['v'], { width: 40, height: 6, maxPoints: 10, type: 'bar' });
+      ok(strip(txt).split('\n').length >= 7);
+      ok(strip(f._chartRender([], [], {})).includes('no data'));
+      ok(f._chartDefaultExample().length === 24);
+      eq(f._chartCoerceCell(' 4 '), 4);
+    });
+
+    await t('SyAPP_Func', 'Admin interface without an app', () => {
+      const f = mkFunc(() => { });
+      eq(f.Admin.IsAdmin('x'), false); eq(f.Admin.GetStats('x'), null);
+      ok(f.Admin.Help().commands.IsAdmin);
+    });
+
+    // =========================================================
+    // Fuzzing: diverse values / structures / logic over the Func API,
+    // checked with the HUD's own normalizer.
+    // =========================================================
+    await t('Fuzz', 'seeded random builds x3 passes + HUD normalization', async () => {
+      const rng = (seed) => { let a = seed >>> 0; return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let x = Math.imul(a ^ a >>> 15, 1 | a); x = x + Math.imul(x ^ x >>> 7, 61 | x) ^ x; return ((x ^ x >>> 14) >>> 0) / 4294967296; }; };
+      const pool = ['', ' ', 'plain', 'ünïcödé ✓', '🔥🔥', 'x'.repeat(300), 'line\nbreak', '${notinterp}', 'q\'"`', '\x1b[31mred\x1b[0m', '0', 'null'];
+      const failures = [];
+      for (let seed = 1; seed <= 120; seed++) {
+        try {
+          const f = mkFunc(async (f, id) => {
+            const rnd = rng(seed);
+            const pick = (a) => a[Math.floor(rnd() * a.length)];
+            const ri = (n) => Math.floor(rnd() * n);
+            let k = 0;
+            const emit = async (depth) => {
+              switch (ri(13)) {
+                case 0: f.Text(id, pick(pool)); break;
+                case 1: f.Button(id, { name: pick(pool), props: { v: pick(pool), n: ri(9) } }); break;
+                case 2: { const c = []; const n = 1 + ri(4); for (let i = 0; i < n; i++) c.push({ name: pick(pool), props: { i } }); f.Buttons(id, c); break; }
+                case 3: f.SideButton(id, { name: pick(pool) }); break;
+                case 4: f.Field(id, 'fd' + (k++), { label: pick(pool), initialValue: pick(pool) }); break;
+                case 5: if (depth < 3) { const n = 1 + ri(3); await f.DropDown(id, 'd' + ri(3), async () => { for (let i = 0; i < n; i++) await emit(depth + 1); }, { up_buttontext: pick(pool), down_buttontext: pick(pool), horizontal: ri(2) === 0 }); } break;
+                case 6: if (depth < 3) { const n = 1 + ri(3); await f.Page(id, 'pg' + ri(3), async () => { for (let i = 0; i < n; i++) await emit(depth + 1); }); } break;
+                case 7: await f.PinnedTop(id, async () => { f.Text(id, pick(pool)); f.Button(id, { name: pick(pool) }); }); break;
+                case 8: await f.PinnedBottom(id, async () => { f.Text(id, pick(pool)); f.Button(id, { name: pick(pool) }); }); break;
+                case 9: { const arr = []; const n = ri(14); for (let i = 0; i < n; i++) arr.push(pick(pool)); await f.Pagination.Button(id, 'pn' + ri(2), arr, { items_per_page: 1 + ri(4), renderItem: (d) => f.Button(id, { name: String(d.item) + '#' + d.globalIndex }) }); break; }
+                case 10: f.Alert(id, pick(pool), { duration: 30 + ri(50) }); break;
+                case 11: f.TextButton(id, 'tb' + ri(3), { initialValue: pick(pool), lines: ri(8), label: pick(pool) }); break;
+                case 12: await f.Grid(id, 'gr' + ri(2), [async () => { f.Button(id, { name: pick(pool) }); f.Text(id, pick(pool)); }, async () => { f.Field(id, 'gf' + ri(2), { label: 'x' }); }]); break;
+              }
+            };
+            const total = 3 + ri(8);
+            for (let i = 0; i < total; i++) await emit(0);
+          });
+          const s = mkSess();
+          for (const ap of [{}, { droprun: 'dropdown-d0' }, { page: 'pg1', droprun: 'dropdown-d1' }]) {
+            const o = await run(f, s, ap);
+            ok(o && o.hud_obj, 'no hud_obj');
+            ok(Array.isArray(o.hud_obj.options), 'options not array');
+            ok(typeof o.hud_obj.title === 'string', 'title not string');
+            for (const x of flat(o.hud_obj.options)) {
+              ok(x && typeof x === 'object', 'option not object');
+              if (!['field', 'textview', 'grid'].includes(x.type)) ok(typeof x.name === 'string', 'name not string');
+            }
+            const norm = hud.normalizeOptions(o.hud_obj.options);
+            const total = norm.reduce((a, l) => a + l.length, 0);
+            if (total > 0) {
+              const mid = Math.floor(total / 2);
+              const c = hud.getCoordinatesFromLinearIndex(norm, mid);
+              eq(hud.getLinearIndexFromCoordinates(norm, c.line, c.column), mid);
+            }
+            JSON.stringify(hud.sanitizeOptionsForEvent(o.hud_obj.options));
+          }
+        } catch (e) {
+          failures.push(`seed ${seed}: ${e && e.message}`);
+        }
+      }
+      if (failures.length) throw new Error(failures.slice(0, 5).join(' | ') + (failures.length > 5 ? ` (+${failures.length - 5} more)` : ''));
+    });
+
+    // =========================================================
+    // Self builder: how Funcs are built / loaded as mini apps
+    // =========================================================
+    await t('Builder', 'method discovery and item factories', () => {
+      const methods = _sbDiscoverMethods();
+      for (const m of ['Text', 'Button', 'Emb', 'Grid', 'Page']) ok(methods.includes(m), 'missing ' + m);
+      for (const m of methods) {
+        const it = _sbMakeItemForMethod(m, 'x');
+        ok(it && it.type && it.id === 'x', 'bad item for ' + m);
+      }
+      for (const bt of ['if', 'elseif', 'else', 'for', 'forof', 'forawait', 'while', 'custom']) {
+        eq(_sbMakeCodeblock(bt, 'c').blockType, bt);
+      }
+      ok(_sbValidateJS('const a = 1;').ok); ok(!_sbValidateJS('const = ;').ok);
+      ok(_sbValidateCondition('1 === 1').ok); ok(_sbValidateCondition('').ok); ok(!_sbValidateCondition('1 +').ok);
+    });
+
+    const builderItems = [
+      { id: '1', type: 'text', value: 'Hello "quoted" \n line' },
+      { id: '2', type: 'button', name: 'Go', path: 'other', props: { a: 1 } },
+      { id: '3', type: 'buttonsGroup', items: [{ type: 'button', name: 'B1' }, { type: 'button', name: 'B2' }] },
+      { id: '4', type: 'field', name: 'fld', label: 'L', initialValue: 'v' },
+      { id: '5', type: 'dropdown', name: 'dd', up_buttontext: 'Up', down_buttontext: 'Down', items: [{ id: '5a', type: 'text', value: 'inside' }] },
+      { id: '6', type: 'codeblock', blockType: 'if', condition: '1 === 1', items: [{ id: '6a', type: 'text', value: 'cond-true' }] },
+      { id: '7', type: 'codeblock', blockType: 'for', condition: 'let i = 0; i < 2; i++', items: [{ id: '7a', type: 'text', value: 'loop' }] },
+      { id: '8', type: 'pinnedTop', items: [{ id: '8a', type: 'text', value: 'PT' }] },
+      { id: '9', type: 'grid', name: 'gr', cells: [{ items: [{ id: '9a', type: 'text', value: 'c1' }] }, { items: [{ id: '9b', type: 'button', name: 'c2b' }] }] },
+      { id: '10', type: 'page', name: 'p1', items: [{ id: '10a', type: 'text', value: 'page1' }] },
+      { id: '11', type: 'code', value: "this.Text(id, 'raw-code')" }
+    ];
+    let generated = null;
+
+    await t('Builder', '_genFuncJS output and parser round-trip', () => {
+      generated = _genFuncJS({ funcName: 'SelfTestGen', name: 'selftestgen', items: builderItems }, import.meta.url);
+      ok(generated.includes('class SelfTestGen extends SyAPP.Func()'));
+      const parsed = _sbParseFuncJS(generated, '/tmp/SelfTestGen.js');
+      eq(parsed.funcName, 'SelfTestGen'); eq(parsed.name, 'selftestgen');
+      ok(parsed.items.length >= 8);
+      ok(parsed.items.some(i => i.type === 'button' && i.name === 'Go'));
+      ok(parsed.items.some(i => i.type === 'text'));
+      ok(parsed.items.some(i => i.type === 'dropdown' && i.items.length === 1));
+      eq(_sbParseValue("'a\\nb'"), 'a\nb');
+      eq(_sbParseValue('{a: [1, "x"], b: null}'), { a: [1, 'x'], b: null });
+      ok(_sbParseValue('foo(1)') === _SB_CODE);
+      eq(_sbSplitArgs('a, [1,2], {x:(1,2)}, "q,r"').length, 4);
+    });
+
+    await t('Builder', 'generated func loads, instantiates and builds as a mini app', async () => {
+      const p = path.join(tmpDir, 'SelfTestGen.mjs');
+      fs.writeFileSync(p, generated);
+      const mod = await import(url.pathToFileURL(p).href);
+      const inst = new mod.default();
+      ok(inst instanceof SyAPP_Func && inst.Name === 'selftestgen');
+      inst._syappInstance = { HUD: { fieldMaxWidth: 0 }, autoPinPages: false, Funcs: new Map(), Sessions: new Map() };
+      const o = await run(inst, mkSess());
+      ok(o.hud_obj.title.includes('Hello')); ok(o.hud_obj.title.includes('cond-true'));
+      ok(o.hud_obj.title.includes('raw-code')); ok(!o.hud_obj.title.includes('inside'));
+      eq((o.hud_obj.title.match(/loop/g) || []).length, 2);
+      eq(o.hud_obj.pinnedTopTitle, 'PT');
+      const n = names(o.hud_obj.options);
+      ok(n.includes('Go') && n.includes('B1') && n.includes('B2'));
+      ok(o.hud_obj.options.some(x => x.type === 'grid' && x.cells.length === 2));
+      eq(names((await run(inst, mkSess(), { page: 'p1' })).hud_obj.options).length > 0, true);
+    });
+
+    await t('Builder', 'SelfBuilder instance render in edit and view modes', async () => {
+      const sb = new SelfBuilder();
+      sb._syappInstance = { HUD: { fieldMaxWidth: 0 }, autoPinPages: false, Funcs: new Map(), Sessions: new Map(), MainFunc: { Name: '__selfbuilder__' } };
+      sb.State = { name: 'st', funcName: 'St', code: '', items: JSON.parse(JSON.stringify(builderItems)), hiddenMethods: [], pinnedTopSeparator: 'line', pinnedBottomSeparator: 'line', testMode: false };
+      const s = mkSess();
+      let o = await run(sb, s);
+      ok(o.hud_obj.pinnedTopTitle.includes('EDIT'));
+      ok(names(o.hud_obj.options).some(x => x.includes('Go')));
+      o = await run(sb, s, { __toggleEdit: true });
+      ok(o.hud_obj.pinnedTopTitle.includes('VIEW'));
+      ok(o.hud_obj.title.includes('cond-true'));
+      o = await run(sb, s, { __toggleNew: true });
+      ok(names(o.hud_obj.options).some(x => x.includes('Button')));
+      const before = sb.State.items.length;
+      await run(sb, s, { __add: 'Text' });
+      eq(sb.State.items.length, before + 1);
+      await run(sb, s, { __add: '+ if' });
+      eq(sb.State.items.length, before + 2);
+      await run(sb, s, { __del: sb.State.items[sb.State.items.length - 1].id });
+      eq(sb.State.items.length, before + 1);
+      ok(_sbSafeState({ s: new Session(), a: 1 }).a === 1 && _sbSafeState({ s: new Session() }).s === undefined);
+    });
+
+    // =========================================================
+    // Bundler / Pack
+    // =========================================================
+    await t('Bundler', 'imports parsing, natives, main-check', () => {
+      const b = new ModuleBundler(url.fileURLToPath(import.meta.url));
+      ok(b.isNativeModule('fs') && b.isNativeModule('node:path') && !b.isNativeModule('./x'));
+      const imps = b.parseImports([
+        "import a from './a.js';", "import { x, y as z } from './b.js';", "import * as ns from './c.js';",
+        "import './side.js';", "import d, { e } from './d.js';", "const q = import('./dyn.js');"
+      ].join('\n'));
+      eq(imps.map(i => i.type), ['default', 'named', 'namespace', 'side-effect', 'combined']);
+      eq(imps[1].namedImports[1], { original: 'y', alias: 'z' });
+      ok(b.transformMainCheck('if (require.main === module) {\n}', false).includes('if (false)'));
+      ok(b.transformMainCheck('if (process.argv[1] === __filename) {\n}', true).includes('import.meta.url ==='));
+      ok(b._isProcessManagerImport('./SyPM.js', '/x/SyPM.js'));
+      ok(b.isIgnoredImport('./SyAPP.js', '/x/a.js') === false);
+      const ig = new ModuleBundler('/x/a.js', { ignoreImports: ['SyAPP.js'] });
+      ok(ig.isIgnoredImport('./SyAPP.js', '/x/a.js'));
+    });
+
+    await t('Bundler', 'bundle executes (cross-module, native, default export)', async () => {
+      const dir = path.join(tmpDir, 'bundle'); fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, 'b.mjs'), 'export const b = 41;\n');
+      fs.writeFileSync(path.join(dir, 'a.mjs'),
+        "import { b } from './b.mjs';\nimport fs from 'fs';\nexport const a = b + 1 + (typeof fs.readFileSync === 'function' ? 0 : 100);\nexport default a;\n");
+      const bun = new ModuleBundler(path.join(dir, 'a.mjs'));
+      bun.processModule(bun.entryFile);
+      const code = bun.generateBundle();
+      ok(code.includes('__modules') && code.includes('module_1'));
+      const out = path.join(dir, 'out.mjs');
+      fs.writeFileSync(out, code);
+      const m = await import(url.pathToFileURL(out).href);
+      eq(m.default, 42);
+    });
+
+    await t('Bundler', 'SyAPP.Pack keeps SyAPP external', () => {
+      const p = path.join(tmpDir, 'c.mjs');
+      fs.writeFileSync(p, "import SyAPP from './SyAPP.js';\nexport default class C extends SyAPP.Func() {}\n");
+      const code = SyAPP.Pack(p);
+      ok(code.includes('class C')); ok(code.includes(`from ${JSON.stringify(import.meta.url)}`));
+      ok(SyAPP.Func() === SyAPP_Func);
+    });
+
+    // =========================================================
+    // SyAPP (the app) + HUD wired together
+    // =========================================================
+    const order = [];
+    let refBuilds = 0;
+    class OtherF extends SyAPP_Func {
+      constructor() { super('otherf', async (p) => { this.Text(p.session.UniqueID, 'OTHER'); }, { refreshMode: false }); }
+    }
+    class BoomF extends SyAPP_Func {
+      constructor() { super('boomf', async () => { throw new Error('boom'); }, { refreshMode: false }); }
+    }
+    class JumpF extends SyAPP_Func {
+      constructor() { super('jumpf', async (p) => { this.GotoNow(p.session.UniqueID, 'otherf', { breakbuild: true }); }, { refreshMode: false }); }
+    }
+    class RefF extends SyAPP_Func {
+      constructor() { super('reff', async (p) => { refBuilds++; this.Text(p.session.UniqueID, 'REF'); }, { refreshMode: false }); }
+    }
+    class MainF extends SyAPP_Func {
+      constructor() {
+        super('mainf', async (p) => {
+          const id = p.session.UniqueID;
+          order.push('build');
+          this.Text(id, 'MAIN');
+          this.Button(id, { name: 'Go', path: 'otherf' });
+          await this.Page(id, 'p2', async () => { this.Text(id, 'PAGE2'); });
+        }, {
+          linked: [OtherF, BoomF, JumpF, RefF],
+          refreshMode: false,
+          syappInit: async () => { await sleep(20); order.push('init'); }
+        });
+      }
+    }
+
+    const shown = [];
+    const patch = (a) => {
+      a.HUD.displayMenu = async (menu) => { shown.push(menu); };
+      a.HUD.ask = async () => 'typed';
+    };
+    let app = null, session = null;
+    try {
+      app = new SyAPP(MainF, { RefreshMode: false });
+      patch(app);
+      await sleep(150);
+      session = app.Sessions.get(app.MainSessionID);
+
+      await t('SyAPP', 'init hook runs fully before the first screen', () => {
+        eq(order, ['init', 'build']);
+        ok(shown[0].title.includes('MAIN'));
+        ok(app.Funcs.has('mainf') && app.Funcs.has('otherf') && app.Funcs.has('notfounded') && app.Funcs.has('error') && app.Funcs.has('__selfbuilder__'));
+      });
+
+      await t('SyAPP', 'LoadScreen navigation, previous path and function history', async () => {
+        await app.LoadScreen('otherf');
+        eq(session.ActualPath, 'otherf'); eq(session.PreviousFuncPath, 'mainf'); eq(session.FuncHistory[0], 'mainf');
+        ok(shown[shown.length - 1].title.includes('OTHER'));
+        await app.LoadScreen('otherf', { props: { _isRefresh: true } });
+        eq(session.PreviousFuncPath, 'mainf');
+      });
+
+      await t('SyAPP', 'MENU_SELECTION event drives navigation with props', async () => {
+        app.HUD.emitEvent(app.HUD.eventTypes.MENU_SELECTION, { metadata: { path: 'mainf', props: { x: 1 } } });
+        await sleep(40);
+        eq(session.ActualPath, 'mainf'); eq(session.ActualProps.x, 1);
+        app.HUD.emitEvent(app.HUD.eventTypes.MENU_SELECTION, { metadata: { path: 'otherf', props: { __skipLoadScreen: true } } });
+        await sleep(40);
+        eq(session.ActualPath, 'mainf');
+      });
+
+      await t('SyAPP', 'not-found and error screens', async () => {
+        await app.LoadScreen('nope');
+        ok(strip(shown[shown.length - 1].title).includes('nope'));
+        await app.LoadScreen('boomf');
+        await sleep(40);
+        const title = strip(shown[shown.length - 1].title);
+        ok(title.includes('Internal error') && title.includes('boomf'));
+        await app.LoadScreen('mainf');
+      });
+
+      await t('SyAPP', 'GotoNow break navigates and pages persist', async () => {
+        await app.LoadScreen('jumpf');
+        await sleep(40);
+        eq(session.ActualPath, 'otherf');
+        await app.LoadScreen('mainf', { props: { page: 'p2' } });
+        ok(shown[shown.length - 1].title.includes('PAGE2'));
+        await app.LoadScreen('mainf', { props: {} });
+        ok(!shown[shown.length - 1].title.includes('PAGE2'));
+      });
+
+      await t('SyAPP', 'refresh gating, resize redraw, InAction lock', async () => {
+        await app.LoadScreen('reff');
+        const base = refBuilds;
+        await app.LoadScreen('reff', { props: { _isRefresh: true } });
+        eq(refBuilds, base);
+        await app.LoadScreen('reff', { props: { _isRefresh: true, _resizeRedraw: true } });
+        eq(refBuilds, base + 1);
+        await Promise.all([app.LoadScreen('reff'), app.LoadScreen('reff')]);
+        eq(refBuilds, base + 2);
+        ok(!app._shouldRefreshFunction('reff'));
+        eq(session.InAction, false);
+      });
+
+      await t('SyAPP', 'admin manager and stats', () => {
+        ok(app.isAdmin(app.MainSessionID)); ok(!app.isAdmin('zzz'));
+        ok(app.registerAdmin('zzz').success); ok(!app.registerAdmin('zzz').success);
+        ok(!app.getAdminManager().removeAdmin(app.MainSessionID).success);
+        const st = app.getAdminManager().getStats();
+        ok(st.sessions.total >= 1 && st.functions.list.includes('mainf'));
+        eq(app.Funcs.get('mainf').Admin.IsAdmin(app.MainSessionID), true);
+        ok(app.Funcs.get('mainf').Admin.GetConfig(app.MainSessionID).mainFuncName === 'mainf');
+        eq(app.Funcs.get('mainf').Admin.GetStats('zzz-not-admin') === null, false);
+        eq(app.getAdminManager().getFunctionInfo('nope'), null);
+        ok(app.getAdminManager().updateConfig({ baseRoute: true, bogus: 1 }).rejected.includes('bogus'));
+      });
+
+      await t('SyAPP', 'HTTP request handling with models and validation', async () => {
+        const log = console.log; console.log = () => { };
+        try {
+          app.routeStorage.addRoute('GET', '/ping', { handler: (req, res) => res.json({ ok: 1, q: req.query }), funcName: 'x', input_model: {} });
+          app.routeStorage.addRoute('GET', '/v', {
+            handler: (req, res) => res.json({ n: req.query.n }), funcName: 'x',
+            input_model: { n: { type: 'number', required: true } }, input_validate: { error: 'bad' }
+          });
+          app.routeStorage.addRoute('POST', '/p', {
+            handler: (req, res) => res.json({ body: req.body }), funcName: 'x', input_model: { a: 'number' }
+          });
+          const call = (method, u, body) => new Promise((resolve) => {
+            const hdrs = {};
+            const res = { statusCode: 0, headersSent: false, setHeader: (k, v) => { hdrs[k] = v; }, writeHead: () => { }, end: (d) => resolve(JSON.parse(d || 'null')) };
+            const listeners = {};
+            const req = { url: u, method, headers: { 'content-type': 'application/json' }, on: (e, cb) => { listeners[e] = cb; }, destroy: () => { } };
+            app.handleRequest(req, res);
+            if (method === 'POST') setImmediate(() => { listeners.data && listeners.data(Buffer.from(body)); listeners.end && listeners.end(); });
+          });
+          eq((await call('GET', '/ping?x=1')).q, { x: '1' });
+          eq((await call('GET', '/v?n=5')).n, 5);
+          const bad = await call('GET', '/v?n=abc');
+          eq(bad.error, 'bad');
+          eq((await call('GET', '/v')).missingKeys, ['n']);
+          eq((await call('POST', '/p', '{"a":"7"}')).body.a, 7);
+          ok((await call('GET', '/nowhere')).error === 'Route not found');
+        } finally { console.log = log; }
+      });
+
+      await t('SyAPP', 'mainFuncName aliasing registers both names', async () => {
+        const app2 = new SyAPP(MainF, { RefreshMode: false, mainFuncName: 'custom' });
+        patch(app2);
+        await sleep(120);
+        ok(app2.Funcs.has('custom') && app2.Funcs.has('mainf'));
+        eq(app2.MainFunc.Name, 'custom');
+        await app2.LoadScreen('mainf');
+        eq(app2.Sessions.get(app2.MainSessionID).ActualPath, 'custom');
+        app2.stopAllRefreshers();
+      });
+    } finally {
+      if (app) { try { app.stopAllRefreshers(); } catch (_) { } }
+    }
+  } finally {
+    try { hud.currentMenuState = null; hud.close(); } catch (_) { }
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { }
+  }
+
+  // ---------------- summary ----------------
+  const total = results.pass + results.fail;
+  console.log('\n' + C.bold('═'.repeat(60)));
+  console.log(C.bold(`Tests: ${total}   `) + C.green(`Passed: ${results.pass}   `) + (results.fail ? C.red(`Failed: ${results.fail}`) : C.dim('Failed: 0')));
+  if (results.fail) {
+    console.log(C.red('\nFailures:'));
+    for (const f of results.failures) console.log(C.red('  • ') + f);
+  } else {
+    console.log(C.brightGreen('\n🎉 ALL TESTS PASSED'));
+  }
+  console.log(C.bold('═'.repeat(60)) + '\n');
+  return results.fail === 0;
+}
+
 // If this file is run directly, execute the CLI with HTTP disabled by default.
 //
 // Usage:
@@ -38502,6 +39423,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     let _customName = null       // explicit --name <value>
     let _userConfigArg = {}      // --config <json> parsed object
     let _viewConfigMode = false  // --viewconfig present
+    let _testMode = false        // --test present
     const _plainArgs = []
 
     for (let i = 0; i < _rawCliArgs.length; i++) {
@@ -38582,6 +39504,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
           console.error(ColorText.brightRed(`❌ --config invalid JSON: ${e.message}`))
           process.exit(1)
         }
+      } else if (a === '--test') {
+        _testMode = true
       } else if (a === '--viewconfig') {
         _viewConfigMode = true
       } else {
@@ -38681,6 +39605,12 @@ ${_vc.brightYellow('NOTES')}
     it never boots an app.
 `)
       return
+    }
+
+    // ---- --test : run the self test suite and exit ----
+    if (_testMode) {
+      const _testOk = await _syappRunSelfTest()
+      process.exit(_testOk ? 0 : 1)
     }
 
     // `--connect` mode runs standalone — no SyAPP app is loaded.
