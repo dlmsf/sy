@@ -39177,6 +39177,343 @@ async function _syappRunSelfTest() {
     // =========================================================
     // Bundler / Pack
     // =========================================================
+    // =========================================================
+    // AUTO-VERIFICATION: build -> audit -> click -> verify state
+    // Every control is checked for correct creation, and every
+    // click is driven from the REAL metadata of the built button.
+    // =========================================================
+    let verifiedControls = 0;
+    const trimName = (b) => strip(b && b.name).trim();
+    const findBtn = (o, label) => {
+      const all = flat(o.hud_obj.options).filter(b => b && typeof b.name === 'string');
+      return all.find(b => trimName(b) === label) || all.find(b => trimName(b).includes(label));
+    };
+    // Simulates exactly what a click does: run the button action, then
+    // rebuild the screen with the button's own props (as MENU_SELECTION does).
+    const clickBtn = async (f, s, o, label, extra) => {
+      const b = findBtn(o, label);
+      ok(b, `button "${label}" not found; have: ${names(o.hud_obj.options).map(x => x.trim()).join(' | ')}`);
+      if (typeof b.action === 'function') {
+        const r = b.action();
+        if (r instanceof Promise) await r;
+      }
+      const md = b.metadata || {};
+      const props = { ...(md.props || {}), ...(extra || {}) };
+      const prev = s.ActualProps || {};
+      if (!('page' in props) && prev.page) props.page = prev.page;
+      return { b, out: await run(f, s, props) };
+    };
+    const audit = (o, allowedPaths) => {
+      const walk = (b) => {
+        ok(b && typeof b === 'object', 'control is not an object');
+        if (b.type === 'field') {
+          ok(typeof b.onChange === 'function', 'field without onChange');
+          ok(typeof b.name !== 'number', 'field name invalid');
+          verifiedControls++; return;
+        }
+        if (b.type === 'textview') {
+          ok(typeof b.onToggle === 'function' && typeof b.onScroll === 'function', 'textview missing handlers');
+          ok(b.lines >= 2, 'textview lines < 2');
+          verifiedControls++; return;
+        }
+        if (b.type === 'grid') {
+          ok(Array.isArray(b.cells) && b.cells.length > 0, 'grid without cells');
+          for (const c of b.cells) { ok(Array.isArray(c.items), 'cell without items'); for (const it of c.items) walk(it); }
+          verifiedControls++; return;
+        }
+        if (b.type === 'cellText') {
+          ok(typeof b.text === 'string', 'cellText without text');
+          verifiedControls++; return;
+        }
+        ok(typeof b.name === 'string', 'button name is not a string: ' + JSON.stringify(b.name));
+        ok(b.metadata && typeof b.metadata === 'object', `button "${b.name}" has no metadata`);
+        ok(typeof b.metadata.path === 'string' && b.metadata.path.length > 0, `button "${b.name}" has no path`);
+        ok(b.metadata.props && typeof b.metadata.props === 'object', `button "${b.name}" has no props object`);
+        ok(typeof b.action === 'function', `button "${b.name}" has no action`);
+        if (allowedPaths) ok(allowedPaths.includes(b.metadata.path), `button "${b.name}" path "${b.metadata.path}" not allowed`);
+        verifiedControls++;
+      };
+      for (const b of flat(o.hud_obj.options)) walk(b);
+      ok(typeof o.hud_obj.title === 'string', 'title is not a string');
+    };
+
+    await t('Verify', 'audit harness detects malformed controls (meta-check)', async () => {
+      const f = mkFunc(() => { });
+      let caught = 0;
+      for (const bad of [{ name: 5 }, { name: 'x' }, { name: 'x', metadata: { path: '', props: {} }, action: () => { } },
+        { name: 'x', metadata: { path: 'p', props: {} } }, { type: 'field', name: 'f' }]) {
+        try { audit({ hud_obj: { title: '', options: [bad] } }); } catch (_) { caught++; }
+      }
+      eq(caught, 5);
+      const o = await run(mkFunc((g, id) => g.Button(id, 'only')), mkSess());
+      eq(findBtn(o, 'missing'), undefined);
+      ok(findBtn(o, 'only'));
+    });
+
+    await t('Verify', 'button created, clicked and state changes (counter round-trip)', async () => {
+      let acted = 0;
+      const f = mkFunc((f, id, p) => {
+        let cur = f.Storages.Get(id, 'n') || 0;
+        if (p.inc) { cur += Number(p.inc); f.Storages.Set(id, 'n', cur); }
+        f.Text(id, 'COUNT=' + cur);
+        f.Button(id, { name: 'Add2', props: { inc: 2 } });
+        f.Button(id, { name: 'Add5', props: { inc: 5 } });
+        f.Button(id, { name: 'Act', action: () => { acted++; } });
+      });
+      const s = mkSess();
+      let o = await run(f, s);
+      audit(o, [f.Name]);
+      eq(o.hud_obj.title, 'COUNT=0');
+      eq(findBtn(o, 'Add2').metadata.props.inc, 2);
+      let r = await clickBtn(f, s, o, 'Add2'); o = r.out; eq(o.hud_obj.title, 'COUNT=2');
+      r = await clickBtn(f, s, o, 'Add5'); o = r.out; eq(o.hud_obj.title, 'COUNT=7');
+      r = await clickBtn(f, s, o, 'Add2'); o = r.out; eq(o.hud_obj.title, 'COUNT=9');
+      o = await run(f, s, { _isRefresh: true });
+      eq(o.hud_obj.title, 'COUNT=9');
+      eq(acted, 0);
+      r = await clickBtn(f, s, o, 'Act');
+      eq(acted, 1);
+      eq(r.out.hud_obj.title, 'COUNT=9');
+    });
+
+    await t('Verify', 'rich UI: every control type is created correctly', async () => {
+      const rich = mkFunc(async (f, id) => {
+        f.Text(id, 'hdr');
+        f.Button(id, { name: 'RB1', props: { k: 1 } });
+        f.Buttons(id, [{ name: 'RG1' }, { name: 'RG2', props: { k: 2 } }]);
+        f.SideButton(id, { name: 'RS1' });
+        f.Button(id, { name: 'RPin', pinned: true });
+        f.Button(id, { name: 'RTop', pinnedTop: true });
+        f.Field(id, 'rf', { label: 'F' });
+        f.TextButton(id, 'rt', { initialValue: 'abc', lines: 3 });
+        await f.DropDown(id, 'rd', async () => { f.Button(id, { name: 'RDin' }); }, { up_buttontext: 'RDUP', down_buttontext: 'RDDOWN' });
+        await f.Grid(id, 'rg', [async () => { f.Button(id, { name: 'GC1' }); }, async () => { f.Text(id, 'gt'); }]);
+      });
+      const o = await run(rich, mkSess(), { droprun: 'dropdown-rd' });
+      audit(o, [rich.Name]);
+      eq(findBtn(o, 'RB1').metadata.props.k, 1);
+      ok(findBtn(o, 'RPin').metadata.pinned === true && findBtn(o, 'RPin').metadata.pinnedTop === false);
+      ok(findBtn(o, 'RTop').metadata.pinnedTop === true && findBtn(o, 'RTop').metadata.pinned === false);
+      const grp = o.hud_obj.options.find(x => x && x.type === 'options' && x.value.some(b => trimName(b) === 'RG1'));
+      ok(grp, 'Buttons group missing'); eq(grp.value.map(trimName), ['RG1', 'RG2']);
+      eq(grp.value[1].metadata.props.k, 2);
+      const sg = o.hud_obj.options.find(x => x && x.type === 'options' && x.value.some(b => trimName(b) === 'RS1'));
+      ok(sg && sg.value.length === 1, 'SideButton group wrong');
+      ok(findBtn(o, 'RDDOWN') && findBtn(o, 'RDin'), 'open dropdown content missing');
+      ok(o.hud_obj.options.some(x => x && x.type === 'field'));
+      ok(o.hud_obj.options.some(x => x && x.type === 'textview'));
+      const gr = o.hud_obj.options.find(x => x && x.type === 'grid');
+      eq(gr.cells.length, 2); eq(trimName(gr.cells[0].items[0]), 'GC1');
+    });
+
+    await t('Verify', 'real HUD mouse click hits the correct button and props', async () => {
+      const hf = mkFunc(async (f, id) => {
+        f.Button(id, { name: 'Btn-A', props: { k: 'a' } });
+        f.Button(id, { name: 'Btn-B', props: { k: 'b' } });
+        f.Buttons(id, [{ name: 'Btn-C', props: { k: 'c' } }, { name: 'Btn-D', props: { k: 'd' } }]);
+        f.Button(id, { name: 'Btn-E', props: { k: 'e' } });
+      });
+      const ho = await run(hf, mkSess());
+      audit(ho, [hf.Name]);
+      const hopts = hud.normalizeOptions(ho.hud_obj.options);
+      eq(hopts.length, 4);
+      let lastFocus = null;
+      const clicked = [];
+      hud.currentMenuState = {
+        normalizedOptions: hopts, question: '', pinnedTopCount: 0, scrollableCount: 4, scrollableStartIndex: 0,
+        pinnedBottomStartIndex: 4, pinnedTopFirstRow: -1, pinnedFirstRow: -1, firstItemRow: 0, scrollOffset: 0,
+        maxVisibleLines: 4, hScrollByLine: {}, currentLine: 0, currentColumn: 0,
+        setFocus: (l, c) => { lastFocus = [l, c]; },
+        selectOption: async () => { clicked.push(hopts[lastFocus[0]][lastFocus[1]]); }
+      };
+      try {
+        const targets = [
+          { y: 0, x: 1, n: 'Btn-A', k: 'a' }, { y: 1, x: 1, n: 'Btn-B', k: 'b' },
+          { y: 2, x: 1, n: 'Btn-C', k: 'c' }, { y: 2, x: 9, n: 'Btn-D', k: 'd' },
+          { y: 3, x: 1, n: 'Btn-E', k: 'e' }
+        ];
+        for (const tg of targets) {
+          hud.resetClickState();
+          hud.handleSGRMouseEvent(['', '0', String(tg.x + 1), String(tg.y + 1), 'M']);
+          await sleep(5);
+          const c = clicked[clicked.length - 1];
+          ok(c, `no click registered at (${tg.x},${tg.y})`);
+          eq(trimName(c), tg.n); eq(c.metadata.props.k, tg.k);
+        }
+        eq(clicked.length, 5);
+        hud.resetClickState();
+        hud.handleSGRMouseEvent(['', '0', '3', '10', 'M']);
+        await sleep(5);
+        eq(clicked.length, 5, 'click on empty area must select nothing');
+      } finally {
+        hud.currentMenuState = null; hud.resetClickState();
+      }
+    });
+
+    await t('Verify', 'DropDown toggles open/closed through its real buttons', async () => {
+      const f = mkFunc(async (f, id) => {
+        await f.DropDown(id, 'ddx', async () => { f.Button(id, { name: 'InsideBtn', props: { z: 1 } }); },
+          { up_buttontext: 'OPENME', down_buttontext: 'CLOSEME' });
+      });
+      const s = mkSess();
+      let o = await run(f, s);
+      audit(o, [f.Name]);
+      ok(findBtn(o, 'OPENME') && !findBtn(o, 'InsideBtn'));
+      o = (await clickBtn(f, s, o, 'OPENME')).out;
+      audit(o, [f.Name]);
+      ok(findBtn(o, 'CLOSEME') && !findBtn(o, 'OPENME'));
+      eq(findBtn(o, 'InsideBtn').metadata.props.z, 1);
+      o = (await clickBtn(f, s, o, 'CLOSEME')).out;
+      ok(findBtn(o, 'OPENME') && !findBtn(o, 'InsideBtn') && !findBtn(o, 'CLOSEME'));
+    });
+
+    await t('Verify', 'Pagination next/prev buttons navigate and hide at edges', async () => {
+      const f = mkFunc(async (f, id) => {
+        await f.Pagination.Button(id, 'pgx', [0, 1, 2, 3, 4, 5, 6], {
+          items_per_page: 3, renderItem: (d) => f.Button(id, { name: 'it' + d.item })
+        });
+      });
+      const s = mkSess();
+      const items = (o) => names(o.hud_obj.options).map(x => x.trim()).filter(x => /^it\d+$/.test(x));
+      let o = await run(f, s);
+      audit(o, [f.Name]);
+      eq(items(o), ['it0', 'it1', 'it2']);
+      ok(findBtn(o, 'Next') && !findBtn(o, 'Prev'));
+      o = (await clickBtn(f, s, o, 'Next')).out; eq(items(o), ['it3', 'it4', 'it5']);
+      ok(findBtn(o, 'Next') && findBtn(o, 'Prev'));
+      o = (await clickBtn(f, s, o, 'Next')).out; eq(items(o), ['it6']);
+      ok(!findBtn(o, 'Next') && findBtn(o, 'Prev'));
+      o = (await clickBtn(f, s, o, 'Prev')).out; eq(items(o), ['it3', 'it4', 'it5']);
+      o = (await clickBtn(f, s, o, 'Prev')).out; eq(items(o), ['it0', 'it1', 'it2']);
+    });
+
+    await t('Verify', 'Page navigation buttons switch pages and mark selection', async () => {
+      const f = mkFunc(async (f, id) => {
+        await f.Page(id, 'p1', async () => { f.Text(id, 'CONTENT-1'); }, { pinButton: true });
+        await f.Page(id, 'p2', async () => { f.Text(id, 'CONTENT-2'); }, { pinButton: true });
+      });
+      const s = mkSess();
+      let o = await run(f, s, { page: 'p1' });
+      audit(o, [f.Name]);
+      eq(o.hud_obj.title, 'CONTENT-1');
+      ok(findBtn(o, '● p1') && findBtn(o, '○ p2'));
+      o = (await clickBtn(f, s, o, 'p2')).out;
+      eq(o.hud_obj.title, 'CONTENT-2');
+      ok(findBtn(o, '● p2') && findBtn(o, '○ p1'));
+      o = (await clickBtn(f, s, o, 'p1')).out;
+      eq(o.hud_obj.title, 'CONTENT-1');
+    });
+
+    await t('Verify', 'TextButton scroll bounds, activation persistence, Field edit persistence', async () => {
+      const long = Array.from({ length: 40 }, (_, i) => 'line' + i).join('\n');
+      const f = mkFunc((f, id) => {
+        f.TextButton(id, 'tbv', { initialValue: long, lines: 4 });
+        f.Field(id, 'fv', { label: 'F', initialValue: 'a' });
+      });
+      const s = mkSess();
+      let o = await run(f, s);
+      audit(o);
+      let tv = o.hud_obj.options.find(x => x.type === 'textview');
+      eq(tv.onScroll(-1), false);
+      let steps = 0;
+      while (tv.onScroll(1) && steps < 200) steps++;
+      eq(steps, 38);
+      eq(tv.onToggle(), 'activated');
+      let fld = o.hud_obj.options.find(x => x.type === 'field');
+      eq(fld.value, 'a');
+      fld.onChange('edited');
+      o = await run(f, s);
+      tv = o.hud_obj.options.find(x => x.type === 'textview');
+      eq(tv.scroll, 38); ok(tv.active === true);
+      eq(tv.onToggle(), 'deactivated');
+      eq(o.hud_obj.options.find(x => x.type === 'field').value, 'edited');
+    });
+
+    await t('Verify', 'full app: clicking real buttons navigates between funcs', async () => {
+      let skipped = 0;
+      class VB extends SyAPP_Func {
+        constructor() {
+          super('vfb', async (p) => {
+            const id = p.session.UniqueID;
+            this.Text(id, 'VB from=' + p.from);
+            this.Button(id, { name: 'Back', path: 'vfa' });
+          }, { refreshMode: false });
+        }
+      }
+      class VA extends SyAPP_Func {
+        constructor() {
+          super('vfa', async (p) => {
+            const id = p.session.UniqueID;
+            this.Text(id, 'VA');
+            this.Button(id, { name: 'ToB', path: 'vfb', props: { from: 'a' } });
+            this.Button(id, { name: 'Silent', path: 'vfb', props: { __skipLoadScreen: true }, action: () => { skipped++; } });
+          }, { linked: [VB], refreshMode: false });
+        }
+      }
+      const vapp = new SyAPP(VA, { RefreshMode: false });
+      const vshown = [];
+      vapp.HUD.displayMenu = async (menu) => { vshown.push(menu); };
+      vapp.HUD.ask = async () => 'typed';
+      try {
+        await sleep(150);
+        const vs = vapp.Sessions.get(vapp.MainSessionID);
+        const last = () => vshown[vshown.length - 1];
+        const clickReal = async (label) => {
+          const b = flat(last().options).find(x => x && trimName(x) === label);
+          ok(b, `app button "${label}" not found`);
+          if (typeof b.action === 'function') await b.action();
+          vapp.HUD.emitEvent(vapp.HUD.eventTypes.MENU_SELECTION, { metadata: b.metadata });
+          await sleep(40);
+        };
+        eq(vs.ActualPath, 'vfa'); ok(last().title.includes('VA'));
+        await clickReal('ToB');
+        eq(vs.ActualPath, 'vfb'); ok(last().title.includes('VB from=a'));
+        await clickReal('Back');
+        eq(vs.ActualPath, 'vfa');
+        await clickReal('Silent');
+        eq(skipped, 1); eq(vs.ActualPath, 'vfa');
+        eq(vs.InAction, false);
+      } finally {
+        try { vapp.stopAllRefreshers(); } catch (_) { }
+        try { vapp.HUD.close(); } catch (_) { }
+      }
+    });
+
+    await t('Verify', 'self-builder button export keeps name/path/props/pins and stays clickable', async () => {
+      const code = _genFuncJS({
+        funcName: 'BtnExport', name: 'btnexport', items: [
+          { id: 'b1', type: 'button', name: 'Plain "q" ünï', path: 'other', props: { a: { b: [1, 2] } } },
+          { id: 'b2', type: 'button', name: 'PinnedB', pinned: true },
+          { id: 'b3', type: 'button', name: 'TopB', pinnedTop: true, resetSelection: true, jumpTo: 3 },
+          { id: 'b4', type: 'buttonsGroup', items: [{ type: 'button', name: 'GrpA' }, { type: 'button', name: 'GrpB', props: { g: 1 } }] }
+        ]
+      }, import.meta.url);
+      const p = path.join(tmpDir, 'BtnExport.mjs');
+      fs.writeFileSync(p, code);
+      const mod = await import(url.pathToFileURL(p).href);
+      const inst = new mod.default();
+      inst._syappInstance = { HUD: { fieldMaxWidth: 0 }, autoPinPages: false, Funcs: new Map(), Sessions: new Map() };
+      const s = mkSess();
+      const o = await run(inst, s);
+      audit(o);
+      const b1 = findBtn(o, 'Plain "q" ünï');
+      ok(b1, 'exported button with special chars missing');
+      eq(b1.metadata.path, 'other'); eq(b1.metadata.props, { a: { b: [1, 2] } });
+      ok(findBtn(o, 'PinnedB').metadata.pinned === true);
+      const top = findBtn(o, 'TopB');
+      ok(top.metadata.pinnedTop === true && top.metadata.resetSelection === true); eq(top.metadata.jumpTo, 3);
+      ok(findBtn(o, 'GrpA') && findBtn(o, 'GrpB').metadata.props.g === 1);
+      for (const label of ['Plain "q" ünï', 'PinnedB', 'TopB', 'GrpA', 'GrpB']) {
+        const r = await clickBtn(inst, s, o, label);
+        ok(r.out && r.out.hud_obj, `click on exported "${label}" failed`);
+      }
+    });
+
+    await t('Verify', 'summary: controls verified by the audit harness', () => {
+      ok(verifiedControls > 40, `only ${verifiedControls} controls audited`);
+      console.log('      ' + C.dim(`${verifiedControls} controls audited`));
+    });
+
     await t('Bundler', 'imports parsing, natives, main-check', () => {
       const b = new ModuleBundler(url.fileURLToPath(import.meta.url));
       ok(b.isNativeModule('fs') && b.isNativeModule('node:path') && !b.isNativeModule('./x'));
