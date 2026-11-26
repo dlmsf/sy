@@ -39,7 +39,7 @@ const TOOL_VERSION = '1.0.0';
 const FILE_MAGIC_NUMBER = 0x53594442;
 const FILE_VERSION_NUMBER = 2;
 const FILE_HEADER_SIZE = 136;
-const DEFAULT_MANAGED_PORT = 18080;
+const DEFAULT_MANAGED_PORT = 8080;
 const DEFAULT_BASE_DIR = '/tmp/sydb_test';
 const UUID_REGEX = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 
@@ -277,7 +277,9 @@ class ServerManager {
 
     async isReachable() {
         const response = await this.run.client.request('GET', '/api/databases');
-        return response.statusCode > 0;
+        if (response.statusCode !== 200) return false;
+        const json = parseJson(response.body);
+        return Boolean(json && json.success === true);
     }
 
     async waitForReady(timeoutSeconds = 10) {
@@ -721,6 +723,14 @@ class TestRun {
             return true;
         }
 
+        if (!opts.managed) {
+            this.fatalError = `Cannot connect to a SyDB server at ${opts.url}. ` +
+                `Start it with: node JS_SyDB.js --server ${opts.port}  ` +
+                `(or pass --url=URL / --port=N, or --managed to let the test start its own server)`;
+            this.out(`${c.red}ERROR: ${this.fatalError}${c.reset}`);
+            return false;
+        }
+
         const localHosts = ['localhost', '127.0.0.1', '::1', '[::1]'];
         if (!localHosts.includes(opts.host)) {
             this.fatalError = `Cannot connect to remote server at ${opts.url}`;
@@ -815,6 +825,15 @@ class TestRun {
         ]);
 
         const ready = await this.prepareServer();
+        if (!ready) {
+            this.record({
+                description: `Server connectivity at ${opts.url}`,
+                category: SMOKE,
+                critical: true,
+                status: 'fail',
+                details: this.fatalError || 'SyDB server is not reachable'
+            });
+        }
         if (ready) {
             await this.cleanupTestDatabases();
             for (const level of levels) {
@@ -998,9 +1017,10 @@ async function suiteSmokeHttp(t) {
     await t.check('Server connectivity test', SMOKE, true, async () => {
         const response = await t.client.request('GET', '/api/databases');
         const extra = { method: 'GET', endpoint: '/api/databases', httpStatus: response.statusCode };
-        return response.statusCode > 0
+        return response.statusCode === 200 && response.body.includes('"success":true')
             ? pass(`HTTP ${response.statusCode}`, extra)
-            : fail(`No response: ${response.error || 'unknown error'}`, extra);
+            : fail(`SyDB server did not answer correctly: HTTP ${response.statusCode}` +
+                `${response.error ? ` (${response.error})` : ''}`, extra);
     });
 
     await t.http({
@@ -2733,7 +2753,7 @@ class SyDBApiTest {
         const level = [1, 2, 3].includes(Number(input.level)) ? Number(input.level) : 1;
         const urlExplicit = typeof input.url === 'string' && input.url.length > 0;
         const managedPort = Number.isInteger(Number(input.port)) && Number(input.port) > 0 ? Number(input.port) : DEFAULT_MANAGED_PORT;
-        let url = urlExplicit ? input.url : `http://127.0.0.1:${managedPort}`;
+        let url = urlExplicit ? input.url : `http://localhost:${managedPort}`;
         if (!/^https?:\/\//.test(url)) url = `http://${url}`;
         url = url.replace(/\/+$/, '');
         const parsed = new URL(url);
@@ -2742,6 +2762,7 @@ class SyDBApiTest {
         return {
             level,
             all: Boolean(input.all),
+            managed: Boolean(input.managed),
             verbose: Boolean(input.verbose),
             url,
             urlExplicit,
@@ -2807,13 +2828,14 @@ class SyDBApiTest {
             '  --no-color          Disable ANSI colors',
             '',
             'SERVER:',
-            '  (default)           Starts an isolated managed SyDB server (JS_SyDB.js next to this file) on',
-            '                      port 18080 with SYDB_BASE_DIR=/tmp/sydb_test and stops it at the end.',
+            '  (default)           Tests the SyDB server at http://localhost:8080. If nothing answers there the',
+            '                      test fails with an explicit error (it never starts a server on its own).',
+            '  --managed           Start an isolated managed SyDB server (JS_SyDB.js next to this file) when none',
+            '                      answers, with SYDB_BASE_DIR=/tmp/sydb_test, and stop it at the end.',
             '                      Crash/restart, file header, stale-lock and corruption steps are enabled.',
-            '  --url=URL           Test an existing server (e.g. http://localhost:8080). If nothing answers on a',
-            '                      local URL, a managed server is started on that port. Against an external',
-            '                      server, crash/restart steps are skipped.',
-            '  --port=N            Port for the managed server (default 18080)',
+            '  --url=URL           Test a server at another URL. Against an external server, crash/restart',
+            '                      steps are skipped.',
+            '  --port=N            Server port (default 8080)',
             '  --base-dir=PATH     Data directory used by the server (enables file-level checks, default /tmp/sydb_test)',
             '  --sydb=PATH         Path to JS_SyDB.js (default: next to this file)',
             '  --keep              Do not delete test databases / data directory at the end',
@@ -2884,6 +2906,9 @@ class SyDBApiTest {
                     break;
                 case '--keep':
                     options.keep = true;
+                    break;
+                case '--managed':
+                    options.managed = true;
                     break;
                 case '--url': {
                     const value = takeValue();
