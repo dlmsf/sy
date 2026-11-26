@@ -1500,7 +1500,7 @@ async function generateStruct(filePaths, outputFileName = 'struct.txt', options 
             structContent += `    - Did I use any abbreviation? (If yes -> rewrite the file.)\n`;
             structContent += `    - Does my output LOOK like the original but with my changes?\n`;
             structContent += `    - Is the closing brace of the file present?\n`;
-            structContent += `  If ANY answer is wrong, REWRITE THE ENTIRE FILE from scratch.\n\n`;
+            structContent += `  If ANY answer is wrong, REWRITE the ENTIRE FILE from scratch.\n\n`;
 
             structContent += `For each file, start the code block with the exact same file path header\n`;
             structContent += `as provided below (FILE: <path>) so it is clear which code belongs to which file.\n\n`;
@@ -3479,6 +3479,12 @@ async function interactiveMode(initialState = null) {
         // Estimated total struct tokens used ONLY for the live split
         // previews in the wizard. The actual split runs on the real
         // generated content so this is just a helpful forecast.
+        //
+        // NOTE: `totalTokens` already reflects PARSED (filtered) sizes
+        // for files that have been parsed in this session - the parse
+        // handler updates `selectedTokenCounts` and `totalTokens` on
+        // parse and restores them on un-parse. So the estimate below
+        // stays in sync with what `generateStruct` will actually emit.
         const STRUCT_OVERHEAD_TOKENS = 5000;
         const estimatedStructTokens = () =>
             totalTokens + (includeInstructions ? STRUCT_OVERHEAD_TOKENS : 0);
@@ -3539,7 +3545,20 @@ async function interactiveMode(initialState = null) {
         const undoRowState = (fromRow) => {
             if (fromRow === ROW.PARSE_FILES) {
                 // Undo parsing done in this session when re-editing this row.
-                for (const f of sessionParsedFiles) parsedFiles.delete(f);
+                // Also restore the ORIGINAL (pre-parse) token count for each
+                // file, so the browser header, the selected-files view and
+                // the wizard previews all go back to showing the real
+                // on-disk size again.
+                for (const f of sessionParsedFiles) {
+                    const info = parsedFiles.get(f);
+                    parsedFiles.delete(f);
+                    if (info && Number.isFinite(info.originalSize) && info.originalSize > 0) {
+                        const originalTokenCount = Math.max(1, Math.round(info.originalSize / 4));
+                        const currentTokenCount = selectedTokenCounts.get(f) || 0;
+                        selectedTokenCounts.set(f, originalTokenCount);
+                        totalTokens += (originalTokenCount - currentTokenCount);
+                    }
+                }
                 sessionParsedFiles.clear();
             }
             if (fromRow === ROW.REF_FILES) {
@@ -3897,6 +3916,16 @@ async function interactiveMode(initialState = null) {
                                 selection: parseResult.selection,
                             });
                             sessionParsedFiles.add(filePath);
+
+                            // NEW: Update the selected token count so the
+                            // browser header, selected-files view and the
+                            // wizard previews reflect the PARSED (filtered)
+                            // size instead of the original on-disk size.
+                            const parsedTokenCount = Math.max(1, Math.round(parseResult.content.length / 4));
+                            const previousTokenCount = selectedTokenCounts.get(filePath) || 0;
+                            selectedTokenCounts.set(filePath, parsedTokenCount);
+                            totalTokens += (parsedTokenCount - previousTokenCount);
+
                             console.log(`\n${GREEN}✓ ${path.basename(filePath)} parsed successfully${RESET}`);
                         }
                     }
@@ -5714,6 +5743,15 @@ async function interactiveMode(initialState = null) {
                             validation: report.validation || { ok: true, issues: [] },
                             selection: parseInfo.selection,
                         });
+
+                        // NEW: Update the selected token count so the
+                        // browser header, selected-files view and the
+                        // wizard previews reflect the RE-PARSED size
+                        // instead of the original on-disk size.
+                        const parsedTokenCount = Math.max(1, Math.round(filtered.length / 4));
+                        const previousTokenCount = selectedTokenCounts.get(filePath) || 0;
+                        selectedTokenCounts.set(filePath, parsedTokenCount);
+                        totalTokens += (parsedTokenCount - previousTokenCount);
                     }
                 } catch {
                     // ignore re-parse errors - selection may no longer fit
