@@ -43,6 +43,7 @@ class JS_SyDB {
 
     // Real-time metrics and terminal monitor
     static METRICS_API_PATH = '/api/metrics';
+    static HEALTH_API_PATH = '/health';
     static METRICS_HISTORY_SECONDS = 900;
     static METRICS_LATENCY_SAMPLE_SIZE = 1000;
     static METRICS_STORAGE_CACHE_MILLISECONDS = 5000;
@@ -164,6 +165,13 @@ class JS_SyDB {
             description: "Real-time server metrics (sections: /instance, /requests, /performance, /operations, /storage)",
             requestSchema: "No request body required",
             responseSchema: '{\n  "success": true,\n  "metrics": {\n    "instance": {},\n    "resources": {},\n    "requests": {},\n    "performance": {},\n    "operations": {},\n    "recent_errors": [],\n    "storage": {}\n  }\n}'
+        },
+        {
+            method: "GET",
+            path: "/health",
+            description: "Check that the server is running",
+            requestSchema: "No request body required",
+            responseSchema: '{\n  "success": true,\n  "status": "ok"\n}'
         }
     ];
 
@@ -2589,6 +2597,12 @@ class JS_SyDB {
         };
     }
 
+    isHealthApiPath(requestPath) {
+        const cleanPath = requestPath.split('?')[0];
+        return cleanPath === JS_SyDB.HEALTH_API_PATH ||
+               cleanPath === `${JS_SyDB.HEALTH_API_PATH}/`;
+    }
+
     isMetricsApiPath(requestPath) {
         const cleanPath = requestPath.split('?')[0];
         return cleanPath === JS_SyDB.METRICS_API_PATH ||
@@ -2701,7 +2715,7 @@ class JS_SyDB {
         const requestUrl = req.url || '/';
 
         // Monitoring calls are counted apart so they do not distort the database statistics
-        if (this.isMetricsApiPath(requestUrl)) {
+        if (this.isMetricsApiPath(requestUrl) || this.isHealthApiPath(requestUrl)) {
             metrics.totals.monitoring++;
             return null;
         }
@@ -3676,6 +3690,18 @@ class JS_SyDB {
 
         if (this.isMetricsApiPath(path)) {
             await this.httpRouteMetricsRequest(context);
+            return;
+        }
+
+        if (this.isHealthApiPath(path)) {
+            if (method === 'GET') {
+                context.response.body = '{"success":true,"status":"ok"}';
+            } else {
+                context.response.statusCode = 405;
+                context.response.statusMessage = 'Method Not Allowed';
+                context.response.headers['Allow'] = 'GET';
+                context.response.body = this.createErrorResponse('Method not allowed');
+            }
             return;
         }
 
