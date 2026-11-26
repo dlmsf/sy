@@ -5638,6 +5638,7 @@ Usage:
  sydb --server --c [port]      # Force C version (overrides default)
  sydb --server --verbose       # Start HTTP server with extreme logging
  sydb --routes                 # Show all HTTP API routes and schemas
+ sydb --monit [port] [--host <host>] [--port <port>] [--interval <ms>]  # Live server monitor
 
 Field types: string, int, float, bool, array, object
 Add -req for required fields
@@ -5753,6 +5754,11 @@ Use --nodejs or --c flags to override the default version setting
            return;
        }
        
+       if (args[2] === '--monit') {
+           await this.#handleMonitor(args);
+           return;
+       }
+
        if (args[2] === '--routes') {
            await this.#handleRoutes();
            return;
@@ -6096,6 +6102,57 @@ static async #handleServer(args) {
         process.exit(1);
     }
 }
+
+   /**
+    * Handle monit command - reuses the terminal monitor embedded in js_sydb_raw
+    * by running that code as its own Node process, attached to this terminal
+    * @private
+    * @static
+    * @async
+    * @param {Array} args
+    */
+   static async #handleMonitor(args) {
+       // Dynamic imports keep this method independent from the imports at the top of the file
+       const fs = await import('fs');
+       const os = await import('os');
+       const path = await import('path');
+       const { spawn } = await import('child_process');
+
+       let temporaryDirectory = null;
+       let exitCode = 1;
+       let child = null;
+
+       // Ctrl+C is handled by the monitor itself; this process waits so it can clean up
+       const ignoreInterrupt = () => {};
+       const forwardTermination = () => child && child.kill('SIGTERM');
+
+       try {
+           // realpath is required: the embedded entry point compares its own resolved path
+           // with process.argv[1], and the temp folder can be a symlink (e.g. macOS)
+           temporaryDirectory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'sydb-monit-')));
+           const monitorFilePath = path.join(temporaryDirectory, 'JS_SyDB.mjs');
+           fs.writeFileSync(monitorFilePath, js_sydb_raw);
+
+           process.on('SIGINT', ignoreInterrupt);
+           process.on('SIGTERM', forwardTermination);
+
+           exitCode = await new Promise((resolve, reject) => {
+               child = spawn(process.execPath, [monitorFilePath, ...args.slice(2)], { stdio: 'inherit' });
+               child.on('error', reject);
+               child.on('exit', (code) => resolve(code === null ? 1 : code));
+           });
+       } catch (error) {
+           console.error('Failed to start SYDB Monitor:', error.message);
+       } finally {
+           process.removeListener('SIGINT', ignoreInterrupt);
+           process.removeListener('SIGTERM', forwardTermination);
+           if (temporaryDirectory) {
+               fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+           }
+       }
+
+       process.exit(exitCode);
+   }
 
    /**
     * Handle routes command
