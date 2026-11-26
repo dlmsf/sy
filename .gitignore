@@ -1,6 +1,9 @@
 test.js
 config.json
 processes.json
+sydb_throughput_errors.txt
+sydb_throughput_samples.jsonl
+sydb_throughput_steps.txt
 logs
 a.out
 b.out
