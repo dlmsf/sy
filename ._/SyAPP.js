@@ -11682,7 +11682,7 @@ class SyAPP_Func {
        * @returns {boolean} Whether user is admin
        */
       IsAdmin: (id) => {
-        if (!this._syappInstance) return false;
+        if (!this._syappInstance || !this._syappInstance._adminManager) return false;
         return this._syappInstance._adminManager.isAdmin(id);
       },
 
@@ -11727,7 +11727,9 @@ class SyAPP_Func {
           if (this.Log) {
             console.log(`Admin.GetStats() - Access denied for ${id}`);
           }
-          return null;
+          return (this._syappInstance && this._syappInstance._adminManager)
+            ? { success: false, error: 'Not authorized' }
+            : null;
         }
         return this._syappInstance._adminManager.getStats();
       },
@@ -12937,7 +12939,7 @@ this.DropDownManager = {
      * @param {string|null} [lockKey=null] - Lock key
      */
     this.LockPage = (id, pageName, lockKey = null) => {
-      if (this.Builds.has(id)) {
+      if (id !== undefined && id !== null) {
         const key = lockKey || `page-lock-${pageName}`;
         this.Storages.Set(id, key, true);
       }
@@ -12950,7 +12952,7 @@ this.DropDownManager = {
      * @param {string|null} [lockKey=null] - Lock key
      */
     this.UnlockPage = (id, pageName, lockKey = null) => {
-      if (this.Builds.has(id)) {
+      if (id !== undefined && id !== null) {
         const key = lockKey || `page-lock-${pageName}`;
         this.Storages.Delete(id, key);
       }
@@ -12964,7 +12966,7 @@ this.DropDownManager = {
      * @returns {boolean} Whether page is locked
      */
     this.IsPageLocked = (id, pageName, lockKey = null) => {
-      if (this.Builds.has(id)) {
+      if (id !== undefined && id !== null) {
         const key = lockKey || `page-lock-${pageName}`;
         return !!this.Storages.Get(id, key);
       }
@@ -16346,13 +16348,13 @@ function levenshteinDistance(str1, str2) {
           nextButtonText: 'Next  ▶',
           pageIndicatorText: null,
           pageInfoText: null,
-          pageInfoStyle: 'text',
+          pageInfoStyle: 'button',
           renderPageInfo: null,
           renderNavigation: null,
           renderSeparator: null,
           renderBlankSpace: null,
           topSpacing: 0,
-          bottomSpacing: 0,
+          bottomSpacing: 1,
         };
     
         // Safely merge custom config
