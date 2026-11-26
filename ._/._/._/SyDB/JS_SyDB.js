@@ -41,6 +41,21 @@ class JS_SyDB {
     static RATE_LIMIT_MAX_REQUESTS = 1000000
     static RATE_LIMIT_WINDOW_SECONDS = 60;
 
+    // Real-time metrics and terminal monitor
+    static METRICS_API_PATH = '/api/metrics';
+    static METRICS_HISTORY_SECONDS = 900;
+    static METRICS_LATENCY_SAMPLE_SIZE = 1000;
+    static METRICS_STORAGE_CACHE_MILLISECONDS = 5000;
+    static METRICS_MAXIMUM_RECENT_ERRORS = 10;
+    static METRICS_MAXIMUM_ACTIVE_LISTED = 20;
+    static METRICS_MAXIMUM_TRACKED_COLLECTIONS = 200;
+    static MONITOR_DEFAULT_HOST = 'localhost';
+    static MONITOR_DEFAULT_INTERVAL_MILLISECONDS = 1000;
+    static MONITOR_MINIMUM_INTERVAL_MILLISECONDS = 250;
+    static MONITOR_MAXIMUM_INTERVAL_MILLISECONDS = 60000;
+    static MONITOR_MAXIMUM_BACKOFF_MILLISECONDS = 5000;
+    static MONITOR_REQUEST_TIMEOUT_MILLISECONDS = 5000;
+
     // Correct file header size (from C struct with alignment)
     static FILE_HEADER_SIZE = 136;
     // Correct record header size (from C struct with alignment)
@@ -142,6 +157,13 @@ class JS_SyDB {
             description: "Execute SYDB commands via HTTP",
             requestSchema: '{\n  "command": "sydb command string",\n  "arguments": ["arg1", "arg2", ...]\n}',
             responseSchema: '{\n  "success": true|false,\n  "result": "command output or data",\n  "error": "error message if any"\n}'
+        },
+        {
+            method: "GET",
+            path: "/api/metrics",
+            description: "Real-time server metrics (sections: /instance, /requests, /performance, /operations, /storage)",
+            requestSchema: "No request body required",
+            responseSchema: '{\n  "success": true,\n  "metrics": {\n    "instance": {},\n    "resources": {},\n    "requests": {},\n    "performance": {},\n    "operations": {},\n    "recent_errors": [],\n    "storage": {}\n  }\n}'
         }
     ];
 
@@ -156,6 +178,7 @@ class JS_SyDB {
         this.httpServer = null;
         this.runningFlag = false;
         this.workerThreads = [];
+        this.serverMetrics = null;
 
         // Initialize base directory
         this.initializeBaseDirectory();
@@ -2449,6 +2472,1197 @@ class JS_SyDB {
         }
     }
 
+    // ==================== REAL-TIME SERVER METRICS ====================
+    // Runtime-only data kept in memory and bound to the running server instance.
+    // Nothing here changes the on-disk SYDB format.
+
+    getMonotonicMilliseconds() {
+        return Number(process.hrtime.bigint()) / 1e6;
+    }
+
+    roundMetricValue(value) {
+        return Math.round(value * 1000) / 1000;
+    }
+
+    createLatencyAccumulator(sampleSize = 0) {
+        return {
+            count: 0,
+            totalMilliseconds: 0,
+            minimumMilliseconds: 0,
+            maximumMilliseconds: 0,
+            lastMilliseconds: 0,
+            sampleSize: sampleSize,
+            samples: [],
+            sampleIndex: 0
+        };
+    }
+
+    recordLatency(accumulator, duration) {
+        if (accumulator.count === 0 || duration < accumulator.minimumMilliseconds) {
+            accumulator.minimumMilliseconds = duration;
+        }
+        if (duration > accumulator.maximumMilliseconds) {
+            accumulator.maximumMilliseconds = duration;
+        }
+        accumulator.count++;
+        accumulator.totalMilliseconds += duration;
+        accumulator.lastMilliseconds = duration;
+
+        if (accumulator.sampleSize > 0) {
+            accumulator.samples[accumulator.sampleIndex] = duration;
+            accumulator.sampleIndex = (accumulator.sampleIndex + 1) % accumulator.sampleSize;
+        }
+    }
+
+    summarizeLatency(accumulator) {
+        const summary = {
+            count: accumulator.count,
+            average_ms: accumulator.count ? this.roundMetricValue(accumulator.totalMilliseconds / accumulator.count) : 0,
+            min_ms: this.roundMetricValue(accumulator.minimumMilliseconds),
+            max_ms: this.roundMetricValue(accumulator.maximumMilliseconds),
+            last_ms: this.roundMetricValue(accumulator.lastMilliseconds)
+        };
+
+        if (accumulator.sampleSize > 0) {
+            const sorted = accumulator.samples.slice().sort((a, b) => a - b);
+            const percentile = (fraction) => sorted.length === 0 ? 0 :
+                this.roundMetricValue(sorted[Math.max(0, Math.ceil(fraction * sorted.length) - 1)]);
+
+            summary.sample_count = sorted.length;
+            summary.median_ms = percentile(0.5);
+            summary.p95_ms = percentile(0.95);
+            summary.p99_ms = percentile(0.99);
+        }
+
+        return summary;
+    }
+
+    readEventLoopUtilization() {
+        if (typeof performance !== 'undefined' && typeof performance.eventLoopUtilization === 'function') {
+            return performance.eventLoopUtilization();
+        }
+        return null;
+    }
+
+    createServerMetrics(port) {
+        const now = this.getMonotonicMilliseconds();
+        return {
+            instanceId: this.generateSecureUniversallyUniqueIdentifier(),
+            port: port,
+            startedAtEpochMilliseconds: Date.now(),
+            startedAtMilliseconds: now,
+            totals: {
+                received: 0,
+                completed: 0,
+                successful: 0,
+                failed: 0,
+                aborted: 0,
+                rateLimited: 0,
+                monitoring: 0
+            },
+            activeRequests: new Set(),
+            nextRequestNumber: 1,
+            processingCount: 0,
+            peakInProgress: 0,
+            peakProcessing: 0,
+            peakRequestsPerSecond: 0,
+            secondBuckets: new Array(JS_SyDB.METRICS_HISTORY_SECONDS + 1).fill(null),
+            processingLatency: this.createLatencyAccumulator(JS_SyDB.METRICS_LATENCY_SAMPLE_SIZE),
+            totalLatency: this.createLatencyAccumulator(JS_SyDB.METRICS_LATENCY_SAMPLE_SIZE),
+            operations: new Map(),
+            collections: new Map(),
+            methods: new Map(),
+            statusCodes: new Map(),
+            bodyBytesReceived: 0,
+            bodyBytesSent: 0,
+            recentErrors: [],
+            resourceSample: {
+                takenAtMilliseconds: now,
+                cpuUsage: process.cpuUsage(),
+                eventLoop: this.readEventLoopUtilization(),
+                cpuPercent: 0,
+                eventLoopPercent: 0
+            },
+            storageCache: null,
+            storageCacheTakenAt: 0,
+            storageScanPromise: null
+        };
+    }
+
+    isMetricsApiPath(requestPath) {
+        const cleanPath = requestPath.split('?')[0];
+        return cleanPath === JS_SyDB.METRICS_API_PATH ||
+               cleanPath.startsWith(`${JS_SyDB.METRICS_API_PATH}/`);
+    }
+
+    // Mirrors the decisions made by httpRouteRequest, for statistics only
+    classifyRequestOperation(method, requestPath) {
+        const target = { operation: 'unknown', databaseName: '', collectionName: '' };
+
+        if (requestPath === '/api/databases') {
+            if (method === 'GET') target.operation = 'list_databases';
+            else if (method === 'POST') target.operation = 'create_database';
+            return target;
+        }
+
+        if (requestPath === '/api/execute') {
+            if (method === 'POST') target.operation = 'execute_command';
+            return target;
+        }
+
+        const components = this.parseApiPathOptimized(requestPath);
+        if (!components || !components.databaseName) {
+            return target;
+        }
+
+        const { databaseName, collectionName, instanceId } = components;
+        target.databaseName = databaseName;
+        target.collectionName = collectionName;
+
+        if (method === 'GET') {
+            if (!collectionName && !instanceId) target.operation = 'list_collections';
+            else if (collectionName && requestPath.includes('/schema')) target.operation = 'get_schema';
+            else if (collectionName && !instanceId) {
+                target.operation = /[?&]query=[^&]/.test(requestPath) ? 'find_instances' : 'list_instances';
+            }
+        } else if (method === 'POST') {
+            if (collectionName && !instanceId) target.operation = 'insert_instance';
+            else if (!collectionName && !instanceId) target.operation = 'create_collection';
+        } else if (method === 'PUT') {
+            if (collectionName && instanceId) target.operation = 'update_instance';
+        } else if (method === 'DELETE') {
+            if (collectionName && instanceId) target.operation = 'delete_instance';
+            else if (collectionName) target.operation = 'delete_collection';
+            else if (!instanceId) target.operation = 'delete_database';
+        }
+
+        return target;
+    }
+
+    getMetricsElapsedSeconds(metrics) {
+        return Math.floor((this.getMonotonicMilliseconds() - metrics.startedAtMilliseconds) / 1000);
+    }
+
+    getCurrentMetricsBucket(metrics) {
+        const second = this.getMetricsElapsedSeconds(metrics);
+        const index = second % metrics.secondBuckets.length;
+        let bucket = metrics.secondBuckets[index];
+
+        if (!bucket || bucket.second !== second) {
+            bucket = {
+                second: second,
+                completed: 0,
+                failed: 0,
+                processed: 0,
+                processingMilliseconds: 0,
+                totalMilliseconds: 0
+            };
+            metrics.secondBuckets[index] = bucket;
+        }
+
+        return bucket;
+    }
+
+    // Sums the last N complete seconds (the current, still running second is excluded)
+    summarizeMetricsWindow(metrics, windowSeconds) {
+        const currentSecond = this.getMetricsElapsedSeconds(metrics);
+        const summary = {
+            coveredSeconds: Math.min(windowSeconds, currentSecond, JS_SyDB.METRICS_HISTORY_SECONDS),
+            completed: 0,
+            failed: 0,
+            processed: 0,
+            processingMilliseconds: 0,
+            totalMilliseconds: 0,
+            perSecond: []
+        };
+
+        for (let offset = summary.coveredSeconds; offset >= 1; offset--) {
+            const second = currentSecond - offset;
+            let bucket = metrics.secondBuckets[second % metrics.secondBuckets.length];
+            if (bucket && bucket.second !== second) bucket = null;
+
+            summary.perSecond.push(bucket ? bucket.completed : 0);
+            if (!bucket) continue;
+
+            summary.completed += bucket.completed;
+            summary.failed += bucket.failed;
+            summary.processed += bucket.processed;
+            summary.processingMilliseconds += bucket.processingMilliseconds;
+            summary.totalMilliseconds += bucket.totalMilliseconds;
+        }
+
+        return summary;
+    }
+
+    beginRequestMetrics(req, res) {
+        const metrics = this.serverMetrics;
+        if (!metrics) return null;
+
+        const requestUrl = req.url || '/';
+
+        // Monitoring calls are counted apart so they do not distort the database statistics
+        if (this.isMetricsApiPath(requestUrl)) {
+            metrics.totals.monitoring++;
+            return null;
+        }
+
+        const method = req.method || 'GET';
+        const target = this.classifyRequestOperation(method, requestUrl);
+        const tracker = {
+            metrics: metrics,
+            requestNumber: metrics.nextRequestNumber++,
+            method: method,
+            path: requestUrl.split('?')[0],
+            operation: target.operation,
+            databaseName: target.databaseName,
+            collectionName: target.collectionName,
+            startedAtMilliseconds: this.getMonotonicMilliseconds(),
+            processingStartedAtMilliseconds: 0,
+            processingMilliseconds: null,
+            phase: 'receiving',
+            connectionClosed: false,
+            responseBody: ''
+        };
+
+        metrics.totals.received++;
+        metrics.activeRequests.add(tracker);
+        metrics.peakInProgress = Math.max(metrics.peakInProgress, metrics.activeRequests.size);
+
+        res.on('finish', () => this.completeRequestMetrics(tracker, res.statusCode, false));
+        res.on('close', () => this.completeRequestMetrics(tracker, res.statusCode, !res.writableFinished));
+
+        return tracker;
+    }
+
+    startRequestProcessingMetrics(tracker, requestBody) {
+        if (!tracker || tracker.phase !== 'receiving') return;
+
+        const metrics = tracker.metrics;
+        tracker.phase = 'processing';
+        tracker.processingStartedAtMilliseconds = this.getMonotonicMilliseconds();
+        metrics.bodyBytesReceived += Buffer.byteLength(requestBody);
+        metrics.processingCount++;
+        metrics.peakProcessing = Math.max(metrics.peakProcessing, metrics.processingCount);
+    }
+
+    endRequestProcessingMetrics(tracker, clientContext) {
+        if (!tracker || tracker.phase !== 'processing') return;
+
+        const metrics = tracker.metrics;
+        const duration = this.getMonotonicMilliseconds() - tracker.processingStartedAtMilliseconds;
+
+        tracker.phase = 'responding';
+        tracker.processingMilliseconds = duration;
+        tracker.responseBody = (clientContext.response && clientContext.response.body) || '';
+        metrics.processingCount--;
+
+        this.recordLatency(metrics.processingLatency, duration);
+        const bucket = this.getCurrentMetricsBucket(metrics);
+        bucket.processed++;
+        bucket.processingMilliseconds += duration;
+
+        // The client left while the database was still working on its request
+        if (tracker.connectionClosed) {
+            this.completeRequestMetrics(tracker, 0, true);
+        }
+    }
+
+    getMetricsGroup(groups, key, maximumGroups = Infinity) {
+        let group = groups.get(key);
+        if (!group && groups.size < maximumGroups) {
+            group = { requests: 0, errors: 0, latency: this.createLatencyAccumulator() };
+            groups.set(key, group);
+        }
+        return group || null;
+    }
+
+    completeRequestMetrics(tracker, statusCode, aborted) {
+        if (!tracker || tracker.phase === 'done') return;
+
+        // Keep it counted as "processing" until the database work really ends
+        if (tracker.phase === 'processing') {
+            if (aborted) tracker.connectionClosed = true;
+            return;
+        }
+
+        const metrics = tracker.metrics;
+        tracker.phase = 'done';
+        metrics.activeRequests.delete(tracker);
+
+        if (aborted || tracker.connectionClosed) {
+            metrics.totals.aborted++;
+            return;
+        }
+
+        const duration = this.getMonotonicMilliseconds() - tracker.startedAtMilliseconds;
+        const responseBody = tracker.responseBody;
+        // Most API errors are answered with HTTP 200 and "success":false
+        const failed = statusCode >= 400 ||
+            (typeof responseBody === 'string' && responseBody.startsWith('{"success":false'));
+
+        metrics.totals.completed++;
+        if (failed) metrics.totals.failed++;
+        else metrics.totals.successful++;
+        if (statusCode === 429) metrics.totals.rateLimited++;
+
+        this.recordLatency(metrics.totalLatency, duration);
+
+        const bucket = this.getCurrentMetricsBucket(metrics);
+        bucket.completed++;
+        bucket.totalMilliseconds += duration;
+        if (failed) bucket.failed++;
+        metrics.peakRequestsPerSecond = Math.max(metrics.peakRequestsPerSecond, bucket.completed);
+
+        metrics.bodyBytesSent += Buffer.byteLength(responseBody);
+        metrics.methods.set(tracker.method, (metrics.methods.get(tracker.method) || 0) + 1);
+        metrics.statusCodes.set(statusCode, (metrics.statusCodes.get(statusCode) || 0) + 1);
+
+        const groups = [this.getMetricsGroup(metrics.operations, tracker.operation)];
+        if (this.validateDatabaseName(tracker.databaseName) &&
+            this.validateCollectionName(tracker.collectionName)) {
+            groups.push(this.getMetricsGroup(
+                metrics.collections,
+                `${tracker.databaseName}/${tracker.collectionName}`,
+                JS_SyDB.METRICS_MAXIMUM_TRACKED_COLLECTIONS
+            ));
+        }
+
+        for (const group of groups) {
+            if (!group) continue;
+            group.requests++;
+            if (failed) group.errors++;
+            if (tracker.processingMilliseconds !== null) {
+                this.recordLatency(group.latency, tracker.processingMilliseconds);
+            }
+        }
+
+        if (failed) {
+            let errorMessage = statusCode === 429 ? 'Rate limit exceeded' : `HTTP ${statusCode}`;
+            try {
+                errorMessage = JSON.parse(responseBody).error || errorMessage;
+            } catch (error) {
+                // Keep the generic message
+            }
+
+            metrics.recentErrors.unshift({
+                timestamp: new Date().toISOString(),
+                method: tracker.method,
+                path: tracker.path,
+                operation: tracker.operation,
+                status_code: statusCode,
+                error: errorMessage
+            });
+            if (metrics.recentErrors.length > JS_SyDB.METRICS_MAXIMUM_RECENT_ERRORS) {
+                metrics.recentErrors.pop();
+            }
+        }
+    }
+
+    buildInstanceMetrics(metrics) {
+        return {
+            id: metrics.instanceId,
+            status: this.runningFlag ? 'running' : 'stopped',
+            pid: process.pid,
+            port: metrics.port,
+            node_version: process.version,
+            platform: process.platform,
+            base_directory: this.getSecureSydbBaseDirectoryPath(),
+            started_at: new Date(metrics.startedAtEpochMilliseconds).toISOString(),
+            uptime_seconds: this.roundMetricValue(
+                (this.getMonotonicMilliseconds() - metrics.startedAtMilliseconds) / 1000
+            )
+        };
+    }
+
+    buildResourceMetrics(metrics) {
+        const sample = metrics.resourceSample;
+        const now = this.getMonotonicMilliseconds();
+        const elapsed = now - sample.takenAtMilliseconds;
+
+        // Refreshed at most once per second, so several monitors read stable values
+        if (elapsed >= 1000) {
+            const cpuDelta = process.cpuUsage(sample.cpuUsage);
+            sample.cpuPercent = this.roundMetricValue((cpuDelta.user + cpuDelta.system) / 1000 / elapsed * 100);
+            sample.cpuUsage = process.cpuUsage();
+
+            const eventLoop = this.readEventLoopUtilization();
+            if (eventLoop && sample.eventLoop) {
+                sample.eventLoopPercent = this.roundMetricValue(
+                    performance.eventLoopUtilization(eventLoop, sample.eventLoop).utilization * 100
+                );
+            }
+            sample.eventLoop = eventLoop;
+            sample.takenAtMilliseconds = now;
+        }
+
+        const memory = process.memoryUsage();
+        return {
+            cpu_percent: sample.cpuPercent,
+            event_loop_utilization_percent: sample.eventLoop ? sample.eventLoopPercent : null,
+            memory: {
+                rss_bytes: memory.rss,
+                heap_used_bytes: memory.heapUsed,
+                heap_total_bytes: memory.heapTotal,
+                external_bytes: memory.external
+            }
+        };
+    }
+
+    buildRequestMetrics(metrics) {
+        const now = this.getMonotonicMilliseconds();
+        const phases = { receiving: 0, processing: 0, responding: 0 };
+        const activeList = [];
+
+        for (const tracker of metrics.activeRequests) {
+            phases[tracker.phase]++;
+            if (activeList.length < JS_SyDB.METRICS_MAXIMUM_ACTIVE_LISTED) {
+                activeList.push({
+                    request_number: tracker.requestNumber,
+                    method: tracker.method,
+                    path: tracker.path,
+                    operation: tracker.operation,
+                    phase: tracker.phase,
+                    elapsed_ms: this.roundMetricValue(now - tracker.startedAtMilliseconds)
+                });
+            }
+        }
+
+        return {
+            in_progress: metrics.activeRequests.size,
+            receiving: phases.receiving,
+            processing: phases.processing,
+            responding: phases.responding,
+            peak_in_progress: metrics.peakInProgress,
+            peak_processing: metrics.peakProcessing,
+            total_received: metrics.totals.received,
+            total_completed: metrics.totals.completed,
+            total_successful: metrics.totals.successful,
+            total_failed: metrics.totals.failed,
+            total_aborted: metrics.totals.aborted,
+            total_rate_limited: metrics.totals.rateLimited,
+            total_monitoring: metrics.totals.monitoring,
+            error_rate_percent: metrics.totals.completed ?
+                this.roundMetricValue(metrics.totals.failed / metrics.totals.completed * 100) : 0,
+            active: activeList
+        };
+    }
+
+    buildPerformanceMetrics(metrics) {
+        const uptimeSeconds = (this.getMonotonicMilliseconds() - metrics.startedAtMilliseconds) / 1000;
+        const lastSecond = this.summarizeMetricsWindow(metrics, 1);
+        const lastTenSeconds = this.summarizeMetricsWindow(metrics, 10);
+        const lastMinute = this.summarizeMetricsWindow(metrics, 60);
+        const lastFiveMinutes = this.summarizeMetricsWindow(metrics, 300);
+        const lastFifteenMinutes = this.summarizeMetricsWindow(metrics, 900);
+
+        const ratio = (total, divisor) => divisor > 0 ? this.roundMetricValue(total / divisor) : 0;
+        // With less than one minute of data, report the real count instead of extrapolating
+        const perMinute = (total, seconds) => this.roundMetricValue(total / Math.max(seconds / 60, 1));
+
+        return {
+            requests_per_second: {
+                current: lastSecond.completed,
+                average_last_10_seconds: ratio(lastTenSeconds.completed, lastTenSeconds.coveredSeconds),
+                average_last_60_seconds: ratio(lastMinute.completed, lastMinute.coveredSeconds),
+                average_since_start: ratio(metrics.totals.completed, Math.max(uptimeSeconds, 1)),
+                peak: metrics.peakRequestsPerSecond
+            },
+            requests_per_minute: {
+                last_minute: lastMinute.completed,
+                average_last_5_minutes: perMinute(lastFiveMinutes.completed, lastFiveMinutes.coveredSeconds),
+                average_last_15_minutes: perMinute(lastFifteenMinutes.completed, lastFifteenMinutes.coveredSeconds),
+                average_since_start: perMinute(metrics.totals.completed, uptimeSeconds)
+            },
+            history_last_60_seconds: lastMinute.perSecond,
+            processing_time: {
+                ...this.summarizeLatency(metrics.processingLatency),
+                average_last_60_seconds_ms: ratio(lastMinute.processingMilliseconds, lastMinute.processed)
+            },
+            total_time: {
+                ...this.summarizeLatency(metrics.totalLatency),
+                average_last_60_seconds_ms: ratio(lastMinute.totalMilliseconds, lastMinute.completed)
+            },
+            traffic: {
+                body_bytes_received: metrics.bodyBytesReceived,
+                body_bytes_sent: metrics.bodyBytesSent
+            }
+        };
+    }
+
+    buildOperationMetrics(metrics) {
+        const describeGroups = (groups) => Array.from(groups, ([name, group]) => ({
+            name: name,
+            requests: group.requests,
+            errors: group.errors,
+            processing_time: this.summarizeLatency(group.latency)
+        })).sort((a, b) => b.requests - a.requests);
+
+        return {
+            by_operation: describeGroups(metrics.operations),
+            by_collection: describeGroups(metrics.collections),
+            by_method: Object.fromEntries(metrics.methods),
+            by_status_code: Object.fromEntries(metrics.statusCodes)
+        };
+    }
+
+    // Strictly read-only: never creates directories or data files
+    async scanStorageMetrics() {
+        const scanStartedAt = this.getMonotonicMilliseconds();
+        const basePath = this.getSecureSydbBaseDirectoryPath();
+        const storage = {
+            database_count: 0,
+            collection_count: 0,
+            instance_count: 0,
+            data_size_bytes: 0,
+            databases: []
+        };
+
+        const databaseNames = (await this.listAllSecureDatabases()).sort();
+        for (const databaseName of databaseNames) {
+            const database = {
+                name: databaseName,
+                collection_count: 0,
+                instance_count: 0,
+                data_size_bytes: 0,
+                collections: []
+            };
+
+            const collectionNames = (await this.listSecureCollectionsInDatabase(databaseName)).sort();
+            for (const collectionName of collectionNames) {
+                const collection = { name: collectionName, instance_count: 0, data_size_bytes: 0 };
+                const dataFilePath = path.join(
+                    basePath, databaseName, collectionName, `data${JS_SyDB.DATA_FILE_EXTENSION}`
+                );
+
+                try {
+                    collection.data_size_bytes = (await fs.promises.stat(dataFilePath)).size;
+                    const fd = fs.openSync(dataFilePath, 'r');
+                    try {
+                        const header = this.readSecureFileHeaderInformation({ fd: fd });
+                        if (header) collection.instance_count = header.recordCount;
+                    } finally {
+                        fs.closeSync(fd);
+                    }
+                } catch (error) {
+                    // Missing or unreadable data file: report it as empty
+                }
+
+                database.collections.push(collection);
+                database.collection_count++;
+                database.instance_count += collection.instance_count;
+                database.data_size_bytes += collection.data_size_bytes;
+            }
+
+            storage.databases.push(database);
+            storage.database_count++;
+            storage.collection_count += database.collection_count;
+            storage.instance_count += database.instance_count;
+            storage.data_size_bytes += database.data_size_bytes;
+        }
+
+        storage.scanned_at = new Date().toISOString();
+        storage.scan_duration_ms = this.roundMetricValue(this.getMonotonicMilliseconds() - scanStartedAt);
+        return storage;
+    }
+
+    async buildStorageMetrics(metrics) {
+        if (metrics.storageCache &&
+            this.getMonotonicMilliseconds() - metrics.storageCacheTakenAt < JS_SyDB.METRICS_STORAGE_CACHE_MILLISECONDS) {
+            return metrics.storageCache;
+        }
+
+        // Concurrent callers share the same scan
+        if (!metrics.storageScanPromise) {
+            metrics.storageScanPromise = this.scanStorageMetrics()
+                .then((storage) => {
+                    metrics.storageCache = storage;
+                    metrics.storageCacheTakenAt = this.getMonotonicMilliseconds();
+                    return storage;
+                })
+                .finally(() => {
+                    metrics.storageScanPromise = null;
+                });
+        }
+
+        return metrics.storageScanPromise;
+    }
+
+    async buildFullMetrics(metrics) {
+        const storage = await this.buildStorageMetrics(metrics);
+        return {
+            timestamp: new Date().toISOString(),
+            instance: this.buildInstanceMetrics(metrics),
+            resources: this.buildResourceMetrics(metrics),
+            requests: this.buildRequestMetrics(metrics),
+            performance: this.buildPerformanceMetrics(metrics),
+            operations: this.buildOperationMetrics(metrics),
+            recent_errors: metrics.recentErrors,
+            storage: storage
+        };
+    }
+
+    async httpRouteMetricsRequest(context) {
+        if (context.request.method !== 'GET') {
+            context.response.statusCode = 405;
+            context.response.statusMessage = 'Method Not Allowed';
+            context.response.headers['Allow'] = 'GET';
+            context.response.body = this.createErrorResponse('Method not allowed');
+            return;
+        }
+
+        const metrics = this.serverMetrics;
+        if (!metrics) {
+            context.response.statusCode = 503;
+            context.response.statusMessage = 'Service Unavailable';
+            context.response.body = this.createErrorResponse('Metrics are not available');
+            return;
+        }
+
+        const section = context.request.path.split('?')[0]
+            .substring(JS_SyDB.METRICS_API_PATH.length)
+            .replace(/\/+$/, '');
+
+        const sections = {
+            '': ['metrics', () => this.buildFullMetrics(metrics)],
+            '/instance': ['instance', () => ({
+                ...this.buildInstanceMetrics(metrics),
+                resources: this.buildResourceMetrics(metrics)
+            })],
+            '/requests': ['requests', () => ({
+                ...this.buildRequestMetrics(metrics),
+                recent_errors: metrics.recentErrors
+            })],
+            '/performance': ['performance', () => this.buildPerformanceMetrics(metrics)],
+            '/operations': ['operations', () => this.buildOperationMetrics(metrics)],
+            '/storage': ['storage', () => this.buildStorageMetrics(metrics)]
+        };
+
+        if (!Object.prototype.hasOwnProperty.call(sections, section)) {
+            context.response.statusCode = 404;
+            context.response.statusMessage = 'Not Found';
+            context.response.body = this.createErrorResponse('Endpoint not found');
+            return;
+        }
+
+        const [responseKey, buildSection] = sections[section];
+        context.response.body = this.createSuccessResponseWithData(responseKey, JSON.stringify(await buildSection()));
+    }
+
+    // ==================== TERMINAL MONITOR (--monit) ====================
+    // Pure HTTP client of /api/metrics: it never reads the database files itself
+
+    parseMonitorArguments(commandArgs) {
+        const options = {
+            host: JS_SyDB.MONITOR_DEFAULT_HOST,
+            port: JS_SyDB.HTTP_SERVER_PORT,
+            intervalMilliseconds: JS_SyDB.MONITOR_DEFAULT_INTERVAL_MILLISECONDS
+        };
+
+        for (let i = 1; i < commandArgs.length; i++) {
+            let name = commandArgs[i];
+            let value;
+
+            if (name === '--verbose') continue;
+
+            if (name === '--host' || name === '--port' || name === '--interval') {
+                value = commandArgs[++i];
+                if (value === undefined || value.startsWith('--')) {
+                    return { error: `Missing value for ${name}` };
+                }
+            } else if (/^\d+$/.test(name)) {
+                value = name;
+                name = '--port';
+            } else {
+                return { error: `Unknown monitor option '${name}'` };
+            }
+
+            if (name === '--host') {
+                options.host = value.replace(/^\[|\]$/g, '');
+            } else if (name === '--port') {
+                const port = Number(value);
+                if (!/^\d+$/.test(value) || port <= 0 || port > 65535) {
+                    return { error: `Invalid port number ${value}` };
+                }
+                options.port = port;
+            } else {
+                const interval = Number(value);
+                if (!/^\d+$/.test(value) ||
+                    interval < JS_SyDB.MONITOR_MINIMUM_INTERVAL_MILLISECONDS ||
+                    interval > JS_SyDB.MONITOR_MAXIMUM_INTERVAL_MILLISECONDS) {
+                    return {
+                        error: `Invalid interval ${value} (use ${JS_SyDB.MONITOR_MINIMUM_INTERVAL_MILLISECONDS}` +
+                               `-${JS_SyDB.MONITOR_MAXIMUM_INTERVAL_MILLISECONDS} milliseconds)`
+                    };
+                }
+                options.intervalMilliseconds = interval;
+            }
+        }
+
+        return options;
+    }
+
+    fetchServerMetrics(host, port) {
+        return new Promise((resolve, reject) => {
+            const request = http.get({
+                host: host,
+                port: port,
+                path: JS_SyDB.METRICS_API_PATH,
+                agent: false,
+                headers: { 'Accept': 'application/json' }
+            }, (response) => {
+                const chunks = [];
+                response.on('data', (chunk) => chunks.push(chunk));
+                response.on('error', reject);
+                response.on('end', () => {
+                    if (response.statusCode === 404) {
+                        reject(new Error('Server has no /api/metrics endpoint (restart it with this version)'));
+                        return;
+                    }
+                    try {
+                        const payload = JSON.parse(Buffer.concat(chunks).toString());
+                        if (payload.success && payload.metrics) {
+                            resolve(payload.metrics);
+                        } else {
+                            reject(new Error(payload.error || `Unexpected response (HTTP ${response.statusCode})`));
+                        }
+                    } catch (error) {
+                        reject(new Error(`Invalid response (HTTP ${response.statusCode})`));
+                    }
+                });
+            });
+
+            const timeout = setTimeout(() => {
+                request.destroy(new Error('Request timed out'));
+            }, JS_SyDB.MONITOR_REQUEST_TIMEOUT_MILLISECONDS);
+
+            request.on('error', reject);
+            request.on('close', () => clearTimeout(timeout));
+        });
+    }
+
+    sanitizeMonitorText(value) {
+        // Prevents data coming from the server from injecting terminal escape sequences
+        return String(value).replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+    }
+
+    formatMonitorNumber(value) {
+        return Number(value || 0).toLocaleString('en-US', { maximumFractionDigits: 2 });
+    }
+
+    formatMonitorBytes(bytes) {
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let value = Number(bytes || 0);
+        let unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.length - 1) {
+            value /= 1024;
+            unitIndex++;
+        }
+        return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+
+    formatMonitorMilliseconds(milliseconds) {
+        const value = Number(milliseconds || 0);
+        if (value >= 1000) return `${(value / 1000).toFixed(2)}s`;
+        return `${value.toFixed(value >= 100 ? 0 : 2)}ms`;
+    }
+
+    formatMonitorDuration(totalSeconds) {
+        const seconds = Math.floor(totalSeconds);
+        const days = Math.floor(seconds / 86400);
+        const clock = [Math.floor(seconds / 3600) % 24, Math.floor(seconds / 60) % 60, seconds % 60]
+            .map((part) => String(part).padStart(2, '0'))
+            .join(':');
+        return days > 0 ? `${days}d ${clock}` : clock;
+    }
+
+    formatMonitorCell(value, width, alignLeft = false) {
+        let text = this.sanitizeMonitorText(value);
+        if (text.length > width) text = `${text.substring(0, width - 1)}~`;
+        return alignLeft ? text.padEnd(width) : text.padStart(width);
+    }
+
+    buildMonitorSparkline(values, width) {
+        const levels = '▁▂▃▄▅▆▇█';
+        const visible = values.slice(-width);
+        const maximum = Math.max(1, ...visible);
+        return visible
+            .map((value) => levels[value === 0 ? 0 : Math.max(1, Math.round(value / maximum * (levels.length - 1)))])
+            .join('');
+    }
+
+    // Cuts a line to the terminal width without counting or breaking color codes
+    fitMonitorLine(line, width) {
+        let result = '';
+        let visibleLength = 0;
+        let position = 0;
+
+        while (position < line.length) {
+            if (line[position] === '\x1b') {
+                const escape = /^\x1b\[[0-9;]*m/.exec(line.substring(position));
+                if (escape) {
+                    result += escape[0];
+                    position += escape[0].length;
+                    continue;
+                }
+            }
+            if (visibleLength >= width) {
+                return result.includes('\x1b') ? `${result}\x1b[0m` : result;
+            }
+            result += line[position];
+            visibleLength++;
+            position++;
+        }
+
+        return result;
+    }
+
+    buildMonitorFrame(state) {
+        const paint = state.paint;
+        const title = (text) => paint('1;36', text);
+        const number = (value) => paint('1', this.formatMonitorNumber(value));
+        const cell = (value, width, alignLeft) => this.formatMonitorCell(value, width, alignLeft);
+        const time = (value) => this.formatMonitorMilliseconds(value);
+
+        const displayHost = state.host.includes(':') ? `[${state.host}]` : state.host;
+        const status = state.online ? paint('1;32', '● ONLINE') :
+            paint('1;31', state.errorMessage ? '● OFFLINE' : '● CONNECTING');
+
+        const header = [
+            `${paint('1;7', ' SyDB MONITOR ')} http://${displayHost}:${state.port}  ${status}` +
+            `${state.paused ? paint('1;33', '  [PAUSED]') : ''}`,
+            `Refresh ${state.intervalMilliseconds}ms` +
+            (state.lastSuccessAt ? `  Updated ${state.lastSuccessAt.toLocaleTimeString()}` : '') +
+            (state.online ? `  API round trip ${time(state.roundTripMilliseconds)}` : '')
+        ];
+
+        if (!state.online && state.errorMessage) {
+            header.push(paint('31', this.sanitizeMonitorText(state.errorMessage)) +
+                (state.paused ? '' : `  (retry in ${(state.nextDelayMilliseconds / 1000).toFixed(1)}s)`));
+            if (state.snapshot) header.push(paint('33', 'Showing the last data received'));
+        }
+
+        const body = [];
+        const snapshot = state.snapshot;
+
+        if (!snapshot) {
+            body.push('', 'Waiting for data. Is the server running?  node JS_SyDB.js --server [port]');
+            return { header, body };
+        }
+
+        const { instance, resources, requests, performance: speed, operations, storage } = snapshot;
+        const perSecond = speed.requests_per_second;
+        const perMinute = speed.requests_per_minute;
+
+        body.push('', title('INSTANCE'));
+        body.push(`  ID ${this.sanitizeMonitorText(instance.id)}  PID ${instance.pid}  ` +
+            `Node ${this.sanitizeMonitorText(instance.node_version)}`);
+        body.push(`  Uptime ${this.formatMonitorDuration(instance.uptime_seconds)}  ` +
+            `Data dir ${this.sanitizeMonitorText(instance.base_directory)}`);
+        body.push(`  CPU ${resources.cpu_percent.toFixed(1)}%  ` +
+            (resources.event_loop_utilization_percent === null ? '' :
+                `Event loop ${resources.event_loop_utilization_percent.toFixed(1)}%  `) +
+            `RSS ${this.formatMonitorBytes(resources.memory.rss_bytes)}  ` +
+            `Heap ${this.formatMonitorBytes(resources.memory.heap_used_bytes)}` +
+            `/${this.formatMonitorBytes(resources.memory.heap_total_bytes)}`);
+
+        body.push('', title('REQUESTS'));
+        body.push(`  In progress ${paint('1;33', this.formatMonitorNumber(requests.in_progress))}  ` +
+            `(receiving ${requests.receiving}, processing ${requests.processing}, responding ${requests.responding})`);
+        body.push(`  Peak in progress ${number(requests.peak_in_progress)}  ` +
+            `Peak processing ${number(requests.peak_processing)}`);
+        body.push(`  Received ${number(requests.total_received)}  Completed ${number(requests.total_completed)}  ` +
+            `OK ${paint('32', this.formatMonitorNumber(requests.total_successful))}  ` +
+            `Failed ${paint(requests.total_failed ? '31' : '0', this.formatMonitorNumber(requests.total_failed))}`);
+        body.push(`  Aborted ${number(requests.total_aborted)}  Rate limited ${number(requests.total_rate_limited)}  ` +
+            `Error rate ${requests.error_rate_percent.toFixed(2)}%`);
+
+        body.push('', title('THROUGHPUT'));
+        body.push(`  Req/s    now ${number(perSecond.current)}  avg 10s ${number(perSecond.average_last_10_seconds)}  ` +
+            `avg 60s ${number(perSecond.average_last_60_seconds)}  ` +
+            `lifetime ${number(perSecond.average_since_start)}  peak ${number(perSecond.peak)}`);
+        body.push(`  Req/min  last 60s ${number(perMinute.last_minute)}  ` +
+            `avg 5m ${number(perMinute.average_last_5_minutes)}  ` +
+            `avg 15m ${number(perMinute.average_last_15_minutes)}  ` +
+            `lifetime ${number(perMinute.average_since_start)}`);
+        body.push(`  Last 60s ${paint('32', this.buildMonitorSparkline(speed.history_last_60_seconds, 60))}`);
+        body.push(`  Traffic  in ${this.formatMonitorBytes(speed.traffic.body_bytes_received)}  ` +
+            `out ${this.formatMonitorBytes(speed.traffic.body_bytes_sent)}  (bodies only)`);
+
+        body.push('', title('TIME PER REQUEST'));
+        body.push(paint('2', `  ${cell('', 11, true)}${['avg', 'avg 60s', 'median', 'p95', 'p99', 'max', 'last']
+            .map((label) => cell(label, 9)).join('')}`));
+        for (const [label, latency] of [['Processing', speed.processing_time], ['Total', speed.total_time]]) {
+            body.push(`  ${cell(label, 11, true)}` + [
+                latency.average_ms, latency.average_last_60_seconds_ms, latency.median_ms,
+                latency.p95_ms, latency.p99_ms, latency.max_ms, latency.last_ms
+            ].map((value) => cell(time(value), 9)).join(''));
+        }
+
+        if (requests.active.length > 0) {
+            body.push('', title('ACTIVE NOW'));
+            for (const active of requests.active.slice(0, 5)) {
+                body.push(`  ${cell(active.method, 7, true)}${cell(active.phase, 11, true)}` +
+                    `${cell(time(active.elapsed_ms), 9)}  ${this.sanitizeMonitorText(active.path)}`);
+            }
+        }
+
+        const groupTable = (heading, nameLabel, groups) => {
+            body.push('', title(heading));
+            body.push(paint('2', `  ${cell(nameLabel, 28, true)}${cell('requests', 10)}${cell('errors', 8)}` +
+                `${cell('avg', 10)}${cell('max', 10)}`));
+            if (groups.length === 0) body.push('  (no requests yet)');
+            for (const group of groups) {
+                body.push(`  ${cell(group.name, 28, true)}` +
+                    `${cell(this.formatMonitorNumber(group.requests), 10)}` +
+                    `${cell(this.formatMonitorNumber(group.errors), 8)}` +
+                    `${cell(time(group.processing_time.average_ms), 10)}` +
+                    `${cell(time(group.processing_time.max_ms), 10)}`);
+            }
+        };
+
+        groupTable('OPERATIONS', 'operation', operations.by_operation);
+        groupTable('BUSIEST COLLECTIONS', 'database/collection', operations.by_collection.slice(0, 5));
+
+        body.push('', title('STORAGE'));
+        body.push(`  Databases ${number(storage.database_count)}  Collections ${number(storage.collection_count)}  ` +
+            `Instances ${number(storage.instance_count)}  Size ${this.formatMonitorBytes(storage.data_size_bytes)}`);
+        if (storage.databases.length > 0) {
+            body.push(paint('2', `  ${cell('database/collection', 38, true)}${cell('instances', 12)}${cell('size', 12)}`));
+        }
+        for (const database of storage.databases) {
+            const row = (name, entry) => `  ${cell(name, 38, true)}` +
+                `${cell(this.formatMonitorNumber(entry.instance_count), 12)}` +
+                `${cell(this.formatMonitorBytes(entry.data_size_bytes), 12)}`;
+            body.push(row(database.name, database));
+            for (const collection of database.collections) {
+                body.push(row(`  └ ${collection.name}`, collection));
+            }
+        }
+
+        if (snapshot.recent_errors.length > 0) {
+            body.push('', title('RECENT ERRORS'));
+            for (const entry of snapshot.recent_errors.slice(0, 5)) {
+                body.push(`  ${new Date(entry.timestamp).toLocaleTimeString()}  ${entry.status_code}  ` +
+                    `${this.sanitizeMonitorText(entry.method)} ${this.sanitizeMonitorText(entry.path)}  ` +
+                    paint('31', this.sanitizeMonitorText(entry.error)));
+            }
+        }
+
+        return { header, body };
+    }
+
+    // Redraws only the lines that changed, which avoids flickering
+    renderMonitorScreen(state) {
+        const width = process.stdout.columns || 80;
+        const height = process.stdout.rows || 24;
+        const { header, body } = this.buildMonitorFrame(state);
+
+        const bodyHeight = Math.max(0, height - header.length - 1);
+        const maximumScroll = Math.max(0, body.length - bodyHeight);
+        state.scrollOffset = Math.min(Math.max(0, state.scrollOffset), maximumScroll);
+
+        let footer = 'q quit  p pause  r refresh  +/- slower/faster';
+        if (maximumScroll > 0) {
+            footer += `  ↑/↓ scroll [${state.scrollOffset}/${maximumScroll}]`;
+        }
+
+        const lines = [
+            ...header,
+            ...body.slice(state.scrollOffset, state.scrollOffset + bodyHeight),
+            state.paint('2', footer)
+        ].slice(0, height).map((line) => this.fitMonitorLine(line, width - 1));
+
+        let output = '';
+        if (state.forceRedraw) {
+            output += '\x1b[2J';
+            state.previousLines = [];
+            state.forceRedraw = false;
+        }
+
+        const lineCount = Math.min(height, Math.max(lines.length, state.previousLines.length));
+        for (let i = 0; i < lineCount; i++) {
+            const line = lines[i] || '';
+            if (line !== state.previousLines[i]) {
+                output += `\x1b[${i + 1};1H${line}\x1b[K`;
+            }
+        }
+
+        state.previousLines = lines;
+        if (output) process.stdout.write(output);
+    }
+
+    startMonitor(options) {
+        const interactive = Boolean(process.stdout.isTTY);
+        const keyboard = interactive && Boolean(process.stdin.isTTY);
+        const useColors = interactive && !process.env.NO_COLOR;
+
+        const state = {
+            host: options.host,
+            port: options.port,
+            intervalMilliseconds: options.intervalMilliseconds,
+            snapshot: null,
+            online: false,
+            errorMessage: '',
+            lastSuccessAt: null,
+            roundTripMilliseconds: 0,
+            nextDelayMilliseconds: options.intervalMilliseconds,
+            consecutiveFailures: 0,
+            paused: false,
+            scrollOffset: 0,
+            previousLines: [],
+            forceRedraw: true,
+            paint: (code, text) => useColors ? `\x1b[${code}m${text}\x1b[0m` : String(text)
+        };
+
+        return new Promise((resolve) => {
+            let timer = null;
+            let polling = false;
+            let stopped = false;
+
+            const render = () => {
+                if (stopped) return;
+                if (interactive) {
+                    this.renderMonitorScreen(state);
+                } else {
+                    const { header, body } = this.buildMonitorFrame(state);
+                    process.stdout.write(`${[...header, ...body].join('\n')}\n\n`);
+                }
+            };
+
+            const poll = async () => {
+                if (stopped || polling) return;
+                polling = true;
+                clearTimeout(timer);
+
+                const requestStartedAt = this.getMonotonicMilliseconds();
+                try {
+                    state.snapshot = await this.fetchServerMetrics(state.host, state.port);
+                    state.online = true;
+                    state.errorMessage = '';
+                    state.lastSuccessAt = new Date();
+                    state.consecutiveFailures = 0;
+                } catch (error) {
+                    state.online = false;
+                    state.errorMessage = error.message || error.code || 'Connection failed';
+                    state.consecutiveFailures++;
+                }
+                state.roundTripMilliseconds = this.getMonotonicMilliseconds() - requestStartedAt;
+                polling = false;
+                if (stopped) return;
+
+                const interval = state.intervalMilliseconds;
+                if (state.online) {
+                    // A slow server is polled less often, so the monitor never piles up on it
+                    state.nextDelayMilliseconds = Math.max(
+                        interval - state.roundTripMilliseconds,
+                        state.roundTripMilliseconds
+                    );
+                } else {
+                    // Exponential backoff while the server is unreachable
+                    state.nextDelayMilliseconds = Math.max(interval, Math.min(
+                        JS_SyDB.MONITOR_MAXIMUM_BACKOFF_MILLISECONDS,
+                        interval * Math.pow(2, state.consecutiveFailures - 1)
+                    ));
+                }
+
+                render();
+
+                // The next poll is scheduled only after this one ends: requests never overlap
+                clearTimeout(timer);
+                if (!state.paused) {
+                    timer = setTimeout(poll, state.nextDelayMilliseconds);
+                }
+            };
+
+            const onKey = (data) => {
+                const key = data.toString();
+                const page = Math.max(1, (process.stdout.rows || 24) - 4);
+
+                if (key === 'q' || key === 'Q' || key === '\u0003' || key === '\u001b') {
+                    stop();
+                    return;
+                }
+
+                if (key === 'p' || key === 'P') {
+                    state.paused = !state.paused;
+                    clearTimeout(timer);
+                    if (!state.paused) poll();
+                } else if (key === 'r' || key === 'R') {
+                    state.forceRedraw = true;
+                    poll();
+                } else if (key === '+' || key === '=') {
+                    state.intervalMilliseconds = Math.min(
+                        JS_SyDB.MONITOR_MAXIMUM_INTERVAL_MILLISECONDS, state.intervalMilliseconds * 2
+                    );
+                } else if (key === '-') {
+                    state.intervalMilliseconds = Math.max(
+                        JS_SyDB.MONITOR_MINIMUM_INTERVAL_MILLISECONDS, Math.round(state.intervalMilliseconds / 2)
+                    );
+                    if (!state.paused) poll();
+                } else if (key === '\u001b[A' || key === 'k') {
+                    state.scrollOffset--;
+                } else if (key === '\u001b[B' || key === 'j') {
+                    state.scrollOffset++;
+                } else if (key === '\u001b[5~') {
+                    state.scrollOffset -= page;
+                } else if (key === '\u001b[6~') {
+                    state.scrollOffset += page;
+                }
+
+                render();
+            };
+
+            const onResize = () => {
+                state.forceRedraw = true;
+                render();
+            };
+
+            const restoreTerminal = () => {
+                if (keyboard) process.stdin.setRawMode(false);
+                if (interactive) process.stdout.write('\x1b[?25h\x1b[?1049l');
+            };
+
+            const stop = () => {
+                if (stopped) return;
+                stopped = true;
+                clearTimeout(timer);
+
+                process.removeListener('SIGINT', stop);
+                process.removeListener('SIGTERM', stop);
+                process.removeListener('exit', restoreTerminal);
+                process.stdout.removeListener('resize', onResize);
+                process.stdout.removeListener('error', stop);
+                if (keyboard) {
+                    process.stdin.removeListener('data', onKey);
+                    process.stdin.pause();
+                }
+
+                restoreTerminal();
+                resolve(0);
+            };
+
+            process.on('SIGINT', stop);
+            process.on('SIGTERM', stop);
+            process.on('exit', restoreTerminal);
+            process.stdout.on('error', stop);
+
+            if (interactive) {
+                // Alternate screen with hidden cursor: the shell history stays untouched
+                process.stdout.write('\x1b[?1049h\x1b[?25l');
+                process.stdout.on('resize', onResize);
+                render();
+            }
+
+            if (keyboard) {
+                process.stdin.setRawMode(true);
+                process.stdin.resume();
+                process.stdin.on('data', onKey);
+            }
+
+            poll();
+        });
+    }
+
     // ==================== HTTP REQUEST ROUTING ====================
     // MUST MATCH C VERSION EXACTLY
 
@@ -2458,6 +3672,11 @@ class JS_SyDB {
 
         if (this.verboseMode) {
             console.log(`Routing request: ${method} ${path}`);
+        }
+
+        if (this.isMetricsApiPath(path)) {
+            await this.httpRouteMetricsRequest(context);
+            return;
         }
 
         const pathComponents = this.parseApiPathOptimized(path);
@@ -2675,6 +3894,8 @@ class JS_SyDB {
         }
 
         this.httpServer = http.createServer(async (req, res) => {
+            const requestMetricsTracker = this.beginRequestMetrics(req, res);
+
             try {
                 const clientIp = req.socket.remoteAddress;
                 if (!(await this.checkRateLimit(this.rateLimiter, clientIp))) {
@@ -2706,7 +3927,12 @@ class JS_SyDB {
                     response: null
                 };
 
-                await this.httpClientHandler(clientContext);
+                this.startRequestProcessingMetrics(requestMetricsTracker, body);
+                try {
+                    await this.httpClientHandler(clientContext);
+                } finally {
+                    this.endRequestProcessingMetrics(requestMetricsTracker, clientContext);
+                }
 
                 if (clientContext.response) {
                     res.writeHead(
@@ -2740,6 +3966,7 @@ class JS_SyDB {
                 };
 
                 this.runningFlag = true;
+                this.serverMetrics = this.createServerMetrics(port);
 
                 if (this.verboseMode) {
                     console.log('Server startup completed successfully');
@@ -2833,6 +4060,7 @@ class JS_SyDB {
         console.log("  node JS_SyDB.js --server [port]          # Start HTTP server");
         console.log("  node JS_SyDB.js --server --verbose       # Start HTTP server with extreme logging");
         console.log("  node JS_SyDB.js --routes                 # Show all HTTP API routes and schemas");
+        console.log("  node JS_SyDB.js --monit [port] [--host <host>] [--port <port>] [--interval <ms>]  # Live server monitor");
         console.log("\nField types: string, int, float, bool, array, object");
         console.log("Add -req for required fields");
         console.log("Add -idx for indexed fields (improves query performance)");
@@ -2890,6 +4118,15 @@ class JS_SyDB {
             }
 
             return result;
+        }
+
+        if (commandArgs[0] === '--monit') {
+            const monitorOptions = this.parseMonitorArguments(commandArgs);
+            if (monitorOptions.error) {
+                console.error(`Error: ${monitorOptions.error}`);
+                return 1;
+            }
+            return this.startMonitor(monitorOptions);
         }
 
         await this.initializeBaseDirectory();
