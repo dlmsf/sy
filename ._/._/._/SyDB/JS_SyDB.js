@@ -3304,6 +3304,40 @@ class JS_SyDB {
             .join('');
     }
 
+    // Precise chart: every row is labeled with its exact value.
+    // With a peak <= 16 each row is exactly 1 req/s; above that the 16 rows split 0..peak evenly.
+    buildMonitorChart(values, width, paint) {
+        const levels = ' ▁▂▃▄▅▆▇█';
+        const visible = values.slice(-width);
+        const maximum = Math.max(1, ...visible);
+        const height = Math.min(16, Math.max(4, maximum));
+        const labelWidth = 8;
+        const rows = [];
+
+        for (let row = height - 1; row >= 0; row--) {
+            const rowTop = maximum * (row + 1) / height;
+            const label = this.formatMonitorNumber(Math.round(rowTop * 10) / 10);
+
+            let line = '';
+            for (const value of visible) {
+                const units = value > 0 ? Math.max(1, Math.round(value / maximum * height * 8)) : 0;
+                const level = Math.min(8, units - row * 8);
+                line += level > 0 ? paint('32', levels[level]) : paint('2', '·');
+            }
+
+            rows.push(`${this.formatMonitorCell(label, labelWidth)} ┤${line}`);
+        }
+
+        rows.push(`${this.formatMonitorCell('0', labelWidth)} └${'─'.repeat(visible.length)}`);
+
+        const left = '-60s';
+        const right = 'now';
+        const gap = Math.max(1, visible.length - left.length - right.length);
+        rows.push(`${' '.repeat(labelWidth + 2)}${left}${' '.repeat(gap)}${right}`);
+
+        return rows;
+    }
+
     // Cuts a line to the terminal width without counting or breaking color codes
     fitMonitorLine(line, width) {
         let result = '';
@@ -3398,7 +3432,10 @@ class JS_SyDB {
             `avg 5m ${number(perMinute.average_last_5_minutes)}  ` +
             `avg 15m ${number(perMinute.average_last_15_minutes)}  ` +
             `lifetime ${number(perMinute.average_since_start)}`);
-        body.push(`  Last 60s ${paint('32', this.buildMonitorSparkline(speed.history_last_60_seconds, 60))}`);
+        body.push('  Req/s last 60s (each row labeled with its exact value)');
+        for (const chartRow of this.buildMonitorChart(speed.history_last_60_seconds, 60, paint)) {
+            body.push(`  ${chartRow}`);
+        }
         body.push(`  Traffic  in ${this.formatMonitorBytes(speed.traffic.body_bytes_received)}  ` +
             `out ${this.formatMonitorBytes(speed.traffic.body_bytes_sent)}  (bodies only)`);
 
