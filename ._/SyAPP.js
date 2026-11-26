@@ -40356,7 +40356,7 @@ ${_vc.brightYellow('NOTES')}
     // was deleted. The pattern accepts both `<name>-pack` (literal
     // `*-pack`) and `<name>-pack.<ext>` (which is what --pack actually
     // emits), plus the `.pack` / `.pack.<ext>` variants for robustness.
-    if (arg1 === 'clean') {
+    if (arg1 === 'clean' || arg1 === 'clear') {
       const cleanDir = process.cwd();
       let entries = [];
       try {
