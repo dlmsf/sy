@@ -22799,6 +22799,259 @@ function levenshteinDistance(str1, str2) {
       return embedded;
     };
 
+    // --------------------------- Embs Method ---------------------------
+
+    /**
+     * Manager of MANY independent this.Emb() widgets inside ONE dropdown.
+     *
+     *   • "＋ New"  → creates a brand new, empty this.Emb() in the dropdown.
+     *   • ☐/■      → bulk selection (select all / none / clear).
+     *   • ✕ / 🗑   → delete one / all selected (confirmation-gated). The
+     *                 Emb's background process tree and storage are removed.
+     *   • ⧉        → clone one / all selected. The clone is an exact copy of
+     *                 the source Emb state, but totally new and decoupled:
+     *                 own name, own storage, own background process.
+     *
+     * @param {string} id - User/build ID
+     * @param {Object} [config]
+     * @param {string} [config.name='default'] - Unique key of this manager
+     * @param {Object} [config.dropdown] - Dropdown texts/emojis
+     * @param {Object} [config.emb] - Extra config passed to every this.Emb()
+     * @returns {Promise<Object|null>} manager state
+     */
+    this.Embs = async (id, config = {}) => {
+      if (!this.Builds.has(id)) {
+        if (this.Log) console.log(`this.Embs() Error - userBuild not found | BuildID: ${id}`);
+        return null;
+      }
+
+      const cfg = { name: 'default', dropdown: {}, emb: {}, ...config };
+      const dd = {
+        up_buttontext: '◈ Embs',
+        down_buttontext: 'Hide Embs',
+        up_emoji: '▶',
+        down_emoji: '▼',
+        ...(cfg.dropdown || {})
+      };
+
+      const storageKey = `embs_${cfg.name}`;
+      const ns = `__embs_${cfg.name}`;
+      const P = {
+        newOne:    `${ns}_new`,
+        selPrefix: `${ns}_sel_`,
+        selAll:    `${ns}_selall`,
+        clearSel:  `${ns}_clearsel`,
+        cloneOne:  `${ns}_cloneone_`,
+        cloneSel:  `${ns}_clonesel`,
+        delOne:    `${ns}_delone_`,
+        delSel:    `${ns}_delsel`,
+        cfYes:     `${ns}_cfyes`,
+        cfNo:      `${ns}_cfno`
+      };
+
+      if (!this.Storages.Has(id, storageKey)) {
+        this.Storages.Set(id, storageKey, { items: [], selected: [], seq: 0, confirm: null });
+      }
+      const state = this.Storages.Get(id, storageKey);
+      if (!Array.isArray(state.items)) state.items = [];
+      if (!Array.isArray(state.selected)) state.selected = [];
+
+      const curProps = this.Builds.get(id).Session.ActualProps || {};
+      const embNameOf = (key) => `${cfg.name}__${key}`;
+
+      // ---------------- helpers ----------------
+      const destroyEmb = (key) => {
+        const sk = `emb_${embNameOf(key)}`;
+        try {
+          const st = this.Storages.Get(id, sk);
+          if (st && st.bgProcess && (st.bgProcess.pid || st.bgProcess.id)) {
+            try { _embKillBackgroundProcess(st.bgProcess); } catch (_) {}
+          }
+        } catch (_) {}
+        try {
+          const all = this.Storages.GetAll(id) || {};
+          for (const k of Object.keys(all)) {
+            if (k === sk || k.includes(`${sk}_`)) this.Storages.Delete(id, k);
+          }
+          this.Storages.Delete(id, sk);
+        } catch (_) {}
+      };
+
+      const cloneItem = (srcKey) => {
+        const idx = state.items.findIndex(i => i.key === srcKey);
+        if (idx < 0) return null;
+        const src = state.items[idx];
+        const newKey = `e${++state.seq}`;
+        const label = `${src.label} (copy)`;
+        const srcSt = this.Storages.Get(id, `emb_${embNameOf(srcKey)}`);
+        if (srcSt && typeof srcSt === 'object') {
+          let copy = null;
+          try { copy = JSON.parse(JSON.stringify({ ...srcSt, bgProcess: null })); } catch (_) { copy = null; }
+          if (copy) {
+            copy.bgProcess = null;   // decoupled: spawns its OWN process
+            copy.pickMode = false;
+            copy.editPanel = false;
+            copy.error = null;
+            copy.dropdown = (copy.dropdown && typeof copy.dropdown === 'object') ? copy.dropdown : {};
+            for (const k of ['up_buttontext', 'down_buttontext']) {
+              if (copy.dropdown[k] === src.label) copy.dropdown[k] = label;
+            }
+            this.Storages.Set(id, `emb_${embNameOf(newKey)}`, copy);
+          }
+        }
+        const pos = state.items.findIndex(i => i.key === srcKey);
+        state.items.splice(pos + 1, 0, { key: newKey, label });
+        return newKey;
+      };
+
+      // ---------------- prop handlers ----------------
+      if (curProps[P.newOne]) {
+        delete curProps[P.newOne];
+        const key = `e${++state.seq}`;
+        state.items.push({ key, label: `Emb ${state.seq}` });
+      }
+
+      for (const k of Object.keys(curProps)) {
+        if (k.startsWith(P.selPrefix)) {
+          const key = k.slice(P.selPrefix.length);
+          delete curProps[k];
+          const i = state.selected.indexOf(key);
+          if (i >= 0) state.selected.splice(i, 1);
+          else if (state.items.some(x => x.key === key)) state.selected.push(key);
+          break;
+        }
+      }
+
+      if (curProps[P.selAll]) {
+        delete curProps[P.selAll];
+        const all = state.items.map(i => i.key);
+        const allSel = all.length > 0 && all.every(k => state.selected.includes(k));
+        state.selected = allSel ? [] : all;
+      }
+      if (curProps[P.clearSel]) {
+        delete curProps[P.clearSel];
+        state.selected = [];
+        state.confirm = null;
+      }
+
+      for (const k of Object.keys(curProps)) {
+        if (k.startsWith(P.cloneOne)) {
+          const key = k.slice(P.cloneOne.length);
+          delete curProps[k];
+          cloneItem(key);
+          break;
+        }
+      }
+      if (curProps[P.cloneSel]) {
+        delete curProps[P.cloneSel];
+        for (const key of state.selected.slice()) cloneItem(key);
+        state.selected = [];
+      }
+
+      for (const k of Object.keys(curProps)) {
+        if (k.startsWith(P.delOne)) {
+          const key = k.slice(P.delOne.length);
+          delete curProps[k];
+          state.confirm = { keys: [key] };
+          break;
+        }
+      }
+      if (curProps[P.delSel]) {
+        delete curProps[P.delSel];
+        if (state.selected.length > 0) state.confirm = { keys: state.selected.slice() };
+      }
+      if (curProps[P.cfNo]) {
+        delete curProps[P.cfNo];
+        state.confirm = null;
+      }
+      if (curProps[P.cfYes]) {
+        delete curProps[P.cfYes];
+        const keys = (state.confirm && Array.isArray(state.confirm.keys)) ? state.confirm.keys : [];
+        for (const key of keys) destroyEmb(key);
+        state.items = state.items.filter(i => !keys.includes(i.key));
+        state.selected = state.selected.filter(k => !keys.includes(k));
+        state.confirm = null;
+        try { SyPM._pruneDeadEntries(); } catch (_) {}
+        const __t = setTimeout(() => { try { SyPM._pruneDeadEntries(); } catch (_) {} }, 1500);
+        if (__t.unref) __t.unref();
+      }
+
+      // prune selection / confirmation against existing items
+      const existing = new Set(state.items.map(i => i.key));
+      state.selected = state.selected.filter(k => existing.has(k));
+      if (state.confirm) {
+        state.confirm.keys = (state.confirm.keys || []).filter(k => existing.has(k));
+        if (state.confirm.keys.length === 0) state.confirm = null;
+      }
+      this.Storages.Set(id, storageKey, state);
+
+      // ---------------- render ----------------
+      await this.DropDown(id, `${storageKey}_dd`, async () => {
+        if (state.confirm) {
+          this.Buttons(id, [
+            {
+              name: ColorText.bgRed(ColorText.brightWhite(` ✓ Delete ${state.confirm.keys.length}? `)),
+              props: { [P.cfYes]: 1 }
+            },
+            { name: ColorText.dim('✕'), props: { [P.cfNo]: 1 } }
+          ]);
+        } else {
+          const bar = [
+            { name: ColorText.bgGreen(ColorText.black(' ＋ New ')), props: { [P.newOne]: 1 } }
+          ];
+          if (state.items.length > 0) {
+            const allSel = state.items.every(i => state.selected.includes(i.key));
+            bar.push({ name: allSel ? '⊟ None' : '⊞ All', props: { [P.selAll]: 1 } });
+          }
+          if (state.selected.length > 0) {
+            bar.push({
+              name: ColorText.bgRed(ColorText.brightWhite(` 🗑 Delete ${state.selected.length} `)),
+              props: { [P.delSel]: 1 }
+            });
+            bar.push({
+              name: ColorText.brightYellow(`⧉ Clone ${state.selected.length}`),
+              props: { [P.cloneSel]: 1 }
+            });
+            bar.push({ name: ColorText.dim('×'), props: { [P.clearSel]: 1 } });
+          }
+          this.Buttons(id, bar);
+        }
+
+        if (state.items.length === 0) {
+          this.Text(id, ColorText.dim('  (no Embs yet — click "＋ New")'));
+          return;
+        }
+
+        for (const item of state.items) {
+          const isSel = state.selected.includes(item.key);
+          this.Buttons(id, [
+            {
+              name: isSel ? ColorText.bgGreen(ColorText.black(' ■ ')) : ColorText.dim('☐'),
+              props: { [P.selPrefix + item.key]: 1 }
+            },
+            { name: ColorText.brightYellow('⧉'), props: { [P.cloneOne + item.key]: 1 } },
+            { name: ColorText.red('✕'), props: { [P.delOne + item.key]: 1 } }
+          ]);
+          await this.Emb(id, {
+            ...(cfg.emb || {}),
+            name: embNameOf(item.key),
+            dropdown: {
+              ...((cfg.emb && cfg.emb.dropdown) || {}),
+              up_buttontext: item.label,
+              down_buttontext: item.label
+            }
+          });
+        }
+      }, {
+        up_buttontext: `${dd.up_buttontext} (${state.items.length})`,
+        down_buttontext: `${dd.down_buttontext} (${state.items.length})`,
+        up_emoji: dd.up_emoji,
+        down_emoji: dd.down_emoji
+      });
+
+      return state;
+    };
+
     // --------------------------- EmbOutput Method ---------------------------
 
     /**
