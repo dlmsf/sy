@@ -36,8 +36,8 @@ NODE_ENTRY_POINTS_CMD="sy"
 # NODE_ENTRY_POINTS_CMD_DEV. Leave empty for no extra dev commands.
 # Remember to also add each dev command name to get_command_working_dir()
 # below (in the DEV-ONLY section) so it uses the right working directory.
-NODE_ENTRY_POINTS_SRC_DEV="._/SyAPP.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js ._/._/._/Qemu/Qemu.js ._/._/._/Util/CodeParser.js ._/._/._/Util/jsinfo.js ._/._/._/Util/Bundler.js ._/._/._/Util/PortClear.js ._/._/._/Util/Replacer.js ._/._/._/Util/GitView.js ._/._/._/Util/Struct.js ._/._/._/Util/shinstall.js ._/._/._/Util/CodeReplacer.js ._/._/._/Util/clipwait.js ._/._/._/Util/Proxy/core/MenuCLI/MenuCLI.js ._/._/._/Util/SingleInstall.js"
-NODE_ENTRY_POINTS_CMD_DEV="syapp sypm sydb pkg pack arc labssh qemujs codeparser jsinfo bundler portclear replacer gitview struct shinstall codereplacer clipwait proxy singleinstall"
+NODE_ENTRY_POINTS_SRC_DEV="._/SyAPP.js ._/SyPM.js ._/SyDB.js pkg-cli.js ._/._/._/Packager/Pack.js ._/._/._/Util/arch.js ._/._/._/Util/SSH.js ._/._/._/Qemu/Qemu.js ._/._/._/Util/CodeParser.js ._/._/._/Util/jsinfo.js ._/._/._/Util/Bundler.js ._/._/._/Util/PortClear.js ._/._/._/Util/Replacer.js ._/._/._/Util/GitView.js ._/._/._/Util/Struct.js ._/._/._/Util/shinstall.js ._/._/._/Util/CodeReplacer.js ._/._/._/Util/clipwait.js ._/._/._/Util/Proxy/core/MenuCLI/MenuCLI.js ._/._/._/Util/SingleInstall.js ._/._/._/Util/JStoString.js"
+NODE_ENTRY_POINTS_CMD_DEV="syapp sypm sydb pkg pack arc labssh qemujs codeparser jsinfo bundler portclear replacer gitview struct shinstall codereplacer clipwait proxy singleinstall stringjs"
 
 # =============================================================================
 # SHELL SCRIPT COMMAND MAPPING (OPTIONAL - for .sh files with bash→ash fallback)
@@ -136,6 +136,7 @@ get_command_working_dir() {
         "shinstall") echo "caller" ;; 
         "replacer") echo "caller" ;;  
         "bundler") echo "caller" ;;  
+        "stringjs") echo "caller" ;; 
         
         # =====================================================================
         # DEV-ONLY NODE.JS COMMANDS (installed only when --dev is passed)
