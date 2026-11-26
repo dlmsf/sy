@@ -1539,7 +1539,7 @@ class SyDBCorruptionTester extends SyAPP_Func {
                 phase: 'idle',
                 host: '127.0.0.1',
                 port: 8080,
-                speedMs: 25,
+                speedMs: 1,
                 maxSteps: 0,
                 runId: null,
                 step: 0,
@@ -2892,7 +2892,7 @@ async function _workerRunLoop(initialState) {
     const st = initialState || {};
     if (!st.host) st.host = '127.0.0.1';
     if (!st.port) st.port = 8080;
-    if (typeof st.speedMs !== 'number') st.speedMs = 25;
+    if (typeof st.speedMs !== 'number') st.speedMs = 1;
     if (typeof st.maxSteps !== 'number') st.maxSteps = 0;
     if (typeof st.step !== 'number') st.step = 0;
     if (typeof st.corruptionCount !== 'number') st.corruptionCount = 0;
