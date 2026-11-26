@@ -22849,8 +22849,96 @@ function levenshteinDistance(str1, str2) {
         cfNo:      `${ns}_cfno`
       };
 
+      P.cloneOneN = `${ns}_clonen_`;
+      P.cloneSelN = `${ns}_clonesel_n`;
+      P.cloneNCommit = `${ns}_clonencommit`;
+
+      // ---- host file resolution (same anchors as this.Emb) ----
+      let __embsHost = null;
+      try {
+        const __cands = [];
+        if (typeof cfg.sourceFile === 'string' && cfg.sourceFile) __cands.push(cfg.sourceFile);
+        if (this._syappInstance && typeof this._syappInstance._mainSourceFile === 'string') {
+          __cands.push(this._syappInstance._mainSourceFile);
+        }
+        const __argvFile = process.argv[2];
+        if (typeof __argvFile === 'string' &&
+            /\.(js|mjs|cjs)$/i.test(__argvFile) &&
+            !/SyAPP\.(js|mjs|cjs)$/i.test(__argvFile)) {
+          __cands.push(path.isAbsolute(__argvFile) ? __argvFile : path.resolve(process.cwd(), __argvFile));
+        }
+        if (typeof __BUILDER_EXPORT_TARGET === 'string' && __BUILDER_EXPORT_TARGET) {
+          __cands.push(__BUILDER_EXPORT_TARGET);
+        }
+        for (const c of __cands) {
+          if (c && fs.existsSync(c)) { __embsHost = c; break; }
+        }
+      } catch (_) {}
+      const __embsCanWrite = this.Name !== '__selfbuilder__';
+
+      // Seed an Emb storage entry from a persisted `emb` config object.
+      const seedEmbState = (key, label, e) => {
+        const skey = `emb_${cfg.name}__${key}`;
+        if (this.Storages.Has(id, skey)) return;
+        e = (e && typeof e === 'object' && !Array.isArray(e)) ? e : {};
+        let fp = (typeof e.filePath === 'string' && e.filePath) ? e.filePath : null;
+        let pm = (e.pathMode === 'global' || e.pathMode === 'relative') ? e.pathMode : 'global';
+        if (fp && !path.isAbsolute(fp) && __embsHost) {
+          try {
+            fp = path.resolve(path.dirname(__embsHost), fp);
+            if (e.pathMode !== 'global') pm = 'relative';
+          } catch (_) {}
+        }
+        const code = (typeof e.code === 'string' && e.code.trim()) ? e.code : null;
+        const source = code ? 'code' : (fp ? 'file' : 'none');
+        const dd0 = {
+          up_buttontext: label,
+          down_buttontext: label,
+          up_emoji: _EMB_DEFAULT_DROPDOWN.up_emoji,
+          down_emoji: _EMB_DEFAULT_DROPDOWN.down_emoji
+        };
+        if (e.dropdown && typeof e.dropdown === 'object') {
+          for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+            if (e.dropdown[k] !== undefined) dd0[k] = e.dropdown[k];
+          }
+        }
+        this.Storages.Set(id, skey, {
+          source,
+          filePath: fp,
+          code,
+          saveMode: (source === 'file' || (e.saveMode === 'path' && fp)) ? 'path' : 'inline',
+          error: null,
+          pickMode: false,
+          editPanel: false,
+          args: Array.isArray(e.args) ? e.args.slice() : [],
+          dropdown: dd0,
+          pathMode: pm,
+          runMode: e.runMode === 'normal' ? 'normal' : 'bg',
+          outputEnabled: e.embOutput !== false,
+          autoApplyArgToDropdown: false,
+          bgProcess: null
+        });
+      };
+
       if (!this.Storages.Has(id, storageKey)) {
-        this.Storages.Set(id, storageKey, { items: [], selected: [], seq: 0, confirm: null });
+        const bootItems = [];
+        let bootSeq = 0;
+        if (Array.isArray(cfg.items)) {
+          for (const it of cfg.items) {
+            if (!it || typeof it !== 'object') continue;
+            const key = (typeof it.key === 'string' && it.key) ? it.key : `e${bootItems.length + 1}`;
+            if (bootItems.some(b => b.key === key)) continue;
+            const label = (typeof it.label === 'string' && it.label) ? it.label : key;
+            bootItems.push({ key, label });
+            const km = key.match(/^e(\d+)$/);
+            if (km) bootSeq = Math.max(bootSeq, parseInt(km[1], 10));
+            seedEmbState(key, label, it.emb);
+          }
+        }
+        if (Number.isFinite(cfg.seq)) bootSeq = Math.max(bootSeq, Math.floor(cfg.seq));
+        this.Storages.Set(id, storageKey, {
+          items: bootItems, selected: [], seq: bootSeq, confirm: null, lastSnippet: null
+        });
       }
       const state = this.Storages.Get(id, storageKey);
       if (!Array.isArray(state.items)) state.items = [];
@@ -22877,12 +22965,12 @@ function levenshteinDistance(str1, str2) {
         } catch (_) {}
       };
 
-      const cloneItem = (srcKey) => {
+      const cloneItem = (srcKey, labelOverride, insertAfterKey) => {
         const idx = state.items.findIndex(i => i.key === srcKey);
         if (idx < 0) return null;
         const src = state.items[idx];
         const newKey = `e${++state.seq}`;
-        const label = `${src.label} (copy)`;
+        const label = labelOverride || `${src.label} (copy)`;
         const srcSt = this.Storages.Get(id, `emb_${embNameOf(srcKey)}`);
         if (srcSt && typeof srcSt === 'object') {
           let copy = null;
@@ -22899,7 +22987,7 @@ function levenshteinDistance(str1, str2) {
             this.Storages.Set(id, `emb_${embNameOf(newKey)}`, copy);
           }
         }
-        const pos = state.items.findIndex(i => i.key === srcKey);
+        const pos = state.items.findIndex(i => i.key === (insertAfterKey || srcKey));
         state.items.splice(pos + 1, 0, { key: newKey, label });
         return newKey;
       };
@@ -22948,6 +23036,71 @@ function levenshteinDistance(str1, str2) {
         state.selected = [];
       }
 
+      // ---------------- BULK CLONE (custom number of copies) ----------------
+      {
+        const __ppEmbs = curProps.page ? { page: curProps.page } : {};
+
+        for (const k of Object.keys(curProps)) {
+          if (k.startsWith(P.cloneOneN)) {
+            const key = k.slice(P.cloneOneN.length);
+            delete curProps[k];
+            if (state.items.some(i => i.key === key)) {
+              state.pendingClone = { keys: [key] };
+              this.Storages.Set(id, storageKey, state);
+              this.WaitInput(id, {
+                question: 'Copies: ',
+                path: this.Name,
+                props: { ...__ppEmbs, [P.cloneNCommit]: 1 }
+              });
+              return state;
+            }
+            break;
+          }
+        }
+
+        if (curProps[P.cloneSelN]) {
+          delete curProps[P.cloneSelN];
+          if (state.selected.length > 0) {
+            state.pendingClone = { keys: state.selected.slice() };
+            this.Storages.Set(id, storageKey, state);
+            this.WaitInput(id, {
+              question: `Copies of each of ${state.selected.length} selected: `,
+              path: this.Name,
+              props: { ...__ppEmbs, [P.cloneNCommit]: 1 }
+            });
+            return state;
+          }
+        }
+
+        if (curProps[P.cloneNCommit]) {
+          delete curProps[P.cloneNCommit];
+          const raw = String(curProps.inputValue || '').trim();
+          delete curProps.inputValue;
+          const n = parseInt(raw, 10);
+          const keys = (state.pendingClone && Array.isArray(state.pendingClone.keys))
+            ? state.pendingClone.keys : [];
+          state.pendingClone = null;
+          if (!isNaN(n) && n >= 1 && keys.length > 0) {
+            const count = Math.min(n, 100);
+            let made = 0;
+            for (const key of keys) {
+              const srcItem = state.items.find(i => i.key === key);
+              if (!srcItem) continue;
+              const baseLabel = srcItem.label;
+              let after = key;
+              for (let c = 0; c < count; c++) {
+                const nk = cloneItem(key, `${baseLabel} #${c + 1}`, after);
+                if (nk) { after = nk; made++; }
+              }
+            }
+            state.selected = [];
+            this.Alert(id,
+              `⧉ Created ${made} cop${made === 1 ? 'y' : 'ies'}${n > count ? ` (capped at ${count} each)` : ''}`,
+              { duration: 2500 });
+          }
+        }
+      }
+
       for (const k of Object.keys(curProps)) {
         if (k.startsWith(P.delOne)) {
           const key = k.slice(P.delOne.length);
@@ -22985,6 +23138,11 @@ function levenshteinDistance(str1, str2) {
       }
       this.Storages.Set(id, storageKey, state);
 
+      // Items of this manager are persisted through the owning
+      // this.Embs(...) call, not through individual this.Emb(...) calls.
+      if (!this._embManagedNames) this._embManagedNames = new Set();
+      for (const item of state.items) this._embManagedNames.add(embNameOf(item.key));
+
       // ---------------- render ----------------
       await this.DropDown(id, `${storageKey}_dd`, async () => {
         if (state.confirm) {
@@ -23012,6 +23170,10 @@ function levenshteinDistance(str1, str2) {
               name: ColorText.brightYellow(`⧉ Clone ${state.selected.length}`),
               props: { [P.cloneSel]: 1 }
             });
+            bar.push({
+              name: ColorText.brightYellow(`⧉ ×N`),
+              props: { [P.cloneSelN]: 1 }
+            });
             bar.push({ name: ColorText.dim('×'), props: { [P.clearSel]: 1 } });
           }
           this.Buttons(id, bar);
@@ -23030,6 +23192,7 @@ function levenshteinDistance(str1, str2) {
               props: { [P.selPrefix + item.key]: 1 }
             },
             { name: ColorText.brightYellow('⧉'), props: { [P.cloneOne + item.key]: 1 } },
+            { name: ColorText.brightYellow('⧉×'), props: { [P.cloneOneN + item.key]: 1 } },
             { name: ColorText.red('✕'), props: { [P.delOne + item.key]: 1 } }
           ]);
           await this.Emb(id, {
@@ -23048,6 +23211,154 @@ function levenshteinDistance(str1, str2) {
         up_emoji: dd.up_emoji,
         down_emoji: dd.down_emoji
       });
+
+      // ---------------- persistence into the host file ----------------
+      const embStateOf = (key) => this.Storages.Get(id, `emb_${embNameOf(key)}`);
+
+      // Object form of an item's Emb config (used by the SelfBuilder).
+      const embObjOf = (item) => {
+        const st = embStateOf(item.key);
+        if (!st || typeof st !== 'object' || st.source === 'none') return {};
+        const o = {};
+        if (st.saveMode === 'path') {
+          if (st.filePath) o.filePath = st.filePath;
+          o.saveMode = 'path';
+        } else {
+          if (st.code && String(st.code).trim()) o.code = st.code;
+          if (st.filePath) o.filePath = st.filePath;
+        }
+        if (st.pathMode === 'relative') o.pathMode = 'relative';
+        if (st.runMode === 'normal') o.runMode = 'normal';
+        if (st.outputEnabled === false) o.embOutput = false;
+        if (Array.isArray(st.args) && st.args.length > 0) o.args = st.args.slice();
+        if (st.dropdown && typeof st.dropdown === 'object') {
+          const ddo = {};
+          for (const k of ['up_buttontext', 'down_buttontext']) {
+            if (st.dropdown[k] !== undefined && st.dropdown[k] !== item.label) ddo[k] = st.dropdown[k];
+          }
+          for (const k of ['up_emoji', 'down_emoji']) {
+            if (st.dropdown[k] !== undefined && st.dropdown[k] !== _EMB_DEFAULT_DROPDOWN[k]) ddo[k] = st.dropdown[k];
+          }
+          if (Object.keys(ddo).length > 0) o.dropdown = ddo;
+        }
+        return o;
+      };
+
+      // Text form of an item's Emb config object (same snippet builders
+      // this.Emb() uses, so escaping rules are identical).
+      const embCfgText = (item) => {
+        const st = embStateOf(item.key);
+        if (!st || typeof st !== 'object' || st.source === 'none') return null;
+        const copy = { ...st, dropdown: { ...(st.dropdown || {}) } };
+        for (const k of ['up_buttontext', 'down_buttontext']) {
+          if (copy.dropdown[k] === item.label) copy.dropdown[k] = _EMB_DEFAULT_DROPDOWN[k];
+        }
+        const hasCode = !!(copy.code && String(copy.code).trim());
+        const hasFile = !!(copy.filePath && fs.existsSync(copy.filePath));
+        const usePath = copy.saveMode === 'path' || (!hasCode && !hasFile);
+        const snipCfg = { name: '__embs_item__' };
+        const snip = usePath
+          ? this._embSnippetPath(copy, snipCfg, __embsHost)
+          : this._embSnippetInline(copy, snipCfg);
+        const obj = _packExtractConfigObjectFromSnippet(snip);
+        if (!obj) return null;
+        return obj.replace(/\n[ \t]*name:\s*"__embs_item__",?/, '');
+      };
+
+      const __embsDDDefault = {
+        up_buttontext: '◈ Embs', down_buttontext: 'Hide Embs', up_emoji: '▶', down_emoji: '▼'
+      };
+
+      const buildEmbsSnippet = () => {
+        const propsOut = [
+          `name: ${JSON.stringify(cfg.name)}`,
+          `seq: ${state.seq || 0}`
+        ];
+        const ddOut = {};
+        for (const k of ['up_buttontext', 'down_buttontext', 'up_emoji', 'down_emoji']) {
+          if (dd[k] !== __embsDDDefault[k]) ddOut[k] = dd[k];
+        }
+        if (Object.keys(ddOut).length > 0) propsOut.push(`dropdown: ${JSON.stringify(ddOut)}`);
+
+        const itemLines = state.items.map((item, idx) => {
+          const txt = embCfgText(item);
+          return `    { key: ${JSON.stringify(item.key)}, label: ${JSON.stringify(item.label)}` +
+            (txt ? `, emb: ${txt}` : '') +
+            ` }${idx < state.items.length - 1 ? ',' : ''}`;
+        });
+        propsOut.push(itemLines.length > 0
+          ? `items: [\n${itemLines.join('\n')}\n  ]`
+          : `items: []`);
+
+        return `await this.Embs(id, {\n${propsOut.map(p => '  ' + p).join(',\n')}\n})`;
+      };
+
+      const replaceEmbsCall = (src, name, snippet) => {
+        const re = /this\.Embs\s*\(/g;
+        let m;
+        while ((m = re.exec(src)) !== null) {
+          const openIdx = m.index + m[0].length - 1;
+          const closeIdx = this._embScanParenSimple(src, openIdx);
+          if (closeIdx < 0) continue;
+          const body = src.slice(openIdx + 1, closeIdx);
+          const stripped = this._embStripTemplateContents(body);
+          const hasName = /(?:["']?name["']?)\s*:/.test(stripped);
+          const matches = this._embBodyHasName(body, name) || (name === 'default' && !hasName);
+          if (!matches) { re.lastIndex = closeIdx + 1; continue; }
+
+          const firstArg = (_sbSplitArgs(body)[0] || '').trim();
+          let plain = String(snippet).replace(/^\s*await\s+/, '');
+          if (/^[A-Za-z_$][\w$]*$/.test(firstArg) && firstArg !== 'id') {
+            plain = plain.replace(/^(\s*this\.Embs\(\s*)id(\s*,)/, `$1${firstArg}$2`);
+          }
+          const result = src.slice(0, m.index) + plain + src.slice(closeIdx + 1);
+          if (!this._embSourceLooksBalanced(src) || this._embSourceLooksBalanced(result)) return result;
+          return null;
+        }
+        return null;
+      };
+
+      const syncEmbsToHost = () => {
+        if (!__embsCanWrite || !__embsHost) return false;
+        let snippet;
+        try { snippet = buildEmbsSnippet(); } catch (_) { return false; }
+        // First pass only records the baseline: the file already
+        // describes the state this manager was booted from.
+        if (state.lastSnippet == null) { state.lastSnippet = snippet; return false; }
+        if (state.lastSnippet === snippet) return false;
+        state.lastSnippet = snippet;
+        try {
+          const existing = fs.readFileSync(__embsHost, 'utf8');
+          const replaced = replaceEmbsCall(existing, cfg.name, snippet);
+          if (replaced !== null && replaced !== existing) {
+            fs.writeFileSync(__embsHost, replaced);
+            return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+
+      if (this.Name === '__selfbuilder__') {
+        try {
+          state.exportItems = state.items.map(item => ({
+            key: item.key, label: item.label, emb: embObjOf(item)
+          }));
+        } catch (_) {}
+      }
+
+      try { syncEmbsToHost(); } catch (_) {}
+
+      // Final write when the process closes.
+      if (!this._embsSyncers) this._embsSyncers = new Map();
+      this._embsSyncers.set(storageKey, syncEmbsToHost);
+      if (!this._embsExitHooked) {
+        this._embsExitHooked = true;
+        process.on('exit', () => {
+          for (const fn of this._embsSyncers.values()) {
+            try { fn(); } catch (_) {}
+          }
+        });
+      }
 
       return state;
     };
@@ -24035,7 +24346,12 @@ function levenshteinDistance(str1, str2) {
      */
     this._embReplaceExistingCall = (src, embName, newSnippet) => {
       const found = this._embFindCall(src, embName);
-      if (!found) return null;
+      if (!found) {
+        // Embs-managed Embs have no this.Emb(...) call in the host file;
+        // their state is persisted through the owning this.Embs(...) call.
+        if (this._embManagedNames && this._embManagedNames.has(embName)) return src;
+        return null;
+      }
 
       // The replacement text (with `await ` stripped, since the call
       // site's own context supplies awaits).
@@ -24537,17 +24853,36 @@ function levenshteinDistance(str1, str2) {
               __tmpDirCandidates.push(path.dirname(path.resolve(__hostSrcForTmp)));
             }
           } catch (_) { /* candidates are best-effort */ }
+          // Never write temp files next to the user's sources. Use the OS
+          // temp dir and, when the project has a node_modules, expose it
+          // through a symlink so bare package imports keep resolving.
+          let __nmDir = null;
           for (const __cand of __tmpDirCandidates) {
-            try {
-              fs.accessSync(__cand, fs.constants.W_OK);
-              tmpDir = __cand;
-              tmpIsSourceDir = true;
-              break;
-            } catch (_) { /* try next candidate */ }
+            let __d = __cand;
+            while (__d) {
+              const __p = path.join(__d, 'node_modules');
+              try { if (fs.existsSync(__p)) { __nmDir = __p; break; } } catch (_) {}
+              const __up = path.dirname(__d);
+              if (__up === __d) break;
+              __d = __up;
+            }
+            if (__nmDir) break;
           }
-          if (!tmpDir) {
-            tmpDir = path.join(os.tmpdir(), 'syapp_emb_bg');
-            if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+          const __bgBase = path.join(os.tmpdir(), 'syapp_emb_bg');
+          tmpDir = __nmDir
+            ? path.join(__bgBase, createHash('sha1').update(__nmDir).digest('hex').slice(0, 12))
+            : __bgBase;
+          if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+          if (__nmDir) {
+            try {
+              const __link = path.join(tmpDir, 'node_modules');
+              let __cur = null;
+              try { __cur = fs.readlinkSync(__link); } catch (_) {}
+              if (__cur !== __nmDir) {
+                try { fs.unlinkSync(__link); } catch (_) {}
+                fs.symlinkSync(__nmDir, __link, 'junction');
+              }
+            } catch (_) { /* best-effort */ }
           }
           const __safeEmbName = (cfg.name || 'default').replace(/[^a-zA-Z0-9_\-]/g, '_');
           // `.mjs` extension so Node treats this temp file as ESM by
@@ -32121,6 +32456,14 @@ function _genFuncJS(state, syappRelPath) {
           L.push(`${indent}await this.Chart(id, ${dataLit}, ${JSON.stringify(cfg)})`)
           break
         }
+        case 'embs': {
+          const cfg = { name: it.name }
+          if (Number(it.seq) > 0) cfg.seq = Number(it.seq)
+          if (it.dropdown && Object.keys(it.dropdown).length) cfg.dropdown = it.dropdown
+          if (Array.isArray(it.embItems) && it.embItems.length > 0) cfg.items = it.embItems
+          L.push(`${indent}await this.Embs(id, ${JSON.stringify(cfg)})`)
+          break
+        }
         case 'connection': {
           const cfg = { name: it.name }
           if (it.config && typeof it.config === 'object') {
@@ -32213,6 +32556,7 @@ const _SB_METHOD_TO_ITEMTYPE = {
   Cells: 'cells',
   Grid: 'grid',
   Emb: 'emb',
+  Embs: 'embs',
   Get: 'route',
   Post: 'route',
   Put: 'route',
@@ -32405,11 +32749,21 @@ function _sbMakeItemForMethod(methodName, id) {
         name: 'conn_' + id,
         config: {}
       }
+    case 'embs':
+      // Manager of many this.Emb() widgets. `embItems` holds the
+      // persisted per-Emb configs and is kept in sync with the live
+      // widget after every render.
+      return { ...base, name: 'embs_' + id, embItems: [], seq: 0, dropdown: {} }
     case 'route':
       return { ...base, method: methodName, path: '/', handler: '// handler code' }
     case 'code':
     default:
-      return { ...base, value: `// this.${methodName}(id, ...)` }
+      return {
+        ...base,
+        value: methodName === 'EmbOutput'
+          ? `this.EmbOutput(id, 'value')`
+          : `// this.${methodName}(id, ...)`
+      }
   }
 }
 
@@ -35235,6 +35589,20 @@ class SelfBuilder extends SyAPP_Func {
             ...(it.config || {})
           })
           break
+        case 'embs': {
+          const embsCfg = { name: it.name }
+          if (Array.isArray(it.embItems) && it.embItems.length > 0) embsCfg.items = it.embItems
+          if (Number(it.seq) > 0) embsCfg.seq = Number(it.seq)
+          if (it.dropdown && Object.keys(it.dropdown).length) embsCfg.dropdown = it.dropdown
+          const embsState = await this.Embs(id, embsCfg)
+          try {
+            if (embsState && Array.isArray(embsState.exportItems)) {
+              it.embItems = embsState.exportItems
+              it.seq = embsState.seq || 0
+            }
+          } catch (_) { /* sync is best-effort */ }
+          break
+        }
         case 'connection': {
           const connCfg = it.config && typeof it.config === 'object'
             ? { ...it.config }
@@ -35634,6 +36002,11 @@ class SelfBuilder extends SyAPP_Func {
         mkProp('args', 'Args (JSON array)', 'json')
         mkProp('dropdown', 'Dropdown Config', 'json')
         break
+      case 'embs':
+        mkProp('name', 'Name', 'string')
+        mkProp('dropdown', 'Dropdown Config', 'json')
+        break
+
       case 'connection':
         mkProp('name', 'Name', 'string')
         mkProp('config', 'Config (JSON)', 'json')
@@ -36405,6 +36778,21 @@ function _sbCallToItem(call, sessionVar) {
           ? cfg.dropdown
           : {},
         args: Array.isArray(cfg.args) ? cfg.args : []
+      };
+    }
+    case 'Embs': {
+      const cfg = rest[0] !== undefined ? _sbObjArg(rest[0]) : {};
+      if (cfg === null) return null;
+      return {
+        type: 'embs',
+        name: typeof cfg.name === 'string' ? cfg.name : `embs_${_sbNid()}`,
+        embItems: Array.isArray(cfg.items)
+          ? cfg.items.filter(i => i && typeof i === 'object' && !Array.isArray(i))
+          : [],
+        seq: typeof cfg.seq === 'number' ? cfg.seq : 0,
+        dropdown: (cfg.dropdown && typeof cfg.dropdown === 'object' && !Array.isArray(cfg.dropdown))
+          ? cfg.dropdown
+          : {}
       };
     }
     case 'Connection': {
